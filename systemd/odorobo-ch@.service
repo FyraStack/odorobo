@@ -1,0 +1,76 @@
+[Unit]
+Description=Odorobo Cloud Hypervisor VM (%i)
+Documentation=https://www.cloudhypervisor.org/docs/
+After=network-online.target odorobo-agent.service
+Wants=network-online.target
+Requires=odorobo-agent.service
+
+# If this unit fails, don't take down other VMs
+OnFailure=odorobo-ch-failed@%i.service
+
+[Service]
+Type=simple
+User=odorobo
+Group=odorobo
+
+RuntimeDirectory=odorobo odorobo/vms odorobo/vms/%i
+RuntimeDirectoryMode=0750
+LogsDirectory=odorobo
+LogsDirectoryMode=0750
+ConfigurationDirectory=odorobo/vms/%i
+ConfigurationDirectoryMode=0750
+
+ExecStartPre=/usr/local/libexec/odorobo-preflight %i
+# the actual VM process
+ExecStart=/usr/bin/cloud-hypervisor \
+    --api-socket /run/odorobo/vms/%i/ch.sock \
+    --log-file /var/log/odorobo/%i.log \
+    --serial tty \
+    --console off
+
+ExecStartPost=/usr/local/libexec/odorobo-postflight %i
+ExecStop=/usr/local/libexec/odorobo-stop %i
+
+Restart=on-failure
+RestartSec=3s
+RestartPreventExitStatus=0
+TimeoutStopSec=30s
+
+CPUAccounting=yes
+MemoryAccounting=yes
+IOAccounting=yes
+TasksAccounting=yes
+
+# Security hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+# CH needs JIT/executable memory
+MemoryDenyWriteExecute=no
+# vCPU threads need realtime scheduling
+RestrictRealtime=no
+AmbientCapabilities=CAP_NET_ADMIN
+
+# Paths CH legitimately needs to write
+ReadWritePaths=/run/odorobo /var/log/odorobo /etc/odorobo /var/lib/odorobo
+
+# KVM device access
+DeviceAllow=/dev/kvm rw
+DeviceAllow=/dev/net/tun rw
+DeviceAllow=/dev/vhost-net rw
+DeviceAllow=/dev/urandom r
+
+# storage
+DeviceAllow=/dev/nbd* rw
+DeviceAllow=/dev/rbd* rw
+DeviceAllow=/dev/sd* rw
+DeviceAllow=/dev/nvme* rw
+DeviceAllow=/dev/disk/by-id/* rw
+
+[Install]
+WantedBy=multi-user.target

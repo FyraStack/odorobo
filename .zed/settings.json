@@ -1,0 +1,9 @@
+{
+  // Folder-specific settings
+  //
+  // For a full list of overridable settings, and general information on folder-specific settings,//zed.dev/docs/configuring-zed#settings-files
+  "project_name": "Odorobo",
+  "file_types": {
+    "shell": ["systemd/scripts/*"],
+  },
+}

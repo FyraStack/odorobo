@@ -1,0 +1,7 @@
+#!/bin/sh
+
+VMID=$1
+if [ -z "$VMID" ]; then
+  echo "Usage: $0 <vmid>"
+  exit 1
+fi

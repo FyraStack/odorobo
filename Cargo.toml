@@ -1,0 +1,9 @@
+[workspace]
+resolver = "3"
+members = ["odorobo-agent"]
+
+[workspace.dependencies]
+stable-eyre = "0.2.2"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+cloud-hypervisor-client = "0.3"
