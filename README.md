@@ -1,4 +1,4 @@
-# Odorobo 🤖💃
+# Odorobo
 
 > [Umicha - Odorobo](https://youtu.be/D_UC0WJmLnc)
 
