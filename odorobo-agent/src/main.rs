@@ -1,7 +1,6 @@
+mod api;
 mod state;
-
 use stable_eyre::Result;
-use state::VMInstance;
 #[tokio::main]
 async fn main() -> Result<()> {
     stable_eyre::install()?;
@@ -11,8 +10,11 @@ async fn main() -> Result<()> {
 
     tracing::info!("Starting odorobo-agent...");
 
-    let list = VMInstance::list()?;
-    tracing::info!("VM Instances: {list:#?}");
+    // minimal axum server
+
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:8890").await?;
+    tracing::info!("Listening on http://{}", listener.local_addr()?);
+    axum::serve(listener, api::router()).await?;
 
     Ok(())
 }

@@ -1,7 +1,7 @@
 use cloud_hypervisor_client::{
     SocketBasedApiClient,
     apis::DefaultApi,
-    models::{self, VmInfo},
+    models::{self, VmInfo, VmmPingResponse},
 };
 use hyper::Method;
 use serde_json::Value;
@@ -39,6 +39,10 @@ impl VMInstance {
         }
     }
 
+    pub fn get(vmid: &str) -> Option<Self> {
+        Self::list().ok()?.into_iter().find(|i| i.id == vmid)
+    }
+
     pub fn runtime_root() -> PathBuf {
         Self::configured_runtime_root().join(VMS_DIR_NAME)
     }
@@ -73,18 +77,25 @@ impl VMInstance {
         &self.ch_socket_path
     }
 
-    async fn info(&self) -> Result<VmInfo> {
+    pub async fn info(&self) -> Result<VmInfo> {
         self.conn()
             .vm_info_get()
             .await
             .wrap_err(eyre!("Failed to get VM info for {}", self.vm_id()))
     }
 
-    async fn shutdown(&self) -> Result<()> {
+    pub async fn shutdown(&self) -> Result<()> {
         self.conn()
             .shutdown_vm()
             .await
             .wrap_err(eyre!("Failed to shutdown VM {}", self.vm_id()))
+    }
+
+    pub async fn ping(&self) -> Result<VmmPingResponse> {
+        self.conn()
+            .vmm_ping_get()
+            .await
+            .wrap_err(eyre!("Failed to ping VM {}", self.vm_id()))
     }
 
     pub async fn console_socket(&self) -> Result<PathBuf> {
@@ -208,8 +219,8 @@ impl VMInstance {
     ///
     /// Applies node-specific transforms, saves config to disk, then:
     /// 1. Creates the VM via CH API
-    /// 2. Boots the VM
-    pub async fn create_and_boot(&self, config: models::VmConfig) -> Result<()> {
+    /// 2. Boots the VM (if boot is true)
+    pub async fn create(&self, config: models::VmConfig, boot: bool) -> Result<()> {
         let mut config = config;
         apply_builtin_transforms(&mut config).wrap_err("Failed to apply config transforms")?;
 
@@ -219,11 +230,13 @@ impl VMInstance {
             .await
             .wrap_err(eyre!("Failed to create VM {}", self.vm_id()))?;
 
-        self.conn()
-            .boot_vm()
-            .await
-            .wrap_err(eyre!("Failed to boot VM {}", self.vm_id()))?;
-
+        if boot {
+            debug!(vm_id = self.vm_id(), "Booting VM");
+            self.conn()
+                .boot_vm()
+                .await
+                .wrap_err(eyre!("Failed to boot VM {}", self.vm_id()))?;
+        }
         info!(vm_id = self.vm_id(), "VM created and booted");
         Ok(())
     }

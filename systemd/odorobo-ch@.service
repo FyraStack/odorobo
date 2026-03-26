@@ -22,7 +22,7 @@ ConfigurationDirectoryMode=0750
 
 ExecStartPre=/usr/local/libexec/odorobo-preflight %i
 # the actual VM process
-ExecStart=/usr/bin/cloud-hypervisor \
+ExecStart=/usr/bin/cloud-hypervisor -vv \
     --api-socket /run/odorobo/vms/%i/ch.sock \
     --log-file /var/log/odorobo/%i.log
 
