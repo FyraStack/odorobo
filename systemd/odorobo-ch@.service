@@ -24,9 +24,8 @@ ExecStartPre=/usr/local/libexec/odorobo-preflight %i
 # the actual VM process
 ExecStart=/usr/bin/cloud-hypervisor \
     --api-socket /run/odorobo/vms/%i/ch.sock \
-    --log-file /var/log/odorobo/%i.log \
-    --serial tty \
-    --console off
+    --log-file /var/log/odorobo/%i.log
+
 
 ExecStartPost=/usr/local/libexec/odorobo-postflight %i
 ExecStop=/usr/local/libexec/odorobo-stop %i
