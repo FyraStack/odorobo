@@ -4,7 +4,7 @@
 
 Stack Virtualization Platform - Powered by Cloud Hypervisor
 
-Odorobo^(robot dance)^ is a hypervisor platform built on top of 
+Odorobo<sup>(robot dance)</sup> is a hypervisor platform built on top of 
 [Cloud Hypervisor](https://www.cloudhypervisor.org/), a lightweight 
 VMM built on rust-vmm, with a focus on providing lightweight,
 stateful, and portable virtual machines.
