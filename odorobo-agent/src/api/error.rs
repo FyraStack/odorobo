@@ -18,4 +18,8 @@ pub enum ApiError {
     #[error("Failed to create VM")]
     #[http(code = 500)]
     CreateFailed,
+
+    #[error("Failed to open VM console")]
+    #[http(code = 500)]
+    ConsoleFailed,
 }

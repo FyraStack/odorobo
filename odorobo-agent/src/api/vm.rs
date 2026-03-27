@@ -1,9 +1,7 @@
-use axum::{
-    Json,
-    extract::{Path, Query},
-};
+use axum::{Json, extract::{Path, Query}};
 use cloud_hypervisor_client::models::{self, VmInfo, VmmPingResponse};
 use serde::Deserialize;
+use stable_eyre::Result;
 
 use super::error::ApiError;
 use crate::state::VMInstance;
@@ -14,6 +12,8 @@ pub fn router() -> axum::Router<()> {
         .route("/", axum::routing::put(create_vm))
         .route("/{vmid}", axum::routing::get(vm_info))
         .route("/{vmid}/ping", axum::routing::get(ping_vm))
+        .route("/{vmid}", axum::routing::delete(destroy_vm))
+        .route("/{vmid}/console", axum::routing::get(super::console::console_stream))
 }
 
 async fn list_vms() -> Result<Json<Vec<String>>, ApiError> {

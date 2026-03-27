@@ -23,4 +23,4 @@ Agents run on each node and manage Cloud Hypervisor instances directly via syste
 
 ## Usage
 
-TODO
+See `docs/console.md` for PTY-over-WebSocket usage and integration details.

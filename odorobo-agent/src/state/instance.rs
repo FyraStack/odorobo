@@ -11,6 +11,7 @@ use stable_eyre::{
 };
 use std::{
     env, fs,
+    fs::OpenOptions,
     path::{Path, PathBuf},
 };
 use tracing::{debug, info, warn};
@@ -21,6 +22,7 @@ use super::transform::apply_builtin_transforms;
 pub const CONFIG_FILE_NAME: &str = "config.json";
 const SOCKET_FILE_NAME: &str = "ch.sock";
 pub const VMS_DIR_NAME: &str = "vms";
+pub type ConsoleStream = tokio::fs::File;
 
 const DEFAULT_RUNTIME_ROOT_DIR: &str = "/run/odorobo";
 const RUNTIME_ROOT_ENV_VAR: &str = "ODOROBO_RUNTIME_DIR";
@@ -73,6 +75,23 @@ impl VMInstance {
         &self.id
     }
 
+    /// Opens the PTY console device for this VM and returns a connected stream.
+    pub async fn open_console(&self) -> Result<ConsoleStream> {
+        let console_path = self.console_path().await?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&console_path)
+            .wrap_err_with(|| {
+                eyre!(
+                    "Failed to open PTY console device for {} at {}",
+                    self.vm_id(),
+                    console_path.display()
+                )
+            })?;
+        Ok(tokio::fs::File::from_std(file))
+    }
+
     pub fn ch_socket_path(&self) -> &Path {
         &self.ch_socket_path
     }
@@ -98,19 +117,19 @@ impl VMInstance {
             .wrap_err(eyre!("Failed to ping VM {}", self.vm_id()))
     }
 
-    pub async fn console_socket(&self) -> Result<PathBuf> {
+    pub async fn console_path(&self) -> Result<PathBuf> {
         let vminfo = self.info().await?;
         if let Some(console) = vminfo.config.console {
             match console.mode {
                 models::console_config::Mode::Pty => {
                     debug!(
                         vm_id = self.vm_id(),
-                        "VM has PTY console configured, returning socket path"
+                        "VM has PTY console configured, returning PTY path"
                     );
-                    let socket_path = console.file.ok_or_else(|| {
+                    let console_path = console.file.ok_or_else(|| {
                         eyre!("Console config is missing file path for PTY console")
                     })?;
-                    Ok(socket_path.into())
+                    Ok(console_path.into())
                 }
                 _ => Err(eyre!(
                     "Console is configured but is not a PTY console, unsupported console type"

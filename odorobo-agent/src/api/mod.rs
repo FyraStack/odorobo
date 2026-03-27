@@ -1,4 +1,5 @@
 //! REST Management API for odorobo-agent
+mod console;
 mod error;
 pub use error::ApiError;
 
