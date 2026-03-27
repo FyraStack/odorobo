@@ -22,4 +22,8 @@ pub enum ApiError {
     #[error("Failed to open VM console")]
     #[http(code = 500)]
     ConsoleFailed,
+
+    #[error("Failed to proxy Cloud Hypervisor API request")]
+    #[http(code = 500)]
+    PassthroughFailed,
 }

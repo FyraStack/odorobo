@@ -3,6 +3,7 @@ use cloud_hypervisor_client::{
     apis::DefaultApi,
     models::{self, VmInfo, VmmPingResponse},
 };
+use hyper::{Request, Response, body::Bytes};
 use hyper::Method;
 use serde_json::Value;
 use stable_eyre::{
@@ -16,7 +17,7 @@ use std::{
 };
 use tracing::{debug, info, warn};
 
-use super::api::call;
+use super::api::{call, call_request};
 use super::transform::apply_builtin_transforms;
 
 pub const CONFIG_FILE_NAME: &str = "config.json";
@@ -267,6 +268,13 @@ impl VMInstance {
         call(self.ch_socket_path(), method, path, body)
             .await
             .wrap_err(eyre!("Failed to call {} for {}", path, self.vm_id()))
+    }
+
+    /// Proxy a raw HTTP request to the CH API socket.
+    pub async fn call_request(&self, request: Request<Bytes>) -> Result<Response<Bytes>> {
+        call_request(self.ch_socket_path(), request)
+            .await
+            .wrap_err(eyre!("Failed to proxy CH API request for {}", self.vm_id()))
     }
 
     /// List running VM instances.

@@ -1,11 +1,12 @@
 //! REST Management API for odorobo-agent
+mod ch;
 mod console;
 mod error;
-pub use error::ApiError;
-
+use tower_http::trace::TraceLayer;
 mod vm;
 pub fn router() -> axum::Router<()> {
     axum::Router::new()
+        .layer(TraceLayer::new_for_http())
         .route("/", axum::routing::get(root))
         .route("/health", axum::routing::get(health))
         .nest("/vms", vm::router())

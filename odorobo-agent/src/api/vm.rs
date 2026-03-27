@@ -1,4 +1,7 @@
-use axum::{Json, extract::{Path, Query}};
+use axum::{
+    Json,
+    extract::{Path, Query},
+};
 use cloud_hypervisor_client::models::{self, VmInfo, VmmPingResponse};
 use serde::Deserialize;
 use stable_eyre::Result;
@@ -13,18 +16,28 @@ pub fn router() -> axum::Router<()> {
         .route("/{vmid}", axum::routing::get(vm_info))
         .route("/{vmid}/ping", axum::routing::get(ping_vm))
         .route("/{vmid}", axum::routing::delete(destroy_vm))
-        .route("/{vmid}/console", axum::routing::get(super::console::console_stream))
+        .route(
+            "/{vmid}/console",
+            axum::routing::get(super::console::console_stream),
+        )
+        .route(
+            "/{vmid}/ch/{*path}",
+            axum::routing::any(super::ch::passthrough),
+        )
 }
 
+/// Lists all VMs by their IDs
 async fn list_vms() -> Result<Json<Vec<String>>, ApiError> {
     let vms = VMInstance::list().map_err(|_| ApiError::ListFailed)?;
     Ok(Json(vms.into_iter().map(|i| i.id).collect()))
 }
 
+/// Helper function to get a VM instance by ID, returning an error if not found
 fn get_vm(vmid: &str) -> Result<VMInstance, ApiError> {
     VMInstance::get(vmid).ok_or_else(|| ApiError::VmNotFound(vmid.to_string()))
 }
 
+/// Gets detailed information about a specific VM
 async fn vm_info(
     vmid: Path<String>,
 ) -> Result<Json<cloud_hypervisor_client::models::VmInfo>, ApiError> {
@@ -33,6 +46,7 @@ async fn vm_info(
     let info = vm.info().await.map_err(|_| ApiError::VmInfoFailed)?;
     Ok(Json(info))
 }
+
 /// Pings the VMM to check if it's running
 async fn ping_vm(vmid: Path<String>) -> Result<Json<VmmPingResponse>, ApiError> {
     let vm = get_vm(&vmid.0)?;
@@ -69,6 +83,7 @@ async fn create_vm(
     Ok(Json(info))
 }
 
+/// Destroys a VM, stopping it if it's running and cleaning up resources
 async fn destroy_vm(vmid: Path<String>) -> Result<Json<()>, ApiError> {
     let vm = get_vm(&vmid.0)?;
     vm.destroy().await.map_err(|_| ApiError::VmInfoFailed)?;

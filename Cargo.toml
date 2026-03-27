@@ -12,3 +12,4 @@ serde = "1.0"
 axum = { version = "0.8.8", features = ["ws"] }
 axum-responses = "0.5.5"
 axum-extra = "0.12"
+tower-http = { version = "0.6", features = ["trace"] }
