@@ -1,7 +1,8 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use reqwest::Client;
+use reqwest::{Client, Response};
+use serde::Deserialize;
 use stable_eyre::Result;
 
 #[derive(Parser)]
@@ -93,6 +94,51 @@ pub enum Command {
     },
 }
 
+
+// the fields are used using debug printing, so we allow dead code warnings
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+pub struct APIError {
+    pub code: u16,
+    pub message: String,
+    pub errors: Option<Vec<String>>,
+    pub success: bool,
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+}
+
+async fn print_api_error(response: Response) -> Result<()> {
+    let status = response.status();
+    let body = response.text().await?;
+
+    if let Ok(error) = serde_json::from_str::<APIError>(&body) {
+        eprintln!("Error (HTTP {}): {:#?}", status.as_u16(), error);
+    } else {
+        eprintln!("Error (HTTP {}): {:?}", status.as_u16(), body);
+    }
+
+    Ok(())
+}
+
+async fn print_text_response(response: Response) -> Result<()> {
+    if response.status().is_success() {
+        println!("{}", response.text().await?);
+    } else {
+        print_api_error(response).await?;
+    }
+
+    Ok(())
+}
+
+async fn print_message_response(response: Response, success_message: &str) -> Result<()> {
+    if response.status().is_success() {
+        println!("{success_message}");
+    } else {
+        print_api_error(response).await?;
+    }
+
+    Ok(())
+}
+
 pub async fn run_command(cli: Cli) -> Result<()> {
     let client = Client::new();
     let base_url = format!("{}/vms", cli.agent_addr);
@@ -108,30 +154,20 @@ pub async fn run_command(cli: Cli) -> Result<()> {
                     println!("- {}", vm);
                 }
             } else {
-                eprintln!("Error: {:?}", response.text().await?);
+                print_api_error(response).await?;
             }
         }
 
         Command::Info { vmid } => {
             let url = format!("{}/{}", base_url, vmid);
             let response = client.get(&url).send().await?;
-
-            if response.status().is_success() {
-                println!("{}", response.text().await?);
-            } else {
-                eprintln!("Error: {:?}", response.text().await?);
-            }
+            print_text_response(response).await?;
         }
 
         Command::Ping { vmid } => {
             let url = format!("{}/{}/ping", base_url, vmid);
             let response = client.get(&url).send().await?;
-
-            if response.status().is_success() {
-                println!("{}", response.text().await?);
-            } else {
-                eprintln!("Error: {:?}", response.text().await?);
-            }
+            print_text_response(response).await?;
         }
 
         Command::Spawn { vmid, config, boot } => {
@@ -149,11 +185,7 @@ pub async fn run_command(cli: Cli) -> Result<()> {
                 client.put(&url).send().await?
             };
 
-            if response.status().is_success() {
-                println!("{}", response.text().await?);
-            } else {
-                eprintln!("Error: {:?}", response.text().await?);
-            }
+            print_text_response(response).await?;
         }
 
         Command::Create { vmid, config, boot } => {
@@ -166,88 +198,49 @@ pub async fn run_command(cli: Cli) -> Result<()> {
                 .send()
                 .await?;
 
-            if response.status().is_success() {
-                println!("VM created successfully");
-            } else {
-                eprintln!("Error: {:?}", response.text().await?);
-            }
+            print_message_response(response, "VM created successfully").await?;
         }
 
         Command::Delete { vmid } => {
             let url = format!("{base_url}/{vmid}/config");
             let response = client.delete(&url).send().await?;
-
-            if response.status().is_success() {
-                println!("VM configuration deleted successfully");
-            } else {
-                eprintln!("Error: {:?}", response.text().await?);
-            }
+            print_message_response(response, "VM configuration deleted successfully").await?;
         }
 
         Command::Boot { vmid } => {
             let url = format!("{}/{}/boot", base_url, vmid);
             let response = client.put(&url).send().await?;
-
-            if response.status().is_success() {
-                println!("VM booted successfully");
-            } else {
-                eprintln!("Error: {:?}", response.text().await?);
-            }
+            print_message_response(response, "VM booted successfully").await?;
         }
 
         Command::Pause { vmid } => {
             let url = format!("{}/{}/pause", base_url, vmid);
             let response = client.put(&url).send().await?;
-
-            if response.status().is_success() {
-                println!("VM paused successfully");
-            } else {
-                eprintln!("Error: {:?}", response.text().await?);
-            }
+            print_message_response(response, "VM paused successfully").await?;
         }
 
         Command::Resume { vmid } => {
             let url = format!("{}/{}/resume", base_url, vmid);
             let response = client.put(&url).send().await?;
-
-            if response.status().is_success() {
-                println!("VM resumed successfully");
-            } else {
-                eprintln!("Error: {:?}", response.text().await?);
-            }
+            print_message_response(response, "VM resumed successfully").await?;
         }
 
         Command::Shutdown { vmid } => {
             let url = format!("{}/{}/shutdown", base_url, vmid);
             let response = client.put(&url).send().await?;
-
-            if response.status().is_success() {
-                println!("VM shutdown initiated");
-            } else {
-                eprintln!("Error: {:?}", response.text().await?);
-            }
+            print_message_response(response, "VM shutdown initiated").await?;
         }
 
         Command::AcpiShutdown { vmid } => {
             let url = format!("{}/{}/acpi_shutdown", base_url, vmid);
             let response = client.put(&url).send().await?;
-
-            if response.status().is_success() {
-                println!("ACPI shutdown signal sent");
-            } else {
-                eprintln!("Error: {:?}", response.text().await?);
-            }
+            print_message_response(response, "ACPI shutdown signal sent").await?;
         }
 
         Command::Destroy { vmid } => {
             let url = format!("{}/{}", base_url, vmid);
             let response = client.delete(&url).send().await?;
-
-            if response.status().is_success() {
-                println!("VM destroyed successfully");
-            } else {
-                eprintln!("Error: {:?}", response.text().await?);
-            }
+            print_message_response(response, "VM destroyed successfully").await?;
         }
 
         Command::ChRemote { vmid, args } => {

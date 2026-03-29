@@ -55,20 +55,14 @@ async fn vm_info(
 ) -> Result<Json<cloud_hypervisor_client::models::VmInfo>, ApiError> {
     let vm = get_vm(&vmid.0)?;
 
-    let info = vm
-        .info()
-        .await
-        .map_err(|e| ApiError::VmInfoFailed { msg: e.to_string() })?;
+    let info = vm.info().await.map_err(ApiError::vm_info)?;
     Ok(Json(info))
 }
 
 /// Pings the VMM to check if it's running
 async fn ping_vm(vmid: Path<String>) -> Result<Json<VmmPingResponse>, ApiError> {
     let vm = get_vm(&vmid.0)?;
-    let res = vm
-        .ping()
-        .await
-        .map_err(|e| ApiError::VmInfoFailed { msg: e.to_string() })?;
+    let res = vm.ping().await.map_err(ApiError::vm_info)?;
     Ok(Json(res))
 }
 
@@ -102,6 +96,7 @@ async fn spawn_vm(
         error!(vmid = ?vmid, "VM with this ID already exists");
         return Err(ApiError::CreateFailed {
             msg: "VM with this ID already exists".to_string(),
+            errors: vec![],
         });
     }
 
@@ -110,15 +105,16 @@ async fn spawn_vm(
     let runtime_dir = VMInstance::runtime_dir_for(&vmid.0);
     std::fs::create_dir_all(&runtime_dir).map_err(|e| {
         error!(error = %e, "Failed to create runtime dir");
-        ApiError::CreateFailed { msg: e.to_string() }
+        ApiError::CreateFailed {
+            msg: e.to_string(),
+            errors: vec![],
+        }
     })?;
     // trace!(?)
 
     let vm = VMInstance::spawn(&vmid.0).await.map_err(|e| {
         error!(error = ?e, "Failed to spawn VM process");
-        ApiError::CreateFailed {
-            msg: format!("{:?}", e),
-        }
+        ApiError::create(e)
     })?;
 
     let mut created = false;
@@ -128,9 +124,7 @@ async fn spawn_vm(
             .await
             .map_err(|e| {
                 error!(error = ?e, "Failed to create VM");
-                ApiError::CreateConfigFailed {
-                    msg: format!("{:?}", e),
-                }
+                ApiError::create_config(e)
             })?;
 
         created = true;
@@ -141,9 +135,7 @@ async fn spawn_vm(
     let vm_info = if vm_config.is_some() {
         Some(vm.info().await.map_err(|e| {
             error!(error = ?e, "Failed to get VM info after creation");
-            ApiError::VmInfoFailed {
-                msg: format!("{:?}", e),
-            }
+            ApiError::vm_info(e)
         })?)
     } else {
         None
@@ -164,7 +156,7 @@ async fn create_vm_config(
     let vm = get_vm(&vmid.0)?;
     vm.create(vm_config, query.boot)
         .await
-        .map_err(|e| ApiError::CreateConfigFailed { msg: e.to_string() })?;
+        .map_err(ApiError::create_config)?;
     Ok(Json(()))
 }
 
@@ -172,7 +164,7 @@ async fn delete_vm_config(vmid: Path<String>) -> Result<Json<()>, ApiError> {
     let vm = get_vm(&vmid.0)?;
     vm.delete_config()
         .await
-        .map_err(|e| ApiError::DeleteConfigFailed { msg: e.to_string() })?;
+        .map_err(ApiError::delete_config)?;
     Ok(Json(()))
 }
 
@@ -183,9 +175,7 @@ async fn delete_vm_config(vmid: Path<String>) -> Result<Json<()>, ApiError> {
 /// not fully cleaning up resources.
 async fn shutdown_vm(vmid: Path<String>) -> Result<Json<()>, ApiError> {
     let vm = get_vm(&vmid.0)?;
-    vm.shutdown()
-        .await
-        .map_err(|e| ApiError::VmInfoFailed { msg: e.to_string() })?;
+    vm.shutdown().await.map_err(ApiError::vm_info)?;
     Ok(Json(()))
 }
 
@@ -197,16 +187,14 @@ async fn shutdown_acpi(vmid: Path<String>) -> Result<Json<()>, ApiError> {
     let vm = get_vm(&vmid.0)?;
     vm.acpi_power_button()
         .await
-        .map_err(|e| ApiError::VmInfoFailed { msg: e.to_string() })?;
+        .map_err(ApiError::vm_info)?;
     Ok(Json(()))
 }
 
 /// Boots a VM that has been created but not yet started. If the VM is already running, this will return an error.
 async fn boot_vm(vmid: Path<String>) -> Result<Json<()>, ApiError> {
     let vm = get_vm(&vmid.0)?;
-    vm.boot()
-        .await
-        .map_err(|e| ApiError::VmInfoFailed { msg: e.to_string() })?;
+    vm.boot().await.map_err(ApiError::vm_info)?;
     Ok(Json(()))
 }
 
@@ -214,26 +202,20 @@ async fn boot_vm(vmid: Path<String>) -> Result<Json<()>, ApiError> {
 /// it is resumed again.
 async fn pause_vm(vmid: Path<String>) -> Result<Json<()>, ApiError> {
     let vm = get_vm(&vmid.0)?;
-    vm.pause()
-        .await
-        .map_err(|e| ApiError::VmInfoFailed { msg: e.to_string() })?;
+    vm.pause().await.map_err(ApiError::vm_info)?;
     Ok(Json(()))
 }
 
 /// Resumes a paused VM, allowing it to continue running from where it left off.
 async fn resume_vm(vmid: Path<String>) -> Result<Json<()>, ApiError> {
     let vm = get_vm(&vmid.0)?;
-    vm.resume()
-        .await
-        .map_err(|e| ApiError::VmInfoFailed { msg: e.to_string() })?;
+    vm.resume().await.map_err(ApiError::vm_info)?;
     Ok(Json(()))
 }
 
 /// Destroys a VM, stopping it if it's running and cleaning up resources
 async fn destroy_vm(vmid: Path<String>) -> Result<Json<()>, ApiError> {
     let vm = get_vm(&vmid.0)?;
-    vm.destroy()
-        .await
-        .map_err(|e| ApiError::VmInfoFailed { msg: e.to_string() })?;
+    vm.destroy().await.map_err(ApiError::vm_info)?;
     Ok(Json(()))
 }

@@ -1,6 +1,6 @@
 use cloud_hypervisor_client::{
     SocketBasedApiClient,
-    apis::DefaultApi,
+    apis::{DefaultApi, Error as ChClientError},
     models::{self, VmInfo, VmmPingResponse},
 };
 use hyper::Method;
@@ -15,6 +15,7 @@ use std::{
     fs::OpenOptions,
     path::{Path, PathBuf},
 };
+use thiserror::Error;
 use tracing::{debug, info, trace, warn};
 
 use super::api::{call, call_request};
@@ -34,6 +35,30 @@ pub struct VMInstance {
     pub ch_socket_path: PathBuf,
 }
 
+#[derive(Debug, Error)]
+pub enum ChApiError {
+    #[error("Cloud Hypervisor API error {status}: {errors:?}")]
+    Api {
+        status: hyper::StatusCode,
+        errors: Vec<String>,
+    },
+    #[error(transparent)]
+    Client(ChClientError),
+}
+
+impl From<ChClientError> for ChApiError {
+    fn from(error: ChClientError) -> Self {
+        match error {
+            ChClientError::Api(api) => Self::Api {
+                status: api.code,
+                errors: serde_json::from_str::<Vec<String>>(&api.body)
+                    .unwrap_or_else(|_| vec![api.body]),
+            },
+            other => Self::Client(other),
+        }
+    }
+}
+
 impl VMInstance {
     pub fn new(id: &str, ch_socket_path: PathBuf) -> Self {
         Self {
@@ -50,6 +75,7 @@ impl VMInstance {
         self.conn()
             .boot_vm()
             .await
+            .map_err(ChApiError::from)
             .wrap_err(eyre!("Failed to boot VM {}", self.vm_id()))
     }
 
@@ -57,6 +83,7 @@ impl VMInstance {
         self.conn()
             .pause_vm()
             .await
+            .map_err(ChApiError::from)
             .wrap_err(eyre!("Failed to pause VM {}", self.vm_id()))
     }
 
@@ -64,6 +91,7 @@ impl VMInstance {
         self.conn()
             .resume_vm()
             .await
+            .map_err(ChApiError::from)
             .wrap_err(eyre!("Failed to resume VM {}", self.vm_id()))
     }
 
@@ -79,6 +107,7 @@ impl VMInstance {
 
         conn.vm_send_migration_put(send_migration_data)
             .await
+            .map_err(ChApiError::from)
             .wrap_err(eyre!(
                 "Failed to send migration command for {}",
                 self.vm_id()
@@ -103,6 +132,7 @@ impl VMInstance {
 
         conn.vm_receive_migration_put(receive_migration_data)
             .await
+            .map_err(ChApiError::from)
             .wrap_err(eyre!("Failed to prepare VM for migration {}", self.vm_id()))?;
 
         info!(
@@ -185,6 +215,7 @@ impl VMInstance {
         self.conn()
             .vm_info_get()
             .await
+            .map_err(ChApiError::from)
             .wrap_err(eyre!("Failed to get VM info for {}", self.vm_id()))
     }
 
@@ -192,20 +223,26 @@ impl VMInstance {
         self.conn()
             .shutdown_vm()
             .await
+            .map_err(ChApiError::from)
             .wrap_err(eyre!("Failed to shutdown VM {}", self.vm_id()))
     }
 
     pub async fn acpi_power_button(&self) -> Result<()> {
-        self.conn().power_button_vm().await.wrap_err(eyre!(
-            "Failed to send ACPI power button event to VM {}",
-            self.vm_id()
-        ))
+        self.conn()
+            .power_button_vm()
+            .await
+            .map_err(ChApiError::from)
+            .wrap_err(eyre!(
+                "Failed to send ACPI power button event to VM {}",
+                self.vm_id()
+            ))
     }
 
     pub async fn ping(&self) -> Result<VmmPingResponse> {
         self.conn()
             .vmm_ping_get()
             .await
+            .map_err(ChApiError::from)
             .wrap_err(eyre!("Failed to ping VM {}", self.vm_id()))
     }
 
@@ -284,6 +321,7 @@ impl VMInstance {
         self.conn()
             .shutdown_vmm()
             .await
+            .map_err(ChApiError::from)
             .wrap_err(eyre!("Failed to shutdown VMM for {}", self.vm_id()))?;
 
         provisioner.stop_instance(self.vm_id()).await?;
@@ -349,6 +387,7 @@ impl VMInstance {
         self.conn()
             .create_vm(config)
             .await
+            .map_err(ChApiError::from)
             .wrap_err(eyre!("Failed to create VM {}", self.vm_id()))?;
 
         if boot {
@@ -356,6 +395,7 @@ impl VMInstance {
             self.conn()
                 .boot_vm()
                 .await
+                .map_err(ChApiError::from)
                 .wrap_err(eyre!("Failed to boot VM {}", self.vm_id()))?;
         }
         info!(vm_id = self.vm_id(), "VM created and booted");
@@ -367,6 +407,7 @@ impl VMInstance {
         trace!(vm_id = self.vm_id(), "Deleting VM via CH API");
         conn.delete_vm()
             .await
+            .map_err(ChApiError::from)
             .wrap_err(eyre!("Failed to delete VM {}", self.vm_id()))?;
         let config_path = self.config_path();
         if config_path.exists() {
