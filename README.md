@@ -16,7 +16,7 @@ disk images can be backed by distributed storage for full portability, or kept n
 
 - **Agent**: A lightweight agent that handles VM lifecycle management, including creation, deletion, and state management.
 - **Gateway**: A central controller that orchestrates the deployment and management of VMs, reconciling and handling migration across nodes (unimplemented).
-- **CLI**: Debugging and management command-line interface for interacting with the platform, not intended for end-users but useful for developers and operators (unimplemented).
+- **CLI**: Debugging and management command-line interface for interacting with the platform, not intended for end-users but useful for developers and operators.
 
 The Gateway orchestrates across nodes;
 Agents run on each node and manage Cloud Hypervisor instances directly via systemd.
