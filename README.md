@@ -55,7 +55,7 @@ Now apply the [Cloud Hypervisor VM spec](https://github.com/cloud-hypervisor/clo
 ```
 # the `--boot` flag additionally also tells Cloud Hypervisor to boot the VM after applying the configuration, otherwise it will stay
 # in the "Created" state, requiring a separate `odoroboctl boot` call to start it.
-odoroboctl create --boot ./my-vm.json
+odoroboctl create my-vm --boot ./my-vm.json
 ```
 
 Now the VM should be running. You can connect to the VM's virtio-console with:
