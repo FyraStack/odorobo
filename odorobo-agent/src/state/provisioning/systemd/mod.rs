@@ -1,4 +1,4 @@
-mod proxy;
+pub mod proxy;
 use super::VMProvisionerBackend;
 use proxy::{start_instance, stop_instance};
 use stable_eyre::{Result, eyre::WrapErr};

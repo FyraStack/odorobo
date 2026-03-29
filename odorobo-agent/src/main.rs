@@ -1,4 +1,5 @@
 mod api;
+mod util;
 mod state;
 use stable_eyre::Result;
 #[tokio::main]

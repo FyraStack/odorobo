@@ -1,5 +1,6 @@
 //! systemd provisioning module for odorobo agent
 
+use crate::util::{systemd_instance_unit_name, zbus_system_connection};
 /// This module provides functions for provisioning CH instances for odorobo agent
 /// using systemd.
 ///
@@ -8,17 +9,16 @@ use stable_eyre::{Result, eyre::WrapErr};
 use tracing::trace;
 use zbus::Connection;
 use zbus_systemd::systemd1::{ManagerProxy, ServiceProxy};
-
 /// template for systemd unit name for CH instances, where the instance ID is substituted into the unit name
-fn instance_unit_name(vmid: &str) -> String {
-    format!("odorobo-ch@{vmid}.service")
-}
+// pub fn instance_unit_name(vmid: &str) -> String {
+//     format!("odorobo-ch@{vmid}.service")
+// }
 
-async fn system_connection() -> Result<Connection> {
-    Connection::system()
-        .await
-        .wrap_err("Failed to connect to system D-Bus")
-}
+// async fn system_connection() -> Result<Connection> {
+//     Connection::system()
+//         .await
+//         .wrap_err("Failed to connect to system D-Bus")
+// }
 
 pub async fn manager_proxy(connection: &Connection) -> Result<ManagerProxy<'_>> {
     ManagerProxy::new(connection)
@@ -46,9 +46,9 @@ pub async fn service_proxy<'a>(
 
 #[tracing::instrument]
 pub async fn start_instance(vmid: &str) -> Result<i32> {
-    let connection = system_connection().await?;
+    let connection = zbus_system_connection().await?;
     let manager = manager_proxy(&connection).await?;
-    let unit_name = instance_unit_name(vmid);
+    let unit_name = systemd_instance_unit_name(vmid);
     trace!(?unit_name, "Starting systemd unit");
 
     manager
@@ -68,9 +68,9 @@ pub async fn start_instance(vmid: &str) -> Result<i32> {
 #[tracing::instrument]
 pub async fn stop_instance(vmid: &str) -> Result<()> {
     trace!(?vmid, "Stopping instance");
-    let connection = system_connection().await?;
+    let connection = zbus_system_connection().await?;
     let manager = manager_proxy(&connection).await?;
-    let unit_name = instance_unit_name(vmid);
+    let unit_name = systemd_instance_unit_name(vmid);
 
     manager
         .stop_unit(unit_name.clone(), "replace".into())
@@ -83,8 +83,8 @@ pub async fn stop_instance(vmid: &str) -> Result<()> {
 #[tracing::instrument]
 pub async fn get_main_pid(vmid: &str) -> Result<i32> {
     trace!(?vmid, "Getting MainPID for instance");
-    let connection = system_connection().await?;
-    let unit_name = instance_unit_name(vmid);
+    let connection = zbus_system_connection().await?;
+    let unit_name = systemd_instance_unit_name(vmid);
     let service = service_proxy(&connection, &unit_name).await?;
 
     let pid = service
