@@ -137,18 +137,17 @@ pub async fn run_command(cli: Cli) -> Result<()> {
         Command::Spawn { vmid, config, boot } => {
             let url = format!("{base_url}/{vmid}?boot={boot}");
 
-            let config_content = if let Some(config_path) = config {
-                Some(std::fs::read_to_string(&config_path)?)
+            let response = if let Some(config_path) = config {
+                let config_content = std::fs::read_to_string(&config_path)?;
+                client
+                    .put(&url)
+                    .header("Content-Type", "application/json")
+                    .body(config_content)
+                    .send()
+                    .await?
             } else {
-                None
+                client.put(&url).send().await?
             };
-
-            let response = client
-                .put(&url)
-                .header("Content-Type", "application/json")
-                .body(config_content.unwrap_or_default())
-                .send()
-                .await?;
 
             if response.status().is_success() {
                 println!("{}", response.text().await?);

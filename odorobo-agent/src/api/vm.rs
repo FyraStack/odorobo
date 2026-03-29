@@ -85,16 +85,26 @@ pub struct CreateVmQuery {
 pub struct VmSpawnResponse {
     pub info: Option<VmInfo>,
     pub booted: bool,
-    pub created: bool,
+    pub created_config: bool,
 }
 
 /// Spawns a new VM instance with the given ID, optionally creating it with the provided configuration and booting it immediately
 async fn spawn_vm(
     vmid: Path<String>,
     Query(query): Query<CreateVmQuery>,
-    Json(vm_config): Json<Option<models::VmConfig>>,
+    vm_config: Option<Json<models::VmConfig>>,
 ) -> Result<Json<VmSpawnResponse>, ApiError> {
     VMInstance::validate_vmid(&vmid.0).map_err(|e| ApiError::InvalidVmId { msg: e.to_string() })?;
+    let vm_config = vm_config.map(|Json(vm_config)| vm_config);
+
+    // check if VM already exists, if so error out for already existing instance
+    if VMInstance::get(&vmid.0).is_some() {
+        error!(vmid = ?vmid, "VM with this ID already exists");
+        return Err(ApiError::CreateFailed {
+            msg: "VM with this ID already exists".to_string(),
+        });
+    }
+
     trace!(?vmid, ?query, "Creating VM with config");
     // trace!(?vm_config, "VM config details");
     let runtime_dir = VMInstance::runtime_dir_for(&vmid.0);
@@ -102,6 +112,7 @@ async fn spawn_vm(
         error!(error = %e, "Failed to create runtime dir");
         ApiError::CreateFailed { msg: e.to_string() }
     })?;
+    // trace!(?)
 
     let vm = VMInstance::spawn(&vmid.0).await.map_err(|e| {
         error!(error = ?e, "Failed to spawn VM process");
@@ -110,6 +121,7 @@ async fn spawn_vm(
         }
     })?;
 
+    let mut created = false;
     if vm_config.is_some() {
         trace!(?vmid, "Creating VM with provided config");
         vm.create(vm_config.clone().unwrap(), query.boot)
@@ -120,6 +132,8 @@ async fn spawn_vm(
                     msg: format!("{:?}", e),
                 }
             })?;
+
+        created = true;
     } else {
         trace!(?vmid, "No VM config provided, skipping creation step");
     }
@@ -138,7 +152,7 @@ async fn spawn_vm(
     Ok(Json(VmSpawnResponse {
         info: vm_info,
         booted: query.boot,
-        created: true,
+        created_config: created,
     }))
 }
 
