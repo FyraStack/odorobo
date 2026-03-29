@@ -13,7 +13,7 @@ Type=simple
 User=odorobo
 Group=odorobo
 
-RuntimeDirectory=odorobo odorobo/vms odorobo/vms/%i
+RuntimeDirectory=odorobo/vms/%i
 RuntimeDirectoryMode=0750
 LogsDirectory=odorobo
 LogsDirectoryMode=0750
@@ -54,7 +54,7 @@ RestrictRealtime=no
 AmbientCapabilities=CAP_NET_ADMIN
 
 # Paths CH legitimately needs to write
-ReadWritePaths=/run/odorobo /var/log/odorobo /etc/odorobo /var/lib/odorobo
+ReadWritePaths=/run/odorobo/vms/%i /var/log/odorobo /etc/odorobo /var/lib/odorobo
 
 # KVM device access
 DeviceAllow=/dev/kvm rw
