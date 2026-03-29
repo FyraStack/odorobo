@@ -1,0 +1,14 @@
+[package]
+name = "odoroboctl"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+stable-eyre = { workspace = true }
+clap = { version = "4", features = ["derive", "env"] }
+tokio = { workspace = true, features = ["full"] }
+anyhow = "1"
+reqwest = { version = "0.13.2", features = ["json"] }
+serde_json = { workspace = true }
+serde = { workspace = true, features = ["derive"] }

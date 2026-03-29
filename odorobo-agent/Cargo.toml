@@ -15,7 +15,7 @@ hyper-util = { version = "0.1.20", features = ["client", "client-legacy", "http1
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 hyperlocal = "0.9.1"
-tokio = { version = "1.50.0", features = ["full"] }
+tokio = { workspace = true, features = ["full"] }
 axum = { workspace = true, features = ["ws"] }
 axum-extra = { workspace = true, features = ["query"] }
 axum_responses = "0.5.5"

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["odorobo-agent"]
+members = ["odorobo-agent", "odoroboctl"]
 
 [workspace.dependencies]
 stable-eyre = "0.2.2"
@@ -13,3 +13,4 @@ axum = { version = "0.8.8", features = ["ws"] }
 axum-responses = "0.5.5"
 axum-extra = "0.12"
 tower-http = { version = "0.6", features = ["trace"] }
+tokio = { version = "1.50.0" }
