@@ -1,29 +1,36 @@
-use axum_responses::HttpError;
-use thiserror::Error;
+use axum_responses::{HttpError, thiserror::Error};
 
 #[derive(Debug, Error, HttpError)]
 pub enum ApiError {
-    #[error("VM not found: {0}")]
-    #[http(code = 404)]
-    VmNotFound(String),
+    #[error("VM not found: {vmid}")]
+    #[http(code = 404, message = vmid)]
+    VmNotFound { vmid: String },
 
-    #[error("Failed to get VM info")]
-    #[http(code = 500)]
-    VmInfoFailed,
+    #[error("Failed to get VM info: {msg}")]
+    #[http(code = 500, message = msg)]
+    VmInfoFailed { msg: String },
 
-    #[error("Failed to list VMs")]
-    #[http(code = 500)]
-    ListFailed,
+    #[error("Failed to list VMs: {msg}")]
+    #[http(code = 500, message = msg)]
+    ListFailed { msg: String },
 
-    #[error("Failed to create VM")]
-    #[http(code = 500)]
-    CreateFailed,
+    #[error("Failed to create VM: {msg}")]
+    #[http(code = 500, message = msg)]
+    CreateFailed { msg: String },
 
-    #[error("Failed to open VM console")]
-    #[http(code = 500)]
-    ConsoleFailed,
+    #[error("Failed to open VM console: {msg}")]
+    #[http(code = 500, message = msg)]
+    ConsoleFailed { msg: String },
 
-    #[error("Failed to proxy Cloud Hypervisor API request")]
-    #[http(code = 500)]
-    PassthroughFailed,
+    #[error("Failed to proxy Cloud Hypervisor API request: {msg}")]
+    #[http(code = 500, message = msg)]
+    PassthroughFailed { msg: String },
+
+    #[error("Failed to delete VM configuration: configuration: {msg}")]
+    #[http(code = 500, message = msg)]
+    DeleteConfigFailed { msg: String },
+
+    #[error("Failed to delete VM configuration: configuration: {msg}")]
+    #[http(code = 500, message = msg)]
+    CreateConfigFailed { msg: String },
 }

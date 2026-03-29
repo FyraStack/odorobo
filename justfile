@@ -8,6 +8,12 @@ build: build_agent
 build_agent:
     cargo build --release -p odorobo-agent
 
+build_agent_debug:
+    cargo build -p odorobo-agent
+    
+debug: build_agent_debug
+    sudo target/debug/odorobo-agent
+
 install: install_script install_unit install_agent
 
 install_script:
@@ -18,5 +24,8 @@ install_script:
 install_unit:
     install -Dm644 systemd/odorobo-ch@.service {{ DATADIR }}/systemd/user/odorobo-ch@.service
 
-install_agent:
+install_agent: build_agent
     install -Dm755 target/release/odorobo-agent {{ BINDIR }}/odorobo-agent
+
+install_agent_debug:
+    install -Dm755 target/debug/odorobo-agent {{ BINDIR }}/odorobo-agent

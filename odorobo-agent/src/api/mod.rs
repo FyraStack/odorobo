@@ -2,11 +2,15 @@
 mod ch;
 mod console;
 mod error;
-use tower_http::trace::TraceLayer;
+use tower_http::trace::{DefaultOnRequest, DefaultOnResponse, TraceLayer};
 mod vm;
 pub fn router() -> axum::Router<()> {
     axum::Router::new()
-        .layer(TraceLayer::new_for_http())
+        .layer(
+            TraceLayer::new_for_http()
+                .on_request(DefaultOnRequest::new())
+                .on_response(DefaultOnResponse::new())
+        )
         .route("/", axum::routing::get(root))
         .route("/health", axum::routing::get(health))
         .nest("/vms", vm::router())

@@ -3,8 +3,8 @@ use cloud_hypervisor_client::{
     apis::DefaultApi,
     models::{self, VmInfo, VmmPingResponse},
 };
-use hyper::{Request, Response, body::Bytes};
 use hyper::Method;
+use hyper::{Request, Response, body::Bytes};
 use serde_json::Value;
 use stable_eyre::{
     Result,
@@ -15,7 +15,7 @@ use std::{
     fs::OpenOptions,
     path::{Path, PathBuf},
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 use super::api::{call, call_request};
 use super::transform::apply_builtin_transforms;
@@ -44,6 +44,74 @@ impl VMInstance {
 
     pub fn get(vmid: &str) -> Option<Self> {
         Self::list().ok()?.into_iter().find(|i| i.id == vmid)
+    }
+
+    pub async fn boot(&self) -> Result<()> {
+        self.conn()
+            .boot_vm()
+            .await
+            .wrap_err(eyre!("Failed to boot VM {}", self.vm_id()))
+    }
+
+    pub async fn pause(&self) -> Result<()> {
+        self.conn()
+            .pause_vm()
+            .await
+            .wrap_err(eyre!("Failed to pause VM {}", self.vm_id()))
+    }
+
+    pub async fn resume(&self) -> Result<()> {
+        self.conn()
+            .resume_vm()
+            .await
+            .wrap_err(eyre!("Failed to resume VM {}", self.vm_id()))
+    }
+
+    #[tracing::instrument]
+    pub async fn send_migration(&self, dest: &str) -> Result<()> {
+        let conn = self.conn();
+        trace!(destination = dest, "Sending migration command to VM");
+
+        let send_migration_data = models::SendMigrationData {
+            destination_url: dest.to_string(),
+            ..Default::default()
+        };
+
+        conn.vm_send_migration_put(send_migration_data)
+            .await
+            .wrap_err(eyre!(
+                "Failed to send migration command for {}",
+                self.vm_id()
+            ))
+    }
+
+    #[tracing::instrument]
+    pub async fn prepare_migration(&self) -> Result<()> {
+        let conn = self.conn();
+        trace!("Preparing VM for migration");
+
+        let rand_port = random_port::PortPicker::new().pick()?;
+
+        trace!(port = rand_port, "Selected random port for migration");
+
+        let reciever_uri = format!("tcp:0.0.0.0:{}", rand_port);
+
+        let receive_migration_data = models::ReceiveMigrationData {
+            receiver_url: reciever_uri.clone(),
+            ..Default::default()
+        };
+
+        conn.vm_receive_migration_put(receive_migration_data)
+            .await
+            .wrap_err(eyre!("Failed to prepare VM for migration {}", self.vm_id()))?;
+
+        info!(
+            vm_id = self.vm_id(),
+            uri = ?reciever_uri,
+            "VM prepared for migration, receiver listening"
+        );
+
+        Ok(())
     }
 
     pub fn runtime_root() -> PathBuf {
@@ -111,6 +179,13 @@ impl VMInstance {
             .wrap_err(eyre!("Failed to shutdown VM {}", self.vm_id()))
     }
 
+    pub async fn acpi_power_button(&self) -> Result<()> {
+        self.conn().power_button_vm().await.wrap_err(eyre!(
+            "Failed to send ACPI power button event to VM {}",
+            self.vm_id()
+        ))
+    }
+
     pub async fn ping(&self) -> Result<VmmPingResponse> {
         self.conn()
             .vmm_ping_get()
@@ -144,7 +219,7 @@ impl VMInstance {
     /// Spawn a new CH process and create a VMInstance for it.
     ///
     /// Waits for the socket to become available (polls up to ~30 seconds).
-    /// The caller should handle config persistence and VM creation.
+    /// Calls a backend to handle the actual CH process spawning - typically a systemd unit
     pub async fn spawn(id: &str) -> Result<Self> {
         info!(
             vm_id = id,
@@ -152,10 +227,14 @@ impl VMInstance {
             "Spawning CH process for new VM"
         );
 
+        let provisioner = super::provisioning::default_provisioner();
+        provisioner.start_instance(id).await?;
+
         let instance = Self::new(id, Self::runtime_dir_for(id).join(SOCKET_FILE_NAME));
 
         const MAX_ATTEMPTS: u32 = 31;
         for attempt in 0..MAX_ATTEMPTS {
+            trace!(vm_id = id, attempt, "Checking if CH socket is available");
             if instance.conn().vmm_ping_get().await.is_ok() {
                 debug!(vm_id = id, "CH socket available");
                 return Ok(instance);
@@ -174,8 +253,6 @@ impl VMInstance {
     }
 
     /// Gracefully shutdown the VM and VMM, then clean up runtime state.
-    ///
-    /// Does NOT stop the CH deployment - that should be handled by the orchestrator.
     pub async fn destroy(&self) -> Result<()> {
         if let Ok(info) = self.info().await {
             if matches!(
@@ -186,11 +263,14 @@ impl VMInstance {
                 self.shutdown().await?;
             }
         }
+        let provisioner = super::provisioning::default_provisioner();
 
         self.conn()
             .shutdown_vmm()
             .await
             .wrap_err(eyre!("Failed to shutdown VMM for {}", self.vm_id()))?;
+
+        provisioner.stop_instance(self.vm_id()).await?;
 
         if let Err(err) = self.purge_instance_data() {
             warn!(
@@ -241,10 +321,15 @@ impl VMInstance {
     /// 1. Creates the VM via CH API
     /// 2. Boots the VM (if boot is true)
     pub async fn create(&self, config: models::VmConfig, boot: bool) -> Result<()> {
+        trace!(vm_id = self.vm_id(), "Creating VM with provided config");
         let mut config = config;
+        trace!(vm_id = self.vm_id(), "Applying config transforms");
         apply_builtin_transforms(&mut config).wrap_err("Failed to apply config transforms")?;
 
+        trace!(vm_id = self.vm_id(), "Saving config to runtime dir");
         self.save_config(&config)?;
+
+        trace!(vm_id = self.vm_id(), "Creating VM via CH API");
         self.conn()
             .create_vm(config)
             .await
@@ -258,6 +343,20 @@ impl VMInstance {
                 .wrap_err(eyre!("Failed to boot VM {}", self.vm_id()))?;
         }
         info!(vm_id = self.vm_id(), "VM created and booted");
+        Ok(())
+    }
+
+    pub async fn delete_config(&self) -> Result<()> {
+        let conn = self.conn();
+        trace!(vm_id = self.vm_id(), "Deleting VM via CH API");
+        conn.delete_vm()
+            .await
+            .wrap_err(eyre!("Failed to delete VM {}", self.vm_id()))?;
+        let config_path = self.config_path();
+        if config_path.exists() {
+            fs::remove_file(config_path)
+                .wrap_err(eyre!("Failed to remove config file for {}", self.vm_id()))?;
+        }
         Ok(())
     }
 
@@ -281,7 +380,9 @@ impl VMInstance {
     ///
     /// Scans runtime root for directories with valid sockets.
     pub fn list() -> Result<Vec<Self>> {
-        Ok(fs::read_dir(Self::runtime_root())?
+        let root = Self::runtime_root();
+        fs::create_dir_all(&root)?;
+        Ok(fs::read_dir(root)?
             .filter_map(|entry| {
                 entry.ok().and_then(|entry| {
                     if !entry.file_type().ok()?.is_dir() {

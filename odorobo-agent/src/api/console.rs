@@ -21,8 +21,8 @@ pub async fn console_stream(
     ws: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
     let vmid = vmid.0;
-    let vm = VMInstance::get(&vmid).ok_or_else(|| ApiError::VmNotFound(vmid.clone()))?;
-    let console = vm.open_console().await.map_err(|_| ApiError::ConsoleFailed)?;
+    let vm = VMInstance::get(&vmid).ok_or_else(|| ApiError::VmNotFound { vmid: vmid.clone() })?;
+    let console = vm.open_console().await.map_err(|e| ApiError::ConsoleFailed { msg: e.to_string() })?;
 
     Ok(ws.on_upgrade(move |socket| proxy_console_socket(vmid, socket, console)))
 }
