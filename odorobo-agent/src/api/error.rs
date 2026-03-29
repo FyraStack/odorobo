@@ -1,7 +1,11 @@
-use axum_responses::{HttpError, thiserror::Error};
+use axum_responses::{thiserror::Error, HttpError};
 
 #[derive(Debug, Error, HttpError)]
 pub enum ApiError {
+    #[error("Invalid VM ID: {msg}")]
+    #[http(code = 400, message = msg)]
+    InvalidVmId { msg: String },
+
     #[error("VM not found: {vmid}")]
     #[http(code = 404, message = vmid)]
     VmNotFound { vmid: String },

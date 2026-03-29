@@ -5,7 +5,7 @@ use axum::{
 use cloud_hypervisor_client::models::{self, VmInfo, VmmPingResponse};
 use serde::{Deserialize, Serialize};
 use stable_eyre::Result;
-use tracing::{error, trace, warn};
+use tracing::{error, trace};
 
 use super::error::ApiError;
 use crate::state::VMInstance;
@@ -42,6 +42,8 @@ async fn list_vms() -> Result<Json<Vec<String>>, ApiError> {
 
 /// Helper function to get a VM instance by ID, returning an error if not found
 fn get_vm(vmid: &str) -> Result<VMInstance, ApiError> {
+    use crate::state::VMInstance;
+    VMInstance::validate_vmid(vmid).map_err(|e| ApiError::InvalidVmId { msg: e.to_string() })?;
     VMInstance::get(vmid).ok_or_else(|| ApiError::VmNotFound {
         vmid: vmid.to_string(),
     })
@@ -92,6 +94,7 @@ async fn spawn_vm(
     Query(query): Query<CreateVmQuery>,
     Json(vm_config): Json<Option<models::VmConfig>>,
 ) -> Result<Json<VmSpawnResponse>, ApiError> {
+    VMInstance::validate_vmid(&vmid.0).map_err(|e| ApiError::InvalidVmId { msg: e.to_string() })?;
     trace!(?vmid, ?query, "Creating VM with config");
     // trace!(?vm_config, "VM config details");
     let runtime_dir = VMInstance::runtime_dir_for(&vmid.0);

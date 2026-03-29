@@ -118,6 +118,22 @@ impl VMInstance {
         Self::configured_runtime_root().join(VMS_DIR_NAME)
     }
 
+    pub fn validate_vmid(vmid: &str) -> Result<()> {
+        if vmid.is_empty() {
+            return Err(eyre!("VM ID cannot be empty"));
+        }
+        if vmid.contains("..") {
+            return Err(eyre!("VM ID cannot contain path traversal sequences"));
+        }
+        if vmid.contains('/') || vmid.contains('\\') {
+            return Err(eyre!("VM ID cannot contain path separators"));
+        }
+        if vmid.starts_with('.') {
+            return Err(eyre!("VM ID cannot start with a dot"));
+        }
+        Ok(())
+    }
+
     pub fn runtime_dir_for(id: &str) -> PathBuf {
         Self::runtime_root().join(id)
     }
