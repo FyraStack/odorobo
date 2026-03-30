@@ -14,7 +14,7 @@ User=odorobo
 Group=odorobo
 
 RuntimeDirectory=odorobo/vms/%i
-RuntimeDirectoryMode=0750
+RuntimeDirectoryMode=0770
 LogsDirectory=odorobo
 LogsDirectoryMode=0750
 ConfigurationDirectory=odorobo/vms/%i
