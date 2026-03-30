@@ -59,15 +59,20 @@ impl ProvisioningHook for CHMachineProvisioningHook {
         })
     }
 
-    fn after_stop(&self, vmid: &str) -> HookFuture<'_> {
+    fn before_stop(&self, vmid: &str) -> HookFuture<'_> {
         let vmid = vmid.to_string();
         Box::pin(async move {
             tracing::info!(vmid, "Unregistering machine from systemd-machined");
             let manager = get_manager_proxy().await?;
-            manager
-                .unregister_machine(vmid)
+            let res = manager
+                .unregister_machine(vmid.clone())
                 .await
-                .wrap_err("Failed to unregister machine from systemd-machined")?;
+                .wrap_err("Failed to unregister machine from systemd-machined");
+
+            // don't fail if hook fails, just log the error
+            if let Err(e) = res {
+                tracing::error!(vmid, error = ?e, "Failed to unregister machine from systemd-machined");
+            }
 
             Ok(())
         })
