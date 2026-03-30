@@ -81,3 +81,9 @@ See [docs/console.md](docs/console.md) for PTY-over-WebSocket usage and integrat
 For more advanced usage, Odorobo Agent also exposes a passthrough route for the local Cloud Hypervisor API, allowing you to call the full Cloud Hypervisor API directly through the agent's REST API
 
 See `docs/ch-passthrough.md` for Cloud Hypervisor API passthrough usage.
+
+## Security notes
+
+Currently, the `odorobo-ch@.service` unit is configured to be sandboxed and confined to a list of read-writable paths that are necessary for operation, and by default only has access to `/var/lib/odorobo` and `/dev` for runtime data.
+
+To allow Cloud Hypervisor to access the disk, you will have to either move your disk images into `/var/lib/odorobo` or add additional read access to the paths where your disk images are stored.
