@@ -26,7 +26,7 @@ ExecStart=/usr/bin/cloud-hypervisor \
     --api-socket /run/odorobo/vms/%i/ch.sock
 
 ExecStartPost=/usr/local/libexec/odorobo-postflight %i
-ExecStop=/usr/local/libexec/odorobo-stop %i
+ExecStop=/usr/local/libexec/odorobo-cleanup %i
 
 Restart=on-failure
 RestartSec=3s
