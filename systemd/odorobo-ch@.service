@@ -1,9 +1,9 @@
 [Unit]
 Description=Odorobo Cloud Hypervisor VM (%i)
 Documentation=https://www.cloudhypervisor.org/docs/
-After=network-online.target odorobo-agent.service
+After=network-online.target
 Wants=network-online.target
-Requires=odorobo-agent.service
+#Requires=odorobo-agent.service
 
 # If this unit fails, don't take down other VMs
 OnFailure=odorobo-ch-failed@%i.service

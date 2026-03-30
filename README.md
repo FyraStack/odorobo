@@ -27,7 +27,18 @@ Odorobo Agent is meant to be run as a system agent on each bare-metal node (or a
 
 Build the Agent binary with `cargo build --release` and run it on the host machine. The Agent will listen for commands from the Gateway to create, manage, and delete VMs.
 
+Install the systemd integration first:
+```bash
+# Create the `odorobo` user (the unit is hardcoded to run as this for now)
+sudo useradd -r -s /usr/sbin/nologin odorobo
+# Install unit hook scripts
+sudo just install_script
+# finally, install the unit
+sudo just install_unit
 ```
+
+Then build and run the agent:
+```bash
 # Build the Agent
 cargo build --release
 # Run the Agent (requires write permissions to /run/odorobo, and access to systemd's system session bus
@@ -40,19 +51,19 @@ For debugging and/or small-scale single-node usage, the CLI is available to inte
 
 Install the CLI helper
 
-```
+```bash
 cargo install --path odoroboctl
 ```
 
 You can then use `odoroboctl` to directly interact with the Agent, for example to spawn a VM instance
 
-```
+```bash
 odoroboctl spawn my-vm
 ```
 
 Now apply the [Cloud Hypervisor VM spec](https://github.com/cloud-hypervisor/cloud-hypervisor/blob/main/docs/api.md#create-a-virtual-machine) to the instance, for example with a simple configuration that boots from a disk image
 
-```
+```bash
 # the `--boot` flag additionally also tells Cloud Hypervisor to boot the VM after applying the configuration, otherwise it will stay
 # in the "Created" state, requiring a separate `odoroboctl boot` call to start it.
 odoroboctl create my-vm --boot ./my-vm.json
@@ -60,7 +71,7 @@ odoroboctl create my-vm --boot ./my-vm.json
 
 Now the VM should be running. You can connect to the VM's virtio-console with:
 
-```
+```bash
 screen /run/odorobo/my-vm/console.sock
 ```
 
