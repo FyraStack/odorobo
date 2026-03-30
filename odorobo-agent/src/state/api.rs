@@ -11,7 +11,7 @@ use stable_eyre::{
     eyre::{WrapErr, eyre},
 };
 use std::path::Path;
-
+#[allow(dead_code)]
 pub async fn call(
     socket_path: &Path,
     method: Method,

@@ -3,6 +3,7 @@
 use crate::state::VMInstance;
 use crate::state::provisioning::hooks::{HookFuture, ProvisioningHook};
 use crate::util::zbus_system_connection;
+use cloud_hypervisor_client::models::VmConfig;
 use stable_eyre::eyre::Context;
 use stable_eyre::{Result, eyre::eyre};
 use zbus_systemd::machine1::ManagerProxy;
@@ -37,7 +38,7 @@ pub const SERVICE_CLASS: &str = "cloud-hypervisor";
 pub struct CHMachineProvisioningHook;
 
 impl ProvisioningHook for CHMachineProvisioningHook {
-    fn after_start(&self, vmid: &str, pid: i32) -> HookFuture<'_> {
+    fn after_start(&self, vmid: &str, _config: &VmConfig, pid: i32) -> HookFuture<'_> {
         let vmid = vmid.to_string();
         Box::pin(async move {
             tracing::info!(vmid, pid, "Registering machine with systemd-machined");
@@ -59,7 +60,7 @@ impl ProvisioningHook for CHMachineProvisioningHook {
         })
     }
 
-    fn before_stop(&self, vmid: &str) -> HookFuture<'_> {
+    fn before_stop(&self, vmid: &str, _config: &VmConfig) -> HookFuture<'_> {
         let vmid = vmid.to_string();
         Box::pin(async move {
             tracing::info!(vmid, "Unregistering machine from systemd-machined");

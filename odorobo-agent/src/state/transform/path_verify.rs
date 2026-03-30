@@ -3,7 +3,7 @@
 //! Verifies paths for validity, returning errors when an invalid path is found
 use std::path::Path;
 
-use cloud_hypervisor_client::models::{ConsoleConfig, VmConfig};
+use cloud_hypervisor_client::models::VmConfig;
 use stable_eyre::{Result, eyre::eyre};
 use tracing::trace;
 
@@ -14,7 +14,7 @@ pub struct PathVerify;
 
 impl ConfigTransform for PathVerify {
     #[tracing::instrument(skip(config))]
-    fn transform(&self, config: &mut VmConfig) -> Result<()> {
+    fn transform(&self, _vmid: &str, config: &mut VmConfig) -> Result<()> {
         trace!("Verifying paths");
         let config = config.clone();
         // payload path verification

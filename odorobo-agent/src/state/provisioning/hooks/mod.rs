@@ -1,4 +1,13 @@
 //! Hooks for provisioning state.
+//!
+//! These are hooks, code that runs at various points during the provisioning lifecycle, that can be used to perform additional actions related to provisioning
+//!
+//! For example, networking setup, registering with systemd-machined, etc.
+//!
+//! They are different from transforms which are designed to modify the configuration itself
+//! to accomodate for the host environment, while hooks provide ways for the host itself
+//! to react to provisioning events and perform necessary setup/teardown actions.
+use cloud_hypervisor_client::models::VmConfig;
 use stable_eyre::Result;
 use std::{future::Future, pin::Pin};
 
@@ -14,18 +23,26 @@ mod machined;
 pub type HookFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
 
 pub trait ProvisioningHook: Send + Sync {
-    fn before_start(&self, _vmid: &str) -> HookFuture<'_> {
+    fn before_start(&self, _vmid: &str, config: &VmConfig) -> HookFuture<'_> {
         Box::pin(async { Ok(()) })
     }
-    fn after_start(&self, _vmid: &str, _pid: i32) -> HookFuture<'_> {
+    fn after_start(&self, _vmid: &str, _config: &VmConfig, _pid: i32) -> HookFuture<'_> {
         Box::pin(async { Ok(()) })
     }
-    fn before_stop(&self, _vmid: &str) -> HookFuture<'_> {
+    fn before_stop(&self, _vmid: &str, _config: &VmConfig) -> HookFuture<'_> {
         Box::pin(async { Ok(()) })
     }
-    fn after_stop(&self, _vmid: &str) -> HookFuture<'_> {
+    fn after_stop(&self, _vmid: &str, _config: &VmConfig) -> HookFuture<'_> {
         Box::pin(async { Ok(()) })
     }
+
+    fn before_boot(&self, _vmid: &str, _config: &VmConfig) -> HookFuture<'_> {
+        Box::pin(async { Ok(()) })
+    }
+    fn after_boot(&self, _vmid: &str, _config: &VmConfig) -> HookFuture<'_> {
+        Box::pin(async { Ok(()) })
+    }
+
     // fn before_destroy(&self, _vmid: &str) -> HookFuture<'_> {
     //     Box::pin(async { Ok(()) })
     // }
@@ -44,30 +61,44 @@ impl HookManager {
         self
     }
 
-    pub async fn before_start(&self, vmid: &str) -> Result<()> {
+    pub async fn before_start(&self, vmid: &str, config: &VmConfig) -> Result<()> {
         for hook in &self.hooks {
-            hook.before_start(vmid).await?;
+            hook.before_start(vmid, config).await?;
         }
         Ok(())
     }
 
-    pub async fn after_start(&self, vmid: &str, pid: i32) -> Result<()> {
+    pub async fn after_start(&self, vmid: &str, config: &VmConfig, pid: i32) -> Result<()> {
         for hook in &self.hooks {
-            hook.after_start(vmid, pid).await?;
+            hook.after_start(vmid, config, pid).await?;
         }
         Ok(())
     }
 
-    pub async fn before_stop(&self, vmid: &str) -> Result<()> {
+    pub async fn before_stop(&self, vmid: &str, config: &VmConfig) -> Result<()> {
         for hook in &self.hooks {
-            hook.before_stop(vmid).await?;
+            hook.before_stop(vmid, config).await?;
         }
         Ok(())
     }
 
-    pub async fn after_stop(&self, vmid: &str) -> Result<()> {
+    pub async fn after_stop(&self, vmid: &str, config: &VmConfig) -> Result<()> {
         for hook in &self.hooks {
-            hook.after_stop(vmid).await?;
+            hook.after_stop(vmid, config).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn before_boot(&self, vmid: &str, config: &VmConfig) -> Result<()> {
+        for hook in &self.hooks {
+            hook.before_boot(vmid, config).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn after_boot(&self, vmid: &str, config: &VmConfig) -> Result<()> {
+        for hook in &self.hooks {
+            hook.after_boot(vmid, config).await?;
         }
         Ok(())
     }

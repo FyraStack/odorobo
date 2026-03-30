@@ -1,7 +1,7 @@
 use cloud_hypervisor_client::{
     SocketBasedApiClient,
     apis::{DefaultApi, Error as ChClientError},
-    models::{self, VmInfo, VmmPingResponse},
+    models::{self, VmConfig, VmInfo, VmmPingResponse},
 };
 use hyper::Method;
 use hyper::{Request, Response, body::Bytes};
@@ -72,11 +72,22 @@ impl VMInstance {
     }
 
     pub async fn boot(&self) -> Result<()> {
+        // boot hooks
+        let provisioner = super::provisioning::default_provisioner();
+
+        let vm_config = self.info().await?.config;
+
+        provisioner.before_boot(self.vm_id(), &vm_config).await?;
+
         self.conn()
             .boot_vm()
             .await
             .map_err(ChApiError::from)
-            .wrap_err(eyre!("Failed to boot VM {}", self.vm_id()))
+            .wrap_err(eyre!("Failed to boot VM {}", self.vm_id()))?;
+
+        provisioner.after_boot(self.vm_id(), &vm_config).await?;
+
+        Ok(())
     }
 
     pub async fn pause(&self) -> Result<()> {
@@ -115,7 +126,7 @@ impl VMInstance {
     }
 
     #[tracing::instrument]
-    pub async fn prepare_migration(&self) -> Result<()> {
+    pub async fn receive_migration(&self) -> Result<()> {
         let conn = self.conn();
         trace!("Preparing VM for migration");
 
@@ -269,10 +280,52 @@ impl VMInstance {
         }
     }
 
+    pub async fn debug_console_path(&self) -> Result<PathBuf> {
+        let vminfo = self.info().await?;
+        if let Some(debug_console) = vminfo.config.debug_console {
+            match debug_console.mode {
+                models::debug_console_config::Mode::Pty => {
+                    debug!(
+                        vm_id = self.vm_id(),
+                        "VM has PTY debug console configured, returning PTY path"
+                    );
+                    let console_path = debug_console.file.ok_or_else(|| {
+                        eyre!("Debug console config is missing file path for PTY console")
+                    })?;
+                    Ok(console_path.into())
+                }
+                _ => Err(eyre!(
+                    "Debug console is configured but is not a PTY console, unsupported console type"
+                )),
+            }
+        } else {
+            Err(eyre!(
+                "VM does not have a debug console configured nor supported"
+            ))
+        }
+    }
+
+    pub async fn open_debug_console(&self) -> Result<ConsoleStream> {
+        let console_path = self.debug_console_path().await?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&console_path)
+            .wrap_err_with(|| {
+                eyre!(
+                    "Failed to open PTY debug console device for {} at {}",
+                    self.vm_id(),
+                    console_path.display()
+                )
+            })?;
+        Ok(tokio::fs::File::from_std(file))
+    }
+
     /// Spawn a new CH process and create a VMInstance for it.
     ///
     /// Waits for the socket to become available (polls up to ~30 seconds).
     /// Calls a backend to handle the actual CH process spawning - typically a systemd unit
+    #[allow(dead_code)] // this thing is used in the REST API
     pub async fn spawn(id: &str) -> Result<Self> {
         info!(
             vm_id = id,
@@ -281,7 +334,8 @@ impl VMInstance {
         );
 
         let provisioner = super::provisioning::default_provisioner();
-        provisioner.start_instance(id).await?;
+        // nothing for now, transformers will be used instead?
+        provisioner.start_instance(id, &VmConfig::default()).await?;
 
         let instance = Self::new(id, Self::runtime_dir_for(id).join(SOCKET_FILE_NAME));
 
@@ -318,13 +372,15 @@ impl VMInstance {
         }
         let provisioner = super::provisioning::default_provisioner();
 
+        let vm_config = self.info().await?.config;
+
         self.conn()
             .shutdown_vmm()
             .await
             .map_err(ChApiError::from)
             .wrap_err(eyre!("Failed to shutdown VMM for {}", self.vm_id()))?;
 
-        provisioner.stop_instance(self.vm_id()).await?;
+        provisioner.stop_instance(self.vm_id(), &vm_config).await?;
 
         if let Err(err) = self.purge_instance_data() {
             warn!(
@@ -378,7 +434,8 @@ impl VMInstance {
         trace!(vm_id = self.vm_id(), "Creating VM with provided config");
         let mut config = config;
         trace!(vm_id = self.vm_id(), "Applying config transforms");
-        apply_builtin_transforms(&mut config).wrap_err("Failed to apply config transforms")?;
+        apply_builtin_transforms(self.vm_id(), &mut config)
+            .wrap_err("Failed to apply config transforms")?;
 
         trace!(vm_id = self.vm_id(), "Saving config to runtime dir");
         self.save_config(&config)?;
@@ -392,10 +449,8 @@ impl VMInstance {
 
         if boot {
             debug!(vm_id = self.vm_id(), "Booting VM");
-            self.conn()
-                .boot_vm()
+            self.boot()
                 .await
-                .map_err(ChApiError::from)
                 .wrap_err(eyre!("Failed to boot VM {}", self.vm_id()))?;
         }
         info!(vm_id = self.vm_id(), "VM created and booted");
