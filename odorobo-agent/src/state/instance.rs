@@ -12,6 +12,7 @@ use stable_eyre::{
 };
 use std::{
     env, fs,
+    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
 };
 use thiserror::Error;
@@ -23,7 +24,7 @@ use super::transform::apply_builtin_transforms;
 pub const CONFIG_FILE_NAME: &str = "config.json";
 const SOCKET_FILE_NAME: &str = "ch.sock";
 pub const VMS_DIR_NAME: &str = "vms";
-pub type ConsoleStream = tokio::fs::File;
+pub type ConsoleStream = std::fs::File;
 
 const DEFAULT_RUNTIME_ROOT_DIR: &str = "/run/odorobo";
 const RUNTIME_ROOT_ENV_VAR: &str = "ODOROBO_RUNTIME_DIR";
@@ -223,24 +224,27 @@ impl VMInstance {
     }
 
     /// Returns the PTY path for this VM's serial console by querying the CH API.
+    #[tracing::instrument]
     pub async fn console_path(&self) -> Result<PathBuf> {
+        trace!("Getting console PTY path from CH API");
         let info = self.info().await?;
-        let path = info
-            .config
-            .serial
-            .and_then(|s| s.path)
-            .ok_or_else(|| eyre!("No serial console PTY path available for {}", self.vm_id()))?;
+        let path =
+            info.config.serial.and_then(|s| s.file).ok_or_else(|| {
+                eyre!("No serial console PTY path available for {}", self.vm_id())
+            })?;
         Ok(PathBuf::from(path))
     }
 
     /// Opens the PTY console device for this VM and returns a connected stream.
+    #[tracing::instrument]
     pub async fn open_console(&self) -> Result<ConsoleStream> {
         let pty_path = self.console_path().await?;
-        tokio::fs::OpenOptions::new()
+        trace!(pty_path = ?pty_path, "Opening console PTY device");
+        fs::OpenOptions::new()
             .read(true)
             .write(true)
+            .custom_flags(libc::O_NONBLOCK)
             .open(&pty_path)
-            .await
             .wrap_err_with(|| {
                 eyre!(
                     "Failed to open console PTY for {} at {}",

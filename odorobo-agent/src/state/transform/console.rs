@@ -1,4 +1,4 @@
-use cloud_hypervisor_client::models::{ConsoleConfig, DebugConsoleConfig, VmConfig};
+use cloud_hypervisor_client::models::{ConsoleConfig, VmConfig};
 use stable_eyre::Result;
 use tracing::trace;
 

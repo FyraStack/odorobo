@@ -28,7 +28,7 @@ Cloud Hypervisor allocates a PTY for the serial console. The PTY path is reporte
 odoroboctl info my-vm
 ```
 
-Look at the `config.serial` section of the output and find the `path` field. This is the PTY on the host connected to the VM's serial console. Connect to it with `screen` or any other terminal program:
+Look at the `config.serial` section of the output and find the `file` field. This is the PTY on the host connected to the VM's serial console. Connect to it with `screen` or any other terminal program:
 
 ```bash
 screen /dev/pts/N

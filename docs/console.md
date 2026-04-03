@@ -22,6 +22,7 @@ This endpoint upgrades to a WebSocket and proxies the VM's serial console PTY in
   - WebSocket `Binary` frames are written to the PTY as-is
   - WebSocket `Text` frames are reserved for JSON control messages
 - VM -> Client:
+  - A `{"type":"connected","vm_id":"..."}` text frame is sent immediately on upgrade before any PTY data
   - PTY output is sent back as WebSocket `Binary` frames
   - Server control or protocol errors are sent as WebSocket `Text` frames containing JSON
 - Control frames:

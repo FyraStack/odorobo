@@ -76,7 +76,7 @@ websocat --binary ws://127.0.0.1:8890/vms/my-vm/console
 To connect directly on the host, look up the PTY path from the VM info:
 
 ```bash
-odoroboctl info my-vm  # find config.serial.path, e.g. /dev/pts/3
+odoroboctl info my-vm  # find config.serial.file, e.g. /dev/pts/3
 screen /dev/pts/3
 ```
 
