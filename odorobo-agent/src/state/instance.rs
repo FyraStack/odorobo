@@ -22,10 +22,8 @@ use super::transform::apply_builtin_transforms;
 
 pub const CONFIG_FILE_NAME: &str = "config.json";
 const SOCKET_FILE_NAME: &str = "ch.sock";
-const CONSOLE_SOCKET_FILE_NAME: &str = "console.sock";
-const DEBUG_CONSOLE_SOCKET_FILE_NAME: &str = "debug_console.socket";
 pub const VMS_DIR_NAME: &str = "vms";
-pub type ConsoleStream = tokio::net::UnixStream;
+pub type ConsoleStream = tokio::fs::File;
 
 const DEFAULT_RUNTIME_ROOT_DIR: &str = "/run/odorobo";
 const RUNTIME_ROOT_ENV_VAR: &str = "ODOROBO_RUNTIME_DIR";
@@ -216,7 +214,7 @@ impl VMInstance {
             .unwrap_or_else(|| PathBuf::from(DEFAULT_RUNTIME_ROOT_DIR))
     }
 
-    fn conn(&self) -> SocketBasedApiClient {
+    pub fn conn(&self) -> SocketBasedApiClient {
         cloud_hypervisor_client::socket_based_api_client(self.ch_socket_path.clone())
     }
 
@@ -224,16 +222,30 @@ impl VMInstance {
         &self.id
     }
 
+    /// Returns the PTY path for this VM's serial console by querying the CH API.
+    pub async fn console_path(&self) -> Result<PathBuf> {
+        let info = self.info().await?;
+        let path = info
+            .config
+            .serial
+            .and_then(|s| s.path)
+            .ok_or_else(|| eyre!("No serial console PTY path available for {}", self.vm_id()))?;
+        Ok(PathBuf::from(path))
+    }
+
     /// Opens the PTY console device for this VM and returns a connected stream.
     pub async fn open_console(&self) -> Result<ConsoleStream> {
-        let socket_path = self.console_path();
-        tokio::net::UnixStream::connect(&socket_path)
+        let pty_path = self.console_path().await?;
+        tokio::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&pty_path)
             .await
             .wrap_err_with(|| {
                 eyre!(
-                    "Failed to connect to console socket for {} at {}",
+                    "Failed to open console PTY for {} at {}",
                     self.vm_id(),
-                    socket_path.display()
+                    pty_path.display()
                 )
             })
     }
@@ -275,27 +287,6 @@ impl VMInstance {
             .await
             .map_err(ChApiError::from)
             .wrap_err(eyre!("Failed to ping VM {}", self.vm_id()))
-    }
-
-    pub fn console_path(&self) -> PathBuf {
-        self.runtime_dir().join(CONSOLE_SOCKET_FILE_NAME)
-    }
-
-    pub fn debug_console_path(&self) -> PathBuf {
-        self.runtime_dir().join(DEBUG_CONSOLE_SOCKET_FILE_NAME)
-    }
-
-    pub async fn open_debug_console(&self) -> Result<ConsoleStream> {
-        let socket_path = self.debug_console_path();
-        tokio::net::UnixStream::connect(&socket_path)
-            .await
-            .wrap_err_with(|| {
-                eyre!(
-                    "Failed to connect to debug console socket for {} at {}",
-                    self.vm_id(),
-                    socket_path.display()
-                )
-            })
     }
 
     /// Spawn a new CH process and create a VMInstance for it.

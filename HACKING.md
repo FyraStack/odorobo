@@ -20,25 +20,21 @@ python scripts/vsock.py my-vm
 Fyra Stack production images should just have a management agent to talk over vsock and do other stuff,
 but this is a quick way to get a shell over vsock for testing and debugging.
 
-## serial console socket
+## serial console (PTY)
 
-Cloud Hypervisor is configured to expose the serial console as a Unix domain socket at a stable, predictable path:
-
-```
-/run/odorobo/vms/<vmid>/console.sock
-```
-
-Connect directly on the host with socat:
+Cloud Hypervisor allocates a PTY for the serial console. The PTY path is reported via the CH API after the VM is created.
 
 ```bash
-# raw output only (useful for scripting or piping)
-socat - UNIX-CONNECT:/run/odorobo/vms/my-vm/console.sock
-
-# interactive session with local terminal in raw mode
-socat file:`tty`,raw,echo=0 UNIX-CONNECT:/run/odorobo/vms/my-vm/console.sock
+odoroboctl info my-vm
 ```
 
-Press `Ctrl-]` then `q` to exit socat in interactive mode, or just close the terminal.
+Look at the `config.serial` section of the output and find the `path` field. This is the PTY on the host connected to the VM's serial console. Connect to it with `screen` or any other terminal program:
+
+```bash
+screen /dev/pts/N
+```
+
+Where `N` is the number from the `path` field.
 
 Alternatively, use the agent's WebSocket console proxy from any machine that can reach the agent:
 
@@ -46,4 +42,4 @@ Alternatively, use the agent's WebSocket console proxy from any machine that can
 websocat --binary ws://127.0.0.1:8890/vms/my-vm/console
 ```
 
-The socket path is stable across live migrations — after a migration completes, reconnect to the same path on the destination node.
+Note: the PTY path changes every time the VM is restarted or the VMM process is recreated. It is not stable across live migrations.

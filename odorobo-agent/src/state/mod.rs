@@ -5,6 +5,7 @@
 
 mod api;
 mod instance;
+mod devices;
 mod provisioning;
 mod transform;
 

@@ -19,14 +19,15 @@ impl ConfigTransform for ConsoleTransform {
             ..Default::default()
         });
         // note: console passthrough is kinda janky and breaks live migration, needs a way to fix this
-        // 
+        //
         // todo: TTY mode also doesn't work well with systemd, need to figure out a good way to
         // remotely attach TTY on boot without breaking systemd or live migration
-        // 
+        //
         // consider some virtual GPU device, but CH doesn't have QXL or virtio-gpu so idk
         config.serial = Some(ConsoleConfig {
-            mode: cloud_hypervisor_client::models::console_config::Mode::Tty,
-            socket: Some(format!("{}/console.sock", runtime_path.display())),
+            mode: cloud_hypervisor_client::models::console_config::Mode::Pty,
+            // file: Some(format!("{}/serial", runtime_path.display())),
+            // socket: Some(format!("{}/console.sock", runtime_path.display())),
             ..Default::default()
         });
 
