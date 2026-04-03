@@ -83,20 +83,20 @@ async fn proxy_console(socket: &mut WebSocket, mut console: AsyncFd<ConsoleStrea
     let mut buf = [0_u8; 8192];
 
     loop {
-        trace!("select waiting on ws.recv() and console.read()");
+        // trace!("select waiting on ws.recv() and console.read()");
         tokio::select! {
             message = socket.recv() => {
-                trace!("ws.recv() returned: {:?}", message.as_ref().map(|m| match m {
-                    Ok(Message::Binary(d)) => format!("Binary({}b)", d.len()),
-                    Ok(Message::Text(t)) => format!("Text({}b)", t.len()),
-                    Ok(Message::Close(_)) => "Close".into(),
-                    Ok(Message::Ping(_)) => "Ping".into(),
-                    Ok(Message::Pong(_)) => "Pong".into(),
-                    Err(e) => format!("Error: {}", e),
-                }));
+                // trace!("ws.recv() returned: {:?}", message.as_ref().map(|m| match m {
+                //     Ok(Message::Binary(d)) => format!("Binary({}b)", d.len()),
+                //     Ok(Message::Text(t)) => format!("Text({}b)", t.len()),
+                //     Ok(Message::Close(_)) => "Close".into(),
+                //     Ok(Message::Ping(_)) => "Ping".into(),
+                //     Ok(Message::Pong(_)) => "Pong".into(),
+                //     Err(e) => format!("Error: {}", e),
+                // }));
                 match message {
                     Some(Ok(Message::Binary(data))) => {
-                        trace!(bytes = data.len(), "ws -> pty (binary)");
+                        // trace!(bytes = data.len(), "ws -> pty (binary)");
                         let _ = console.writable().await?;
                         let data_copy = data.to_vec();
                         let write_result = tokio::task::block_in_place(|| {
@@ -105,22 +105,22 @@ async fn proxy_console(socket: &mut WebSocket, mut console: AsyncFd<ConsoleStrea
                             Ok::<(), io::Error>(())
                         });
                         write_result?;
-                        trace!("write and flush done");
+                        // trace!("write and flush done");
                     }
                     Some(Ok(Message::Text(text))) => {
-                        trace!(len = text.len(), "ws -> pty (text/control)");
+                        // trace!(len = text.len(), "ws -> pty (text/control)");
                         handle_console_control(socket, &mut console, text.to_string()).await?
                     }
                     Some(Ok(Message::Close(_))) | None => {
-                        trace!("ws close or none");
+                        // trace!("ws close or none");
                         break;
                     }
                     Some(Ok(Message::Ping(payload))) => {
-                        trace!("ws ping");
+                        // trace!("ws ping");
                         socket.send(Message::Pong(payload)).await?
                     }
                     Some(Ok(Message::Pong(_))) => {
-                        trace!("ws pong");
+                        // trace!("ws pong");
                     }
                     Some(Err(err)) => {
                         trace!(?err, "ws error");
@@ -137,14 +137,14 @@ async fn proxy_console(socket: &mut WebSocket, mut console: AsyncFd<ConsoleStrea
                 match read_result {
                     Ok(n) => {
                         if n == 0 {
-                            trace!("pty read returned 0 bytes");
+                            // trace!("pty read returned 0 bytes");
                             break;
                         }
-                        trace!(bytes = n, "pty -> ws");
+                        // trace!(bytes = n, "pty -> ws");
                         socket.send(Message::Binary(buf[..n].to_vec().into())).await?;
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        trace!("pty read would block, retrying");
+                        // trace!("pty read would block, retrying");
                         // Continue select loop to try again
                     }
                     Err(e) => return Err(e.into()),
