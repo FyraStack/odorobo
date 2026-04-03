@@ -82,6 +82,15 @@ For more advanced usage, Odorobo Agent also exposes a passthrough route for the 
 
 See `docs/ch-passthrough.md` for Cloud Hypervisor API passthrough usage.
 
+## Live Migration
+
+To start a live migration, you will first need to spawn a VM on the destination node with `odoroboctl spawn`, then call the `migrate` command on the source node with the destination node's address:
+
+```bash
+odoroboctl spawn my-vm-dest
+```
+
+
 ## Security notes
 
 Currently, the `odorobo-ch@.service` unit is configured to be sandboxed and confined to a list of read-writable paths that are necessary for operation, and by default only has access to `/var/lib/odorobo` and `/dev` for runtime data.

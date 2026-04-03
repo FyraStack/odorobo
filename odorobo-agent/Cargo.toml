@@ -24,6 +24,7 @@ futures-util = "0.3.31"
 libc = "0.2"
 tower-http = { workspace = true, features = ["trace"] }
 random-port = "0.1.1"
+if-addrs = "0.13"
 zbus = "5.14.0"
 zbus_systemd = { version = "0.26000.0", features = ["machine1", "systemd1", "zbus-async-tokio"] }
 

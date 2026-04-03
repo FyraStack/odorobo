@@ -21,6 +21,11 @@ pub fn router() -> axum::Router<()> {
         .route("/{vmid}/boot", axum::routing::put(boot_vm))
         .route("/{vmid}/pause", axum::routing::put(pause_vm))
         .route("/{vmid}/resume", axum::routing::put(resume_vm))
+        .route("/{vmid}/migrate/send", axum::routing::put(migrate_send_vm))
+        .route(
+            "/{vmid}/migrate/receive",
+            axum::routing::put(migrate_receive_vm),
+        )
         .route("/{vmid}", axum::routing::get(vm_info))
         .route("/{vmid}/ping", axum::routing::get(ping_vm))
         .route("/{vmid}", axum::routing::delete(destroy_vm))
@@ -80,6 +85,44 @@ pub struct VmSpawnResponse {
     pub info: Option<VmInfo>,
     pub booted: bool,
     pub created_config: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct VmMigrateSendResponse {
+    pub info: Option<VmInfo>,
+}
+#[derive(Debug, Deserialize, Serialize)]
+pub struct VmMigrateReceiveResponse {
+    pub listening_address: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VmMigrateSendRequest {
+    pub destination: String,
+    #[serde(default)]
+    pub local: bool,
+}
+
+/// Sends a live migration to the given destination URL
+async fn migrate_send_vm(
+    vmid: Path<String>,
+    Json(body): Json<VmMigrateSendRequest>,
+) -> Result<Json<VmMigrateSendResponse>, ApiError> {
+    let vm = get_vm(&vmid.0)?;
+    vm.send_migration(&body.destination, body.local)
+        .await
+        .map_err(ApiError::migration)?;
+    let info = vm.info().await.map_err(ApiError::vm_info)?;
+    Ok(Json(VmMigrateSendResponse { info: Some(info) }))
+}
+
+/// Prepares a VM to receive a live migration, returning the address the sender should connect to
+async fn migrate_receive_vm(
+    vmid: Path<String>,
+) -> Result<Json<VmMigrateReceiveResponse>, ApiError> {
+    let vm = get_vm(&vmid.0)?;
+    let listening_address = vm.receive_migration().await.map_err(ApiError::migration)?;
+    Ok(Json(VmMigrateReceiveResponse { listening_address }))
 }
 
 /// Spawns a new VM instance with the given ID, optionally creating it with the provided configuration and booting it immediately
@@ -162,9 +205,7 @@ async fn create_vm_config(
 
 async fn delete_vm_config(vmid: Path<String>) -> Result<Json<()>, ApiError> {
     let vm = get_vm(&vmid.0)?;
-    vm.delete_config()
-        .await
-        .map_err(ApiError::delete_config)?;
+    vm.delete_config().await.map_err(ApiError::delete_config)?;
     Ok(Json(()))
 }
 
@@ -185,9 +226,7 @@ async fn shutdown_vm(vmid: Path<String>) -> Result<Json<()>, ApiError> {
 /// allowing them to be re-provisioned again on any other node (if running in a cluster)
 async fn shutdown_acpi(vmid: Path<String>) -> Result<Json<()>, ApiError> {
     let vm = get_vm(&vmid.0)?;
-    vm.acpi_power_button()
-        .await
-        .map_err(ApiError::vm_info)?;
+    vm.acpi_power_button().await.map_err(ApiError::vm_info)?;
     Ok(Json(()))
 }
 

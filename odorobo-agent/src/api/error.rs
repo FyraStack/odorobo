@@ -44,6 +44,10 @@ pub enum ApiError {
     #[error("Failed to delete VM configuration: configuration: {msg}")]
     #[http(code = 500, message = msg, errors = errors)]
     CreateConfigFailed { msg: String, errors: Vec<String> },
+
+    #[error("Failed to migrate VM: {msg}")]
+    #[http(code = 500, message = msg, errors = errors)]
+    MigrationFailed { msg: String, errors: Vec<String> },
 }
 
 impl ApiError {
@@ -87,5 +91,9 @@ impl ApiError {
             msg,
             errors,
         })
+    }
+
+    pub fn migration(error: Report) -> Self {
+        Self::from_report(error, |msg, errors| Self::MigrationFailed { msg, errors })
     }
 }

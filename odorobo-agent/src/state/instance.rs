@@ -16,7 +16,7 @@ use std::{
     path::{Path, PathBuf},
 };
 use thiserror::Error;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use super::api::{call, call_request};
 use super::transform::apply_builtin_transforms;
@@ -106,13 +106,19 @@ impl VMInstance {
             .wrap_err(eyre!("Failed to resume VM {}", self.vm_id()))
     }
 
+    /// Initiates a migration from this VM to the specified destination URI.
+    /// 
+    /// Options:
+    /// - `dest`: the destination URI to migrate to, in the format expected by CH (e.g. "tcp:<IP_ADDRESS>:12345")
+    /// - `local`: if true, indicates that the migration is local (e.g. within the same host, for renaming a VM). This is passed to CH and may affect how the migration is performed.
     #[tracing::instrument]
-    pub async fn send_migration(&self, dest: &str) -> Result<()> {
+    pub async fn send_migration(&self, dest: &str, local: bool) -> Result<()> {
         let conn = self.conn();
         trace!(destination = dest, "Sending migration command to VM");
 
         let send_migration_data = models::SendMigrationData {
             destination_url: dest.to_string(),
+            local: Some(local),
             ..Default::default()
         };
 
@@ -125,34 +131,50 @@ impl VMInstance {
             ))
     }
 
+    /// Prepares the VM to receive a migration by starting a migration receiver in the background.
+    /// Returns the URI that the sender should connect to for migration.
+    ///
+    /// Note: This does not currently track migration state,
+    /// so it's currently up to the caller to make sure that the receiver is ready before the sender tries to connect.
+    /// Future improvement: add some kind of global tracker for active migrations and their states.
     #[tracing::instrument]
-    pub async fn receive_migration(&self) -> Result<()> {
+    pub async fn receive_migration(&self) -> Result<String> {
         let conn = self.conn();
         trace!("Preparing VM for migration");
 
-        let rand_port = random_port::PortPicker::new().pick()?;
+        let rand_port = random_port::PortPicker::new()
+            .port_range(49152u16..=65535u16)
+            .pick()?;
 
         trace!(port = rand_port, "Selected random port for migration");
 
-        let reciever_uri = format!("tcp:0.0.0.0:{}", rand_port);
+        let receiver_uri = format!("tcp:0.0.0.0:{}", rand_port);
 
         let receive_migration_data = models::ReceiveMigrationData {
-            receiver_url: reciever_uri.clone(),
+            receiver_url: receiver_uri.clone(),
             ..Default::default()
         };
 
-        conn.vm_receive_migration_put(receive_migration_data)
-            .await
-            .map_err(ChApiError::from)
-            .wrap_err(eyre!("Failed to prepare VM for migration {}", self.vm_id()))?;
-
+        let vm_id = self.vm_id().to_string();
         info!(
-            vm_id = self.vm_id(),
-            uri = ?reciever_uri,
-            "VM prepared for migration, receiver listening"
+            vm_id,
+            port = rand_port,
+            "Preparing VM for migration, spawning receiver in background"
         );
 
-        Ok(())
+        tokio::spawn(async move {
+            match conn
+                .vm_receive_migration_put(receive_migration_data)
+                .await
+                .map_err(ChApiError::from)
+                .wrap_err(eyre!("Failed to prepare VM for migration {}", vm_id))
+            {
+                Ok(_) => info!(vm_id, "Migration receiver completed successfully"),
+                Err(e) => error!(vm_id, error = ?e, "Migration receiver failed"),
+            }
+        });
+
+        Ok(receiver_uri)
     }
 
     pub fn runtime_root() -> PathBuf {
@@ -372,7 +394,13 @@ impl VMInstance {
         }
         let provisioner = super::provisioning::default_provisioner();
 
-        let vm_config = self.info().await?.config;
+        let vm_config = self
+            .info()
+            .await
+            .ok()
+            .map(|i| i.config)
+            .or_else(|| self.load_config().ok())
+            .unwrap_or_default();
 
         self.conn()
             .shutdown_vmm()

@@ -92,8 +92,26 @@ pub enum Command {
         #[arg(last = true)]
         args: Vec<String>,
     },
-}
 
+    /// Migrate a VM to another host
+    MigrateSend {
+        /// VM ID of the source VM to migrate
+        vmid: String,
+
+        /// Address of the destination host to migrate to
+        destination: String,
+
+        /// Indicate that this is a local migration (e.g. within the same host)
+        #[arg(long)]
+        local: bool,
+    },
+
+    /// Prepare a VM to receive a migration from another host
+    MigrateReceive {
+        /// VM ID of the destination VM to prepare for migration
+        vmid: String,
+    },
+}
 
 // the fields are used using debug printing, so we allow dead code warnings
 #[allow(dead_code)]
@@ -241,6 +259,19 @@ pub async fn run_command(cli: Cli) -> Result<()> {
             let url = format!("{}/{}", base_url, vmid);
             let response = client.delete(&url).send().await?;
             print_message_response(response, "VM destroyed successfully").await?;
+        }
+
+        Command::MigrateSend { vmid, destination, local } => {
+            let url = format!("{base_url}/{vmid}/migrate/send");
+            let body = serde_json::json!({ "destination": destination, "local": local });
+            let response = client.put(&url).json(&body).send().await?;
+            print_text_response(response).await?;
+        }
+
+        Command::MigrateReceive { vmid } => {
+            let url = format!("{base_url}/{vmid}/migrate/receive");
+            let response = client.put(&url).send().await?;
+            print_text_response(response).await?;
         }
 
         Command::ChRemote { vmid, args } => {

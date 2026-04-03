@@ -44,9 +44,9 @@ impl ProvisioningHook for CHMachineProvisioningHook {
             tracing::info!(vmid, pid, "Registering machine with systemd-machined");
             let runtime_dir = VMInstance::runtime_dir_for(&vmid);
             let manager = get_manager_proxy().await?;
-            manager
+            let res = manager
                 .register_machine(
-                    vmid,
+                    vmid.clone(),
                     Vec::new(),
                     SERVICE_CLASS.to_string(),
                     "vm".to_string(),
@@ -54,7 +54,12 @@ impl ProvisioningHook for CHMachineProvisioningHook {
                     runtime_dir.display().to_string(),
                 )
                 .await
-                .wrap_err("Failed to register machine with systemd-machined")?;
+                .wrap_err("Failed to register machine with systemd-machined");
+
+            if let Err(e) = res {
+                tracing::error!(vmid, error = ?e, "Failed to register machine with systemd-machined");
+                tracing::warn!(vmid, "Continuing without systemd-machined registration");
+            }
 
             Ok(())
         })

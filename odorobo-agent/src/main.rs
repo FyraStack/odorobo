@@ -1,6 +1,6 @@
 mod api;
-mod util;
 mod state;
+mod util;
 use stable_eyre::Result;
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -16,8 +16,14 @@ async fn main() -> Result<()> {
     // minimal axum server
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8890").await?;
-    tracing::info!("Listening on http://{}", listener.local_addr()?);
-    axum::serve(listener, api::router()).await?;
+    let port = listener.local_addr()?.port();
+    let addrs: Vec<String> = if_addrs::get_if_addrs()?
+        .into_iter()
+        .filter(|i| !i.is_loopback())
+        .map(|i| format!("http://{}:{}", i.ip(), port))
+        .collect();
+    tracing::info!(port, ?addrs, "Listening");
+    axum::serve(listener, api::router(port)).await?;
 
     Ok(())
 }
