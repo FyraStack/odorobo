@@ -29,8 +29,6 @@ Build the Agent binary with `cargo build --release` and run it on the host machi
 
 Install the systemd integration first:
 ```bash
-# Create the `odorobo` user (the unit is hardcoded to run as this for now)
-sudo useradd -r -s /usr/sbin/nologin odorobo
 # Install unit hook scripts
 sudo just install_script
 # finally, install the unit
@@ -69,14 +67,19 @@ Now apply the [Cloud Hypervisor VM spec](https://github.com/cloud-hypervisor/clo
 odoroboctl create my-vm --boot ./my-vm.json
 ```
 
-Now the VM should be running. You can connect to the VM's virtio-console with:
+Now the VM should be running. You can connect to the VM's serial console directly on the host:
 
 ```bash
-screen /run/odorobo/my-vm/console.sock
+socat file:`tty`,raw,echo=0 UNIX-CONNECT:/run/odorobo/vms/my-vm/console.sock
 ```
 
-There is also a WebSocket proxy that can be used to connect to the console over WebSockets, for example with `websocat`.
-See [docs/console.md](docs/console.md) for PTY-over-WebSocket usage and integration details.
+Or connect remotely via the agent's WebSocket proxy, for example with `websocat`:
+
+```bash
+websocat --binary ws://127.0.0.1:8890/vms/my-vm/console
+```
+
+See [docs/console.md](docs/console.md) for serial console WebSocket usage and integration details.
 
 For more advanced usage, Odorobo Agent also exposes a passthrough route for the local Cloud Hypervisor API, allowing you to call the full Cloud Hypervisor API directly through the agent's REST API
 

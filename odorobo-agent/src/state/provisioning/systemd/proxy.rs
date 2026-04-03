@@ -5,7 +5,8 @@ use crate::util::{systemd_instance_unit_name, zbus_system_connection};
 /// using systemd.
 ///
 /// All it should do is simply just start and stop systemd services with the correct parameters
-use stable_eyre::{Result, eyre::WrapErr};
+use stable_eyre::{Result, eyre::WrapErr, eyre::eyre};
+use tokio::time::{Duration, sleep};
 use tracing::trace;
 use zbus::Connection;
 use zbus_systemd::systemd1::{ManagerProxy, ServiceProxy};
@@ -56,13 +57,63 @@ pub async fn start_instance(vmid: &str) -> Result<i32> {
         .await
         .wrap_err_with(|| format!("Failed to start systemd unit {unit_name}"))?;
 
-    let service = service_proxy(&connection, &unit_name).await?;
-    let pid = service
-        .main_pid()
+    let unit_path = manager
+        .load_unit(unit_name.clone())
         .await
-        .wrap_err_with(|| format!("Failed to get MainPID for {unit_name}"))?;
+        .wrap_err_with(|| format!("Failed to load systemd unit {unit_name}"))?;
 
-    Ok(pid as i32)
+    let unit = zbus_systemd::systemd1::UnitProxy::builder(&connection)
+        .path(unit_path.clone())
+        .wrap_err_with(|| format!("Failed to build path for systemd unit {unit_name}"))?
+        .build()
+        .await
+        .wrap_err_with(|| format!("Failed to create unit proxy for systemd unit {unit_name}"))?;
+
+    let service = zbus_systemd::systemd1::ServiceProxy::builder(&connection)
+        .path(&unit_path)
+        .wrap_err_with(|| format!("Failed to build path for systemd unit {unit_name}"))?
+        .build()
+        .await
+        .wrap_err_with(|| format!("Failed to create service proxy for systemd unit {unit_name}"))?;
+
+    // start_unit enqueues a job but doesn't wait for it to complete.
+    // Poll until the service reaches a terminal state so we can return a real PID.
+    const MAX_WAIT: u32 = 30;
+    for attempt in 0..MAX_WAIT {
+        let state = unit
+            .active_state()
+            .await
+            .wrap_err_with(|| format!("Failed to get ActiveState for {unit_name}"))?;
+
+        trace!(
+            ?unit_name,
+            ?state,
+            attempt,
+            "Waiting for systemd unit to start"
+        );
+
+        match state.as_str() {
+            "active" => {
+                let pid = service
+                    .main_pid()
+                    .await
+                    .wrap_err_with(|| format!("Failed to get MainPID for {unit_name}"))?;
+                return Ok(pid as i32);
+            }
+            "failed" => {
+                return Err(eyre!("Systemd unit {unit_name} failed to start"));
+            }
+            _ => {}
+        }
+
+        if attempt < MAX_WAIT - 1 {
+            sleep(Duration::from_millis(500)).await;
+        }
+    }
+
+    Err(eyre!(
+        "Systemd unit {unit_name} did not become active within {MAX_WAIT} attempts"
+    ))
 }
 
 #[tracing::instrument]

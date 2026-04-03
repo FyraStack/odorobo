@@ -12,7 +12,6 @@ use stable_eyre::{
 };
 use std::{
     env, fs,
-    fs::OpenOptions,
     path::{Path, PathBuf},
 };
 use thiserror::Error;
@@ -23,8 +22,10 @@ use super::transform::apply_builtin_transforms;
 
 pub const CONFIG_FILE_NAME: &str = "config.json";
 const SOCKET_FILE_NAME: &str = "ch.sock";
+const CONSOLE_SOCKET_FILE_NAME: &str = "console.sock";
+const DEBUG_CONSOLE_SOCKET_FILE_NAME: &str = "debug_console.socket";
 pub const VMS_DIR_NAME: &str = "vms";
-pub type ConsoleStream = tokio::fs::File;
+pub type ConsoleStream = tokio::net::UnixStream;
 
 const DEFAULT_RUNTIME_ROOT_DIR: &str = "/run/odorobo";
 const RUNTIME_ROOT_ENV_VAR: &str = "ODOROBO_RUNTIME_DIR";
@@ -107,7 +108,7 @@ impl VMInstance {
     }
 
     /// Initiates a migration from this VM to the specified destination URI.
-    /// 
+    ///
     /// Options:
     /// - `dest`: the destination URI to migrate to, in the format expected by CH (e.g. "tcp:<IP_ADDRESS>:12345")
     /// - `local`: if true, indicates that the migration is local (e.g. within the same host, for renaming a VM). This is passed to CH and may affect how the migration is performed.
@@ -225,19 +226,16 @@ impl VMInstance {
 
     /// Opens the PTY console device for this VM and returns a connected stream.
     pub async fn open_console(&self) -> Result<ConsoleStream> {
-        let console_path = self.console_path().await?;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&console_path)
+        let socket_path = self.console_path();
+        tokio::net::UnixStream::connect(&socket_path)
+            .await
             .wrap_err_with(|| {
                 eyre!(
-                    "Failed to open PTY console device for {} at {}",
+                    "Failed to connect to console socket for {} at {}",
                     self.vm_id(),
-                    console_path.display()
+                    socket_path.display()
                 )
-            })?;
-        Ok(tokio::fs::File::from_std(file))
+            })
     }
 
     pub fn ch_socket_path(&self) -> &Path {
@@ -279,68 +277,25 @@ impl VMInstance {
             .wrap_err(eyre!("Failed to ping VM {}", self.vm_id()))
     }
 
-    pub async fn console_path(&self) -> Result<PathBuf> {
-        let vminfo = self.info().await?;
-        if let Some(console) = vminfo.config.console {
-            match console.mode {
-                models::console_config::Mode::Pty => {
-                    debug!(
-                        vm_id = self.vm_id(),
-                        "VM has PTY console configured, returning PTY path"
-                    );
-                    let console_path = console.file.ok_or_else(|| {
-                        eyre!("Console config is missing file path for PTY console")
-                    })?;
-                    Ok(console_path.into())
-                }
-                _ => Err(eyre!(
-                    "Console is configured but is not a PTY console, unsupported console type"
-                )),
-            }
-        } else {
-            Err(eyre!("VM does not have a console configured nor supported"))
-        }
+    pub fn console_path(&self) -> PathBuf {
+        self.runtime_dir().join(CONSOLE_SOCKET_FILE_NAME)
     }
 
-    pub async fn debug_console_path(&self) -> Result<PathBuf> {
-        let vminfo = self.info().await?;
-        if let Some(debug_console) = vminfo.config.debug_console {
-            match debug_console.mode {
-                models::debug_console_config::Mode::Pty => {
-                    debug!(
-                        vm_id = self.vm_id(),
-                        "VM has PTY debug console configured, returning PTY path"
-                    );
-                    let console_path = debug_console.file.ok_or_else(|| {
-                        eyre!("Debug console config is missing file path for PTY console")
-                    })?;
-                    Ok(console_path.into())
-                }
-                _ => Err(eyre!(
-                    "Debug console is configured but is not a PTY console, unsupported console type"
-                )),
-            }
-        } else {
-            Err(eyre!(
-                "VM does not have a debug console configured nor supported"
-            ))
-        }
+    pub fn debug_console_path(&self) -> PathBuf {
+        self.runtime_dir().join(DEBUG_CONSOLE_SOCKET_FILE_NAME)
     }
 
     pub async fn open_debug_console(&self) -> Result<ConsoleStream> {
-        let console_path = self.debug_console_path().await?;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&console_path)
+        let socket_path = self.debug_console_path();
+        tokio::net::UnixStream::connect(&socket_path)
+            .await
             .wrap_err_with(|| {
                 eyre!(
-                    "Failed to open PTY debug console device for {} at {}",
+                    "Failed to connect to debug console socket for {} at {}",
                     self.vm_id(),
-                    console_path.display()
+                    socket_path.display()
                 )
-            })?;
-        Ok(tokio::fs::File::from_std(file))
+            })
     }
 
     /// Spawn a new CH process and create a VMInstance for it.
@@ -383,7 +338,12 @@ impl VMInstance {
 
     /// Gracefully shutdown the VM and VMM, then clean up runtime state.
     pub async fn destroy(&self) -> Result<()> {
+        info!(
+            vm_id = self.vm_id(),
+            "Destroying VM instance, shutting down VM and cleaning up runtime state"
+        );
         if let Ok(info) = self.info().await {
+            trace!(vm_id = self.vm_id(), state = ?info.state, "Checking VM state before destroy");
             if matches!(
                 info.state,
                 models::vm_info::State::Running | models::vm_info::State::Paused
@@ -392,6 +352,7 @@ impl VMInstance {
                 self.shutdown().await?;
             }
         }
+
         let provisioner = super::provisioning::default_provisioner();
 
         let vm_config = self

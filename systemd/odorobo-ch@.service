@@ -10,8 +10,8 @@ OnFailure=odorobo-ch-failed@%i.service
 
 [Service]
 Type=simple
-User=odorobo
-Group=odorobo
+User=root
+Group=root
 
 RuntimeDirectory=odorobo/vms/%i
 RuntimeDirectoryMode=0770
@@ -22,7 +22,7 @@ ConfigurationDirectoryMode=0750
 
 ExecStartPre=/usr/local/libexec/odorobo-preflight %i
 # the actual VM process
-ExecStart=/usr/bin/cloud-hypervisor \
+ExecStart=/usr/bin/cloud-hypervisor -v \
     --api-socket /run/odorobo/vms/%i/ch.sock
 
 ExecStartPost=/usr/local/libexec/odorobo-postflight %i
@@ -40,8 +40,8 @@ TasksAccounting=yes
 
 # Security hardening
 NoNewPrivileges=yes
-PrivateTmp=yes
-ProtectSystem=strict
+# PrivateTmp=yes
+# ProtectSystem=strict
 ProtectHome=yes
 ProtectKernelTunables=yes
 ProtectControlGroups=yes
@@ -54,7 +54,7 @@ RestrictRealtime=no
 AmbientCapabilities=CAP_NET_ADMIN
 
 # Paths CH legitimately needs to write
-ReadWritePaths=/run/odorobo/vms/%i /var/log/odorobo /etc/odorobo /var/lib/odorobo
+# ReadWritePaths=/run/odorobo/vms/%i /var/log/odorobo /etc/odorobo /var/lib/odorobo
 
 # KVM device access
 DeviceAllow=/dev/kvm rw

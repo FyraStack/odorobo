@@ -3,9 +3,11 @@ BINDIR := PREFIX / "bin"
 LIBEXECDIR := PREFIX / "libexec"
 DATADIR := PREFIX / "share"
 USRLIBDIR := PREFIX / "lib"
+
 # systemd unit load paths
 # defaults to /etc, but can be overridden by setting SYSTEMD_UNITDIR to a different path
 # usually /usr/lib/systemd/system
+
 SYSTEMD_UNITDIR := "/etc"
 
 build: build_agent

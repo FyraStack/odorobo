@@ -20,20 +20,30 @@ python scripts/vsock.py my-vm
 Fyra Stack production images should just have a management agent to talk over vsock and do other stuff,
 but this is a quick way to get a shell over vsock for testing and debugging.
 
-## virtio-console socket
+## serial console socket
 
-To connect to the virtio-console socket directly, you will need to find the PTY allocated for it
+Cloud Hypervisor is configured to expose the serial console as a Unix domain socket at a stable, predictable path:
 
-```bash
-odoroboctl info my-vm
+```
+/run/odorobo/vms/<vmid>/console.sock
 ```
 
-Look at the `config.console` section of the output, and find the `path` field. This is the path to the PTY on the host that is connected to the VM's virtio-console. You can connect to this socket with `screen` or `minicom` or any other terminal program:
+Connect directly on the host with socat:
 
 ```bash
-screen /dev/pts/N
+# raw output only (useful for scripting or piping)
+socat - UNIX-CONNECT:/run/odorobo/vms/my-vm/console.sock
+
+# interactive session with local terminal in raw mode
+socat file:`tty`,raw,echo=0 UNIX-CONNECT:/run/odorobo/vms/my-vm/console.sock
 ```
 
-Where `N` is the number from the `path` field in the `config.console` section of the `odoroboctl info` output.
+Press `Ctrl-]` then `q` to exit socat in interactive mode, or just close the terminal.
 
-odoroboctl should implement the WebSocket tty proxy later, but for now this is how you get a shell on the console directly
+Alternatively, use the agent's WebSocket console proxy from any machine that can reach the agent:
+
+```bash
+websocat --binary ws://127.0.0.1:8890/vms/my-vm/console
+```
+
+The socket path is stable across live migrations — after a migration completes, reconnect to the same path on the destination node.

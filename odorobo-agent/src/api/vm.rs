@@ -103,7 +103,8 @@ pub struct VmMigrateSendRequest {
     pub local: bool,
 }
 
-/// Sends a live migration to the given destination URL
+/// Sends a live migration to the given destination URL.
+/// Note: the source VMM exits after migration completes, so no VM info is returned.
 async fn migrate_send_vm(
     vmid: Path<String>,
     Json(body): Json<VmMigrateSendRequest>,
@@ -112,8 +113,7 @@ async fn migrate_send_vm(
     vm.send_migration(&body.destination, body.local)
         .await
         .map_err(ApiError::migration)?;
-    let info = vm.info().await.map_err(ApiError::vm_info)?;
-    Ok(Json(VmMigrateSendResponse { info: Some(info) }))
+    Ok(Json(VmMigrateSendResponse { info: None }))
 }
 
 /// Prepares a VM to receive a live migration, returning the address the sender should connect to
