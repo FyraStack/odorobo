@@ -36,10 +36,10 @@ install_unit:
     install -Dm644 systemd/odorobo-agent.service {{ SYSTEMD_UNITDIR }}/systemd/system/odorobo-agent.service
     systemctl daemon-reload || true
 
-install_agent: build_agent
+install_agent:
     install -Dm755 target/release/odorobo-agent {{ BINDIR }}/odorobo-agent
 
-install_cli: build_cli
+install_cli:
     install -Dm755 target/release/odoroboctl {{ BINDIR }}/odoroboctl
 
 install_agent_debug:
