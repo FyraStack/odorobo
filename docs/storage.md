@@ -30,7 +30,7 @@ Odorobo will automatically detect the `rbd://` scheme, map the RBD image to a lo
   ...
   "disks": [
     {
-      "path": "/dev/rbd0",
+      "path": "/dev/rbd/my-pool/my-image",
       "id": "rdb://my-pool/my-image?id=disk0",
     }
   ],
@@ -39,3 +39,14 @@ Odorobo will automatically detect the `rbd://` scheme, map the RBD image to a lo
 
 The `id` field is transformed to include the original URI for reference, and can be used in provisioning hooks to identify which disk is which when attaching/detaching storage devices on demand.
 
+
+> [!NOTE]
+> Ceph RBD integration requires the following udev rule to allow Odorobo to easily find the mapped block device for a given RBD image:
+>
+> ```
+> # /etc/udev/rules.d/50-rbd.rules
+> KERNEL=="rbd[0-9]*", ENV{DEVTYPE}=="disk", PROGRAM="/usr/bin/ceph-rbdnamer %k", SYMLINK+="rbd/%c"
+> KERNEL=="rbd[0-9]*", ENV{DEVTYPE}=="partition", PROGRAM="/usr/bin/ceph-rbdnamer %k", SYMLINK+="rbd/%c-part%n"
+> ```
+> 
+> This rule is commonly included in Ceph packages (`ceph-common` in Fedora), but if your distribution does not include it by default, you will need to add it manually for RBD support to work properly. This allows Odorobo to find the mapped block device for a given RBD image under `/dev/rbd/`, which is necessary for passing the correct block device path to Cloud Hypervisor.

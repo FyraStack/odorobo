@@ -1,7 +1,7 @@
 use super::StorageBackend;
 use async_trait::async_trait;
 use stable_eyre::{Result, eyre::eyre};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tokio::process::Command;
 use tracing::{info, trace};
 use url::Url;
@@ -127,31 +127,14 @@ impl StorageBackend for RbdStorage {
     }
 
     async fn resolve(&self, uri: &Url) -> Result<PathBuf> {
-        // format is rbd://pool/image, we need to map this to a local block device using `rbd device map`
-
+        // format is rbd://pool/image; map and return the udev-stable path at /dev/rbd/<pool>/<image>
         let rbd_path = resolve_rbd_path(uri)?;
-
-        // Ensure required environment variables are set
-        let output = map_device(&rbd_path).await?;
-
-        // now we want to symlink this to a stable path under /run/odorobo/disks/rbd/{pool}/{image} so that we can use that path in the VM config and it won't change across reboots or remaps
-        let device_path = PathBuf::from(output);
-
-        let stable_path_str = format!("/run/odorobo/disks/rbd/{}", rbd_path);
-        let stable_path = Path::new(&stable_path_str);
-
-        tokio::fs::create_dir_all(stable_path.parent().unwrap()).await?;
-        if std::path::Path::new(&stable_path).exists() {
-            tokio::fs::remove_file(&stable_path).await?;
-        }
-        tokio::fs::symlink(&device_path, &stable_path).await?;
-
-        Ok(PathBuf::from(stable_path))
+        map_device(&rbd_path).await?;
+        Ok(PathBuf::from(format!("/dev/rbd/{}", rbd_path)))
     }
 
     async fn release(&self, uri: &Url) -> Result<()> {
         let rbd_path = resolve_rbd_path(uri)?;
-        let stable_path_str = format!("/run/odorobo/disks/rbd/{}", rbd_path);
         let output = Command::new("rbd")
             .args(rbd_extra_args())
             .arg("device")
@@ -164,8 +147,6 @@ impl StorageBackend for RbdStorage {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(eyre!("rbd unmap failed: {stderr}"));
         }
-
-        tokio::fs::remove_file(&stable_path_str).await?;
         Ok(())
     }
 }
