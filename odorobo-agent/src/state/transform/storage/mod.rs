@@ -7,6 +7,7 @@ use tracing::warn;
 use url::Url;
 
 mod file;
+mod iscsi;
 mod rbd;
 
 /// A storage backend for Odorobo to resolve storage URIs to local paths.
@@ -60,7 +61,10 @@ impl StorageChain {
 
 impl Default for StorageChain {
     fn default() -> Self {
-        Self::new().add(file::FileStorage).add(rbd::RbdStorage)
+        Self::new()
+            .add(file::FileStorage)
+            .add(rbd::RbdStorage)
+            .add(iscsi::ISCSIStorage)
     }
 }
 
