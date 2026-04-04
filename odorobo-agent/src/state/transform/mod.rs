@@ -7,6 +7,7 @@ pub trait ConfigTransform: Send + Sync {
 
 mod console;
 mod path_verify;
+mod storage;
 pub use console::ConsoleTransform;
 pub use path_verify::PathVerify;
 
@@ -41,6 +42,7 @@ pub fn apply_builtin_transforms(vmid: &str, config: &mut VmConfig) -> Result<()>
     TransformChain::new()
         .add(ConsoleTransform)
         .add(PathVerify)
+        .add(storage::StorageChain::default())
         .then()
         .transform(vmid, config)
 }
