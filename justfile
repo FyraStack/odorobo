@@ -10,10 +10,13 @@ USRLIBDIR := PREFIX / "lib"
 
 SYSTEMD_UNITDIR := "/etc"
 
-build: build_agent
+build: build_agent build_cli
 
 build_agent:
     cargo build --release -p odorobo-agent
+
+build_cli:
+    cargo build --release -p odoroboctl
 
 build_agent_debug:
     cargo build -p odorobo-agent
@@ -21,7 +24,7 @@ build_agent_debug:
 debug: build_agent_debug
     sudo target/debug/odorobo-agent
 
-install: install_script install_unit install_agent
+install: install_script install_unit install_agent install_cli
 
 install_script:
     install -Dm755 systemd/scripts/odorobo-preflight {{ LIBEXECDIR }}/odorobo-preflight
@@ -35,6 +38,9 @@ install_unit:
 
 install_agent: build_agent
     install -Dm755 target/release/odorobo-agent {{ BINDIR }}/odorobo-agent
+
+install_cli: build_cli
+    install -Dm755 target/release/odoroboctl {{ BINDIR }}/odoroboctl
 
 install_agent_debug:
     install -Dm755 target/debug/odorobo-agent {{ BINDIR }}/odorobo-agent
