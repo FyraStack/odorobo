@@ -1,0 +1,17 @@
+FROM alpine:3.23.3
+RUN <<EOF
+apk add \
+	bash \
+	gcc \
+	musl-dev \
+	rustup \
+	zig
+rustup-init \
+	--profile minimal \
+	--target riscv64a23-unknown-linux-gnu \
+	-y
+EOF
+ENV CARGO_BUILD_TARGET="riscv64a23-unknown-linux-gnu"
+ENV PATH="/root/.cargo/bin:$PATH"
+ENV CC_riscv64a23_unknown_linux_gnu="/code/scripts/zig-cc-rva23.sh"
+ENV CARGO_TARGET_RISCV64A23_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C linker=scripts/zig-cc-rva23.sh"
