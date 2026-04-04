@@ -13,7 +13,6 @@ use stable_eyre::Result;
 
 mod machined;
 
-
 // Rust 1.75 does not support dyn async traits, we still need async_trait for this
 #[async_trait]
 pub trait ProvisioningHook: Send + Sync {

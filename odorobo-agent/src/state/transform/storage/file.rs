@@ -9,7 +9,23 @@ use stable_eyre::{Result, eyre::eyre};
 use std::path::PathBuf;
 use url::Url;
 
+pub struct FileTarget {
+    pub path: PathBuf,
+}
+
+impl TryFrom<&Url> for FileTarget {
+    type Error = stable_eyre::Report;
+
+    fn try_from(uri: &Url) -> Result<Self, Self::Error> {
+        let path = uri
+            .to_file_path()
+            .map_err(|_| eyre!("Failed to convert file URI to path: '{}'", uri.as_str()))?;
+        Ok(FileTarget { path })
+    }
+}
+
 pub struct FileStorage;
+
 #[async_trait]
 impl StorageBackend for FileStorage {
     fn scheme(&self) -> &'static str {
@@ -17,10 +33,7 @@ impl StorageBackend for FileStorage {
     }
 
     async fn resolve(&self, uri: &Url) -> Result<PathBuf> {
-        let path = uri
-            .to_file_path()
-            .map_err(|_| eyre!("Failed to convert file URI to path: '{}'", uri.as_str()))?;
-        Ok(path)
+        Ok(FileTarget::try_from(uri)?.path)
     }
 
     async fn release(&self, _uri: &Url) -> Result<()> {

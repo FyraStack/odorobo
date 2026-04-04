@@ -11,8 +11,6 @@ const CEPH_KEYFILE_ENV: &str = "CEPH_KEYFILE";
 const CEPH_CLUSTER_ENV: &str = "CEPH_CLUSTER";
 const CEPH_CONFIG_ENV: &str = "CEPH_CONFIG";
 
-pub struct RbdStorage;
-
 fn rbd_extra_args() -> Vec<String> {
     let mut args = Vec::new();
     if let Ok(ceph_config) = std::env::var(CEPH_CONFIG_ENV) {
@@ -29,6 +27,7 @@ fn rbd_extra_args() -> Vec<String> {
     }
     args
 }
+
 #[tracing::instrument]
 async fn rbd_map_list() -> Result<Vec<(String, String)>> {
     // returns a list of (rbd_path, device_path) for all currently mapped rbd devices
@@ -74,67 +73,54 @@ fn rbd_lines_list(input: &str) -> Result<Vec<(String, String)>> {
     Ok(mappings)
 }
 
-/// Maps the given RBD image to a local block device and returns the device path.
-/// If already mapped, returns the existing device path.
-#[tracing::instrument]
-async fn map_device(rbd_path: &str) -> Result<String> {
-    let mappings = rbd_map_list().await?;
+#[derive(Debug, Clone)]
+pub struct RbdImage {
+    pub pool: String,
+    pub image: String,
+}
 
-    if let Some((_, device_path)) = mappings.into_iter().find(|(path, _)| path == rbd_path) {
-        info!(
-            ?device_path,
-            "RBD image already mapped to device, returning existing mapping"
-        );
-        Ok(device_path)
-    } else {
+impl RbdImage {
+    pub fn rbd_path(&self) -> String {
+        format!("{}/{}", self.pool, self.image)
+    }
+
+    /// Returns the udev-stable device path at `/dev/rbd/<pool>/<image>`.
+    pub fn device_path(&self) -> PathBuf {
+        PathBuf::from(format!("/dev/rbd/{}/{}", self.pool, self.image))
+    }
+
+    /// Maps the RBD image to a kernel block device. If already mapped, this is a no-op.
+    #[tracing::instrument(skip(self))]
+    pub async fn map(&self) -> Result<()> {
+        let rbd_path = self.rbd_path();
+        let mappings = rbd_map_list().await?;
+
+        if mappings.iter().any(|(path, _)| path == &rbd_path) {
+            info!(?rbd_path, "RBD image already mapped, reusing");
+            return Ok(());
+        }
+
         info!(?rbd_path, "Mapping RBD image to device");
         let output = Command::new("rbd")
             .args(rbd_extra_args())
             .arg("device")
             .arg("map")
-            .arg(rbd_path)
+            .arg(&rbd_path)
             .output()
             .await
             .map_err(|e| eyre!("Failed to execute rbd command: {e}"))?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(eyre!("rbd command failed: {stderr}"));
+            return Err(eyre!("rbd map failed: {stderr}"));
         }
-
-        let output_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-
-        info!(?output_str, "RBD image mapped to device");
-
-        Ok(output_str)
-    }
-}
-
-fn resolve_rbd_path(uri: &Url) -> Result<String> {
-    let host = uri
-        .host_str()
-        .ok_or_else(|| eyre!("RBD URI must have a host (pool name)"))?;
-    let path = uri.path();
-    if path.is_empty() || path == "/" {
-        return Err(eyre!("RBD URI must have a path (image name)"));
-    }
-    Ok(format!("{}{}", host, path))
-}
-
-#[async_trait]
-impl StorageBackend for RbdStorage {
-    fn scheme(&self) -> &'static str {
-        "rbd"
+        Ok(())
     }
 
-    async fn resolve(&self, uri: &Url) -> Result<PathBuf> {
-        // format is rbd://pool/image; map and return the udev-stable path at /dev/rbd/<pool>/<image>
-        let rbd_path = resolve_rbd_path(uri)?;
-        map_device(&rbd_path).await?;
-        Ok(PathBuf::from(format!("/dev/rbd/{}", rbd_path)))
-    }
-
-    async fn release(&self, uri: &Url) -> Result<()> {
-        let rbd_path = resolve_rbd_path(uri)?;
+    /// Unmaps the RBD image from the kernel block device.
+    #[tracing::instrument(skip(self))]
+    pub async fn unmap(&self) -> Result<()> {
+        let rbd_path = self.rbd_path();
+        info!(?rbd_path, "Unmapping RBD image");
         let output = Command::new("rbd")
             .args(rbd_extra_args())
             .arg("device")
@@ -151,11 +137,54 @@ impl StorageBackend for RbdStorage {
     }
 }
 
+impl TryFrom<&Url> for RbdImage {
+    type Error = stable_eyre::Report;
+
+    fn try_from(uri: &Url) -> Result<Self, Self::Error> {
+        let pool = uri
+            .host_str()
+            .ok_or_else(|| eyre!("RBD URI must have a host (pool name)"))?
+            .to_string();
+        let path = uri.path();
+        if path.is_empty() || path == "/" {
+            return Err(eyre!("RBD URI must have a path (image name)"));
+        }
+        let image = path.trim_start_matches('/').to_string();
+        Ok(RbdImage { pool, image })
+    }
+}
+
+pub struct RbdStorage;
+
+#[async_trait]
+impl StorageBackend for RbdStorage {
+    fn scheme(&self) -> &'static str {
+        "rbd"
+    }
+
+    async fn resolve(&self, uri: &Url) -> Result<PathBuf> {
+        let image = RbdImage::try_from(uri)?;
+        image.map().await?;
+        Ok(image.device_path())
+    }
+
+    async fn release(&self, uri: &Url) -> Result<()> {
+        let image = RbdImage::try_from(uri)?;
+        image.unmap().await
+    }
+}
+
 #[test]
-fn test_resolve_rbd_path() {
+fn test_rbd_image_from_uri() {
     let uri = Url::parse("rbd://my-pool/my-image").unwrap();
-    let resolved = resolve_rbd_path(&uri).unwrap();
-    assert_eq!(resolved, "my-pool/my-image");
+    let image = RbdImage::try_from(&uri).unwrap();
+    assert_eq!(image.pool, "my-pool");
+    assert_eq!(image.image, "my-image");
+    assert_eq!(image.rbd_path(), "my-pool/my-image");
+    assert_eq!(
+        image.device_path(),
+        std::path::PathBuf::from("/dev/rbd/my-pool/my-image")
+    );
 }
 
 #[test]

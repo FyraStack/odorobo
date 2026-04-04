@@ -57,6 +57,36 @@ impl StorageChain {
         self.backends.push(Box::new(backend));
         self
     }
+
+    fn find_backend(&self, uri: &Url) -> Option<&dyn StorageBackend> {
+        self.backends
+            .iter()
+            .find(|b| b.scheme() == uri.scheme())
+            .map(|b| b.as_ref())
+    }
+
+    /// Releases storage resources for all URI-backed disks in a VM config.
+    /// Checks both `path` and `id` fields for a URI, since after transforms `path` is the
+    /// resolved device path while `id` holds the original URI.
+    /// Errors are logged as warnings and do not abort the remaining releases.
+    pub async fn release_config(&self, config: &VmConfig) {
+        let Some(disks) = config.disks.as_ref() else {
+            return;
+        };
+        for disk in disks {
+            let candidates = [disk.path.as_deref(), disk.id.as_deref()];
+            let Some((uri, backend)) = candidates.into_iter().flatten().find_map(|s| {
+                let uri = Url::parse(s).ok()?;
+                let backend = self.find_backend(&uri)?;
+                Some((uri, backend))
+            }) else {
+                continue;
+            };
+            if let Err(e) = backend.release(&uri).await {
+                warn!(path = uri.as_str(), error = ?e, "Failed to release storage for disk");
+            }
+        }
+    }
 }
 
 impl Default for StorageChain {
@@ -69,6 +99,13 @@ impl Default for StorageChain {
 }
 
 impl ConfigTransform for StorageChain {
+    fn teardown(&self, _vmid: &str, config: &mut VmConfig) -> Result<()> {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(self.release_config(config))
+        });
+        Ok(())
+    }
+
     fn transform(&self, _vmid: &str, config: &mut VmConfig) -> Result<()> {
         let Some(disks) = config.disks.as_mut() else {
             return Ok(());
@@ -83,7 +120,7 @@ impl ConfigTransform for StorageChain {
                 continue;
             };
 
-            let Some(backend) = self.backends.iter().find(|b| b.scheme() == uri.scheme()) else {
+            let Some(backend) = self.find_backend(&uri) else {
                 warn!(
                     scheme = uri.scheme(),
                     path,

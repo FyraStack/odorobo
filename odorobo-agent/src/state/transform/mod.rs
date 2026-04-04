@@ -13,7 +13,7 @@ pub trait ConfigTransform: Send + Sync {
 
 mod console;
 mod path_verify;
-mod storage;
+pub mod storage;
 pub use console::ConsoleTransform;
 pub use path_verify::PathVerify;
 use tracing::trace;
@@ -56,9 +56,9 @@ impl ConfigTransform for TransformChain {
 impl Default for TransformChain {
     fn default() -> Self {
         Self::new()
+            .add(storage::StorageChain::default())
             .add(ConsoleTransform)
             .add(PathVerify)
-            .add(storage::StorageChain::default())
     }
 }
 
