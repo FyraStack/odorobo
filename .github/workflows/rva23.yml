@@ -1,0 +1,27 @@
+name: Cross-compile to RVA23
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Build image
+      run: podman build -t odorobo-builder:rva23 .
+    - name: Build binaries
+      run: podman run --rm -v ${{ github.workspace }}:/code -w /code odorobo-builder:rva23 cargo build --release
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: odorobo
+        path: |
+          target/riscv64a23-unknown-linux-gnu/release/odorobo-agent
+          target/riscv64a23-unknown-linux-gnu/release/odoroboctl
