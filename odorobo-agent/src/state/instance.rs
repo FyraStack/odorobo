@@ -354,6 +354,11 @@ impl VMInstance {
                 info!(vm_id = self.vm_id(), "Shutting down VM before destroy");
                 self.shutdown().await?;
             }
+        } else {
+            warn!(
+                vm_id = self.vm_id(),
+                "Failed to get VM info before destroy, proceeding with shutdown and cleanup anyway"
+            );
         }
 
         let provisioner = super::provisioning::default_provisioner();
@@ -366,11 +371,14 @@ impl VMInstance {
             .or_else(|| self.load_config().ok())
             .unwrap_or_default();
 
-        self.conn()
-            .shutdown_vmm()
-            .await
-            .map_err(ChApiError::from)
-            .wrap_err(eyre!("Failed to shutdown VMM for {}", self.vm_id()))?;
+        if let Ok(()) = self.conn().shutdown_vmm().await {
+            debug!(vm_id = self.vm_id(), "VMM shutdown successfully");
+        } else {
+            warn!(
+                vm_id = self.vm_id(),
+                "Failed to shutdown VMM, assuming it is already stopped or unresponsive"
+            );
+        }
 
         provisioner.stop_instance(self.vm_id(), &vm_config).await?;
 
