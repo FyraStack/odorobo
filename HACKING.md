@@ -52,3 +52,7 @@ of dynamic dispatch for config hooks and config transformers, which are still no
 To work around this, Odorobo uses the `async_trait` crate to allow async functions in traits with dynamic dispatch.
 
 If your trait needs to do dynamic dispatch (e.g. for provisioning hooks), you must use `async_trait`. Else use normal async functions.
+
+## Rust Hypervisor Firmware failing to boot newer images
+
+out of scope for odorobo, tracking issue [here](https://github.com/cloud-hypervisor/rust-hypervisor-firmware/issues/412)
