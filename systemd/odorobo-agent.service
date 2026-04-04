@@ -10,12 +10,6 @@ Type=simple
 User=root
 Group=root
 
-RuntimeDirectory=odorobo/
-RuntimeDirectoryMode=1775
-LogsDirectory=odorobo
-LogsDirectoryMode=0750
-ConfigurationDirectory=odorobo/
-ConfigurationDirectoryMode=0750
 
 ExecStart=/usr/bin/odorobo-agent
 

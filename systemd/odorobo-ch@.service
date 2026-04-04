@@ -13,8 +13,6 @@ Type=simple
 User=root
 Group=root
 
-RuntimeDirectory=odorobo/vms/%i
-RuntimeDirectoryMode=0770
 LogsDirectory=odorobo
 LogsDirectoryMode=0750
 ConfigurationDirectory=odorobo/vms/%i
