@@ -18,6 +18,8 @@ use std::{
 use thiserror::Error;
 use tracing::{debug, error, info, trace, warn};
 
+use crate::state::transform::{ConfigTransform, TransformChain};
+
 use super::api::{call, call_request};
 use super::transform::apply_builtin_transforms;
 
@@ -128,7 +130,13 @@ impl VMInstance {
             .wrap_err(eyre!(
                 "Failed to send migration command for {}",
                 self.vm_id()
-            ))
+            ))?;
+
+        // if migration is successful, we can assume the VM is effectively "gone" from this host, so we can clean up runtime state.
+        self.purge_instance_data()
+            .wrap_err("Failed to purge instance data after migration")?;
+
+        Ok(())
     }
 
     /// Prepares the VM to receive a migration by starting a migration receiver in the background.
@@ -381,6 +389,8 @@ impl VMInstance {
     ///
     /// This removes the runtime directory and all its contents if it exists.
     pub fn purge_instance_data(&self) -> Result<()> {
+        let mut vm_config = self.load_config().unwrap_or_default();
+        TransformChain::default().teardown(self.vm_id(), &mut vm_config)?;
         let runtime_dir = self.runtime_dir();
         if runtime_dir.exists() {
             fs::remove_dir_all(runtime_dir).wrap_err(eyre!(

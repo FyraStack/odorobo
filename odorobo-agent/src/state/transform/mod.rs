@@ -3,6 +3,12 @@ use stable_eyre::Result;
 
 pub trait ConfigTransform: Send + Sync {
     fn transform(&self, vmid: &str, config: &mut VmConfig) -> Result<()>;
+
+    /// Optional teardown method to reverse transformations if needed,
+    /// used for tearing down VMs
+    fn teardown(&self, _vmid: &str, _config: &mut VmConfig) -> Result<()> {
+        Ok(())
+    }
 }
 
 mod console;
@@ -10,8 +16,8 @@ mod path_verify;
 mod storage;
 pub use console::ConsoleTransform;
 pub use path_verify::PathVerify;
+use tracing::trace;
 
-#[derive(Default)]
 pub struct TransformChain(Vec<Box<dyn ConfigTransform>>);
 
 impl TransformChain {
@@ -31,18 +37,31 @@ impl TransformChain {
 
 impl ConfigTransform for TransformChain {
     fn transform(&self, vmid: &str, config: &mut VmConfig) -> Result<()> {
+        trace!("Applying transform chain with {} transforms", self.0.len());
         for t in &self.0 {
             t.transform(vmid, config)?;
         }
         Ok(())
     }
+
+    fn teardown(&self, vmid: &str, config: &mut VmConfig) -> Result<()> {
+        trace!("Teardown transform chain with {} transforms", self.0.len());
+        for t in self.0.iter().rev() {
+            t.teardown(vmid, config)?;
+        }
+        Ok(())
+    }
+}
+
+impl Default for TransformChain {
+    fn default() -> Self {
+        Self::new()
+            .add(ConsoleTransform)
+            .add(PathVerify)
+            .add(storage::StorageChain::default())
+    }
 }
 
 pub fn apply_builtin_transforms(vmid: &str, config: &mut VmConfig) -> Result<()> {
-    TransformChain::new()
-        .add(ConsoleTransform)
-        .add(PathVerify)
-        .add(storage::StorageChain::default())
-        .then()
-        .transform(vmid, config)
+    TransformChain::default().transform(vmid, config)
 }
