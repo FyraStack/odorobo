@@ -30,6 +30,7 @@ install_script:
 
 install_unit:
     install -Dm644 systemd/odorobo-ch@.service {{ SYSTEMD_UNITDIR }}/systemd/system/odorobo-ch@.service
+    install -Dm644 systemd/odorobo-agent.service {{ SYSTEMD_UNITDIR }}/systemd/system/odorobo-agent.service
     systemctl daemon-reload || true
 
 install_agent: build_agent
