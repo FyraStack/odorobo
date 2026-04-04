@@ -43,3 +43,12 @@ websocat --binary ws://127.0.0.1:8890/vms/my-vm/console
 ```
 
 Note: the PTY path changes every time the VM is restarted or the VMM process is recreated. It is not stable across live migrations.
+
+## `async_trait` usage
+
+While Rust 1.75 (2024) finally adds support for async functions in traits, Odorobo makes extensive usage
+of dynamic dispatch for config hooks and config transformers, which are still not supported by Rust's async fn in traits.
+
+To work around this, Odorobo uses the `async_trait` crate to allow async functions in traits with dynamic dispatch.
+
+If your trait needs to do dynamic dispatch (e.g. for provisioning hooks), you must use `async_trait`. Else use normal async functions.

@@ -1531,6 +1531,7 @@ dependencies = [
 name = "odorobo-agent"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
  "axum-extra",
  "axum_responses",
@@ -1551,6 +1552,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "url",
  "zbus",
  "zbus_systemd",
 ]
@@ -2713,6 +2715,7 @@ dependencies = [
  "idna",
  "percent-encoding",
  "serde",
+ "serde_derive",
 ]
 
 [[package]]

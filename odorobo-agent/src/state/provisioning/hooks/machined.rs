@@ -1,8 +1,9 @@
 //! systemd-machined integration hook for odorobo agent
 
 use crate::state::VMInstance;
-use crate::state::provisioning::hooks::{HookFuture, ProvisioningHook};
+use crate::state::provisioning::hooks::ProvisioningHook;
 use crate::util::zbus_system_connection;
+use async_trait::async_trait;
 use cloud_hypervisor_client::models::VmConfig;
 use stable_eyre::eyre::Context;
 use stable_eyre::{Result, eyre::eyre};
@@ -37,62 +38,57 @@ pub const SERVICE_CLASS: &str = "cloud-hypervisor";
 
 pub struct CHMachineProvisioningHook;
 
+#[async_trait]
 impl ProvisioningHook for CHMachineProvisioningHook {
-    fn after_start(&self, vmid: &str, _config: &VmConfig, pid: i32) -> HookFuture<'_> {
-        let vmid = vmid.to_string();
-        Box::pin(async move {
-            if pid == 0 {
-                tracing::warn!(
-                    vmid,
-                    "Skipping systemd-machined registration: PID is 0 (service not yet active)"
-                );
-                return Ok(());
-            }
-            tracing::info!(vmid, pid, "Registering machine with systemd-machined");
-            let runtime_dir = VMInstance::runtime_dir_for(&vmid);
-            let res = async {
-                let manager = get_manager_proxy().await?;
-                manager
-                    .register_machine(
-                        vmid.clone(),
-                        Vec::new(),
-                        SERVICE_CLASS.to_string(),
-                        "vm".to_string(),
-                        pid as u32,
-                        runtime_dir.display().to_string(),
-                    )
-                    .await
-                    .wrap_err("Failed to register machine with systemd-machined")
-            }
-            .await;
+    async fn after_start(&self, vmid: &str, _config: &VmConfig, pid: i32) -> Result<()> {
+        if pid == 0 {
+            tracing::warn!(
+                vmid,
+                "Skipping systemd-machined registration: PID is 0 (service not yet active)"
+            );
+            return Ok(());
+        }
+        tracing::info!(vmid, pid, "Registering machine with systemd-machined");
+        let runtime_dir = VMInstance::runtime_dir_for(vmid);
+        let res = async {
+            let manager = get_manager_proxy().await?;
+            manager
+                .register_machine(
+                    vmid.to_string(),
+                    Vec::new(),
+                    SERVICE_CLASS.to_string(),
+                    "vm".to_string(),
+                    pid as u32,
+                    runtime_dir.display().to_string(),
+                )
+                .await
+                .wrap_err("Failed to register machine with systemd-machined")
+        }
+        .await;
 
-            if let Err(e) = res {
-                tracing::error!(vmid, error = ?e, "Failed to register machine with systemd-machined");
-                tracing::warn!(vmid, "Continuing without systemd-machined registration");
-            }
+        if let Err(e) = res {
+            tracing::error!(vmid, error = ?e, "Failed to register machine with systemd-machined");
+            tracing::warn!(vmid, "Continuing without systemd-machined registration");
+        }
 
-            Ok(())
-        })
+        Ok(())
     }
 
-    fn before_stop(&self, vmid: &str, _config: &VmConfig) -> HookFuture<'_> {
-        let vmid = vmid.to_string();
-        Box::pin(async move {
-            tracing::info!(vmid, "Unregistering machine from systemd-machined");
-            let res = async {
-                let manager = get_manager_proxy().await?;
-                manager
-                    .unregister_machine(vmid.clone())
-                    .await
-                    .wrap_err("Failed to unregister machine from systemd-machined")
-            }
-            .await;
+    async fn before_stop(&self, vmid: &str, _config: &VmConfig) -> Result<()> {
+        tracing::info!(vmid, "Unregistering machine from systemd-machined");
+        let res = async {
+            let manager = get_manager_proxy().await?;
+            manager
+                .unregister_machine(vmid.to_string())
+                .await
+                .wrap_err("Failed to unregister machine from systemd-machined")
+        }
+        .await;
 
-            if let Err(e) = res {
-                tracing::error!(vmid, error = ?e, "Failed to unregister machine from systemd-machined");
-            }
+        if let Err(e) = res {
+            tracing::error!(vmid, error = ?e, "Failed to unregister machine from systemd-machined");
+        }
 
-            Ok(())
-        })
+        Ok(())
     }
 }

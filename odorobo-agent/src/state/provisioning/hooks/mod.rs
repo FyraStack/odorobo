@@ -7,48 +7,34 @@
 //! They are different from transforms which are designed to modify the configuration itself
 //! to accomodate for the host environment, while hooks provide ways for the host itself
 //! to react to provisioning events and perform necessary setup/teardown actions.
+use async_trait::async_trait;
 use cloud_hypervisor_client::models::VmConfig;
 use stable_eyre::Result;
-use std::{future::Future, pin::Pin};
 
 mod machined;
 
-// hack: our own mini async-trait implementation
-// because for some reason using async inside a dynamic dispatch trait
-// like this causes the compiler to complain about
-// not being able to make vtables for the trait, even though
-// rust 2024 should have been supporting this...
-//
-// and I don't want to pull in the async-trait crate just for this
-pub type HookFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
 
+// Rust 1.75 does not support dyn async traits, we still need async_trait for this
+#[async_trait]
 pub trait ProvisioningHook: Send + Sync {
-    fn before_start(&self, _vmid: &str, config: &VmConfig) -> HookFuture<'_> {
-        Box::pin(async { Ok(()) })
+    async fn before_start(&self, _vmid: &str, _config: &VmConfig) -> Result<()> {
+        Ok(())
     }
-    fn after_start(&self, _vmid: &str, _config: &VmConfig, _pid: i32) -> HookFuture<'_> {
-        Box::pin(async { Ok(()) })
+    async fn after_start(&self, _vmid: &str, _config: &VmConfig, _pid: i32) -> Result<()> {
+        Ok(())
     }
-    fn before_stop(&self, _vmid: &str, _config: &VmConfig) -> HookFuture<'_> {
-        Box::pin(async { Ok(()) })
+    async fn before_stop(&self, _vmid: &str, _config: &VmConfig) -> Result<()> {
+        Ok(())
     }
-    fn after_stop(&self, _vmid: &str, _config: &VmConfig) -> HookFuture<'_> {
-        Box::pin(async { Ok(()) })
+    async fn after_stop(&self, _vmid: &str, _config: &VmConfig) -> Result<()> {
+        Ok(())
     }
-
-    fn before_boot(&self, _vmid: &str, _config: &VmConfig) -> HookFuture<'_> {
-        Box::pin(async { Ok(()) })
+    async fn before_boot(&self, _vmid: &str, _config: &VmConfig) -> Result<()> {
+        Ok(())
     }
-    fn after_boot(&self, _vmid: &str, _config: &VmConfig) -> HookFuture<'_> {
-        Box::pin(async { Ok(()) })
+    async fn after_boot(&self, _vmid: &str, _config: &VmConfig) -> Result<()> {
+        Ok(())
     }
-
-    // fn before_destroy(&self, _vmid: &str) -> HookFuture<'_> {
-    //     Box::pin(async { Ok(()) })
-    // }
-    // fn after_destroy(&self, _vmid: &str) -> HookFuture<'_> {
-    //     Box::pin(async { Ok(()) })
-    // }
 }
 
 pub struct HookManager {

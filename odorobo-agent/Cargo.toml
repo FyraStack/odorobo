@@ -27,4 +27,6 @@ random-port = "0.1.1"
 if-addrs = "0.13"
 zbus = "5.14.0"
 zbus_systemd = { version = "0.26000.0", features = ["machine1", "systemd1", "zbus-async-tokio"] }
+url = { version = "2.5.8", features = ["serde"] }
+async-trait = "0.1.89"
 
