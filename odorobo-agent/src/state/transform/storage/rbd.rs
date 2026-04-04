@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use stable_eyre::{Result, eyre::eyre};
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
+use tracing::{info, trace};
 use url::Url;
 
 const CEPH_ID_ENV: &str = "CEPH_ID";
@@ -28,6 +29,85 @@ fn rbd_extra_args() -> Vec<String> {
     }
     args
 }
+#[tracing::instrument]
+async fn rbd_map_list() -> Result<Vec<(String, String)>> {
+    // returns a list of (rbd_path, device_path) for all currently mapped rbd devices
+    let output = Command::new("rbd")
+        .args(rbd_extra_args())
+        .arg("device")
+        .arg("list")
+        .output()
+        .await
+        .map_err(|e| eyre!("Failed to execute rbd command: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(eyre!("rbd command failed: {stderr}"));
+    }
+
+    let output_str = String::from_utf8_lossy(&output.stdout);
+    rbd_lines_list(&output_str)
+}
+
+#[tracing::instrument]
+fn rbd_lines_list(input: &str) -> Result<Vec<(String, String)>> {
+    let mut mappings = Vec::new();
+    for line in input.lines().skip(1) {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        // id  pool               namespace  image    snap  device
+        // 0   pool               foo        testimg    -   /dev/rbd0
+        if parts.len() == 6 {
+            let rbd_path = format!("{}/{}", parts[1], parts[3]);
+            let device_path = parts[5].to_string();
+            mappings.push((rbd_path, device_path));
+        }
+        if parts.len() == 5 {
+            // if namespace is empty, it might be omitted from the output, so we need to handle that case as well
+            // id  pool               image    snap  device
+            // 0   pool               testimg    -   /dev/rbd0
+            let rbd_path = format!("{}/{}", parts[1], parts[2]);
+            let device_path = parts[4].to_string();
+            mappings.push((rbd_path, device_path));
+        }
+    }
+
+    trace!(?mappings, "Parsed RBD device list");
+    Ok(mappings)
+}
+
+/// Maps the given RBD image to a local block device and returns the device path.
+/// If already mapped, returns the existing device path.
+#[tracing::instrument]
+async fn map_device(rbd_path: &str) -> Result<String> {
+    let mappings = rbd_map_list().await?;
+
+    if let Some((_, device_path)) = mappings.into_iter().find(|(path, _)| path == rbd_path) {
+        info!(
+            ?device_path,
+            "RBD image already mapped to device, returning existing mapping"
+        );
+        Ok(device_path)
+    } else {
+        info!(?rbd_path, "Mapping RBD image to device");
+        let output = Command::new("rbd")
+            .args(rbd_extra_args())
+            .arg("device")
+            .arg("map")
+            .arg(rbd_path)
+            .output()
+            .await
+            .map_err(|e| eyre!("Failed to execute rbd command: {e}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(eyre!("rbd command failed: {stderr}"));
+        }
+
+        let output_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+        info!(?output_str, "RBD image mapped to device");
+
+        Ok(output_str)
+    }
+}
 
 fn resolve_rbd_path(uri: &Url) -> Result<String> {
     let host = uri
@@ -52,21 +132,10 @@ impl StorageBackend for RbdStorage {
         let rbd_path = resolve_rbd_path(uri)?;
 
         // Ensure required environment variables are set
-        let output = Command::new("rbd")
-            .args(rbd_extra_args())
-            .arg("device")
-            .arg("map")
-            .arg(&rbd_path)
-            .output()
-            .await
-            .map_err(|e| eyre!("Failed to execute rbd command: {e}"))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(eyre!("rbd command failed: {stderr}"));
-        }
+        let output = map_device(&rbd_path).await?;
 
         // now we want to symlink this to a stable path under /run/odorobo/disks/rbd/{pool}/{image} so that we can use that path in the VM config and it won't change across reboots or remaps
-        let device_path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+        let device_path = PathBuf::from(output);
 
         let stable_path_str = format!("/run/odorobo/disks/rbd/{}", rbd_path);
         let stable_path = Path::new(&stable_path_str);
@@ -106,4 +175,15 @@ fn test_resolve_rbd_path() {
     let uri = Url::parse("rbd://my-pool/my-image").unwrap();
     let resolved = resolve_rbd_path(&uri).unwrap();
     assert_eq!(resolved, "my-pool/my-image");
+}
+
+#[test]
+fn test_rbd_lines_list() {
+    let input = "\
+id  pool               namespace  image    snap  device
+0   kessoku-blockpool             testimg  -     /dev/rbd0";
+    let mappings = rbd_lines_list(input).unwrap();
+    assert_eq!(mappings.len(), 1);
+    assert_eq!(mappings[0].0, "kessoku-blockpool/testimg");
+    assert_eq!(mappings[0].1, "/dev/rbd0");
 }
