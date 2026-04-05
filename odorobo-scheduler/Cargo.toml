@@ -1,0 +1,28 @@
+[package]
+name = "odorobo-scheduler"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "odorobo-scheduler"
+
+[[bin]]
+name = "gen_openapi_spec"
+
+[dependencies]
+kameo = { version = "0.19.2", features = ["remote"] }
+axum = { version = "0.8.8", features = ["tracing", "macros"] }
+env = "1.0.1"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+tokio = { version = "1.50.0", features = ["full"] } # TODO (june): tracing is only in tokio unstable?      NOTE (caleb): I think that just refers to tokio logging tracing events, we can still make our own and look at other crate's events if necessary.
+tower-http = { version = "0.6.1", features = ["trace"] }
+tracing = "0.1.44"
+optional_struct = "0.5.2"
+tracing-subscriber = { version = "0.3.2", features = ["env-filter"] }
+uuid = { version = "1.23.0", features = ["serde"]}
+libp2p = { version = "0.56.0", features = ["yamux", "serde", "mdns"] }
+reqwest = { version = "0.13", features = ["json"] }
+ahash = { version = "0.8.12", features = ["serde"] }
+utoipa = { version = "5.4.0", features=["uuid"] }
+odorobo-shared = { path = "../odorobo-shared" }

@@ -29,3 +29,7 @@ dev
 AGENTS.md
 CLAUDE.md
 .claude/
+
+
+# mac bullshit
+.DS_Store

@@ -1,4 +1,5 @@
 pub mod utils;
+pub mod kameo_messages;
 
 use kameo::prelude::*;
 use libp2p::{mdns, noise, tcp, yamux, PeerId};
