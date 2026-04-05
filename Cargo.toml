@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["odorobo-agent", "odoroboctl", "shared"]
+members = ["odorobo-agent", "odoroboctl", "odorobo-scheduler", "odorobo-shared"]
 
 [workspace.dependencies]
 stable-eyre = "0.2.2"

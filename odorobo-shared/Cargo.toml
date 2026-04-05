@@ -1,5 +1,5 @@
 [package]
-name = "shared"
+name = "odorobo-shared"
 version = "0.1.0"
 edition = "2024"
 license = "AGPL-3.0-or-later"
@@ -8,3 +8,5 @@ license = "AGPL-3.0-or-later"
 kameo = { version = "0.19.2", features = ["remote"] }
 tokio = { version = "1.50.0", features = ["full"] }
 libp2p = { version = "0.56.0", features = ["yamux", "serde", "mdns"] }
+serde = { version = "1.0.228", features = ["derive"] }
+utoipa = { version = "5.4.0", features=["uuid"] }
