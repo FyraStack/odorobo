@@ -1,0 +1,10 @@
+[package]
+name = "shared"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+kameo = { version = "0.19.2", features = ["remote"] }
+tokio = { version = "1.50.0", features = ["full"] }
+libp2p = { version = "0.56.0", features = ["yamux", "serde", "mdns"] }
