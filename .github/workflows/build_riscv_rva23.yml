@@ -1,4 +1,4 @@
-name: Cross-compile to RVA23
+name: Build RISC V RVA23 via x86 cross-compile
 
 on:
   push:
@@ -26,11 +26,11 @@ jobs:
     - name: Build image
       run: podman build -t odorobo-builder:rva23 .
     - name: Build binaries
-      run: podman run --rm -v ${{ github.workspace }}:/code -w /code odorobo-builder:rva23 cargo build --release
+      run: podman run --rm -v ${{ github.workspace }}:/code -w /code odorobo-builder:rva23 cargo build --release --verbose
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
-        name: odorobo
+        name: odorobo_riscv_rva23
         path: |
           target/riscv64a23-unknown-linux-gnu/release/odorobo-agent
           target/riscv64a23-unknown-linux-gnu/release/odoroboctl
