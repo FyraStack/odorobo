@@ -45,7 +45,7 @@ codegen-units = 1
 
 # we are specifically NOT using panic = "abort" because we need to use catch_unwind for kameo actors on_panic. 
 # for any crates using kameo actors on_panic, this would literally break the binary.
-# For specific crates/binaries this might be something we do, but I doubt it.
+# For specific crates/binaries this might be something we do, but I (caleb) doubt it.
 
 strip = "symbols" # TODO: this we should talk about doing this, because it makes debugging harder, so if we have a panic in production, the backtrace will likely not be as useful.
 
