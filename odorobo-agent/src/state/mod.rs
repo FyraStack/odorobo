@@ -6,7 +6,7 @@
 mod api;
 mod instance;
 mod devices;
-mod provisioning;
+pub mod provisioning;
 mod transform;
 
 pub use api::{call, call_request};

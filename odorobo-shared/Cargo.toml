@@ -5,8 +5,14 @@ edition = "2024"
 license = "AGPL-3.0-or-later"
 
 [dependencies]
-kameo = { version = "0.19.2", features = ["remote"] }
-tokio = { version = "1.50.0", features = ["full"] }
-libp2p = { version = "0.56.0", features = ["yamux", "serde", "mdns"] }
-serde = { version = "1.0.228", features = ["derive"] }
+kameo = { workspace = true, features = ["remote"] }
+tokio = { workspace = true, features = ["full"] }
+libp2p = { workspace = true, features = ["yamux", "serde", "mdns", "kad"] }
+serde = { workspace = true, features = ["derive"] }
 utoipa = { version = "5.4.0", features=["uuid"] }
+stable-eyre = { workspace = true }
+thiserror = { workspace = true }
+ulid = { workspace = true }
+cloud-hypervisor-client = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+tracing = { workspace = true }
