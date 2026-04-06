@@ -7,6 +7,7 @@ use libp2p::PeerId;
 use libp2p::futures::TryStreamExt;
 use odorobo_shared::messages::server_status::GetServerStatus;
 use serde::{Deserialize, Serialize};
+use tracing::info;
 use utoipa::OpenApi;
 use uuid::Uuid;
 //use odorobo_shared::odorobo::server_actor::ServerActor;
@@ -58,7 +59,7 @@ impl Actor for SchedulerActor {
             })
             .await?;
 
-        println!("Created VM Reply: {:?}", reply);
+        info!("Created VM Reply: {:?}", reply);
 
         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
 
