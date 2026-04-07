@@ -4,6 +4,35 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
+mod bytesize_as_u64 {
+    use bytesize::ByteSize;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(size: &ByteSize, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_u64(size.as_u64())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<ByteSize, D::Error> {
+        Ok(ByteSize(u64::deserialize(d)?))
+    }
+}
+
+mod opt_bytesize_as_u64 {
+    use bytesize::ByteSize;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(size: &Option<ByteSize>, s: S) -> Result<S::Ok, S::Error> {
+        match size {
+            Some(b) => s.serialize_some(&b.as_u64()),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<ByteSize>, D::Error> {
+        Ok(Option::<u64>::deserialize(d)?.map(ByteSize))
+    }
+}
+
 // Newtype so aide can generate a path parameter schema for Ulid.
 /// VM ID, in the format of ULID
 #[derive(Deserialize, JsonSchema, OperationIo)]
@@ -34,6 +63,7 @@ pub struct VMData {
     pub max_vcpus: Option<u32>,
     /// Amount of RAM in bytes allocated to the VM.
     #[schemars(with = "u64")]
+    #[serde(with = "bytesize_as_u64")]
     pub memory: ByteSize,
     /// Image used for the VM.
     pub image: String,
@@ -41,6 +71,7 @@ pub struct VMData {
     #[serde(default)]
     pub volumes: Vec<Volume>,
 }
+
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Default)]
 pub struct UpdateVMRequest {
     /// Updated name of the VM.
@@ -50,7 +81,8 @@ pub struct UpdateVMRequest {
     /// Updated maximum number of vCPUs the VM can scale up to, if supported by the underlying hypervisor.
     pub max_vcpus: Option<u32>,
     /// Updated amount of RAM in bytes allocated to the VM.
-    #[schemars(with = "u64")]
+    #[schemars(with = "Option<u64>")]
+    #[serde(with = "opt_bytesize_as_u64")]
     pub memory: Option<ByteSize>,
     /// Updated list of volumes to attach to the VM. This will replace the existing list of attached volumes.
     #[serde(default)]
@@ -94,6 +126,7 @@ pub struct Volume {
     pub name: String,
     /// Size of the volume in bytes.
     #[schemars(with = "u64")]
+    #[serde(with = "bytesize_as_u64")]
     pub size: ByteSize,
 }
 
@@ -131,6 +164,7 @@ pub struct Node {
     pub total_vcpus: u32,
     /// Total amount of RAM in bytes available on the node.
     #[schemars(with = "u64")]
+    #[serde(with = "bytesize_as_u64")]
     pub total_memory: ByteSize,
     #[serde(default)]
     pub status: NodeStatus,
