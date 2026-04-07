@@ -1,16 +1,15 @@
-pub mod utils;
-pub mod messages;
 pub mod error;
+pub mod messages;
+pub mod utils;
 use kameo::prelude::*;
-use libp2p::kad::Record;
-use libp2p::{mdns, noise, tcp, yamux, PeerId, kad};
-use libp2p::futures::StreamExt;
-use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
-use stable_eyre::Result;
 use libp2p::bytes::BufMut;
-use tracing::{debug, info, warn};
+use libp2p::futures::StreamExt;
+use libp2p::kad::Record;
+use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
+use libp2p::{PeerId, kad, mdns, noise, tcp, yamux};
+use stable_eyre::Result;
 use std::cell::RefCell;
-
+use tracing::{debug, info, warn};
 
 #[derive(NetworkBehaviour)]
 pub struct ProductionBehaviour {
@@ -24,19 +23,19 @@ pub struct ProductionBehaviour {
 pub fn connect_to_swarm() -> Result<PeerId> {
     let mut swarm = libp2p::SwarmBuilder::with_new_identity()
         .with_tokio()
-        .with_tcp(tcp::Config::default(), noise::Config::new, yamux::Config::default)?
+        .with_tcp(
+            tcp::Config::default(),
+            noise::Config::new,
+            yamux::Config::default,
+        )?
         .with_behaviour(|key| {
             let local_peer_id = key.public().to_peer_id();
 
-            let kameo = remote::Behaviour::new(
-                local_peer_id,
-                remote::messaging::Config::default(),
-            );        
+            let kameo = remote::Behaviour::new(local_peer_id, remote::messaging::Config::default());
             let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id)?;
             Ok(ProductionBehaviour { kameo, mdns })
         })?
-        .build();    
-    
+        .build();
 
     // Initialize Kameo's global registry
     swarm.behaviour().kameo.init_global();
@@ -53,32 +52,36 @@ pub fn connect_to_swarm() -> Result<PeerId> {
         loop {
             match swarm.select_next_some().await {
                 // Handle mDNS discovery
-                SwarmEvent::Behaviour(ProductionBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
+                SwarmEvent::Behaviour(ProductionBehaviourEvent::Mdns(mdns::Event::Discovered(
+                    list,
+                ))) => {
                     for (peer_id, multiaddr) in list {
                         info!("mDNS discovered peer: {peer_id}");
                         swarm.add_peer_address(peer_id, multiaddr);
                     }
                 }
-                SwarmEvent::Behaviour(ProductionBehaviourEvent::Mdns(mdns::Event::Expired(list))) => {
+                SwarmEvent::Behaviour(ProductionBehaviourEvent::Mdns(mdns::Event::Expired(
+                    list,
+                ))) => {
                     for (peer_id, _) in list {
                         warn!("mDNS peer expired: {peer_id}");
                         let _ = swarm.disconnect_peer_id(peer_id);
                     }
                 }
                 // Handle Kameo events (optional - for monitoring)
-                SwarmEvent::Behaviour(ProductionBehaviourEvent::Kameo(remote::Event::Registry(
-                                                                          registry_event,
-                                                                      ))) => {
-                    debug!("Registry event: {:?}", registry_event);
+                SwarmEvent::Behaviour(ProductionBehaviourEvent::Kameo(
+                    remote::Event::Registry(registry_event),
+                )) => {
+                    debug!(?registry_event, "Registry event");
                 }
-                SwarmEvent::Behaviour(ProductionBehaviourEvent::Kameo(remote::Event::Messaging(
-                                                                          messaging_event,
-                                                                      ))) => {
-                    debug!("Messaging event: {:?}", messaging_event);
+                SwarmEvent::Behaviour(ProductionBehaviourEvent::Kameo(
+                    remote::Event::Messaging(messaging_event),
+                )) => {
+                    debug!(?messaging_event, "Messaging event");
                 }
                 // Handle other swarm events
                 SwarmEvent::NewListenAddr { address, .. } => {
-                    info!("Listening on {address}");
+                    info!(?address, "Listening");
                 }
                 SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                     info!("Connected to {peer_id}");
