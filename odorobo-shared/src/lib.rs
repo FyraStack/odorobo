@@ -8,6 +8,7 @@ use libp2p::futures::StreamExt;
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use stable_eyre::Result;
 use libp2p::bytes::BufMut;
+use tracing::{debug, info, warn};
 use std::cell::RefCell;
 
 
@@ -45,7 +46,7 @@ pub fn connect_to_swarm() -> Result<PeerId> {
 
     let local_peer_id = *swarm.local_peer_id();
 
-    println!("Local peer id: {:?}", local_peer_id);
+    info!("Local peer id: {:?}", local_peer_id);
 
     // Spawn the swarm task
     tokio::spawn(async move {
@@ -54,13 +55,13 @@ pub fn connect_to_swarm() -> Result<PeerId> {
                 // Handle mDNS discovery
                 SwarmEvent::Behaviour(ProductionBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
                     for (peer_id, multiaddr) in list {
-                        println!("mDNS discovered peer: {peer_id}");
+                        info!("mDNS discovered peer: {peer_id}");
                         swarm.add_peer_address(peer_id, multiaddr);
                     }
                 }
                 SwarmEvent::Behaviour(ProductionBehaviourEvent::Mdns(mdns::Event::Expired(list))) => {
                     for (peer_id, _) in list {
-                        println!("mDNS peer expired: {peer_id}");
+                        warn!("mDNS peer expired: {peer_id}");
                         let _ = swarm.disconnect_peer_id(peer_id);
                     }
                 }
@@ -68,22 +69,22 @@ pub fn connect_to_swarm() -> Result<PeerId> {
                 SwarmEvent::Behaviour(ProductionBehaviourEvent::Kameo(remote::Event::Registry(
                                                                           registry_event,
                                                                       ))) => {
-                    println!("Registry event: {:?}", registry_event);
+                    debug!("Registry event: {:?}", registry_event);
                 }
                 SwarmEvent::Behaviour(ProductionBehaviourEvent::Kameo(remote::Event::Messaging(
                                                                           messaging_event,
                                                                       ))) => {
-                    println!("Messaging event: {:?}", messaging_event);
+                    debug!("Messaging event: {:?}", messaging_event);
                 }
                 // Handle other swarm events
                 SwarmEvent::NewListenAddr { address, .. } => {
-                    println!("Listening on {address}");
+                    info!("Listening on {address}");
                 }
                 SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                    println!("Connected to {peer_id}");
+                    info!("Connected to {peer_id}");
                 }
                 SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
-                    println!("Disconnected from {peer_id}: {cause:?}");
+                    info!("Disconnected from {peer_id}: {cause:?}");
                 }
                 _ => {}
             }

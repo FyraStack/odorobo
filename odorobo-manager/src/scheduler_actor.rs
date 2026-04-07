@@ -7,7 +7,7 @@ use libp2p::PeerId;
 use libp2p::futures::TryStreamExt;
 use odorobo_shared::messages::server_status::GetServerStatus;
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{error, info, warn};
 use utoipa::OpenApi;
 use uuid::Uuid;
 //use odorobo_shared::odorobo::server_actor::ServerActor;
@@ -31,7 +31,7 @@ impl Actor for SchedulerActor {
     async fn on_start(state: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
         let peer_id = actor_ref.id().peer_id().unwrap().clone();
 
-        println!("Actor started! Scheduler peer id: {peer_id}");
+        info!("Actor started! Scheduler peer id: {peer_id}");
 
         let mut agent_actor: Option<RemoteActorRef<AgentActor>> = None;
 
@@ -50,7 +50,7 @@ impl Actor for SchedulerActor {
 
         let agent_actor_peer_id = agent_actor.id().peer_id().unwrap().clone();
 
-        println!("Agent actor peer id: {agent_actor_peer_id}");
+        info!("Agent actor peer id: {agent_actor_peer_id}");
 
         let reply = agent_actor
             .ask(&CreateVM {
@@ -59,15 +59,15 @@ impl Actor for SchedulerActor {
             })
             .await?;
 
-        info!("Created VM Reply: {:?}", reply);
+        info!(?reply, "Created VM Reply");
 
         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
 
-        println!("Panicking Agent.");
+        warn!("Panicking Agent");
 
         agent_actor.tell(&PanicAgent).send()?;
 
-        println!("Agent has been panicked.");
+        error!("Agent has been panicked.");
 
         Ok(state)
     }

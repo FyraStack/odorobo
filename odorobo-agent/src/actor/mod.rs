@@ -1,15 +1,16 @@
 use crate::state::provisioning::actor::VMActor;
 use ahash::AHashMap;
 use bytesize::ByteSize;
+use kameo::error::ActorStopReason;
 use kameo::prelude::*;
 use odorobo_shared::messages::create_vm::*;
 use odorobo_shared::messages::debug::PanicAgent;
 use serde::{Deserialize, Serialize};
 use stable_eyre::{Report, Result};
+use tracing::error;
+use std::ops::ControlFlow;
 use std::{fs, path::PathBuf};
 use sysinfo::System;
-use std::ops::ControlFlow;
-use kameo::error::ActorStopReason;
 
 use kameo::error::PanicError;
 
@@ -75,16 +76,16 @@ impl Actor for AgentActor {
     // async fn on_panic(state: Self::Args, weak_actor_ref: WeakActorRef<Self>, _panic: &PanicError) {
     //     panic!("Agent panicked: {:?}", _panic);
     // }
-    // 
+    //
     async fn on_panic(
-            &mut self,
-            actor_ref: WeakActorRef<Self>,
-            err: PanicError,
-        ) -> Result<std::ops::ControlFlow<ActorStopReason>> {
-        println!("Agent panicked: {:?}", err);
-        
+        &mut self,
+        actor_ref: WeakActorRef<Self>,
+        err: PanicError,
+    ) -> Result<std::ops::ControlFlow<ActorStopReason>> {
+        error!("Agent panicked: {:?}", err);
+
         // todo: if we panic, we should completely regen the self struct from scratch. The assumption should be that memory corruption could have possibly happened becauew
-        
+
         Ok(ControlFlow::Continue(()))
     }
 }
