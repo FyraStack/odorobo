@@ -16,22 +16,23 @@ aide = { version = "0.15.1", features = [
     "macros",
 ] }
 schemars.workspace = true
+clap.workspace = true
 bytesize.workspace = true
-env = "1.0.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 tokio = { workspace = true, features = [
     "full",
 ] } # TODO (june): tracing is only in tokio unstable?      NOTE (caleb): I think that just refers to tokio logging tracing events, we can still make our own and look at other crate's events if necessary.
 tower-http = { version = "0.6.8", features = ["trace"] }
-tracing = "0.1.44"
+dotenvy = { workspace = true }
+tracing = { workspace = true }
 optional_struct = "0.5.2"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { workspace = true }
 ulid = { workspace = true }
 libp2p = { version = "0.56.0", features = ["yamux", "serde", "mdns"] }
 reqwest = { version = "0.13", features = ["json"] }
 ahash = { version = "0.8.12", features = ["serde"] }
-utoipa = { version = "5.4.0", features = ["uuid"] }
+# utoipa = { version = "5.4.0", features = ["uuid"] }
 odorobo-shared = { workspace = true }
 stable-eyre = { workspace = true }
 odorobo-agent = { workspace = true }
