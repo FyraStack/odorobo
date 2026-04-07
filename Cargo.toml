@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["odorobo-agent", "odoroboctl", "odorobo-scheduler", "odorobo-shared"]
+members = ["odorobo-agent", "odoroboctl", "odorobo-manager", "odorobo-shared"]
 
 [workspace.dependencies]
 stable-eyre = "0.2.2"
@@ -26,7 +26,7 @@ ulid = { version = "1.2", features = ["serde"] }
 odorobo-shared = { path = "odorobo-shared" }
 odorobo-agent = { path = "odorobo-agent" }
 odoroboctl = { path = "odoroboctl" }
-odorobo-scheduler = { path = "odorobo-scheduler" }
+odorobo-manager = { path = "odorobo-manager" }
 
 
 [profile.release-optimized]

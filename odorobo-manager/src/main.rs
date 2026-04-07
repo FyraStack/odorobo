@@ -1,12 +1,12 @@
 use kameo::prelude::*;
-use stable_eyre::Result;
-use odorobo_scheduler::scheduler_actor::SchedulerActor;
+use odorobo_manager::scheduler_actor::SchedulerActor;
 use odorobo_shared::connect_to_swarm;
+use stable_eyre::Result;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let _local_peer_id = connect_to_swarm()?;
-    
+
     odorobo_shared::utils::init()?;
 
     let actor_ref = SchedulerActor::spawn(SchedulerActor {});

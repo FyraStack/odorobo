@@ -1,10 +1,7 @@
 [package]
-name = "odorobo-scheduler"
+name = "odorobo-manager"
 version = "0.1.0"
 edition = "2024"
-
-[[bin]]
-name = "odorobo-scheduler"
 
 [dependencies]
 kameo = { version = "0.19.2", features = ["remote"] }
