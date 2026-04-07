@@ -1,15 +1,5 @@
-use axum::extract::State;
-use axum::http::StatusCode;
-use axum::routing::{get, post};
-use axum::{Json, Router};
 use kameo::prelude::*;
-use libp2p::PeerId;
-use libp2p::futures::TryStreamExt;
-use odorobo_shared::messages::server_status::GetServerStatus;
-use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
-use utoipa::OpenApi;
-use uuid::Uuid;
 //use odorobo_shared::odorobo::server_actor::ServerActor;
 use odorobo_agent::actor::AgentActor;
 use odorobo_shared::messages::create_vm::*;
@@ -52,22 +42,33 @@ impl Actor for SchedulerActor {
 
         info!("Agent actor peer id: {agent_actor_peer_id}");
 
-        let reply = agent_actor
-            .ask(&CreateVM {
-                vm_id: Default::default(),
-                config: Default::default(),
-            })
-            .await?;
+        // run the HTTP API
+        tokio::spawn(async move {
+            tracing::info!("Starting HTTP server on {EXTERNAL_HTTP_URL}");
+            let listener = tokio::net::TcpListener::bind(EXTERNAL_HTTP_ADDRESS)
+                .await
+                .unwrap();
+            axum::serve(listener, crate::api::build()).await.unwrap();
+        });
 
-        info!(?reply, "Created VM Reply");
 
-        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
 
-        warn!("Panicking Agent");
+        // let reply = agent_actor
+        //     .ask(&CreateVM {
+        //         vm_id: Default::default(),
+        //         config: Default::default(),
+        //     })
+        //     .await?;
 
-        agent_actor.tell(&PanicAgent).send()?;
+        // info!(?reply, "Created VM Reply");
 
-        error!("Agent has been panicked.");
+        // tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+
+        // warn!("Panicking Agent");
+
+        // agent_actor.tell(&PanicAgent).send()?;
+
+        // error!("Agent has been panicked.");
 
         Ok(state)
     }
