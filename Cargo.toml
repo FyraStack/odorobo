@@ -30,15 +30,10 @@ odorobo-agent = { path = "odorobo-agent" }
 odoroboctl = { path = "odoroboctl" }
 odorobo-manager = { path = "odorobo-manager" }
 
-
-[profile.release-optimized]
 # these are for performance optimizations, based on https://nnethercote.github.io/perf-book/build-configuration.html#optimization-level
 # these options can take a while to compile (up to 5-10 minutes), so its really only necessary for production binaries.
-
-# you should also try to setup rustflags -C target-cpu=native, but this only works on the target machine.
-# this enables microarchitecture optimizations, which is just better if we can.
-# You can also set the target-cpu to do cross compilation if you know the exact micro architecture of the target machine.
-
+# also look in .cargo/config.toml for info on microarchitecture optimizations.
+[profile.release-optimized]
 inherits = "release"
 
 opt-level = 3
