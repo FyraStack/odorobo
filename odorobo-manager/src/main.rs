@@ -1,11 +1,10 @@
 use clap::Parser;
 use kameo::prelude::*;
-use odorobo_manager::scheduler_actor::SchedulerActor;
+use odorobo_manager::actors::{http_actor::HTTPActor, scheduler_actor::SchedulerActor};
 use odorobo_shared::connect_to_swarm;
 use serde::{Deserialize, Serialize};
 use stable_eyre::Result;
 use tracing::info;
-
 
 // A config we definitely need: what is the router ip.
 // TODO: talk to katherine about exactly how they want this config, since they may or may not be doing some of this, and we dont know if they want a .json for this or .env or something else.
@@ -33,13 +32,20 @@ async fn main() -> Result<()> {
     let _local_peer_id = connect_to_swarm()?;
 
     odorobo_shared::utils::init()?;
-    dotenvy::dotenv()?;
+    dotenvy::dotenv().ok();
     info!("Starting odorobo-manager");
 
-    let actor_ref = SchedulerActor::spawn(SchedulerActor {});
-    actor_ref.register("scheduler").await?;
+    let actor_ref = SchedulerActor::spawn(());
+    let http_actor = HTTPActor::spawn(());
 
-    actor_ref.wait_for_shutdown().await;
+    actor_ref.register("scheduler").await?;
+    http_actor.register("apiserver").await?;
+
+
+    tokio::join!(
+        actor_ref.wait_for_shutdown(),
+        http_actor.wait_for_shutdown(),
+    );
 
     Ok(())
 }

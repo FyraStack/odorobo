@@ -7,10 +7,10 @@ use odorobo_shared::messages::create_vm::*;
 use odorobo_shared::messages::debug::PanicAgent;
 use serde::{Deserialize, Serialize};
 use stable_eyre::{Report, Result};
-use tracing::error;
 use std::ops::ControlFlow;
 use std::{fs, path::PathBuf};
 use sysinfo::System;
+use tracing::error;
 
 use kameo::error::PanicError;
 
@@ -101,13 +101,9 @@ impl Message<CreateVM> for AgentActor {
     ) -> Self::Reply {
         // TODO: this is unfinished. we intend on using the state::provisioning::actor stuff for this I think.
         let vmid = ulid::Ulid::new();
-        let actor_ref = VMActor::spawn(VMActor {
-            ch_socket_path: PathBuf::from(format!("/run/odorobo/vms/{}/ch.sock", vmid)),
-            vmid,
-            vm_config: Default::default(),
-        });
+        let actor_ref = VMActor::spawn((vmid, msg.config));
 
-        let actor_registration_result = actor_ref.register("vm").await;
+        let _ = actor_ref.register("vm").await;
 
         tracing::info!("someone asked us for available capacity");
         CreateVMReply {

@@ -1,4 +1,4 @@
-mod http_actor;
-mod scheduler_actor;
-mod serial_terminal_websocket_actor;
-mod ip_management_actor;
+pub mod http_actor;
+pub mod scheduler_actor;
+pub mod serial_terminal_websocket_actor;
+pub mod ip_management_actor;
