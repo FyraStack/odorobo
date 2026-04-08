@@ -56,3 +56,21 @@ If your trait needs to do dynamic dispatch (e.g. for provisioning hooks), you mu
 ## Rust Hypervisor Firmware failing to boot newer images
 
 out of scope for odorobo, tracking issue [here](https://github.com/cloud-hypervisor/rust-hypervisor-firmware/issues/412)
+
+## creating kameo handlers
+
+You need to impl a `Message<RequestMessageType>` trait for the actor to be able to handle a message on an actor. The following is a template for this
+
+You also need to implement 
+
+```rs
+#[remote_message]
+impl Message<RequestMessageType> for Actor {
+    type Reply = ReplyType;
+
+    async fn handle(&mut self, msg: RequestMessageType, _ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
+        // this code will run whenever someone sends the actor this type of message.
+        ReplyType {}
+    }
+}
+```

@@ -4,6 +4,7 @@
 //! Cloud Hypervisor process for a given instance
 mod hooks;
 mod systemd;
+pub mod actor;
 use cloud_hypervisor_client::models::VmConfig;
 use stable_eyre::{Result, eyre::Context};
 use tracing::info;

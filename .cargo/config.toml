@@ -1,0 +1,5 @@
+# we should try to use this rustflags -C target-cpu=native for microarchitecture optimizations,
+# but this only works on the target machine, so we have it commented out at the moment.
+# You can also set the target-cpu to do cross compilation if you know the exact micro architecture of the target machine.
+[build]
+#rustflags = ["-C", "target-cpu=native"]

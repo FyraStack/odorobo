@@ -1,0 +1,38 @@
+[package]
+name = "odorobo-manager"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+kameo = { version = "0.19.2", features = ["remote"] }
+axum = { version = "0.8.8", features = ["tracing", "macros"] }
+aide = { version = "0.15.1", features = [
+    "axum",
+    "axum-json",
+    "axum-extra",
+    "axum-tokio",
+    "axum-ws",
+    "swagger",
+    "macros",
+] }
+schemars.workspace = true
+clap.workspace = true
+bytesize.workspace = true
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+tokio = { workspace = true, features = [
+    "full",
+] } # TODO (june): tracing is only in tokio unstable?      NOTE (caleb): I think that just refers to tokio logging tracing events, we can still make our own and look at other crate's events if necessary.
+tower-http = { version = "0.6.8", features = ["trace"] }
+dotenvy = { workspace = true }
+tracing = { workspace = true }
+optional_struct = "0.5.2"
+tracing-subscriber = { workspace = true }
+ulid = { workspace = true }
+libp2p = { version = "0.56.0", features = ["yamux", "serde", "mdns"] }
+reqwest = { version = "0.13", features = ["json"] }
+ahash = { version = "0.8.12", features = ["serde"] }
+# utoipa = { version = "5.4.0", features = ["uuid"] }
+odorobo-shared = { workspace = true }
+stable-eyre = { workspace = true }
+odorobo-agent = { workspace = true }
