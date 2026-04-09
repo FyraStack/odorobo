@@ -1,19 +1,9 @@
-use super::VMProvisionerBackend;
 use crate::state::VMInstance;
-use crate::state::provisioning::default_provisioner;
 use cloud_hypervisor_client::models::VmConfig;
 use kameo::prelude::*;
-use odorobo_shared::messages::create_vm::DeleteVM;
-use odorobo_shared::messages::create_vm::GetVMInfo;
-use odorobo_shared::messages::create_vm::GetVMInfoReply;
-use odorobo_shared::messages::create_vm::ShutdownVM;
-use stable_eyre::Report;
-use stable_eyre::Result;
-use std::path::PathBuf;
-use tracing::error;
-use tracing::info;
-use tracing::trace;
-use tracing::warn;
+use odorobo_shared::messages::create_vm::{DeleteVM, GetVMInfo, GetVMInfoReply, ShutdownVM};
+use stable_eyre::{Report, Result};
+use tracing::{error, info, trace, warn};
 /*
 use std::process::Command;
 
@@ -99,7 +89,6 @@ impl From<VMActor> for VMInstance {
     }
 }
 
-
 impl Message<GetVMInfo> for VMActor {
     type Reply = GetVMInfoReply;
     async fn handle(
@@ -126,7 +115,6 @@ impl Message<ShutdownVM> for VMActor {
         // ctx.actor_ref().kill();
     }
 }
-
 
 impl Message<DeleteVM> for VMActor {
     type Reply = ();
