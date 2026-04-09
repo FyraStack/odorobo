@@ -12,12 +12,12 @@ use crate::actor::AgentActor;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    odorobo_shared::utils::init()?;
+    odorobo_shared::utils::init(Some("odorobo_agent"))?;
 
     tracing::info!("Starting odorobo-agent...");
 
     // minimal axum server, debug socket
-    // 
+    //
     // todo: remove this, here to stub out dead code
     tokio::task::spawn(async {
         let listener = tokio::net::TcpListener::bind("0.0.0.0:8890").await?;

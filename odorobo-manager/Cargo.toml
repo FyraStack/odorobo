@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 kameo = { version = "0.19.2", features = ["remote"] }
 axum = { version = "0.8.8", features = ["tracing", "macros"] }
+cloud-hypervisor-client = { workspace = true }
 aide = { version = "0.15.1", features = [
     "axum",
     "axum-json",

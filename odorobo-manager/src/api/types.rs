@@ -1,5 +1,6 @@
 use aide::OperationIo;
 use bytesize::ByteSize;
+use cloud_hypervisor_client::models::VmConfig;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
@@ -42,7 +43,7 @@ pub struct VmId(#[schemars(with = "String")] pub Ulid);
 #[derive(Deserialize, JsonSchema)]
 pub struct VolumeId(#[schemars(with = "String")] pub Ulid);
 
-#[derive(Serialize, Deserialize, Debug, JsonSchema, Default)]
+#[derive(Serialize, Deserialize, Debug, JsonSchema, Default, Clone)]
 pub struct CreateVMRequest {
     /// Data of the VM to create
     pub data: VMData,
@@ -50,7 +51,20 @@ pub struct CreateVMRequest {
     pub boot: bool,
 }
 
-#[derive(Serialize, Deserialize, Debug, JsonSchema, Default)]
+/// An internal, debug-only request for creating a VM.
+/// 
+/// please don't use this in production, this is for debugging
+/// 
+/// PUT /vms/
+#[derive(Serialize, Deserialize, Debug, OperationIo, Default, Clone)]
+pub struct DebugCreateVMRequest {
+    /// Data of the VM to create
+    pub vm_config: VmConfig,
+    /// Whether to boot the VM immediately after creation
+    pub boot: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, JsonSchema, Default, Clone)]
 pub struct VMData {
     /// VM ID. This is a ULID string.
     #[schemars(with = "String")]
@@ -117,7 +131,7 @@ pub struct VMInfo {
     pub status: VMStatus,
 }
 
-#[derive(Serialize, Deserialize, Debug, JsonSchema, Default)]
+#[derive(Serialize, Deserialize, Debug, JsonSchema, Default, Clone)]
 pub struct Volume {
     /// Volume ID. This is a ULID string.
     #[schemars(with = "String")]

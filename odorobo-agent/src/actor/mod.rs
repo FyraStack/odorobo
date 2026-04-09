@@ -5,12 +5,14 @@ use kameo::error::ActorStopReason;
 use kameo::prelude::*;
 use odorobo_shared::messages::create_vm::*;
 use odorobo_shared::messages::debug::PanicAgent;
+use odorobo_shared::messages::{Ping, Pong};
 use serde::{Deserialize, Serialize};
 use stable_eyre::{Report, Result};
+use std::fs;
 use std::ops::ControlFlow;
-use std::{fs, path::PathBuf};
 use sysinfo::System;
-use tracing::error;
+use tracing::{error, info, trace, warn};
+use ulid::Ulid;
 
 use kameo::error::PanicError;
 
@@ -19,6 +21,7 @@ pub struct AgentActor {
     pub vcpus: u32,
     pub memory: ByteSize,
     pub config: Config,
+    pub vms: AHashMap<Ulid, ActorRef<VMActor>>,
 }
 
 /// Gets the system hostname
@@ -31,6 +34,17 @@ pub fn default_reserved_vcpus() -> u32 {
     2
 }
 
+fn default_datacenter() -> String {
+    warn!("No datacenter specified, defaulting to Dev");
+
+    "Dev".into()
+}
+
+fn default_region() -> String {
+    warn!("No region specified, defaulting to Local");
+    "Local".into()
+}
+
 // The infra team wants a config file on the box where they can set info specific for the box its on.
 // TODO: Double check with infra team (katherine) if they want any other config on the box.
 #[derive(Serialize, Deserialize)]
@@ -40,8 +54,10 @@ pub struct Config {
     #[serde(default = "hostname")]
     pub hostname: String,
     /// The datacenter the agent is running in.
+    #[serde(default = "default_datacenter")]
     pub datacenter: String,
     /// The region the agent is running in.
+    #[serde(default = "default_region")]
     pub region: String,
     /// The number of VCPUs reserved for the agent. Defaults to 2.
     #[serde(default = "default_reserved_vcpus")]
@@ -70,6 +86,7 @@ impl Actor for AgentActor {
             vcpus: sys.cpus().len() as u32,
             memory: ByteSize::b(sys.total_memory()),
             config,
+            vms: AHashMap::new(),
         })
     }
 
@@ -94,21 +111,98 @@ impl Actor for AgentActor {
 impl Message<CreateVM> for AgentActor {
     type Reply = CreateVMReply;
 
+    async fn handle(&mut self, msg: CreateVM, ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
+        let vmid = msg.vm_id;
+        let actor_ref = VMActor::spawn((vmid, msg.config.clone()));
+
+        let _ = actor_ref.register(vmid.to_string()).await;
+        self.vms.insert(vmid, actor_ref.clone());
+
+        trace!(?vmid, "spawned VM actor, linking to context");
+        ctx.actor_ref().link(&actor_ref).await;
+
+        info!(?vmid, "VM Spawned successfully");
+        CreateVMReply {
+            config: Some(msg.config),
+        }
+    }
+}
+
+#[remote_message]
+impl Message<DeleteVM> for AgentActor {
+    type Reply = DeleteVMReply;
+
     async fn handle(
         &mut self,
-        msg: CreateVM,
+        msg: DeleteVM,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        // TODO: this is unfinished. we intend on using the state::provisioning::actor stuff for this I think.
-        let vmid = ulid::Ulid::new();
-        let actor_ref = VMActor::spawn((vmid, msg.config));
-
-        let _ = actor_ref.register("vm").await;
-
-        tracing::info!("someone asked us for available capacity");
-        CreateVMReply {
-            config: Default::default(),
+        match self.vms.remove(&msg.vm_id) {
+            Some(actor_ref) => {
+                let res = actor_ref.stop_gracefully().await;
+                if let Err(err) = res {
+                    // probably a bad way to do this
+                    warn!(vm_id = %msg.vm_id, ?err, "failed to stop VM actor gracefully, killing");
+                    actor_ref.kill();
+                }
+            }
+            None => {
+                warn!(vm_id = %msg.vm_id, "VM actor not found for delete");
+            }
         }
+
+        DeleteVMReply
+    }
+}
+
+#[remote_message]
+impl Message<ShutdownVM> for AgentActor {
+    type Reply = ShutdownVMReply;
+
+    async fn handle(
+        &mut self,
+        msg: ShutdownVM,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        match self.vms.get(&msg.vm_id) {
+            Some(actor_ref) => {
+                let res = actor_ref.stop_gracefully().await;
+                if let Err(err) = res {
+                    // probably a bad way to do this
+                    warn!(vm_id = %msg.vm_id, ?err, "failed to stop VM actor gracefully, killing");
+                    actor_ref.kill();
+                }
+            }
+            None => {
+                warn!(vm_id = %msg.vm_id, "VM actor not found for shutdown");
+            }
+        }
+
+        ShutdownVMReply
+    }
+}
+
+#[remote_message]
+impl Message<AgentListVMs> for AgentActor {
+    type Reply = AgentListVMsReply;
+
+    async fn handle(
+        &mut self,
+        _msg: AgentListVMs,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let vms = self.vms.keys().copied().collect();
+
+        AgentListVMsReply { vms }
+    }
+}
+
+#[remote_message]
+impl Message<Ping> for AgentActor {
+    type Reply = Pong;
+
+    async fn handle(&mut self, _msg: Ping, _ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
+        Pong
     }
 }
 

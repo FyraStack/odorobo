@@ -2993,6 +2993,7 @@ dependencies = [
  "axum",
  "bytesize",
  "clap",
+ "cloud-hypervisor-client",
  "dotenvy",
  "kameo",
  "libp2p",

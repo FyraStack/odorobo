@@ -21,12 +21,8 @@ let output = Command::new("echo")
 #[derive(RemoteActor)]
 pub struct VMActor {
     pub vmid: ulid::Ulid,
-    /// Pre-transform config, transformed config goes into the CH instance itself
-    pub vm_config: VmConfig,
     /// path to the Cloud Hypervisor socket, in /run/odorobo/vms/<VMID>/ch.sock
     pub vm_instance: VMInstance,
-    // handle to the Cloud Hypervisor process
-    process_handle: tokio::process::Child,
 }
 
 impl Actor for VMActor {
@@ -36,33 +32,30 @@ impl Actor for VMActor {
 
     #[tracing::instrument(skip_all)]
     async fn on_start((vmid, vm_config): Self::Args, actor_ref: ActorRef<Self>) -> Result<Self> {
-        let ch_sock_path = VMInstance::runtime_dir_for(&vmid.to_string()).join("ch.sock");
+        // let ch_sock_path = VMInstance::runtime_dir_for(&vmid.to_string()).join("ch.sock");
 
-        let vminstance = VMInstance::new(&vmid.to_string(), ch_sock_path.clone());
+        // // no transform chain
 
-        tracing::warn!("no-op");
-        // spawn CH instance
-        // this probably is not an ideal way to do this, but we want a minimal thing
-        // so let's spawn CH as a child
-        //
-        // ...or we go back to that systemd way
+        // tracing::warn!("no-op");
+        // // spawn CH instance
+        // // this probably is not an ideal way to do this, but we want a minimal thing
+        // // so let's spawn CH as a child
+        // //
+        // // ...or we go back to that systemd way
 
-        // ownership quirk
-        // let value = ch_sock_path.clone();
-        let ch_process = tokio::process::Command::new("cloud-hypervisor")
-            .arg("--api-socket")
-            .arg(&ch_sock_path)
-            .spawn()?;
+        // // ownership quirk
+        // // let value = ch_sock_path.clone();
+        // let ch_process = tokio::process::Command::new("cloud-hypervisor")
+        //     .arg("--api-socket")
+        //     .arg(&ch_sock_path)
+        //     .spawn()?;
         // tokio::spawn(async move {
 
-        //     Ok::<_, Report>(ch_process)
-        // });
+        let vminstance = VMInstance::spawn(&vmid.to_string(), Some(vm_config), None).await?;
 
         Ok(Self {
             vmid,
-            vm_config,
             vm_instance: vminstance,
-            process_handle: ch_process,
         })
     }
 
@@ -88,8 +81,7 @@ impl Actor for VMActor {
 
         self.vm_instance.destroy().await?;
 
-        let res = self.process_handle.wait().await;
-        info!(vmid = %self.vmid, ?res, "VM process exited");
+        // info!(vmid = %self.vmid, ?res, "VM process exited");
 
         Ok(())
     }

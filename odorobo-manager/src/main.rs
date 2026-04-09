@@ -31,19 +31,18 @@ struct Config {
 async fn main() -> Result<()> {
     let _local_peer_id = connect_to_swarm()?;
 
-    odorobo_shared::utils::init()?;
+    odorobo_shared::utils::init(Some("odorobo_manager"))?;
     dotenvy::dotenv().ok();
     info!("Starting odorobo-manager");
 
-    let actor_ref = SchedulerActor::spawn(());
-    let http_actor = HTTPActor::spawn(());
+    let scheduler_actor = SchedulerActor::spawn(());
+    let http_actor = HTTPActor::spawn(scheduler_actor.clone());
 
-    actor_ref.register("scheduler").await?;
+    scheduler_actor.register("scheduler").await?;
     http_actor.register("apiserver").await?;
 
-
     tokio::join!(
-        actor_ref.wait_for_shutdown(),
+        scheduler_actor.wait_for_shutdown(),
         http_actor.wait_for_shutdown(),
     );
 

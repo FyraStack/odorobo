@@ -27,3 +27,29 @@ pub struct CreateVM {
 pub struct CreateVMReply {
     pub config: Option<VmConfig>,
 }
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct DeleteVM {
+    pub vm_id: Ulid,
+}
+
+#[derive(Serialize, Deserialize, Reply, Debug)]
+pub struct DeleteVMReply;
+
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct ShutdownVM {
+    pub vm_id: Ulid,
+}
+
+#[derive(Serialize, Deserialize, Reply, Debug)]
+pub struct ShutdownVMReply;
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct AgentListVMs;
+
+#[derive(Serialize, Deserialize, Reply, Debug)]
+pub struct AgentListVMsReply {
+    // list VMs
+    pub vms: Vec<Ulid>,
+}

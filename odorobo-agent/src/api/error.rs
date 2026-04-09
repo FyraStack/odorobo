@@ -1,4 +1,4 @@
-use axum_responses::{thiserror::Error, HttpError};
+use axum_responses::{HttpError, thiserror::Error};
 use stable_eyre::Report;
 
 use crate::state::ChApiError;

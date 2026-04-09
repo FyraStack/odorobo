@@ -2,9 +2,9 @@
 //!
 //! Provides helper functions that calls the necessary hooks and various methods to start a
 //! Cloud Hypervisor process for a given instance
-mod hooks;
-mod systemd;
 pub mod actor;
+pub mod hooks;
+mod systemd;
 use cloud_hypervisor_client::models::VmConfig;
 use stable_eyre::{Result, eyre::Context};
 use tracing::info;
