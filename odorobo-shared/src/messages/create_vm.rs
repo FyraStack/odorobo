@@ -13,7 +13,7 @@ use ulid::Ulid;
 #[derive(Serialize, Deserialize, Debug)]
 pub struct CreateVM {
     /// the ULID of the VM to create
-    pub vm_id: Ulid,
+    pub vmid: Ulid,
     /// VmConfig in message, untransformed.
     ///
     /// Transformer API will transform this VmConfig into proper
@@ -28,18 +28,17 @@ pub struct CreateVMReply {
     pub config: Option<VmConfig>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DeleteVM {
-    pub vm_id: Ulid,
+    pub vmid: Ulid,
 }
 
-#[derive(Serialize, Deserialize, Reply, Debug)]
+#[derive(Serialize, Deserialize, Reply, Debug, Clone)]
 pub struct DeleteVMReply;
 
-
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ShutdownVM {
-    pub vm_id: Ulid,
+    pub vmid: Ulid,
 }
 
 #[derive(Serialize, Deserialize, Reply, Debug)]
@@ -52,4 +51,15 @@ pub struct AgentListVMs;
 pub struct AgentListVMsReply {
     // list VMs
     pub vms: Vec<Ulid>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct GetVMInfo {
+    pub vmid: Ulid,
+}
+
+#[derive(Serialize, Deserialize, Reply, Debug)]
+pub struct GetVMInfoReply {
+    pub vmid: Ulid,
+    pub config: Option<VmConfig>,
 }

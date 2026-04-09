@@ -10,98 +10,98 @@ use tracing::{error, trace};
 use super::error::ApiError;
 use crate::state::VMInstance;
 
-pub fn router() -> axum::Router<()> {
-    axum::Router::new()
-        .route("/", axum::routing::get(list_vms))
-        // .route("/{vmid}", axum::routing::put(spawn_vm))
-        // .route("/{vmid}/config", axum::routing::put(create_vm_config))
-        // .route("/{vmid}/config", axum::routing::delete(delete_vm_config))
-        // .route("/{vmid}/shutdown", axum::routing::put(shutdown_vm))
-        // .route("/{vmid}/acpi_shutdown", axum::routing::put(shutdown_acpi))
-        // .route("/{vmid}/boot", axum::routing::put(boot_vm))
-        // .route("/{vmid}/pause", axum::routing::put(pause_vm))
-        // .route("/{vmid}/resume", axum::routing::put(resume_vm))
-        // .route("/{vmid}/migrate/send", axum::routing::put(migrate_send_vm))
-        // .route(
-        //     "/{vmid}/migrate/receive",
-        //     axum::routing::put(migrate_receive_vm),
-        // )
-        // .route("/{vmid}", axum::routing::get(vm_info))
-        // .route("/{vmid}/ping", axum::routing::get(ping_vm))
-        // .route("/{vmid}", axum::routing::delete(destroy_vm))
-        // .route(
-        //     "/{vmid}/console",
-        //     axum::routing::get(super::console::console_stream),
-        // )
-        // .route(
-        //     "/{vmid}/ch/{*path}",
-        //     axum::routing::any(super::ch::passthrough),
-        // )
-}
+// pub fn router() -> axum::Router<()> {
+//     axum::Router::new()
+//         .route("/", axum::routing::get(list_vms))
+//         // .route("/{vmid}", axum::routing::put(spawn_vm))
+//         // .route("/{vmid}/config", axum::routing::put(create_vm_config))
+//         // .route("/{vmid}/config", axum::routing::delete(delete_vm_config))
+//         // .route("/{vmid}/shutdown", axum::routing::put(shutdown_vm))
+//         // .route("/{vmid}/acpi_shutdown", axum::routing::put(shutdown_acpi))
+//         // .route("/{vmid}/boot", axum::routing::put(boot_vm))
+//         // .route("/{vmid}/pause", axum::routing::put(pause_vm))
+//         // .route("/{vmid}/resume", axum::routing::put(resume_vm))
+//         // .route("/{vmid}/migrate/send", axum::routing::put(migrate_send_vm))
+//         // .route(
+//         //     "/{vmid}/migrate/receive",
+//         //     axum::routing::put(migrate_receive_vm),
+//         // )
+//         // .route("/{vmid}", axum::routing::get(vm_info))
+//         // .route("/{vmid}/ping", axum::routing::get(ping_vm))
+//         // .route("/{vmid}", axum::routing::delete(destroy_vm))
+//         // .route(
+//         //     "/{vmid}/console",
+//         //     axum::routing::get(super::console::console_stream),
+//         // )
+//         // .route(
+//         //     "/{vmid}/ch/{*path}",
+//         //     axum::routing::any(super::ch::passthrough),
+//         // )
+// }
 
-/// Lists all VMs by their IDs
-async fn list_vms() -> Result<Json<Vec<String>>, ApiError> {
-    let vms = VMInstance::list().map_err(|e| ApiError::ListFailed { msg: e.to_string() })?;
-    Ok(Json(vms.into_iter().map(|i| i.id).collect()))
-}
+// /// Lists all VMs by their IDs
+// async fn list_vms() -> Result<Json<Vec<String>>, ApiError> {
+//     let vms = VMInstance::list().map_err(|e| ApiError::ListFailed { msg: e.to_string() })?;
+//     Ok(Json(vms.into_iter().map(|i| i.id).collect()))
+// }
 
-/// Helper function to get a VM instance by ID, returning an error if not found
-fn get_vm(vmid: &str) -> Result<VMInstance, ApiError> {
-    use crate::state::VMInstance;
-    VMInstance::validate_vmid(vmid).map_err(|e| ApiError::InvalidVmId { msg: e.to_string() })?;
-    VMInstance::get(vmid).ok_or_else(|| ApiError::VmNotFound {
-        vmid: vmid.to_string(),
-    })
-}
+// /// Helper function to get a VM instance by ID, returning an error if not found
+// fn get_vm(vmid: &str) -> Result<VMInstance, ApiError> {
+//     use crate::state::VMInstance;
+//     VMInstance::validate_vmid(vmid).map_err(|e| ApiError::InvalidVmId { msg: e.to_string() })?;
+//     VMInstance::get(vmid).ok_or_else(|| ApiError::VmNotFound {
+//         vmid: vmid.to_string(),
+//     })
+// }
 
-/// Gets detailed information about a specific VM
-async fn vm_info(
-    vmid: Path<String>,
-) -> Result<Json<cloud_hypervisor_client::models::VmInfo>, ApiError> {
-    let vm = get_vm(&vmid.0)?;
+// /// Gets detailed information about a specific VM
+// async fn vm_info(
+//     vmid: Path<String>,
+// ) -> Result<Json<cloud_hypervisor_client::models::VmInfo>, ApiError> {
+//     let vm = get_vm(&vmid.0)?;
 
-    let info = vm.info().await.map_err(ApiError::vm_info)?;
-    Ok(Json(info))
-}
+//     let info = vm.info().await.map_err(ApiError::vm_info)?;
+//     Ok(Json(info))
+// }
 
-/// Pings the VMM to check if it's running
-async fn ping_vm(vmid: Path<String>) -> Result<Json<VmmPingResponse>, ApiError> {
-    let vm = get_vm(&vmid.0)?;
-    let res = vm.ping().await.map_err(ApiError::vm_info)?;
-    Ok(Json(res))
-}
+// /// Pings the VMM to check if it's running
+// async fn ping_vm(vmid: Path<String>) -> Result<Json<VmmPingResponse>, ApiError> {
+//     let vm = get_vm(&vmid.0)?;
+//     let res = vm.ping().await.map_err(ApiError::vm_info)?;
+//     Ok(Json(res))
+// }
 
-#[derive(Debug, Deserialize)]
-pub struct CreateVmQuery {
-    #[serde(default)]
-    /// Whether to boot the VM immediately
-    /// after creation
-    ///
-    /// Defaults to `false`.
-    pub boot: bool,
-}
-#[derive(Debug, Deserialize, Serialize)]
-pub struct VmSpawnResponse {
-    pub info: Option<VmInfo>,
-    pub booted: bool,
-    pub created_config: bool,
-}
+// #[derive(Debug, Deserialize)]
+// pub struct CreateVmQuery {
+//     #[serde(default)]
+//     /// Whether to boot the VM immediately
+//     /// after creation
+//     ///
+//     /// Defaults to `false`.
+//     pub boot: bool,
+// }
+// #[derive(Debug, Deserialize, Serialize)]
+// pub struct VmSpawnResponse {
+//     pub info: Option<VmInfo>,
+//     pub booted: bool,
+//     pub created_config: bool,
+// }
 
-#[derive(Debug, Deserialize, Serialize)]
-pub struct VmMigrateSendResponse {
-    pub info: Option<VmInfo>,
-}
-#[derive(Debug, Deserialize, Serialize)]
-pub struct VmMigrateReceiveResponse {
-    pub listening_address: String,
-}
+// #[derive(Debug, Deserialize, Serialize)]
+// pub struct VmMigrateSendResponse {
+//     pub info: Option<VmInfo>,
+// }
+// #[derive(Debug, Deserialize, Serialize)]
+// pub struct VmMigrateReceiveResponse {
+//     pub listening_address: String,
+// }
 
-#[derive(Debug, Deserialize)]
-pub struct VmMigrateSendRequest {
-    pub destination: String,
-    #[serde(default)]
-    pub local: bool,
-}
+// #[derive(Debug, Deserialize)]
+// pub struct VmMigrateSendRequest {
+//     pub destination: String,
+//     #[serde(default)]
+//     pub local: bool,
+// }
 
 // /// Sends a live migration to the given destination URL.
 // /// Note: the source VMM exits after migration completes, so no VM info is returned.

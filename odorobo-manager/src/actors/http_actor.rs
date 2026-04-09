@@ -21,7 +21,7 @@ pub struct HTTPActor {
 impl HTTPActor {
     pub fn create_vm_message(request: CreateVMRequest) -> CreateVM {
         CreateVM {
-            vm_id: request.data.id,
+            vmid: request.data.id,
             config: VmConfig {
                 cpus: Some(CpusConfig {
                     boot_vcpus: request.data.vcpus as i32,

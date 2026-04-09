@@ -66,7 +66,7 @@ async fn debug_create_vm(
     Json(request): Json<DebugCreateVMRequest>,
 ) -> impl IntoApiResponse {
     let message = odorobo_shared::messages::create_vm::CreateVM {
-        vm_id: ulid::Ulid::new(),
+        vmid: ulid::Ulid::new(),
         config: request.vm_config,
     };
 
@@ -79,7 +79,7 @@ async fn delete_vm(
     State(state): State<ActorRef<HTTPActor>>,
     Path(VmId(vmid)): Path<VmId>,
 ) -> impl IntoApiResponse {
-    let _reply = state.ask(DeleteVM { vm_id: vmid }).await.unwrap();
+    let _reply = state.ask(DeleteVM { vmid }).await.unwrap();
 
     Json(())
 }
@@ -88,7 +88,7 @@ async fn shutdown_vm(
     State(state): State<ActorRef<HTTPActor>>,
     Path(VmId(vmid)): Path<VmId>,
 ) -> impl IntoApiResponse {
-    let _reply = state.ask(ShutdownVM { vm_id: vmid }).await.unwrap();
+    let _reply = state.ask(ShutdownVM { vmid }).await.unwrap();
 
     Json(())
 }

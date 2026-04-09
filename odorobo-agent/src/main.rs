@@ -19,18 +19,18 @@ async fn main() -> Result<()> {
     // minimal axum server, debug socket
     //
     // todo: remove this, here to stub out dead code
-    tokio::task::spawn(async {
-        let listener = tokio::net::TcpListener::bind("0.0.0.0:8890").await?;
-        let port = listener.local_addr()?.port();
-        let addrs: Vec<String> = if_addrs::get_if_addrs()?
-            .into_iter()
-            .filter(|i| !i.is_loopback())
-            .map(|i| format!("http://{}:{}", i.ip(), port))
-            .collect();
-        tracing::info!(port, ?addrs, "Listening");
-        axum::serve(listener, api::router(port)).await?;
-        Ok::<(), stable_eyre::Report>(())
-    });
+    // tokio::task::spawn(async {
+    //     let listener = tokio::net::TcpListener::bind("0.0.0.0:8890").await?;
+    //     let port = listener.local_addr()?.port();
+    //     let addrs: Vec<String> = if_addrs::get_if_addrs()?
+    //         .into_iter()
+    //         .filter(|i| !i.is_loopback())
+    //         .map(|i| format!("http://{}:{}", i.ip(), port))
+    //         .collect();
+    //     tracing::info!(port, ?addrs, "Listening");
+    //     axum::serve(listener, api::router(port)).await?;
+    //     Ok::<(), stable_eyre::Report>(())
+    // });
 
     let local_peer_id = connect_to_swarm().unwrap();
     tracing::info!(?local_peer_id, "Peer ID");

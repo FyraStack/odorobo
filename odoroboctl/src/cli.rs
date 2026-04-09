@@ -94,6 +94,8 @@ async fn print_api_error(response: Response) -> Result<()> {
 
 async fn print_message_response(response: Response, success_message: &str) -> Result<()> {
     if response.status().is_success() {
+        let text = response.text().await?;
+        println!("{text}");
         println!("{success_message}");
     } else {
         print_api_error(response).await?;

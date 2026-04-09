@@ -3,6 +3,7 @@ use ahash::AHashMap;
 use bytesize::ByteSize;
 use kameo::error::ActorStopReason;
 use kameo::prelude::*;
+use kameo::reply::ForwardedReply;
 use odorobo_shared::messages::create_vm::*;
 use odorobo_shared::messages::debug::PanicAgent;
 use odorobo_shared::messages::{Ping, Pong};
@@ -71,6 +72,15 @@ pub struct Config {
     pub annotations: AHashMap<String, String>,
 }
 
+impl AgentActor {
+    async fn lookup_vm_actor(vmid: Ulid) -> Option<ActorRef<VMActor>> {
+        ActorRef::<VMActor>::lookup(format!("vm:{}", vmid))
+            .await
+            .ok()
+            .flatten()
+    }
+}
+
 impl Actor for AgentActor {
     type Args = ();
     type Error = Report;
@@ -105,6 +115,19 @@ impl Actor for AgentActor {
 
         Ok(ControlFlow::Continue(()))
     }
+
+    async fn on_link_died(
+        &mut self,
+        _actor_ref: WeakActorRef<Self>,
+        id: ActorId,
+        reason: ActorStopReason,
+    ) -> Result<ControlFlow<ActorStopReason>> {
+        warn!("Linked actor {id:?} died with reason {reason:?}");
+
+        self.vms.retain(|_, actor_ref| actor_ref.id() != id);
+
+        Ok(ControlFlow::Continue(()))
+    }
 }
 
 #[remote_message]
@@ -112,10 +135,11 @@ impl Message<CreateVM> for AgentActor {
     type Reply = CreateVMReply;
 
     async fn handle(&mut self, msg: CreateVM, ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
-        let vmid = msg.vm_id;
+        let vmid = msg.vmid;
         let actor_ref = VMActor::spawn((vmid, msg.config.clone()));
 
-        let _ = actor_ref.register(vmid.to_string()).await;
+        let _ = actor_ref.register(format!("vm:{}", vmid)).await;
+        let _ = actor_ref.register("vm").await;
         self.vms.insert(vmid, actor_ref.clone());
 
         trace!(?vmid, "spawned VM actor, linking to context");
@@ -137,17 +161,17 @@ impl Message<DeleteVM> for AgentActor {
         msg: DeleteVM,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        match self.vms.remove(&msg.vm_id) {
+        match self.vms.remove(&msg.vmid) {
             Some(actor_ref) => {
-                let res = actor_ref.stop_gracefully().await;
+                let res = actor_ref.tell(msg.clone()).await;
                 if let Err(err) = res {
                     // probably a bad way to do this
-                    warn!(vm_id = %msg.vm_id, ?err, "failed to stop VM actor gracefully, killing");
+                    warn!(vm_id = %msg.vmid, ?err, "failed to stop VM actor gracefully, killing");
                     actor_ref.kill();
                 }
             }
             None => {
-                warn!(vm_id = %msg.vm_id, "VM actor not found for delete");
+                warn!(vm_id = %msg.vmid, "VM actor not found for delete");
             }
         }
 
@@ -157,28 +181,49 @@ impl Message<DeleteVM> for AgentActor {
 
 #[remote_message]
 impl Message<ShutdownVM> for AgentActor {
-    type Reply = ShutdownVMReply;
+    type Reply = Result<ShutdownVMReply, String>;
 
     async fn handle(
         &mut self,
         msg: ShutdownVM,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        match self.vms.get(&msg.vm_id) {
+        match Self::lookup_vm_actor(msg.vmid).await {
             Some(actor_ref) => {
-                let res = actor_ref.stop_gracefully().await;
+                trace!(?msg, "Telling VM to shut down");
+                let res = actor_ref.tell(msg.clone()).await;
                 if let Err(err) = res {
-                    // probably a bad way to do this
-                    warn!(vm_id = %msg.vm_id, ?err, "failed to stop VM actor gracefully, killing");
-                    actor_ref.kill();
+                    warn!(vm_id = %msg.vmid, ?err, "failed to shutdown VM actor");
                 }
             }
             None => {
-                warn!(vm_id = %msg.vm_id, "VM actor not found for shutdown");
+                warn!(vm_id = %msg.vmid, "VM actor not found for shutdown");
+                return Err("VM actor not found for shutdown".to_string());
             }
         }
 
-        ShutdownVMReply
+        Ok(ShutdownVMReply)
+    }
+}
+// forward GetVMInfo to VM actor
+#[remote_message]
+impl Message<GetVMInfo> for AgentActor {
+    type Reply = ForwardedReply<GetVMInfo, GetVMInfoReply>;
+
+    async fn handle(
+        &mut self,
+        msg: GetVMInfo,
+        ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let vmid = msg.vmid;
+
+        match Self::lookup_vm_actor(vmid).await {
+            Some(actor_ref) => ctx.forward(&actor_ref, msg).await,
+            None => {
+                warn!(vm_id = %vmid, "VM actor not found for info lookup");
+                ForwardedReply::from_ok(GetVMInfoReply { vmid, config: None })
+            }
+        }
     }
 }
 
@@ -191,7 +236,17 @@ impl Message<AgentListVMs> for AgentActor {
         _msg: AgentListVMs,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
+        // look up with cache
         let vms = self.vms.keys().copied().collect();
+        // let vms_actors: Vec<_> = RemoteActorRef::<VMActor>::lookup_all("vm").collect().await;
+
+        // let mut vms = Vec::new();
+        // for actor in vms_actors.into_iter().flatten() {
+        //     trace!(?actor, "looking up VM info");
+        //     if let Ok(reply) = actor.ask(&GetVMInfo).await {
+        //         vms.push(reply.vmid);
+        //     }
+        // }
 
         AgentListVMsReply { vms }
     }

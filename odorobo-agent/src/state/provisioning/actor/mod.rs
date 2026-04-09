@@ -3,11 +3,16 @@ use crate::state::VMInstance;
 use crate::state::provisioning::default_provisioner;
 use cloud_hypervisor_client::models::VmConfig;
 use kameo::prelude::*;
+use odorobo_shared::messages::create_vm::DeleteVM;
+use odorobo_shared::messages::create_vm::GetVMInfo;
+use odorobo_shared::messages::create_vm::GetVMInfoReply;
+use odorobo_shared::messages::create_vm::ShutdownVM;
 use stable_eyre::Report;
 use stable_eyre::Result;
 use std::path::PathBuf;
 use tracing::error;
 use tracing::info;
+use tracing::trace;
 use tracing::warn;
 /*
 use std::process::Command;
@@ -91,6 +96,47 @@ impl Actor for VMActor {
 impl From<VMActor> for VMInstance {
     fn from(actor: VMActor) -> Self {
         actor.vm_instance
+    }
+}
+
+
+impl Message<GetVMInfo> for VMActor {
+    type Reply = GetVMInfoReply;
+    async fn handle(
+        &mut self,
+        _msg: GetVMInfo,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        GetVMInfoReply {
+            vmid: self.vmid,
+            config: self.vm_instance.vm_config.clone(),
+        }
+    }
+}
+
+impl Message<ShutdownVM> for VMActor {
+    type Reply = ();
+    async fn handle(
+        &mut self,
+        _msg: ShutdownVM,
+        ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        trace!(vmid = %self.vmid, "Shutting down VM actor");
+        ctx.actor_ref().stop_gracefully().await.unwrap();
+        // ctx.actor_ref().kill();
+    }
+}
+
+
+impl Message<DeleteVM> for VMActor {
+    type Reply = ();
+    async fn handle(
+        &mut self,
+        _msg: DeleteVM,
+        ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        trace!(vmid = %self.vmid, "Shutting down VM actor");
+        ctx.actor_ref().stop_gracefully().await.unwrap();
     }
 }
 
