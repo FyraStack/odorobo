@@ -18,7 +18,7 @@ pub fn env_filter(debug_target: Option<&str>) -> EnvFilter {
         };
 
         base.add_directive(
-            format!("{}=trace", env!("CARGO_PKG_NAME").replace('-', "_"))
+            format!("{}=debug", env!("CARGO_PKG_NAME").replace('-', "_"))
                 .parse()
                 .unwrap(),
         )

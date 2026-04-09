@@ -1,4 +1,5 @@
 use std::ops::ControlFlow;
+use std::time::Duration;
 
 use kameo::prelude::*;
 use odorobo_agent::actor::AgentActor;
@@ -29,6 +30,7 @@ impl SchedulerActor {
             info!("Using agent actor peer id: {agent_actor_peer_id}");
 
             // remotely link actor, on link death it will be automatically unlinked
+            info!("Linking agent actor: {agent_actor_peer_id}");
             actor_ref.link_remote(&agent_actor).await?;
 
             return Ok(agent_actor);
@@ -60,6 +62,18 @@ impl Actor for SchedulerActor {
 
         let agent_actor = Self::lookup_agent(&actor_ref).await?;
 
+        let ping_actor = agent_actor.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                if let Err(err) = ping_actor.ask(&Ping).await {
+                    warn!("Periodic ping to agent failed: {err}");
+                    break;
+                }
+            }
+        });
+
         Ok(Self {
             agent_actor: Some(agent_actor),
         })
@@ -80,6 +94,19 @@ impl Actor for SchedulerActor {
         };
 
         let new_agent = Self::lookup_agent(&actor_ref).await?;
+
+        let ping_actor = new_agent.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                if let Err(err) = ping_actor.ask(&Ping).await {
+                    warn!("Periodic ping to agent failed: {err}");
+                    break;
+                }
+            }
+        });
+
         self.agent_actor = Some(new_agent);
 
         Ok(ControlFlow::Continue(()))
