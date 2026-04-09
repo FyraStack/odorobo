@@ -36,11 +36,11 @@ mod opt_bytesize_as_u64 {
 
 // Newtype so aide can generate a path parameter schema for Ulid.
 /// VM ID, in the format of ULID
-#[derive(Deserialize, JsonSchema, OperationIo)]
+#[derive(Serialize, Deserialize, Debug, JsonSchema, OperationIo, Default, Clone)]
 pub struct VmId(#[schemars(with = "String")] pub Ulid);
 
 /// Volume ID, in the format of ULID
-#[derive(Deserialize, JsonSchema)]
+#[derive(Serialize, Deserialize, Debug, JsonSchema, OperationIo, Default, Clone)]
 pub struct VolumeId(#[schemars(with = "String")] pub Ulid);
 
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Default, Clone)]
@@ -52,9 +52,9 @@ pub struct CreateVMRequest {
 }
 
 /// An internal, debug-only request for creating a VM.
-/// 
+///
 /// please don't use this in production, this is for debugging
-/// 
+///
 /// PUT /vms/
 #[derive(Serialize, Deserialize, Debug, OperationIo, Default, Clone)]
 pub struct DebugCreateVMRequest {
@@ -129,6 +129,12 @@ pub struct VMInfo {
     pub node: Option<String>,
     /// Current status of the VM
     pub status: VMStatus,
+}
+
+#[derive(Serialize, Deserialize, Debug, JsonSchema, Default)]
+pub struct VMListResponse {
+    /// List of VMs currently known by the agent.
+    pub vms: Vec<VmId>,
 }
 
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Default, Clone)]

@@ -112,6 +112,92 @@ impl Message<CreateVM> for SchedulerActor {
     }
 }
 
+impl Message<DeleteVM> for SchedulerActor {
+    type Reply = Result<DeleteVMReply, Report>;
+
+    async fn handle(&mut self, msg: DeleteVM, ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
+        let actor_ref = ctx.actor_ref();
+
+        let first_agent = self.ensure_agent(&actor_ref).await?;
+        match first_agent.ask(&msg).await {
+            Ok(reply) => Ok(reply),
+            Err(first_err) => {
+                warn!(
+                    "DeleteVM forwarding failed, clearing cached agent and retrying lookup: {first_err}"
+                );
+                self.agent_actor = None;
+
+                let retry_agent = self.ensure_agent(&actor_ref).await?;
+                retry_agent.ask(&msg).await.map_err(|retry_err| {
+                    eyre!(
+                        "failed to forward DeleteVM to agent actor after reconnect; first error: {first_err}; retry error: {retry_err}"
+                    )
+                })
+            }
+        }
+    }
+}
+
+impl Message<ShutdownVM> for SchedulerActor {
+    type Reply = Result<ShutdownVMReply, Report>;
+
+    async fn handle(
+        &mut self,
+        msg: ShutdownVM,
+        ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let actor_ref = ctx.actor_ref();
+
+        let first_agent = self.ensure_agent(&actor_ref).await?;
+        match first_agent.ask(&msg).await {
+            Ok(reply) => Ok(reply),
+            Err(first_err) => {
+                warn!(
+                    "ShutdownVM forwarding failed, clearing cached agent and retrying lookup: {first_err}"
+                );
+                self.agent_actor = None;
+
+                let retry_agent = self.ensure_agent(&actor_ref).await?;
+                retry_agent.ask(&msg).await.map_err(|retry_err| {
+                    eyre!(
+                        "failed to forward ShutdownVM to agent actor after reconnect; first error: {first_err}; retry error: {retry_err}"
+                    )
+                })
+            }
+        }
+    }
+}
+
+impl Message<AgentListVMs> for SchedulerActor {
+    type Reply = Result<AgentListVMsReply, Report>;
+
+    async fn handle(
+        &mut self,
+        msg: AgentListVMs,
+        ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let actor_ref = ctx.actor_ref();
+
+        let first_agent = self.ensure_agent(&actor_ref).await?;
+        match first_agent.ask(&msg).await {
+            Ok(reply) => Ok(reply),
+            Err(first_err) => {
+                warn!(
+                    "AgentListVMs forwarding failed, clearing cached agent and retrying lookup: {first_err}"
+                );
+                self.agent_actor = None;
+
+                let retry_agent = self.ensure_agent(&actor_ref).await?;
+                retry_agent.ask(&msg).await.map_err(|retry_err| {
+                    eyre!(
+                        "failed to forward AgentListVMs to agent actor after reconnect; first error: {first_err}; retry error: {retry_err}"
+                    )
+                })
+            }
+        }
+    }
+}
+
 impl Message<Ping> for SchedulerActor {
     type Reply = Pong;
 

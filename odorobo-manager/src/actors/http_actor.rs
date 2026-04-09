@@ -1,6 +1,9 @@
 use cloud_hypervisor_client::models::{CpusConfig, MemoryConfig, PayloadConfig, VmConfig};
 use kameo::prelude::*;
-use odorobo_shared::messages::create_vm::{CreateVM, CreateVMReply};
+use odorobo_shared::messages::create_vm::{
+    AgentListVMs, AgentListVMsReply, CreateVM, CreateVMReply, DeleteVM, DeleteVMReply, ShutdownVM,
+    ShutdownVMReply,
+};
 use stable_eyre::{Report, Result};
 
 use crate::api::types::CreateVMRequest;
@@ -72,6 +75,42 @@ impl Message<CreateVM> for HTTPActor {
     async fn handle(
         &mut self,
         msg: CreateVM,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        Ok(self.scheduler.ask(msg).await?)
+    }
+}
+
+impl Message<DeleteVM> for HTTPActor {
+    type Reply = Result<DeleteVMReply, Report>;
+
+    async fn handle(
+        &mut self,
+        msg: DeleteVM,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        Ok(self.scheduler.ask(msg).await?)
+    }
+}
+
+impl Message<ShutdownVM> for HTTPActor {
+    type Reply = Result<ShutdownVMReply, Report>;
+
+    async fn handle(
+        &mut self,
+        msg: ShutdownVM,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        Ok(self.scheduler.ask(msg).await?)
+    }
+}
+
+impl Message<AgentListVMs> for HTTPActor {
+    type Reply = Result<AgentListVMsReply, Report>;
+
+    async fn handle(
+        &mut self,
+        msg: AgentListVMs,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         Ok(self.scheduler.ask(msg).await?)

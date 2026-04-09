@@ -36,12 +36,36 @@ pub enum Command {
         #[arg(long)]
         boot: bool,
     },
+
+    /// List VMs currently known by the manager/agent.
+    List,
+
+    /// Delete a VM by ID.
+    Delete {
+        /// VM ID in ULID format
+        vmid: String,
+    },
+
+    /// Shut down a VM by ID.
+    Shutdown {
+        /// VM ID in ULID format
+        vmid: String,
+    },
 }
 
 #[derive(Debug, Serialize)]
 struct DebugCreateVMRequest {
     vm_config: serde_json::Value,
     boot: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(transparent)]
+struct VmId(String);
+
+#[derive(Debug, Deserialize)]
+struct VMListResponse {
+    vms: Vec<VmId>,
 }
 
 // the fields are used using debug printing, so we allow dead code warnings
@@ -91,6 +115,31 @@ pub async fn run_command(cli: Cli) -> Result<()> {
             let response = client.put(&url).json(&body).send().await?;
 
             print_message_response(response, "VM create request sent successfully").await?;
+        }
+        Command::List => {
+            let url = format!("{}/vms", base_url);
+            let response = client.get(&url).send().await?;
+
+            if response.status().is_success() {
+                let body = response.json::<VMListResponse>().await?;
+                for vm in body.vms {
+                    println!("{}", vm.0);
+                }
+            } else {
+                print_api_error(response).await?;
+            }
+        }
+        Command::Delete { vmid } => {
+            let url = format!("{}/vms/{}", base_url, vmid);
+            let response = client.delete(&url).send().await?;
+
+            print_message_response(response, "VM delete request sent successfully").await?;
+        }
+        Command::Shutdown { vmid } => {
+            let url = format!("{}/vms/{}/shutdown", base_url, vmid);
+            let response = client.put(&url).send().await?;
+
+            print_message_response(response, "VM shutdown request sent successfully").await?;
         }
     }
 

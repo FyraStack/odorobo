@@ -1,7 +1,9 @@
 //! VM management API handlers.
 use crate::{
     actors::http_actor::HTTPActor,
-    api::types::{CreateVMRequest, DebugCreateVMRequest, UpdateVMRequest, VMInfo, VmId},
+    api::types::{
+        CreateVMRequest, DebugCreateVMRequest, UpdateVMRequest, VMInfo, VMListResponse, VmId,
+    },
 };
 use aide::axum::{
     ApiRouter, IntoApiResponse,
@@ -12,15 +14,26 @@ use axum::{
     extract::{Path, State},
 };
 use kameo::actor::ActorRef;
+use odorobo_shared::messages::create_vm::{AgentListVMs, DeleteVM, ShutdownVM};
 
 pub fn router() -> ApiRouter<ActorRef<HTTPActor>> {
     ApiRouter::new()
+        .api_route("/", get(list_vms))
         .api_route("/", post(create_vm))
         // undocumented debug route, do not use in prod
         .route("/", axum::routing::put(debug_create_vm))
         .api_route("/{vmid}", get(vm_info))
         .api_route("/{vmid}", patch(update_vm))
         .api_route("/{vmid}", delete(delete_vm))
+        .api_route("/{vmid}/shutdown", put(shutdown_vm))
+}
+
+async fn list_vms(State(state): State<ActorRef<HTTPActor>>) -> impl IntoApiResponse {
+    let reply = state.ask(AgentListVMs).await.unwrap();
+
+    Json(VMListResponse {
+        vms: reply.vms.into_iter().map(VmId).collect(),
+    })
 }
 
 /// Get detailed information about a specific VM
@@ -66,7 +79,18 @@ async fn delete_vm(
     State(state): State<ActorRef<HTTPActor>>,
     Path(VmId(vmid)): Path<VmId>,
 ) -> impl IntoApiResponse {
-    // stub
+    let _reply = state.ask(DeleteVM { vm_id: vmid }).await.unwrap();
+
+    Json(())
+}
+
+async fn shutdown_vm(
+    State(state): State<ActorRef<HTTPActor>>,
+    Path(VmId(vmid)): Path<VmId>,
+) -> impl IntoApiResponse {
+    let _reply = state.ask(ShutdownVM { vm_id: vmid }).await.unwrap();
+
+    Json(())
 }
 
 /// Update an existing VM's configuration (e.g. resize, change resources, etc.)
