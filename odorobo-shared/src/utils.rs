@@ -34,11 +34,16 @@ pub fn vm_actor_id(vmid: Ulid) -> String {
 
 pub fn init(debug_target: Option<&str>) -> Result<()> {
     stable_eyre::install()?;
-    tracing_subscriber::fmt()
-        .with_env_filter(env_filter(debug_target))
-        .with_file(true)
-        .with_line_number(true)
-        .init();
+    let fmt = tracing_subscriber::fmt().with_env_filter(env_filter(debug_target));
+    #[cfg(debug_assertions)]
+    let fmt = {
+        fmt.pretty()
+            .with_file(true)
+            .with_line_number(true)
+            .with_ansi(true)
+    };
+
+    fmt.init();
 
     Ok(())
 }
