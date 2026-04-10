@@ -3,7 +3,7 @@ use tracing::{error, info, warn};
 use stable_eyre::{Report, Result};
 
 
-/// HTTP REST API service
+/// 
 #[derive(RemoteActor)]
 pub struct SerialTerminalWebsocketActor;
 
