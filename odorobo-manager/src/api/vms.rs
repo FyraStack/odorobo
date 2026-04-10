@@ -88,7 +88,7 @@ async fn delete_vm(
     State(state): State<ActorRef<HTTPActor>>,
     Path(VmId(vmid)): Path<VmId>,
 ) -> impl IntoApiResponse {
-    let _reply = state.ask(DeleteVM { vmid }).await.unwrap();
+    let _reply = state.ask(DeleteVM { vmid }).await;
 
     Json(())
 }
