@@ -3,8 +3,10 @@ use std::time::Duration;
 
 use kameo::prelude::*;
 use odorobo_agent::actor::AgentActor;
+use odorobo_agent::state::provisioning::actor::VMActor;
 use odorobo_shared::messages::create_vm::*;
 use odorobo_shared::messages::{Ping, Pong};
+use odorobo_shared::utils::vm_actor_id;
 use stable_eyre::{Report, Result, eyre::eyre};
 use tracing::{info, warn};
 
@@ -142,25 +144,18 @@ impl Message<CreateVM> for SchedulerActor {
 impl Message<DeleteVM> for SchedulerActor {
     type Reply = Result<DeleteVMReply, Report>;
 
-    async fn handle(&mut self, msg: DeleteVM, ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
-        let actor_ref = ctx.actor_ref();
-
-        let first_agent = self.ensure_agent(&actor_ref).await?;
-        match first_agent.ask(&msg).await {
-            Ok(reply) => Ok(reply),
-            Err(first_err) => {
-                warn!(
-                    "DeleteVM forwarding failed, clearing cached agent and retrying lookup: {first_err}"
-                );
-                self.agent_actor = None;
-
-                let retry_agent = self.ensure_agent(&actor_ref).await?;
-                retry_agent.ask(&msg).await.map_err(|retry_err| {
-                    eyre!(
-                        "failed to forward DeleteVM to agent actor after reconnect; first error: {first_err}; retry error: {retry_err}"
-                    )
-                })
-            }
+    async fn handle(
+        &mut self,
+        msg: DeleteVM,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let vm = RemoteActorRef::<VMActor>::lookup(vm_actor_id(msg.vmid)).await?;
+        tracing::trace!("DeleteVM: vm={:?}", vm);
+        if let Some(vm) = vm {
+            vm.tell(&msg).send()?;
+            Ok(DeleteVMReply)
+        } else {
+            Err(eyre!("VM not found"))
         }
     }
 }
@@ -171,26 +166,15 @@ impl Message<ShutdownVM> for SchedulerActor {
     async fn handle(
         &mut self,
         msg: ShutdownVM,
-        ctx: &mut Context<Self, Self::Reply>,
+        _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        let actor_ref = ctx.actor_ref();
-
-        let first_agent = self.ensure_agent(&actor_ref).await?;
-        match first_agent.ask(&msg).await {
-            Ok(reply) => Ok(reply),
-            Err(first_err) => {
-                warn!(
-                    "ShutdownVM forwarding failed, clearing cached agent and retrying lookup: {first_err}"
-                );
-                self.agent_actor = None;
-
-                let retry_agent = self.ensure_agent(&actor_ref).await?;
-                retry_agent.ask(&msg).await.map_err(|retry_err| {
-                    eyre!(
-                        "failed to forward ShutdownVM to agent actor after reconnect; first error: {first_err}; retry error: {retry_err}"
-                    )
-                })
-            }
+        let vm = RemoteActorRef::<VMActor>::lookup(vm_actor_id(msg.vmid)).await?;
+        tracing::trace!("ShutdownVM: vm={:?}", vm);
+        if let Some(vm) = vm {
+            vm.tell(&msg).send()?;
+            Ok(ShutdownVMReply)
+        } else {
+            Err(eyre!("VM not found"))
         }
     }
 }
@@ -203,6 +187,21 @@ impl Message<AgentListVMs> for SchedulerActor {
         msg: AgentListVMs,
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
+        // Direct VM discovery attempt kept for reference, but it does not work reliably.
+        // let mut vm_actors = RemoteActorRef::<VMActor>::lookup_all("vm");
+        // let mut vms = Vec::new();
+        //
+        // while let Some(vm_actor) = vm_actors.try_next().await? {
+        //     tracing::trace!("AgentListVMs: vm_actor={:?}", vm_actor);
+        //
+        //     match vm_actor.ask(&GetVMInfo { vmid: ulid::Ulid::nil() }).await {
+        //         Ok(reply) => vms.push(reply.vmid),
+        //         Err(err) => warn!("failed to query VM actor info while listing VMs: {err}"),
+        //     }
+        // }
+        //
+        // Ok(AgentListVMsReply { vms })
+
         let actor_ref = ctx.actor_ref();
 
         let first_agent = self.ensure_agent(&actor_ref).await?;

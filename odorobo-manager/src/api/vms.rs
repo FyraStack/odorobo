@@ -2,7 +2,8 @@
 use crate::{
     actors::http_actor::HTTPActor,
     api::types::{
-        CreateVMRequest, DebugCreateVMRequest, UpdateVMRequest, VMInfo, VMListResponse, VmId,
+        CreateVMRequest, DebugCreateVMRequest, UpdateVMRequest, VMData, VMInfo, VMListResponse,
+        VmId,
     },
 };
 use aide::axum::{
@@ -65,14 +66,22 @@ async fn debug_create_vm(
     State(state): State<ActorRef<HTTPActor>>,
     Json(request): Json<DebugCreateVMRequest>,
 ) -> impl IntoApiResponse {
+    let ulid = ulid::Ulid::new();
     let message = odorobo_shared::messages::create_vm::CreateVM {
-        vmid: ulid::Ulid::new(),
+        vmid: ulid,
         config: request.vm_config,
     };
 
     let _reply = state.ask(message).await.unwrap();
 
-    Json(VMInfo::default())
+    Json(VMInfo {
+        status: crate::api::types::VMStatus::Provisioning,
+        data: VMData {
+            id: ulid,
+            ..Default::default()
+        },
+        ..Default::default()
+    })
 }
 
 async fn delete_vm(

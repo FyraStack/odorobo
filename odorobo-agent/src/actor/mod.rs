@@ -2,7 +2,7 @@ use crate::state::provisioning::actor::VMActor;
 use ahash::AHashMap;
 use bytesize::ByteSize;
 use kameo::prelude::*;
-use odorobo_shared::messages::{Ping, Pong, create_vm::*, debug::PanicAgent};
+use odorobo_shared::{messages::{Ping, Pong, create_vm::*, debug::PanicAgent}, utils::vm_actor_id};
 use serde::{Deserialize, Serialize};
 use stable_eyre::{Report, Result};
 use std::fs;
@@ -132,14 +132,12 @@ impl Message<CreateVM> for AgentActor {
 
     async fn handle(&mut self, msg: CreateVM, ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
         let vmid = msg.vmid;
-        let actor_ref = VMActor::spawn((vmid, msg.config.clone()));
+        // spawn AND link at the same time
+        let actor_ref = VMActor::spawn_link(ctx.actor_ref(), (vmid, msg.config.clone())).await;
 
-        let _ = actor_ref.register(format!("vm:{}", vmid)).await;
+        let _ = actor_ref.register(vm_actor_id(vmid)).await;
         let _ = actor_ref.register("vm").await;
         self.vms.insert(vmid, actor_ref.clone());
-
-        trace!(?vmid, "spawned VM actor, linking to context");
-        ctx.actor_ref().link(&actor_ref).await;
 
         info!(?vmid, "VM Spawned successfully");
         CreateVMReply {

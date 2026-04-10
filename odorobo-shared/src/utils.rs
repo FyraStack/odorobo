@@ -1,6 +1,7 @@
 use stable_eyre::Result;
 // use tracing::
 use tracing_subscriber::{EnvFilter, filter::LevelFilter, fmt, prelude::*};
+use ulid::Ulid;
 
 pub fn env_filter(debug_target: Option<&str>) -> EnvFilter {
     let env = std::env::var("ODOROBO_LOG").unwrap_or_else(|_| "".into());
@@ -25,6 +26,10 @@ pub fn env_filter(debug_target: Option<&str>) -> EnvFilter {
     };
 
     base
+}
+
+pub fn vm_actor_id(vmid: Ulid) -> String {
+    format!("vm:{}", vmid)
 }
 
 pub fn init(debug_target: Option<&str>) -> Result<()> {

@@ -88,7 +88,7 @@ impl From<VMActor> for VMInstance {
         actor.vm_instance
     }
 }
-
+#[remote_message]
 impl Message<GetVMInfo> for VMActor {
     type Reply = GetVMInfoReply;
     async fn handle(
@@ -103,6 +103,7 @@ impl Message<GetVMInfo> for VMActor {
     }
 }
 
+#[remote_message]
 impl Message<ShutdownVM> for VMActor {
     type Reply = ();
     async fn handle(
@@ -115,7 +116,7 @@ impl Message<ShutdownVM> for VMActor {
         // ctx.actor_ref().kill();
     }
 }
-
+#[remote_message]
 impl Message<DeleteVM> for VMActor {
     type Reply = ();
     async fn handle(
