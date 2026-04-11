@@ -4,7 +4,7 @@ use std::time::Duration;
 use kameo::prelude::*;
 use odorobo_agent::actor::AgentActor;
 use odorobo_agent::state::provisioning::actor::VMActor;
-use odorobo_shared::messages::create_vm::*;
+use odorobo_shared::messages::vm::*;
 use odorobo_shared::messages::{Ping, Pong};
 use odorobo_shared::utils::vm_actor_id;
 use stable_eyre::{Report, Result, eyre::eyre};

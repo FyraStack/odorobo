@@ -1,3 +1,4 @@
+//! VM-related messages
 use cloud_hypervisor_client::models::VmConfig;
 use kameo::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -9,8 +10,7 @@ use ulid::Ulid;
 /// Message to create a new VM
 ///
 /// VmConfig is a Cloud Hypervisor VM spec, containing the VM's full configuration (untransformed by odorobo)
-
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CreateVM {
     /// the ULID of the VM to create
     pub vmid: Ulid,
@@ -28,6 +28,38 @@ pub struct CreateVMReply {
     pub config: Option<VmConfig>,
 }
 
+/// Message to delete a VM's config from the agent, shutting it down
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct CloudHypervisorDeleteVMConfig {
+    pub vmid: Ulid,
+}
+
+/// Message to migrate a VM to a destination
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct MigrateVMSend {
+    pub vmid: Ulid,
+    pub target: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct MigrateVMReceive {
+    pub vmid: Ulid,
+    pub config: VmConfig,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PrepMigration {
+    pub vmid: Ulid,
+    pub config: VmConfig,
+}
+
+/// Reply to a MigrateVMReceive message, containing the listening address of the VM
+#[derive(Serialize, Deserialize, Debug, Clone, Reply)]
+pub struct MigrateVMReceiveReply {
+    pub listening_address: String,
+}
+
+/// Message to delete a VM
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DeleteVM {
     pub vmid: Ulid,
@@ -36,6 +68,7 @@ pub struct DeleteVM {
 #[derive(Serialize, Deserialize, Reply, Debug, Clone)]
 pub struct DeleteVMReply;
 
+/// Shuts down a VM temporarily
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ShutdownVM {
     pub vmid: Ulid,
@@ -44,6 +77,7 @@ pub struct ShutdownVM {
 #[derive(Serialize, Deserialize, Reply, Debug)]
 pub struct ShutdownVMReply;
 
+/// List VMs on an agent
 #[derive(Serialize, Deserialize, Debug)]
 pub struct AgentListVMs;
 
@@ -53,6 +87,7 @@ pub struct AgentListVMsReply {
     pub vms: Vec<Ulid>,
 }
 
+/// Get VM info
 #[derive(Serialize, Deserialize, Debug)]
 pub struct GetVMInfo {
     pub vmid: Ulid,

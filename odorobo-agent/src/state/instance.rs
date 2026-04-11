@@ -16,6 +16,7 @@ use std::{
     path::{Path, PathBuf},
 };
 use thiserror::Error;
+use tokio::task::JoinHandle;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::state::{
@@ -146,7 +147,6 @@ impl VMInstance {
     /// - `dest`: the destination URI to migrate to, in the format expected by CH (e.g. "tcp:<IP_ADDRESS>:12345")
     /// - `local`: if true, indicates that the migration is local (e.g. within the same host, for renaming a VM). This is passed to CH and may affect how the migration is performed.
     #[tracing::instrument]
-    #[tracing::instrument]
     pub async fn send_migration(&mut self, dest: &str, local: bool) -> Result<()> {
         let conn = self.conn();
         trace!(destination = dest, "Sending migration command to VM");
@@ -179,7 +179,7 @@ impl VMInstance {
     /// so it's currently up to the caller to make sure that the receiver is ready before the sender tries to connect.
     /// Future improvement: add some kind of global tracker for active migrations and their states.
     #[tracing::instrument]
-    pub async fn receive_migration(&self) -> Result<String> {
+    pub async fn receive_migration(&self) -> Result<(String, JoinHandle<()>)> {
         let conn = self.conn();
         trace!("Preparing VM for migration");
 
@@ -203,7 +203,7 @@ impl VMInstance {
             "Preparing VM for migration, spawning receiver in background"
         );
 
-        tokio::spawn(async move {
+        let migration_task = tokio::spawn(async move {
             match conn
                 .vm_receive_migration_put(receive_migration_data)
                 .await
@@ -221,7 +221,7 @@ impl VMInstance {
             }
         });
 
-        Ok(receiver_uri)
+        Ok((receiver_uri, migration_task))
     }
 
     pub fn runtime_root() -> PathBuf {
@@ -511,6 +511,29 @@ impl VMInstance {
                 .wrap_err(eyre!("Failed to boot VM {}", self.vm_id()))?;
         }
         info!(vm_id = self.vm_id(), "VM created and booted");
+        Ok(())
+    }
+
+    /// Dry-apply a VM config without actually setting it in Cloud Hypervisor,
+    /// allowing for live migration of the VM.
+    pub async fn prep_config(&mut self, config: models::VmConfig) -> Result<()> {
+        self.vm_config = Some(config.clone());
+
+        info!(vm_id = self.vm_id(), "Preparing VM config for migration");
+        // simply "transform" the config here without actually setting it in CH, the migrator will do that for us
+
+        let mut transformed_config = config.clone();
+        self.transformer
+            .transform(self.vm_id(), &mut transformed_config)
+            .wrap_err(eyre!(
+                "Failed to apply config transforms for VM {}",
+                self.vm_id()
+            ))?;
+
+        self.hook_manager
+            .before_boot(self.vm_id(), &config.clone())
+            .await?;
+
         Ok(())
     }
 

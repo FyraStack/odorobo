@@ -2,7 +2,7 @@ use cloud_hypervisor_client::models::{CpusConfig, MemoryConfig, PayloadConfig, V
 use kameo::prelude::*;
 use odorobo_agent::state::provisioning::actor::VMActor;
 use odorobo_shared::{
-    messages::create_vm::{
+    messages::vm::{
         AgentListVMs, AgentListVMsReply, CreateVM, CreateVMReply, DeleteVM, DeleteVMReply,
         ShutdownVM, ShutdownVMReply,
     },

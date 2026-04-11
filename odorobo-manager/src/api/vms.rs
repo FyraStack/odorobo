@@ -15,7 +15,7 @@ use axum::{
     extract::{Path, State},
 };
 use kameo::actor::ActorRef;
-use odorobo_shared::messages::create_vm::{AgentListVMs, DeleteVM, ShutdownVM};
+use odorobo_shared::messages::vm::{AgentListVMs, DeleteVM, ShutdownVM};
 
 pub fn router() -> ApiRouter<ActorRef<HTTPActor>> {
     ApiRouter::new()
@@ -67,7 +67,7 @@ async fn debug_create_vm(
     Json(request): Json<DebugCreateVMRequest>,
 ) -> impl IntoApiResponse {
     let ulid = ulid::Ulid::new();
-    let message = odorobo_shared::messages::create_vm::CreateVM {
+    let message = odorobo_shared::messages::vm::CreateVM {
         vmid: ulid,
         config: request.vm_config,
     };

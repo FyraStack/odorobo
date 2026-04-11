@@ -2,7 +2,10 @@ use crate::state::provisioning::actor::VMActor;
 use ahash::AHashMap;
 use bytesize::ByteSize;
 use kameo::prelude::*;
-use odorobo_shared::{messages::{Ping, Pong, create_vm::*, debug::PanicAgent}, utils::vm_actor_id};
+use odorobo_shared::{
+    messages::{Ping, Pong, debug::PanicAgent, vm::*},
+    utils::vm_actor_id,
+};
 use serde::{Deserialize, Serialize};
 use stable_eyre::{Report, Result};
 use std::fs;
@@ -133,7 +136,8 @@ impl Message<CreateVM> for AgentActor {
     async fn handle(&mut self, msg: CreateVM, ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
         let vmid = msg.vmid;
         // spawn AND link at the same time
-        let actor_ref = VMActor::spawn_link(ctx.actor_ref(), (vmid, msg.config.clone())).await;
+        let actor_ref =
+            VMActor::spawn_link(ctx.actor_ref(), (vmid, Some(msg.config.clone()))).await;
 
         let _ = actor_ref.register(vm_actor_id(vmid)).await;
         let _ = actor_ref.register("vm").await;
@@ -143,6 +147,30 @@ impl Message<CreateVM> for AgentActor {
         CreateVMReply {
             config: Some(msg.config),
         }
+    }
+}
+
+#[remote_message]
+impl Message<MigrateVMReceive> for AgentActor {
+    type Reply = MigrateVMReceiveReply;
+
+    async fn handle(
+        &mut self,
+        msg: MigrateVMReceive,
+        ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let vmid = msg.vmid;
+        let actor_ref = VMActor::spawn_link(ctx.actor_ref(), (vmid, None)).await;
+
+        let _ = actor_ref.register(vm_actor_id(vmid)).await;
+        let _ = actor_ref.register("vm").await;
+        self.vms.insert(vmid, actor_ref.clone());
+
+        // now ask the VM actor to handle the migration receive
+        actor_ref
+            .ask(msg)
+            .await
+            .expect("failed to start migration receiver on destination VM actor")
     }
 }
 

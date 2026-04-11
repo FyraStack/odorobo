@@ -1,7 +1,7 @@
 use kameo::prelude::*;
 use serde::{Deserialize, Serialize};
 
-pub mod create_vm;
+pub mod vm;
 pub mod debug;
 pub mod server_status;
 
