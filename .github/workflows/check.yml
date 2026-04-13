@@ -1,4 +1,4 @@
-name: Build x86
+name: Check Clippy
 
 on:
   push:
