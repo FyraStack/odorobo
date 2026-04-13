@@ -2,9 +2,7 @@ name: Build RISC V RVA23 via x86 cross-compile
 
 on:
   push:
-    branches: [ "main" ]
   pull_request:
-    branches: [ "main" ]
 
 env:
   CARGO_TERM_COLOR: always
