@@ -22,13 +22,21 @@ jobs:
     
     - name: Build
       run: cargo build --verbose --release
-    - name: Upload artifact
+    - name: Upload artifact - agent
       uses: actions/upload-artifact@v7
       with:
         archive: false
-        name: odorobo_x86
+        name: odorobo-agent-x86
         path: |
           target/release/odorobo-agent
+          
+    - name: Upload artifact - odoroboctl
+      uses: actions/upload-artifact@v7
+      with:
+        archive: false
+        name: odoroboctl-x86
+        path: |
           target/release/odoroboctl
+          
     - name: Run tests
       run: cargo test --verbose

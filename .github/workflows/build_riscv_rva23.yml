@@ -25,11 +25,19 @@ jobs:
       run: podman build -t odorobo-builder:rva23 .
     - name: Build binaries
       run: podman run --rm -v ${{ github.workspace }}:/code -w /code odorobo-builder:rva23 cargo build --release --verbose
-    - name: Upload artifact
+
+
+    - name: Upload artifact - agent
       uses: actions/upload-artifact@v7
       with:
         archive: false
-        name: odorobo_riscv_rva23
+        name: odorobo-agent-riscv_rva23
         path: |
           target/riscv64a23-unknown-linux-gnu/release/odorobo-agent
+    - name: Upload artifact - odoroboctl
+      uses: actions/upload-artifact@v7
+      with:
+        archive: false
+        name: odoroboctl-riscv_rva23
+        path: |
           target/riscv64a23-unknown-linux-gnu/release/odoroboctl
