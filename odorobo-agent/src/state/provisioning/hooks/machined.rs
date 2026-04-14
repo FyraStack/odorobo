@@ -4,7 +4,7 @@ use crate::state::VMInstance;
 use crate::state::provisioning::hooks::ProvisioningHook;
 use crate::util::zbus_system_connection;
 use async_trait::async_trait;
-use cloud_hypervisor_client::models::VmConfig;
+use cloud_hypervisor_client::models::VmInfo;
 use stable_eyre::eyre::Context;
 use stable_eyre::{Result, eyre::eyre};
 use zbus_systemd::machine1::ManagerProxy;
@@ -40,7 +40,7 @@ pub struct CHMachineProvisioningHook;
 
 #[async_trait]
 impl ProvisioningHook for CHMachineProvisioningHook {
-    async fn after_start(&self, vmid: &str, _config: &VmConfig, pid: i32) -> Result<()> {
+    async fn after_start(&self, vmid: &str, _config: &VmInfo, pid: i32) -> Result<()> {
         if pid == 0 {
             tracing::warn!(
                 vmid,
@@ -74,7 +74,7 @@ impl ProvisioningHook for CHMachineProvisioningHook {
         Ok(())
     }
 
-    async fn before_stop(&self, vmid: &str, _config: &VmConfig) -> Result<()> {
+    async fn before_stop(&self, vmid: &str, _config: &VmInfo) -> Result<()> {
         tracing::info!(vmid, "Unregistering machine from systemd-machined");
         let res = async {
             let manager = get_manager_proxy().await?;

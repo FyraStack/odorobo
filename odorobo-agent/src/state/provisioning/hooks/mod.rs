@@ -8,7 +8,7 @@
 //! to accomodate for the host environment, while hooks provide ways for the host itself
 //! to react to provisioning events and perform necessary setup/teardown actions.
 use async_trait::async_trait;
-use cloud_hypervisor_client::models::VmConfig;
+use cloud_hypervisor_client::models::{VmConfig, VmInfo};
 use stable_eyre::Result;
 
 mod machined;
@@ -19,10 +19,10 @@ pub trait ProvisioningHook: Send + Sync {
     async fn before_start(&self, _vmid: &str, _config: &VmConfig) -> Result<()> {
         Ok(())
     }
-    async fn after_start(&self, _vmid: &str, _config: &VmConfig, _pid: i32) -> Result<()> {
+    async fn after_start(&self, _vmid: &str, _config: &VmInfo, _pid: i32) -> Result<()> {
         Ok(())
     }
-    async fn before_stop(&self, _vmid: &str, _config: &VmConfig) -> Result<()> {
+    async fn before_stop(&self, _vmid: &str, _config: &VmInfo) -> Result<()> {
         Ok(())
     }
     async fn after_stop(&self, _vmid: &str, _config: &VmConfig) -> Result<()> {
@@ -31,7 +31,7 @@ pub trait ProvisioningHook: Send + Sync {
     async fn before_boot(&self, _vmid: &str, _config: &VmConfig) -> Result<()> {
         Ok(())
     }
-    async fn after_boot(&self, _vmid: &str, _config: &VmConfig) -> Result<()> {
+    async fn after_boot(&self, _vmid: &str, _config: &VmInfo) -> Result<()> {
         Ok(())
     }
 }
@@ -53,14 +53,14 @@ impl HookManager {
         Ok(())
     }
 
-    pub async fn after_start(&self, vmid: &str, config: &VmConfig, pid: i32) -> Result<()> {
+    pub async fn after_start(&self, vmid: &str, config: &VmInfo, pid: i32) -> Result<()> {
         for hook in &self.hooks {
             hook.after_start(vmid, config, pid).await?;
         }
         Ok(())
     }
 
-    pub async fn before_stop(&self, vmid: &str, config: &VmConfig) -> Result<()> {
+    pub async fn before_stop(&self, vmid: &str, config: &VmInfo) -> Result<()> {
         for hook in &self.hooks {
             hook.before_stop(vmid, config).await?;
         }
@@ -81,7 +81,7 @@ impl HookManager {
         Ok(())
     }
 
-    pub async fn after_boot(&self, vmid: &str, config: &VmConfig) -> Result<()> {
+    pub async fn after_boot(&self, vmid: &str, config: &VmInfo) -> Result<()> {
         for hook in &self.hooks {
             hook.after_boot(vmid, config).await?;
         }

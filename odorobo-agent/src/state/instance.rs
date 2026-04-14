@@ -116,8 +116,12 @@ impl VMInstance {
             .map_err(ChApiError::from)
             .wrap_err(eyre!("Failed to boot VM {}", self.vm_id()))?;
 
+        // get VM info after boot
+
+        let vm_info_postboot = self.info().await?;
+
         self.hook_manager
-            .after_boot(self.vm_id(), &vm_config)
+            .after_boot(self.vm_id(), &vm_info_postboot)
             .await?;
 
         Ok(())
