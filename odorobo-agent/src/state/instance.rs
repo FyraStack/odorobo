@@ -16,12 +16,15 @@ use std::{
     path::{Path, PathBuf},
 };
 use thiserror::Error;
+use tokio::task::JoinHandle;
 use tracing::{debug, error, info, trace, warn};
 
-use crate::state::transform::{ConfigTransform, TransformChain};
+use crate::state::{
+    provisioning::hooks::HookManager,
+    transform::{ConfigTransform, TransformChain},
+};
 
 use super::api::{call, call_request};
-use super::transform::apply_builtin_transforms;
 
 pub const CONFIG_FILE_NAME: &str = "config.json";
 const SOCKET_FILE_NAME: &str = "ch.sock";
@@ -31,10 +34,24 @@ pub type ConsoleStream = std::fs::File;
 const DEFAULT_RUNTIME_ROOT_DIR: &str = "/run/odorobo";
 const RUNTIME_ROOT_ENV_VAR: &str = "ODOROBO_RUNTIME_DIR";
 
-#[derive(Debug, Clone)]
 pub struct VMInstance {
     pub id: String,
     pub ch_socket_path: PathBuf,
+    transformer: TransformChain,
+    hook_manager: HookManager,
+    child_process: Option<tokio::process::Child>,
+    /// Pre-transformed VM config, if available
+    pub vm_config: Option<models::VmConfig>,
+}
+
+impl std::fmt::Debug for VMInstance {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VMInstance")
+            .field("id", &self.id)
+            .field("ch_socket_path", &self.ch_socket_path)
+            .field("vm_config", &self.vm_config)
+            .finish()
+    }
 }
 
 #[derive(Debug, Error)]
@@ -62,24 +79,38 @@ impl From<ChClientError> for ChApiError {
 }
 
 impl VMInstance {
-    pub fn new(id: &str, ch_socket_path: PathBuf) -> Self {
+    fn new(
+        id: &str,
+        ch_socket_path: PathBuf,
+        transformer: Option<TransformChain>,
+        child_process: Option<tokio::process::Child>,
+    ) -> Self {
         Self {
             id: id.to_string(),
             ch_socket_path,
+            transformer: transformer.unwrap_or_default(),
+            hook_manager: HookManager::default(),
+            child_process,
+            vm_config: None,
         }
     }
 
+    /// Get a VM instance by its ID through the filesystem database
+    ///
+    /// Not reliable as of 0.2
+    #[deprecated(since = "0.2.0")]
     pub fn get(vmid: &str) -> Option<Self> {
         Self::list().ok()?.into_iter().find(|i| i.id == vmid)
     }
 
     pub async fn boot(&self) -> Result<()> {
         // boot hooks
-        let provisioner = super::provisioning::default_provisioner();
 
         let vm_config = self.info().await?.config;
 
-        provisioner.before_boot(self.vm_id(), &vm_config).await?;
+        self.hook_manager
+            .before_boot(self.vm_id(), &vm_config)
+            .await?;
 
         self.conn()
             .boot_vm()
@@ -87,7 +118,9 @@ impl VMInstance {
             .map_err(ChApiError::from)
             .wrap_err(eyre!("Failed to boot VM {}", self.vm_id()))?;
 
-        provisioner.after_boot(self.vm_id(), &vm_config).await?;
+        self.hook_manager
+            .after_boot(self.vm_id(), &vm_config)
+            .await?;
 
         Ok(())
     }
@@ -114,7 +147,7 @@ impl VMInstance {
     /// - `dest`: the destination URI to migrate to, in the format expected by CH (e.g. "tcp:<IP_ADDRESS>:12345")
     /// - `local`: if true, indicates that the migration is local (e.g. within the same host, for renaming a VM). This is passed to CH and may affect how the migration is performed.
     #[tracing::instrument]
-    pub async fn send_migration(&self, dest: &str, local: bool) -> Result<()> {
+    pub async fn send_migration(&mut self, dest: &str, local: bool) -> Result<()> {
         let conn = self.conn();
         trace!(destination = dest, "Sending migration command to VM");
 
@@ -146,7 +179,7 @@ impl VMInstance {
     /// so it's currently up to the caller to make sure that the receiver is ready before the sender tries to connect.
     /// Future improvement: add some kind of global tracker for active migrations and their states.
     #[tracing::instrument]
-    pub async fn receive_migration(&self) -> Result<String> {
+    pub async fn receive_migration(&self) -> Result<(String, JoinHandle<()>)> {
         let conn = self.conn();
         trace!("Preparing VM for migration");
 
@@ -170,19 +203,25 @@ impl VMInstance {
             "Preparing VM for migration, spawning receiver in background"
         );
 
-        tokio::spawn(async move {
+        let migration_task = tokio::spawn(async move {
             match conn
                 .vm_receive_migration_put(receive_migration_data)
                 .await
                 .map_err(ChApiError::from)
                 .wrap_err(eyre!("Failed to prepare VM for migration {}", vm_id))
             {
-                Ok(_) => info!(vm_id, "Migration receiver completed successfully"),
+                Ok(_) => {
+                    info!(vm_id, "Migration receiver completed successfully");
+                    // shut down vm
+                    if let Err(e) = conn.shutdown_vmm().await {
+                        error!(vm_id, error = ?e, "Failed to shut down VM after migration");
+                    }
+                }
                 Err(e) => error!(vm_id, error = ?e, "Migration receiver failed"),
             }
         });
 
-        Ok(receiver_uri)
+        Ok((receiver_uri, migration_task))
     }
 
     pub fn runtime_root() -> PathBuf {
@@ -305,25 +344,33 @@ impl VMInstance {
     ///
     /// Waits for the socket to become available (polls up to ~30 seconds).
     /// Calls a backend to handle the actual CH process spawning - typically a systemd unit
-    #[allow(dead_code)] // this thing is used in the REST API
-    pub async fn spawn(id: &str) -> Result<Self> {
-        info!(
-            vm_id = id,
-            socket_path = ?Self::runtime_dir_for(id).join(SOCKET_FILE_NAME),
-            "Spawning CH process for new VM"
-        );
-
-        let provisioner = super::provisioning::default_provisioner();
-        // nothing for now, transformers will be used instead?
-        provisioner.start_instance(id, &VmConfig::default()).await?;
-
-        let instance = Self::new(id, Self::runtime_dir_for(id).join(SOCKET_FILE_NAME));
+    #[tracing::instrument(skip_all)]
+    pub async fn spawn(
+        id: &str,
+        vm_config: Option<VmConfig>,
+        transformer: Option<TransformChain>,
+    ) -> Result<Self> {
+        let ch_socket_path = Self::runtime_dir_for(id).join(SOCKET_FILE_NAME);
+        info!(?ch_socket_path, "Spawning VM");
+        // make sure socket path parent exists
+        if !ch_socket_path.parent().unwrap().exists() {
+            std::fs::create_dir_all(ch_socket_path.parent().unwrap())?;
+        }
+        let ch_process = tokio::process::Command::new("cloud-hypervisor")
+            .arg("--api-socket")
+            .arg(&ch_socket_path)
+            .spawn()?;
+        let mut instance = Self::new(id, ch_socket_path, transformer, Some(ch_process));
 
         const MAX_ATTEMPTS: u32 = 31;
         for attempt in 0..MAX_ATTEMPTS {
-            trace!(vm_id = id, attempt, "Checking if CH socket is available");
+            info!(vm_id = id, attempt, "Checking if CH socket is available");
             if instance.conn().vmm_ping_get().await.is_ok() {
-                debug!(vm_id = id, "CH socket available");
+                info!(vm_id = id, "CH socket available");
+                if let Some(vm_config) = vm_config {
+                    info!(?vm_config, "Creating VM config and booting");
+                    instance.create_config(vm_config, true).await?;
+                }
                 return Ok(instance);
             }
 
@@ -340,7 +387,7 @@ impl VMInstance {
     }
 
     /// Gracefully shutdown the VM and VMM, then clean up runtime state.
-    pub async fn destroy(&self) -> Result<()> {
+    pub async fn destroy(&mut self) -> Result<()> {
         info!(
             vm_id = self.vm_id(),
             "Destroying VM instance, shutting down VM and cleaning up runtime state"
@@ -349,7 +396,7 @@ impl VMInstance {
             trace!(vm_id = self.vm_id(), state = ?info.state, "Checking VM state before destroy");
             if matches!(
                 info.state,
-                models::vm_info::State::Running | models::vm_info::State::Paused
+                models::VmState::Running | models::VmState::Paused
             ) {
                 info!(vm_id = self.vm_id(), "Shutting down VM before destroy");
                 self.shutdown().await?;
@@ -361,16 +408,6 @@ impl VMInstance {
             );
         }
 
-        let provisioner = super::provisioning::default_provisioner();
-
-        let vm_config = self
-            .info()
-            .await
-            .ok()
-            .map(|i| i.config)
-            .or_else(|| self.load_config().ok())
-            .unwrap_or_default();
-
         if let Ok(()) = self.conn().shutdown_vmm().await {
             debug!(vm_id = self.vm_id(), "VMM shutdown successfully");
         } else {
@@ -379,8 +416,22 @@ impl VMInstance {
                 "Failed to shutdown VMM, assuming it is already stopped or unresponsive"
             );
         }
+        let vm_config = self.vm_config.clone().unwrap_or_default();
+        if let Some(mut child) = self.child_process.take() {
+            trace!("VMM stopped... checking child process");
+            let _ = child.start_kill();
+            if let Err(err) = child.wait().await {
+                warn!(
+                    vm_id = self.vm_id(),
+                    ?err,
+                    "Failed to wait for child process, manual cleanup may be required"
+                );
+            }
+        }
 
-        provisioner.stop_instance(self.vm_id(), &vm_config).await?;
+        self.hook_manager
+            .after_stop(self.vm_id(), &vm_config)
+            .await?;
 
         if let Err(err) = self.purge_instance_data() {
             warn!(
@@ -396,9 +447,9 @@ impl VMInstance {
     /// Purge the runtime data for this VM instance.
     ///
     /// This removes the runtime directory and all its contents if it exists.
-    pub fn purge_instance_data(&self) -> Result<()> {
-        let mut vm_config = self.load_config().unwrap_or_default();
-        TransformChain::default().teardown(self.vm_id(), &mut vm_config)?;
+    pub fn purge_instance_data(&mut self) -> Result<()> {
+        let mut vm_config = self.vm_config.take().unwrap_or_default();
+        self.transformer.teardown(self.vm_id(), &mut vm_config)?;
         let runtime_dir = self.runtime_dir();
         if runtime_dir.exists() {
             fs::remove_dir_all(runtime_dir).wrap_err(eyre!(
@@ -432,19 +483,23 @@ impl VMInstance {
     /// Applies node-specific transforms, saves config to disk, then:
     /// 1. Creates the VM via CH API
     /// 2. Boots the VM (if boot is true)
-    pub async fn create(&self, config: models::VmConfig, boot: bool) -> Result<()> {
+    pub async fn create_config(&mut self, config: models::VmConfig, boot: bool) -> Result<()> {
         trace!(vm_id = self.vm_id(), "Creating VM with provided config");
-        let mut config = config;
-        trace!(vm_id = self.vm_id(), "Applying config transforms");
-        apply_builtin_transforms(self.vm_id(), &mut config)
-            .wrap_err("Failed to apply config transforms")?;
 
-        trace!(vm_id = self.vm_id(), "Saving config to runtime dir");
-        self.save_config(&config)?;
+        trace!(vm_id = self.vm_id(), "Applying config transforms");
+        let mut transformed_config = config.clone();
+        self.transformer
+            .transform(self.vm_id(), &mut transformed_config)
+            .wrap_err(eyre!(
+                "Failed to apply config transforms for VM {}",
+                self.vm_id()
+            ))?;
+
+        // self.save_config(&config)?;
 
         trace!(vm_id = self.vm_id(), "Creating VM via CH API");
         self.conn()
-            .create_vm(config)
+            .create_vm(transformed_config)
             .await
             .map_err(ChApiError::from)
             .wrap_err(eyre!("Failed to create VM {}", self.vm_id()))?;
@@ -456,6 +511,29 @@ impl VMInstance {
                 .wrap_err(eyre!("Failed to boot VM {}", self.vm_id()))?;
         }
         info!(vm_id = self.vm_id(), "VM created and booted");
+        Ok(())
+    }
+
+    /// Dry-apply a VM config without actually setting it in Cloud Hypervisor,
+    /// allowing for live migration of the VM.
+    pub async fn prep_config(&mut self, config: models::VmConfig) -> Result<()> {
+        self.vm_config = Some(config.clone());
+
+        info!(vm_id = self.vm_id(), "Preparing VM config for migration");
+        // simply "transform" the config here without actually setting it in CH, the migrator will do that for us
+
+        let mut transformed_config = config.clone();
+        self.transformer
+            .transform(self.vm_id(), &mut transformed_config)
+            .wrap_err(eyre!(
+                "Failed to apply config transforms for VM {}",
+                self.vm_id()
+            ))?;
+
+        self.hook_manager
+            .before_boot(self.vm_id(), &config.clone())
+            .await?;
+
         Ok(())
     }
 
@@ -474,15 +552,6 @@ impl VMInstance {
         Ok(())
     }
 
-    /// Call a custom CH API path with an explicit HTTP method.
-    ///
-    /// For debugging: lets you hit any CH API endpoint directly.
-    pub async fn call(&self, method: Method, path: &str, body: Option<&Value>) -> Result<()> {
-        call(self.ch_socket_path(), method, path, body)
-            .await
-            .wrap_err(eyre!("Failed to call {} for {}", path, self.vm_id()))
-    }
-
     /// Proxy a raw HTTP request to the CH API socket.
     pub async fn call_request(&self, request: Request<Bytes>) -> Result<Response<Bytes>> {
         call_request(self.ch_socket_path(), request)
@@ -493,6 +562,7 @@ impl VMInstance {
     /// List running VM instances.
     ///
     /// Scans runtime root for directories with valid sockets.
+    #[deprecated(since = "0.2.0")]
     pub fn list() -> Result<Vec<Self>> {
         let root = Self::runtime_root();
         fs::create_dir_all(&root)?;
@@ -506,7 +576,7 @@ impl VMInstance {
                     let id = entry.file_name().to_string_lossy().to_string();
                     let ch_socket_path = Self::runtime_dir_for(&id).join(SOCKET_FILE_NAME);
 
-                    Some(Self::new(&id, ch_socket_path))
+                    Some(Self::new(&id, ch_socket_path, None, None))
                 })
             })
             .collect())

@@ -1,4 +1,4 @@
 pub mod actor;
 mod api;
-mod state;
+pub mod state;
 mod util;

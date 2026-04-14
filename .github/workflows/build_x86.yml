@@ -2,12 +2,12 @@ name: Build x86
 
 on:
   push:
-    branches: [ "main" ]
   pull_request:
-    branches: [ "main" ]
 
 env:
   CARGO_TERM_COLOR: always
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: "sccache"
 
 jobs:
   build:
@@ -16,14 +16,27 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+    - uses: rui314/setup-mold@v1
+    - name: Run sccache-cache
+      uses: mozilla-actions/sccache-action@v0.0.9
+    
     - name: Build
       run: cargo build --verbose --release
-    - name: Upload artifact
-      uses: actions/upload-artifact@v4
+    - name: Upload artifact - agent
+      uses: actions/upload-artifact@v7
       with:
-        name: odorobo_x86
+        archive: false
+        name: odorobo-agent-x86
         path: |
           target/release/odorobo-agent
+          
+    - name: Upload artifact - odoroboctl
+      uses: actions/upload-artifact@v7
+      with:
+        archive: false
+        name: odoroboctl-x86
+        path: |
           target/release/odoroboctl
+          
     - name: Run tests
       run: cargo test --verbose

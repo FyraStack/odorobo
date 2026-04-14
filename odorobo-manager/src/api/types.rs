@@ -1,5 +1,6 @@
 use aide::OperationIo;
 use bytesize::ByteSize;
+use cloud_hypervisor_client::models::VmConfig;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
@@ -35,14 +36,14 @@ mod opt_bytesize_as_u64 {
 
 // Newtype so aide can generate a path parameter schema for Ulid.
 /// VM ID, in the format of ULID
-#[derive(Deserialize, JsonSchema, OperationIo)]
+#[derive(Serialize, Deserialize, Debug, JsonSchema, OperationIo, Default, Clone)]
 pub struct VmId(#[schemars(with = "String")] pub Ulid);
 
 /// Volume ID, in the format of ULID
-#[derive(Deserialize, JsonSchema)]
+#[derive(Serialize, Deserialize, Debug, JsonSchema, OperationIo, Default, Clone)]
 pub struct VolumeId(#[schemars(with = "String")] pub Ulid);
 
-#[derive(Serialize, Deserialize, Debug, JsonSchema, Default)]
+#[derive(Serialize, Deserialize, Debug, JsonSchema, Default, Clone)]
 pub struct CreateVMRequest {
     /// Data of the VM to create
     pub data: VMData,
@@ -50,7 +51,20 @@ pub struct CreateVMRequest {
     pub boot: bool,
 }
 
-#[derive(Serialize, Deserialize, Debug, JsonSchema, Default)]
+/// An internal, debug-only request for creating a VM.
+///
+/// please don't use this in production, this is for debugging
+///
+/// PUT /vms/
+#[derive(Serialize, Deserialize, Debug, OperationIo, Default, Clone)]
+pub struct DebugCreateVMRequest {
+    /// Data of the VM to create
+    pub vm_config: VmConfig,
+    /// Whether to boot the VM immediately after creation
+    pub boot: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, JsonSchema, Default, Clone)]
 pub struct VMData {
     /// VM ID. This is a ULID string.
     #[schemars(with = "String")]
@@ -118,6 +132,12 @@ pub struct VMInfo {
 }
 
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Default)]
+pub struct VMListResponse {
+    /// List of VMs currently known by the agent.
+    pub vms: Vec<VmId>,
+}
+
+#[derive(Serialize, Deserialize, Debug, JsonSchema, Default, Clone)]
 pub struct Volume {
     /// Volume ID. This is a ULID string.
     #[schemars(with = "String")]

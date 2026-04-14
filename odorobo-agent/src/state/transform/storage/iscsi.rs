@@ -1,7 +1,7 @@
 //! iSCSI initiator transformer for storage backend
 //! resolves iscsi:// URIs by logging into the iSCSI target and returning the local
 //! block device path for the specified target and LUN, e.g. /dev/disk/by-path/ip-*
-use super::StorageBackend;
+use super::StorageDriver;
 use async_trait::async_trait;
 use serde::Deserialize;
 use stable_eyre::{Result, eyre::eyre};
@@ -76,26 +76,26 @@ impl From<&Url> for ISCSITarget {
     }
 }
 
-fn list_iscsi_devices() -> Result<Vec<PathBuf>> {
-    // simply just list /dev/disk/by-path/ip-* for now
+// fn list_iscsi_devices() -> Result<Vec<PathBuf>> {
+//     // simply just list /dev/disk/by-path/ip-* for now
 
-    let mut devices = Vec::new();
-    let by_path = Path::new("/dev/disk/by-path");
-    if by_path.exists() {
-        for entry in by_path.read_dir()? {
-            let entry = entry?;
-            let file_name = entry.file_name();
-            let file_name_str = file_name.to_string_lossy();
-            if file_name_str.starts_with("ip-") {
-                let device_path = entry.path();
-                if device_path.exists() {
-                    devices.push(device_path);
-                }
-            }
-        }
-    }
-    Ok(devices)
-}
+//     let mut devices = Vec::new();
+//     let by_path = Path::new("/dev/disk/by-path");
+//     if by_path.exists() {
+//         for entry in by_path.read_dir()? {
+//             let entry = entry?;
+//             let file_name = entry.file_name();
+//             let file_name_str = file_name.to_string_lossy();
+//             if file_name_str.starts_with("ip-") {
+//                 let device_path = entry.path();
+//                 if device_path.exists() {
+//                     devices.push(device_path);
+//                 }
+//             }
+//         }
+//     }
+//     Ok(devices)
+// }
 
 // /dev/disk/by-path/ip-127.0.0.1:3260-iscsi-iqn.2026-03.com.fyrastack:test-lun-0
 
@@ -129,7 +129,7 @@ impl TryFrom<PathBuf> for ISCSITarget {
 pub struct ISCSIStorage;
 
 #[async_trait]
-impl StorageBackend for ISCSIStorage {
+impl StorageDriver for ISCSIStorage {
     fn scheme(&self) -> &'static str {
         "iscsi"
     }

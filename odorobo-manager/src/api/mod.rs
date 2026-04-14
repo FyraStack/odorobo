@@ -8,9 +8,12 @@ use aide::{
     swagger::Swagger,
 };
 use axum::{Extension, Json, Router};
+use kameo::actor::ActorRef;
+
+use crate::actors::http_actor::HTTPActor;
 
 /// Build the full app: finalizes the OpenAPI spec and attaches it as an extension.
-pub fn build() -> Router {
+pub fn build(state: ActorRef<HTTPActor>) -> Router {
     aide::generate::on_error(|error| {
         tracing::warn!("aide schema gen error: {error}");
     });
@@ -24,7 +27,9 @@ pub fn build() -> Router {
         ..Default::default()
     };
 
-    router().finish_api(&mut openapi).layer(Extension(openapi))
+    router::<()>(state)
+        .finish_api(&mut openapi)
+        .layer(Extension(openapi))
 }
 
 // todo: error handling
@@ -34,14 +39,18 @@ pub fn build() -> Router {
 // - cappy
 
 /// Main router for the API
-fn router() -> ApiRouter {
-    ApiRouter::new()
+fn router<S>(state: ActorRef<HTTPActor>) -> ApiRouter<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    ApiRouter::<ActorRef<HTTPActor>>::new()
         .api_route("/health", get(health))
         .api_route("/swagger", Swagger::new("/openapi.json").axum_route())
         .api_route("/openapi.json", get(serve_api))
-        .nest("/nodes", nodes::router())
-        .nest("/vms", vms::router())
-        .nest("/volumes", volumes::router())
+        .nest("/nodes", nodes::router().with_state(state.clone()))
+        .nest("/vms", vms::router().with_state(state.clone()))
+        .nest("/volumes", volumes::router().with_state(state.clone()))
+        .with_state(state)
 }
 
 /// Serve the OpenAPI spec as JSON

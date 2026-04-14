@@ -11,8 +11,8 @@ pub trait ConfigTransform: Send + Sync {
     }
 }
 
-mod console;
-mod path_verify;
+pub mod console;
+pub mod path_verify;
 pub mod storage;
 pub use console::ConsoleTransform;
 pub use path_verify::PathVerify;
@@ -56,12 +56,8 @@ impl ConfigTransform for TransformChain {
 impl Default for TransformChain {
     fn default() -> Self {
         Self::new()
-            .add(storage::StorageChain::default())
+            .add(storage::StorageDriverTransformer::default())
             .add(ConsoleTransform)
             .add(PathVerify)
     }
-}
-
-pub fn apply_builtin_transforms(vmid: &str, config: &mut VmConfig) -> Result<()> {
-    TransformChain::default().transform(vmid, config)
 }

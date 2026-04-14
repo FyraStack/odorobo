@@ -9,7 +9,8 @@ use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::{PeerId, kad, mdns, noise, tcp, yamux};
 use stable_eyre::Result;
 use std::cell::RefCell;
-use tracing::{debug, info, warn};
+use std::time::Duration;
+use tracing::{debug, info, trace, warn};
 
 #[derive(NetworkBehaviour)]
 pub struct ProductionBehaviour {
@@ -77,7 +78,7 @@ pub fn connect_to_swarm() -> Result<PeerId> {
                 SwarmEvent::Behaviour(ProductionBehaviourEvent::Kameo(
                     remote::Event::Messaging(messaging_event),
                 )) => {
-                    debug!(?messaging_event, "Messaging event");
+                    trace!(?messaging_event, "Messaging event");
                 }
                 // Handle other swarm events
                 SwarmEvent::NewListenAddr { address, .. } => {

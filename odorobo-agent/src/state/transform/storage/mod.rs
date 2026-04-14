@@ -29,7 +29,7 @@ mod rbd;
 // using async_trait here because even with Rust 1.75, dyn in async traits do not work due to
 // vtable issues
 #[async_trait]
-pub trait StorageBackend: Send + Sync {
+pub trait StorageDriver: Send + Sync {
     /// The URI scheme this backend handles, e.g. `"rbd"`, `"file"`. Used for dispatch in `StorageChain`.
     fn scheme(&self) -> &'static str;
 
@@ -44,21 +44,21 @@ pub trait StorageBackend: Send + Sync {
 /// whose scheme matches the URI scheme.
 ///
 /// Disk paths that are not URIs or whose scheme has no registered backend are left unchanged.
-pub struct StorageChain {
-    backends: Vec<Box<dyn StorageBackend>>,
+pub struct StorageDriverTransformer {
+    backends: Vec<Box<dyn StorageDriver>>,
 }
 
-impl StorageChain {
+impl StorageDriverTransformer {
     pub fn new() -> Self {
         Self { backends: vec![] }
     }
 
-    pub fn add<B: StorageBackend + 'static>(mut self, backend: B) -> Self {
+    pub fn add<B: StorageDriver + 'static>(mut self, backend: B) -> Self {
         self.backends.push(Box::new(backend));
         self
     }
 
-    fn find_backend(&self, uri: &Url) -> Option<&dyn StorageBackend> {
+    fn find_backend(&self, uri: &Url) -> Option<&dyn StorageDriver> {
         self.backends
             .iter()
             .find(|b| b.scheme() == uri.scheme())
@@ -89,7 +89,7 @@ impl StorageChain {
     }
 }
 
-impl Default for StorageChain {
+impl Default for StorageDriverTransformer {
     fn default() -> Self {
         Self::new()
             .add(file::FileStorage)
@@ -98,7 +98,7 @@ impl Default for StorageChain {
     }
 }
 
-impl ConfigTransform for StorageChain {
+impl ConfigTransform for StorageDriverTransformer {
     fn teardown(&self, _vmid: &str, config: &mut VmConfig) -> Result<()> {
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(self.release_config(config))

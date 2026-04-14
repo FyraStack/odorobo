@@ -1,16 +1,18 @@
 use crate::state::provisioning::actor::VMActor;
 use ahash::AHashMap;
 use bytesize::ByteSize;
-use kameo::error::ActorStopReason;
 use kameo::prelude::*;
-use odorobo_shared::messages::create_vm::*;
-use odorobo_shared::messages::debug::PanicAgent;
+use odorobo_shared::{
+    messages::{Ping, Pong, debug::PanicAgent, vm::*},
+    utils::vm_actor_id,
+};
 use serde::{Deserialize, Serialize};
 use stable_eyre::{Report, Result};
-use tracing::error;
+use std::fs;
 use std::ops::ControlFlow;
-use std::{fs, path::PathBuf};
 use sysinfo::System;
+use tracing::{error, info, trace, warn};
+use ulid::Ulid;
 
 use kameo::error::PanicError;
 
@@ -19,6 +21,7 @@ pub struct AgentActor {
     pub vcpus: u32,
     pub memory: ByteSize,
     pub config: Config,
+    pub vms: AHashMap<Ulid, ActorRef<VMActor>>,
 }
 
 /// Gets the system hostname
@@ -31,6 +34,17 @@ pub fn default_reserved_vcpus() -> u32 {
     2
 }
 
+fn default_datacenter() -> String {
+    warn!("No datacenter specified, defaulting to Dev");
+
+    "Dev".into()
+}
+
+fn default_region() -> String {
+    warn!("No region specified, defaulting to Local");
+    "Local".into()
+}
+
 // The infra team wants a config file on the box where they can set info specific for the box its on.
 // TODO: Double check with infra team (katherine) if they want any other config on the box.
 #[derive(Serialize, Deserialize)]
@@ -40,8 +54,10 @@ pub struct Config {
     #[serde(default = "hostname")]
     pub hostname: String,
     /// The datacenter the agent is running in.
+    #[serde(default = "default_datacenter")]
     pub datacenter: String,
     /// The region the agent is running in.
+    #[serde(default = "default_region")]
     pub region: String,
     /// The number of VCPUs reserved for the agent. Defaults to 2.
     #[serde(default = "default_reserved_vcpus")]
@@ -53,6 +69,15 @@ pub struct Config {
     /// Arbitrary annotations that can be used
     #[serde(default)]
     pub annotations: AHashMap<String, String>,
+}
+
+impl AgentActor {
+    async fn lookup_vm_actor(vmid: Ulid) -> Option<ActorRef<VMActor>> {
+        ActorRef::<VMActor>::lookup(format!("vm:{}", vmid))
+            .await
+            .ok()
+            .flatten()
+    }
 }
 
 impl Actor for AgentActor {
@@ -70,6 +95,7 @@ impl Actor for AgentActor {
             vcpus: sys.cpus().len() as u32,
             memory: ByteSize::b(sys.total_memory()),
             config,
+            vms: AHashMap::new(),
         })
     }
 
@@ -88,31 +114,172 @@ impl Actor for AgentActor {
 
         Ok(ControlFlow::Continue(()))
     }
+
+    async fn on_link_died(
+        &mut self,
+        _actor_ref: WeakActorRef<Self>,
+        id: ActorId,
+        reason: ActorStopReason,
+    ) -> Result<ControlFlow<ActorStopReason>> {
+        warn!("Linked actor {id:?} died with reason {reason:?}");
+
+        self.vms.retain(|_, actor_ref| actor_ref.id() != id);
+
+        Ok(ControlFlow::Continue(()))
+    }
 }
 
 #[remote_message]
 impl Message<CreateVM> for AgentActor {
     type Reply = CreateVMReply;
 
+    async fn handle(&mut self, msg: CreateVM, ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
+        let vmid = msg.vmid;
+        // spawn AND link at the same time
+        let actor_ref =
+            VMActor::spawn_link(ctx.actor_ref(), (vmid, Some(msg.config.clone()))).await;
+
+        let _ = actor_ref.register(vm_actor_id(vmid)).await;
+        let _ = actor_ref.register("vm").await;
+        self.vms.insert(vmid, actor_ref.clone());
+
+        info!(?vmid, "VM Spawned successfully");
+        CreateVMReply {
+            config: Some(msg.config),
+        }
+    }
+}
+
+#[remote_message]
+impl Message<MigrateVMReceive> for AgentActor {
+    type Reply = MigrateVMReceiveReply;
+
     async fn handle(
         &mut self,
-        msg: CreateVM,
+        msg: MigrateVMReceive,
+        ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let vmid = msg.vmid;
+        let actor_ref = VMActor::spawn_link(ctx.actor_ref(), (vmid, None)).await;
+
+        let _ = actor_ref.register(vm_actor_id(vmid)).await;
+        let _ = actor_ref.register("vm").await;
+        self.vms.insert(vmid, actor_ref.clone());
+
+        // now ask the VM actor to handle the migration receive
+        actor_ref
+            .ask(msg)
+            .await
+            .expect("failed to start migration receiver on destination VM actor")
+    }
+}
+
+#[remote_message]
+impl Message<DeleteVM> for AgentActor {
+    type Reply = DeleteVMReply;
+
+    async fn handle(
+        &mut self,
+        msg: DeleteVM,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        // TODO: this is unfinished. we intend on using the state::provisioning::actor stuff for this I think.
-        let vmid = ulid::Ulid::new();
-        let actor_ref = VMActor::spawn(VMActor {
-            ch_socket_path: PathBuf::from(format!("/run/odorobo/vms/{}/ch.sock", vmid)),
-            vmid,
-            vm_config: Default::default(),
-        });
-
-        let actor_registration_result = actor_ref.register("vm").await;
-
-        tracing::info!("someone asked us for available capacity");
-        CreateVMReply {
-            config: Default::default(),
+        match self.vms.remove(&msg.vmid) {
+            Some(actor_ref) => {
+                let res = actor_ref.tell(msg.clone()).await;
+                if let Err(err) = res {
+                    // probably a bad way to do this
+                    warn!(vm_id = %msg.vmid, ?err, "failed to stop VM actor gracefully, killing");
+                    actor_ref.kill();
+                }
+            }
+            None => {
+                warn!(vm_id = %msg.vmid, "VM actor not found for delete");
+            }
         }
+
+        DeleteVMReply
+    }
+}
+
+#[remote_message]
+impl Message<ShutdownVM> for AgentActor {
+    type Reply = Result<ShutdownVMReply, String>;
+
+    async fn handle(
+        &mut self,
+        msg: ShutdownVM,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        match Self::lookup_vm_actor(msg.vmid).await {
+            Some(actor_ref) => {
+                trace!(?msg, "Telling VM to shut down");
+                let res = actor_ref.tell(msg.clone()).await;
+                if let Err(err) = res {
+                    warn!(vm_id = %msg.vmid, ?err, "failed to shutdown VM actor");
+                }
+            }
+            None => {
+                warn!(vm_id = %msg.vmid, "VM actor not found for shutdown");
+                return Err("VM actor not found for shutdown".to_string());
+            }
+        }
+
+        Ok(ShutdownVMReply)
+    }
+}
+// forward GetVMInfo to VM actor
+#[remote_message]
+impl Message<GetVMInfo> for AgentActor {
+    type Reply = ForwardedReply<GetVMInfo, GetVMInfoReply>;
+
+    async fn handle(
+        &mut self,
+        msg: GetVMInfo,
+        ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let vmid = msg.vmid;
+
+        match Self::lookup_vm_actor(vmid).await {
+            Some(actor_ref) => ctx.forward(&actor_ref, msg).await,
+            None => {
+                warn!(vm_id = %vmid, "VM actor not found for info lookup");
+                ForwardedReply::from_ok(GetVMInfoReply { vmid, config: None })
+            }
+        }
+    }
+}
+
+#[remote_message]
+impl Message<AgentListVMs> for AgentActor {
+    type Reply = AgentListVMsReply;
+
+    async fn handle(
+        &mut self,
+        _msg: AgentListVMs,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        // look up with cache
+        let vms = self.vms.keys().copied().collect();
+        // let vms_actors: Vec<_> = RemoteActorRef::<VMActor>::lookup_all("vm").collect().await;
+
+        // let mut vms = Vec::new();
+        // for actor in vms_actors.into_iter().flatten() {
+        //     trace!(?actor, "looking up VM info");
+        //     if let Ok(reply) = actor.ask(&GetVMInfo).await {
+        //         vms.push(reply.vmid);
+        //     }
+        // }
+
+        AgentListVMsReply { vms }
+    }
+}
+
+#[remote_message]
+impl Message<Ping> for AgentActor {
+    type Reply = Pong;
+
+    async fn handle(&mut self, _msg: Ping, _ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
+        Pong
     }
 }
 

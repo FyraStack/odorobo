@@ -11,9 +11,16 @@ pub const FYRA_OUI: [u8; 3] = [0x46, 0x59, 0x52];
 /// Takes the last 3 bytes of the IP address and combines them with the FYRA OUI prefix.
 pub fn calculate_mac_address(ip: [u8; 4]) -> [u8; 6] {
     let mut mac = [0u8; 6];
-    mac[0..2].copy_from_slice(&FYRA_OUI);
-    mac[2..].copy_from_slice(&ip[2..]);
+    mac[0..3].copy_from_slice(&FYRA_OUI);
+    mac[3..].copy_from_slice(&ip[1..]);
     mac
+}
+
+#[test]
+fn test_calculate_mac_address() {
+    let ip = [192, 168, 1, 1];
+    let mac = calculate_mac_address(ip);
+    assert_eq!(mac, [0x46, 0x59, 0x52, 168, 0x01, 0x01]);
 }
 
 /// HTTP REST API service

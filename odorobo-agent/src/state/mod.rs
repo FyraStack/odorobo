@@ -4,8 +4,8 @@
 //! ephemeral VM state like running instances. Persistent state goes in the database.
 
 pub mod api;
-pub mod instance;
 pub mod devices;
+pub mod instance;
 pub mod provisioning;
 pub mod transform;
 
