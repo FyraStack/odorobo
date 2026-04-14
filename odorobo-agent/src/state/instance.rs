@@ -98,7 +98,7 @@ impl VMInstance {
     /// Get a VM instance by its ID through the filesystem database
     ///
     /// Not reliable as of 0.2
-    #[deprecated(since = "0.2")]
+    #[deprecated(since = "0.2.0")]
     pub fn get(vmid: &str) -> Option<Self> {
         Self::list().ok()?.into_iter().find(|i| i.id == vmid)
     }
@@ -562,7 +562,7 @@ impl VMInstance {
     /// List running VM instances.
     ///
     /// Scans runtime root for directories with valid sockets.
-    #[deprecated(since = "0.2")]
+    #[deprecated(since = "0.2.0")]
     pub fn list() -> Result<Vec<Self>> {
         let root = Self::runtime_root();
         fs::create_dir_all(&root)?;
