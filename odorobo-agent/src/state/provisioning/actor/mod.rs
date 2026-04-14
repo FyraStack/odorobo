@@ -43,7 +43,7 @@ impl Actor for VMActor {
     type Error = Report;
 
     #[tracing::instrument(skip_all)]
-    async fn on_start((vmid, vm_config): Self::Args, actor_ref: ActorRef<Self>) -> Result<Self> {
+    async fn on_start((vmid, vm_config): Self::Args, _actor_ref: ActorRef<Self>) -> Result<Self> {
         // let ch_sock_path = VMInstance::runtime_dir_for(&vmid.to_string()).join("ch.sock");
 
         // // no transform chain
@@ -74,7 +74,7 @@ impl Actor for VMActor {
 
     async fn on_stop(
         &mut self,
-        actor_ref: WeakActorRef<Self>,
+        _actor_ref: WeakActorRef<Self>,
         reason: ActorStopReason,
     ) -> std::result::Result<(), Self::Error> {
         match reason {

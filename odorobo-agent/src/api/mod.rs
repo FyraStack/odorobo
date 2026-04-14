@@ -2,9 +2,6 @@
 mod ch;
 mod console;
 mod error;
-use axum::{Json, extract::State};
-use serde::Serialize;
-use tower_http::trace::{DefaultOnRequest, DefaultOnResponse, TraceLayer};
 mod vm;
 
 // pub fn router(port: u16) -> axum::Router<()> {

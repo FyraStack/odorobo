@@ -1,9 +1,6 @@
 use kameo::prelude::*;
-use tracing::{error, info, warn};
 use stable_eyre::{Report, Result};
 
-
-/// 
 #[derive(RemoteActor)]
 pub struct SerialTerminalWebsocketActor;
 

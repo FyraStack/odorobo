@@ -5,9 +5,9 @@ use super::StorageDriver;
 use async_trait::async_trait;
 use serde::Deserialize;
 use stable_eyre::{Result, eyre::eyre};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tokio::process::Command;
-use tracing::{info, trace};
+use tracing::info;
 use url::Url;
 
 /// Struct representation of an iSCSI target,
@@ -53,9 +53,9 @@ impl ISCSITarget {
     }
 }
 
-impl Into<PathBuf> for ISCSITarget {
-    fn into(self) -> PathBuf {
-        self.to_device_path()
+impl From<ISCSITarget> for PathBuf {
+    fn from(val: ISCSITarget) -> Self {
+        val.to_device_path()
     }
 }
 
@@ -65,7 +65,7 @@ impl From<&Url> for ISCSITarget {
         let port = uri.port().unwrap_or(3260);
         let host = format!("{}:{}", host_ip, port);
         let path_segments: Vec<&str> = uri.path_segments().map(|c| c.collect()).unwrap_or_default();
-        let iqn = path_segments.get(0).unwrap_or(&"").to_string();
+        let iqn = path_segments.first().unwrap_or(&"").to_string();
         let lun_str = path_segments.get(1).unwrap_or(&"");
         let lun = lun_str
             .strip_prefix("lun")

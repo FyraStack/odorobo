@@ -5,8 +5,6 @@ mod util;
 use kameo::actor::Spawn;
 use odorobo_shared::connect_to_swarm;
 use stable_eyre::Result;
-use tracing::level_filters::LevelFilter;
-use tracing_subscriber::EnvFilter;
 // use odorobo_shared::
 use crate::actor::AgentActor;
 

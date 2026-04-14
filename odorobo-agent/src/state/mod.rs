@@ -9,6 +9,5 @@ pub mod instance;
 pub mod provisioning;
 pub mod transform;
 
-pub use api::{call, call_request};
-pub use instance::{CONFIG_FILE_NAME, ChApiError, ConsoleStream, VMInstance, VMS_DIR_NAME};
+pub use instance::{ChApiError, ConsoleStream, VMInstance};
 // pub use transform::{ConfigTransform, ConsoleTransform, TransformChain, apply_builtin_transforms};

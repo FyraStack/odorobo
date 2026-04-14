@@ -53,7 +53,7 @@ impl StorageDriverTransformer {
         Self { backends: vec![] }
     }
 
-    pub fn add<B: StorageDriver + 'static>(mut self, backend: B) -> Self {
+    pub fn with_backend<B: StorageDriver + 'static>(mut self, backend: B) -> Self {
         self.backends.push(Box::new(backend));
         self
     }
@@ -92,9 +92,9 @@ impl StorageDriverTransformer {
 impl Default for StorageDriverTransformer {
     fn default() -> Self {
         Self::new()
-            .add(file::FileStorage)
-            .add(rbd::RbdStorage)
-            .add(iscsi::ISCSIStorage)
+            .with_backend(file::FileStorage)
+            .with_backend(rbd::RbdStorage)
+            .with_backend(iscsi::ISCSIStorage)
     }
 }
 

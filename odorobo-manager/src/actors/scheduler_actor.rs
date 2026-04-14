@@ -28,7 +28,7 @@ impl SchedulerActor {
                 continue;
             };
 
-            let agent_actor_peer_id = agent_actor.id().peer_id().unwrap().clone();
+            let agent_actor_peer_id = *agent_actor.id().peer_id().unwrap();
             info!("Using agent actor peer id: {agent_actor_peer_id}");
 
             // remotely link actor, on link death it will be automatically unlinked
@@ -58,7 +58,7 @@ impl Actor for SchedulerActor {
     type Error = Report;
 
     async fn on_start(_state: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
-        let peer_id = actor_ref.id().peer_id().unwrap().clone();
+        let peer_id = *actor_ref.id().peer_id().unwrap();
 
         info!("Actor started! Scheduler peer id: {peer_id}");
 
@@ -121,7 +121,7 @@ impl Message<CreateVM> for SchedulerActor {
     async fn handle(&mut self, msg: CreateVM, ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
         let actor_ref = ctx.actor_ref();
 
-        let first_agent = self.ensure_agent(&actor_ref).await?;
+        let first_agent = self.ensure_agent(actor_ref).await?;
         match first_agent.ask(&msg).await {
             Ok(reply) => Ok(reply),
             Err(first_err) => {
@@ -130,7 +130,7 @@ impl Message<CreateVM> for SchedulerActor {
                 );
                 self.agent_actor = None;
 
-                let retry_agent = self.ensure_agent(&actor_ref).await?;
+                let retry_agent = self.ensure_agent(actor_ref).await?;
                 retry_agent.ask(&msg).await.map_err(|retry_err| {
                     eyre!(
                         "failed to forward CreateVM to agent actor after reconnect; first error: {first_err}; retry error: {retry_err}"
@@ -204,7 +204,7 @@ impl Message<AgentListVMs> for SchedulerActor {
 
         let actor_ref = ctx.actor_ref();
 
-        let first_agent = self.ensure_agent(&actor_ref).await?;
+        let first_agent = self.ensure_agent(actor_ref).await?;
         match first_agent.ask(&msg).await {
             Ok(reply) => Ok(reply),
             Err(first_err) => {
@@ -213,7 +213,7 @@ impl Message<AgentListVMs> for SchedulerActor {
                 );
                 self.agent_actor = None;
 
-                let retry_agent = self.ensure_agent(&actor_ref).await?;
+                let retry_agent = self.ensure_agent(actor_ref).await?;
                 retry_agent.ask(&msg).await.map_err(|retry_err| {
                     eyre!(
                         "failed to forward AgentListVMs to agent actor after reconnect; first error: {first_err}; retry error: {retry_err}"

@@ -1,13 +1,9 @@
 use cloud_hypervisor_client::models::{CpusConfig, MemoryConfig, PayloadConfig, VmConfig};
 use kameo::prelude::*;
-use odorobo_agent::state::provisioning::actor::VMActor;
-use odorobo_shared::{
-    messages::vm::{
+use odorobo_shared::messages::vm::{
         AgentListVMs, AgentListVMsReply, CreateVM, CreateVMReply, DeleteVM, DeleteVMReply,
         ShutdownVM, ShutdownVMReply,
-    },
-    utils::vm_actor_id,
-};
+    };
 use stable_eyre::{Report, Result};
 
 use crate::api::types::CreateVMRequest;

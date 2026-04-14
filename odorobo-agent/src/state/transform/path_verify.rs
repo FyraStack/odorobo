@@ -18,21 +18,18 @@ impl ConfigTransform for PathVerify {
         trace!("Verifying paths");
         let config = config.clone();
         // payload path verification
-        if let Some(kernel_path) = config.payload.kernel {
-            if !Path::new(&kernel_path).is_absolute() {
+        if let Some(kernel_path) = config.payload.kernel
+            && !Path::new(&kernel_path).is_absolute() {
                 return Err(eyre!("Kernel must be an absolute path"));
             }
-        }
-        if let Some(initramfs_path) = config.payload.initramfs {
-            if !Path::new(&initramfs_path).is_absolute() {
+        if let Some(initramfs_path) = config.payload.initramfs
+            && !Path::new(&initramfs_path).is_absolute() {
                 return Err(eyre!("initramfs must be an absolute path"));
             }
-        }
-        if let Some(firmware_path) = config.payload.firmware {
-            if !Path::new(&firmware_path).is_absolute() {
+        if let Some(firmware_path) = config.payload.firmware
+            && !Path::new(&firmware_path).is_absolute() {
                 return Err(eyre!("firmware must be an absolute path"));
             }
-        }
 
         // storage path verification
         if let Some(disk_configs) = config.disks {

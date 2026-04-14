@@ -84,7 +84,7 @@ impl Actor for AgentActor {
     type Args = ();
     type Error = Report;
 
-    async fn on_start(state: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self> {
+    async fn on_start(_state: Self::Args, _actor_ref: ActorRef<Self>) -> Result<Self> {
         // TODO: ask infra team where they want this on the box
         let file = fs::File::open("config.json").expect("file should open read only");
         let config: Config = serde_json::from_reader(file).expect("file should be proper JSON");
@@ -105,7 +105,7 @@ impl Actor for AgentActor {
     //
     async fn on_panic(
         &mut self,
-        actor_ref: WeakActorRef<Self>,
+        _actor_ref: WeakActorRef<Self>,
         err: PanicError,
     ) -> Result<std::ops::ControlFlow<ActorStopReason>> {
         error!("Agent panicked: {:?}", err);
@@ -289,7 +289,7 @@ impl Message<PanicAgent> for AgentActor {
 
     async fn handle(
         &mut self,
-        msg: PanicAgent,
+        _msg: PanicAgent,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         tracing::info!("panicking");

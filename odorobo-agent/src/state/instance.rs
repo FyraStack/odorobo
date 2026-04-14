@@ -3,9 +3,7 @@ use cloud_hypervisor_client::{
     apis::{DefaultApi, Error as ChClientError},
     models::{self, VmConfig, VmInfo, VmmPingResponse},
 };
-use hyper::Method;
 use hyper::{Request, Response, body::Bytes};
-use serde_json::Value;
 use stable_eyre::{
     Result,
     eyre::{Context, eyre},
@@ -24,7 +22,7 @@ use crate::state::{
     transform::{ConfigTransform, TransformChain},
 };
 
-use super::api::{call, call_request};
+use super::api::call_request;
 
 pub const CONFIG_FILE_NAME: &str = "config.json";
 const SOCKET_FILE_NAME: &str = "ch.sock";

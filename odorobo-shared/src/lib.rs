@@ -2,14 +2,10 @@ pub mod error;
 pub mod messages;
 pub mod utils;
 use kameo::prelude::*;
-use libp2p::bytes::BufMut;
 use libp2p::futures::StreamExt;
-use libp2p::kad::Record;
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
-use libp2p::{PeerId, kad, mdns, noise, tcp, yamux};
+use libp2p::{PeerId, mdns, noise, tcp, yamux};
 use stable_eyre::Result;
-use std::cell::RefCell;
-use std::time::Duration;
 use tracing::{debug, info, trace, warn};
 
 #[derive(NetworkBehaviour)]

@@ -1,6 +1,5 @@
 use kameo::prelude::*;
 use stable_eyre::{Report, Result};
-use tracing::{error, info, warn};
 
 /// HTTP REST API service
 #[derive(RemoteActor)]

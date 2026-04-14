@@ -1,6 +1,5 @@
 use kameo::prelude::*;
 use stable_eyre::{Report, Result};
-use tracing::{error, info, warn};
 
 // idk if we ever agreed upon an OUI for fyra, but im reserving `FYR` for this
 // -cappy

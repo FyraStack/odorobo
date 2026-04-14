@@ -39,8 +39,8 @@ async fn list_vms(State(state): State<ActorRef<HTTPActor>>) -> impl IntoApiRespo
 
 /// Get detailed information about a specific VM
 async fn vm_info(
-    State(state): State<ActorRef<HTTPActor>>,
-    Path(VmId(vmid)): Path<VmId>,
+    State(_state): State<ActorRef<HTTPActor>>,
+    Path(VmId(_vmid)): Path<VmId>,
 ) -> impl IntoApiResponse {
     // stub,
     Json(VMInfo::default())
@@ -106,9 +106,9 @@ async fn shutdown_vm(
 ///
 /// todo: make new schema for update request that allows partial updates
 async fn update_vm(
-    State(state): State<ActorRef<HTTPActor>>,
-    Path(VmId(vmid)): Path<VmId>,
-    Json(request): Json<UpdateVMRequest>,
+    State(_state): State<ActorRef<HTTPActor>>,
+    Path(VmId(_vmid)): Path<VmId>,
+    Json(_request): Json<UpdateVMRequest>,
 ) -> impl IntoApiResponse {
     // stub
 

@@ -16,15 +16,15 @@ pub fn router() -> ApiRouter<ActorRef<HTTPActor>> {
         .api_route("/{nodeid}", get(node_info))
 }
 /// Drain a node of all VMs, migrating them away or shutting them down as needed. This is used for maintenance mode.
-async fn drain(State(state): State<ActorRef<HTTPActor>>) -> impl IntoApiResponse {
+async fn drain(State(_state): State<ActorRef<HTTPActor>>) -> impl IntoApiResponse {
     // stub
     Json("Draining...".to_string())
 }
 
 /// Get detailed information about a specific node, including its current VMs and resource usage.
 async fn node_info(
-    State(state): State<ActorRef<HTTPActor>>,
-    Path(node_id): Path<String>,
+    State(_state): State<ActorRef<HTTPActor>>,
+    Path(_node_id): Path<String>,
 ) -> impl IntoApiResponse {
     // stub,
     Json(Node::default())
