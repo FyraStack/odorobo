@@ -1,4 +1,4 @@
-use super::StorageBackend;
+use super::StorageDriver;
 use async_trait::async_trait;
 use stable_eyre::{Result, eyre::eyre};
 use std::path::PathBuf;
@@ -157,7 +157,7 @@ impl TryFrom<&Url> for RbdImage {
 pub struct RbdStorage;
 
 #[async_trait]
-impl StorageBackend for RbdStorage {
+impl StorageDriver for RbdStorage {
     fn scheme(&self) -> &'static str {
         "rbd"
     }

@@ -56,7 +56,7 @@ impl ConfigTransform for TransformChain {
 impl Default for TransformChain {
     fn default() -> Self {
         Self::new()
-            .add(storage::StorageChain::default())
+            .add(storage::StorageDriverTransformer::default())
             .add(ConsoleTransform)
             .add(PathVerify)
     }
