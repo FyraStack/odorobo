@@ -810,9 +810,8 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "cloud-hypervisor-client"
-version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a135a9339a5ad2775b8843dfad19cd5057e9d8092a3c09b523c5030fcc1348ee"
+version = "0.4.0"
+source = "git+https://github.com/FyraStack/cloud-hypervisor-client.git#60ef245a60e8ba393f623cf0d30c0c298f0127ff"
 dependencies = [
  "base64 0.7.0",
  "futures",

@@ -10,7 +10,7 @@ tracing-subscriber = { version = "0.3", features = [
     "fmt",
     "json",
 ] }
-cloud-hypervisor-client = "0.3"
+cloud-hypervisor-client = { git = "https://github.com/FyraStack/cloud-hypervisor-client.git" }
 serde_json = "1.0.149"
 serde = "1.0"
 axum = { version = "0.8.8", features = ["ws"] }

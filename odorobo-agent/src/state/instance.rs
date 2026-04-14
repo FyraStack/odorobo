@@ -396,7 +396,7 @@ impl VMInstance {
             trace!(vm_id = self.vm_id(), state = ?info.state, "Checking VM state before destroy");
             if matches!(
                 info.state,
-                models::vm_info::State::Running | models::vm_info::State::Paused
+                models::VmState::Running | models::VmState::Paused
             ) {
                 info!(vm_id = self.vm_id(), "Shutting down VM before destroy");
                 self.shutdown().await?;

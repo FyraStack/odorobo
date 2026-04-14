@@ -15,7 +15,7 @@ impl ConfigTransform for ConsoleTransform {
         let runtime_path = VMInstance::runtime_dir_for(vmid);
         trace!("Applying ConsoleTransform");
         config.console = Some(ConsoleConfig {
-            mode: cloud_hypervisor_client::models::console_config::Mode::Off,
+            mode: cloud_hypervisor_client::models::ConsoleMode::Off,
             ..Default::default()
         });
         // note: console passthrough is kinda janky and breaks live migration, needs a way to fix this
@@ -25,9 +25,9 @@ impl ConfigTransform for ConsoleTransform {
         //
         // consider some virtual GPU device, but CH doesn't have QXL or virtio-gpu so idk
         config.serial = Some(ConsoleConfig {
-            mode: cloud_hypervisor_client::models::console_config::Mode::Pty,
+            mode: cloud_hypervisor_client::models::ConsoleMode::Socket,
             // file: Some(format!("{}/serial", runtime_path.display())),
-            // socket: Some(format!("{}/console.sock", runtime_path.display())),
+            socket: Some(format!("{}/console.sock", runtime_path.display())),
             ..Default::default()
         });
 
