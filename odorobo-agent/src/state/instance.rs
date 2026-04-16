@@ -396,6 +396,7 @@ impl VMInstance {
         );
         if let Ok(info) = self.info().await {
             trace!(vm_id = self.vm_id(), state = ?info.state, "Checking VM state before destroy");
+            self.hook_manager.before_stop(self.vm_id(), &info).await?;
             if matches!(
                 info.state,
                 models::VmState::Running | models::VmState::Paused

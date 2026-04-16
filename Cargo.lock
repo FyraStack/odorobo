@@ -88,7 +88,7 @@ dependencies = [
  "cfg-if",
  "http 1.4.0",
  "indexmap",
- "schemars",
+ "schemars 0.9.0",
  "serde",
  "serde_json",
  "serde_qs",
@@ -2069,6 +2069,10 @@ name = "ipnet"
 version = "2.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d98f6fed1fde3f8c21bc40a1abb88dd75e67924f9cffc3ef95607bad8017f8e2"
+dependencies = [
+ "schemars 0.8.22",
+ "serde",
+]
 
 [[package]]
 name = "iri-string"
@@ -2706,6 +2710,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "mnl-sys"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a0f3c607af12ed53f3cade8ee7adeced5533800abc0b07f5b6bdc7081d1e0d4c"
+dependencies = [
+ "libc",
+ "pkg-config",
+]
+
+[[package]]
 name = "moka"
 version = "0.12.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2839,6 +2853,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "nftnl"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a530f904e31675dc9d2e3a5c166a844dffc3dad644205fe5abb638f4e9e75d9b"
+dependencies = [
+ "bitflags",
+ "log",
+ "nftnl-sys",
+ "nix",
+]
+
+[[package]]
+name = "nftnl-sys"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cffa28b4c81eea6a8a4fd454634d425e1a559250a50a926de4517dd9607fe9a4"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "mnl-sys",
+ "pkg-config",
+]
+
+[[package]]
 name = "nix"
 version = "0.30.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2963,11 +3001,14 @@ dependencies = [
  "hyper-util",
  "hyperlocal",
  "if-addrs 0.13.4",
+ "ipnet",
  "kameo",
  "libc",
  "libp2p",
+ "nftnl",
  "odorobo-shared",
  "random-port",
+ "rtnetlink",
  "serde",
  "serde_json",
  "stable-eyre",
@@ -3000,7 +3041,7 @@ dependencies = [
  "odorobo-shared",
  "optional_struct",
  "reqwest",
- "schemars",
+ "schemars 0.9.0",
  "serde",
  "serde_json",
  "stable-eyre",
@@ -3213,6 +3254,12 @@ dependencies = [
  "der",
  "spki",
 ]
+
+[[package]]
+name = "pkg-config"
+version = "0.3.33"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
 name = "polling"
@@ -3834,6 +3881,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "91c1b7e4904c873ef0710c1f407dde2e6287de2bebc1bbbf7d430bb7cbffd939"
 dependencies = [
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "schemars"
+version = "0.8.22"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3fbf2ae1b8bc8e02df939598064d22402220cd5bbcca1c76f7d6a310974d5615"
+dependencies = [
+ "dyn-clone",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

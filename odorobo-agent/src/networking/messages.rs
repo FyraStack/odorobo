@@ -1,4 +1,4 @@
-use stable_eyre::Result;
+use ulid::Ulid;
 
 /// Ensures the agent-global networking state is present and configured.
 ///
@@ -15,7 +15,7 @@ pub struct EnsureHostNetwork;
 #[derive(Debug, Clone)]
 pub struct AttachTap {
     /// VM identifier for logging and future bookkeeping.
-    pub vmid: String,
+    pub vmid: Ulid,
     /// Host TAP device name created for this VM by Cloud Hypervisor.
     pub tap_name: String,
 }
@@ -27,7 +27,7 @@ pub struct AttachTap {
 #[derive(Debug, Clone)]
 pub struct DetachTap {
     /// VM identifier for logging and future bookkeeping.
-    pub vmid: String,
+    pub vmid: Ulid,
     /// Host TAP device name previously attached for this VM.
     pub tap_name: String,
 }
@@ -51,10 +51,7 @@ pub struct NetworkStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttachedTap {
     /// VM identifier associated with the TAP.
-    pub vmid: String,
+    pub vmid: Ulid,
     /// Host TAP device name.
     pub tap_name: String,
 }
-
-/// Convenience alias for local networking actor replies.
-pub type NetworkResult<T> = Result<T>;

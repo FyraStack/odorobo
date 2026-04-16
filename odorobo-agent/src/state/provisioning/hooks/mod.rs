@@ -12,6 +12,7 @@ use cloud_hypervisor_client::models::{VmConfig, VmInfo};
 use stable_eyre::Result;
 
 mod machined;
+mod networking;
 
 // Rust 1.75 does not support dyn async traits, we still need async_trait for this
 #[async_trait]
@@ -92,7 +93,10 @@ impl HookManager {
 impl Default for HookManager {
     fn default() -> Self {
         Self {
-            hooks: vec![Box::new(machined::CHMachineProvisioningHook)],
+            hooks: vec![
+                Box::new(machined::CHMachineProvisioningHook),
+                Box::new(networking::NetworkProvisioningHook),
+            ],
         }
     }
 }

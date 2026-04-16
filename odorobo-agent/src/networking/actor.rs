@@ -1,0 +1,366 @@
+use crate::actor::{DhcpConfig, NetworkConfig, NetworkMode};
+use crate::networking::messages::{AttachTap, DetachTap};
+use futures_util::{StreamExt, TryStreamExt};
+
+use kameo::{message::Context, prelude::*};
+use rtnetlink::{Error as NetlinkError, Handle, LinkBridge, LinkUnspec};
+use stable_eyre::Report;
+use stable_eyre::eyre::{Context as EyreContext, eyre};
+use tracing::info;
+
+pub struct DhcpActor {
+    pub config: DhcpConfig,
+}
+
+pub struct NetworkConfigCommon {
+    pub bridge: String,
+    pub subnet: String,
+}
+
+impl Actor for DhcpActor {
+    type Args = DhcpConfig;
+    type Error = Report;
+    async fn on_start(args: Self::Args, _actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
+        Ok(Self { config: args })
+    }
+}
+
+async fn ensure_address(
+    handle: &Handle,
+    link_index: u32,
+    link_name: &str,
+    address: std::net::Ipv4Addr,
+    prefix_len: u8,
+) -> Result<(), Report> {
+    let mut existing = handle
+        .address()
+        .get()
+        .set_link_index_filter(link_index)
+        .execute();
+
+    while let Some(address_msg) = existing.try_next().await? {
+        if address_msg.header.prefix_len != prefix_len {
+            continue;
+        }
+
+        let already_present = address_msg.attributes.iter().any(|attr| match attr {
+            rtnetlink::packet_route::address::AddressAttribute::Address(ip)
+            | rtnetlink::packet_route::address::AddressAttribute::Local(ip) => {
+                matches!(ip, std::net::IpAddr::V4(existing_ip) if *existing_ip == address)
+            }
+            _ => false,
+        });
+
+        if already_present {
+            info!(
+                bridge = link_name,
+                address = %address,
+                prefix_len,
+                "bridge gateway address already present"
+            );
+            return Ok(());
+        }
+    }
+
+    info!(
+        bridge = link_name,
+        address = %address,
+        prefix_len,
+        "adding gateway address to bridge"
+    );
+
+    match handle
+        .address()
+        .add(link_index, address.into(), prefix_len)
+        .execute()
+        .await
+    {
+        Ok(()) => Ok(()),
+        Err(NetlinkError::NetlinkError(err)) if err.raw_code() == -libc::EEXIST => Ok(()),
+        Err(err) => Err(err).wrap_err_with(|| {
+            format!("failed to add address {address}/{prefix_len} to {link_name}")
+        }),
+    }
+}
+#[derive(RemoteActor)]
+pub struct NetworkAgentActor {
+    pub config: NetworkConfig,
+    common: NetworkConfigCommon,
+    pub dhcp_actor: Option<ActorRef<DhcpActor>>,
+    // netlink_handle:
+    netlink_thread: tokio::task::JoinHandle<()>,
+    netlink_handle: Handle,
+}
+
+impl NetworkAgentActor {
+    async fn lookup_link_by_name(
+        &self,
+        link_name: &str,
+    ) -> Result<rtnetlink::packet_route::link::LinkMessage, Report> {
+        self.netlink_handle
+            .link()
+            .get()
+            .match_name(link_name.to_string())
+            .execute()
+            .next()
+            .await
+            .ok_or_else(|| eyre!("link {} not found", link_name))?
+            .wrap_err_with(|| format!("failed to query link {}", link_name))
+    }
+}
+
+impl Actor for NetworkAgentActor {
+    type Args = NetworkConfig;
+    type Error = Report;
+    async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
+        // do some netlink fuckery here
+
+        let (connection, handle, _) = rtnetlink::new_connection()?;
+        let netlink_thread = tokio::spawn(connection);
+
+        let common = match args.network_mode.clone() {
+            NetworkMode::HostonlyNat {
+                bridge,
+                subnet,
+                gateway: _,
+                upstream_iface: _,
+            }
+            | NetworkMode::Bridged {
+                bridge,
+                subnet,
+                gateway: _,
+            } => NetworkConfigCommon {
+                bridge,
+                subnet: subnet.to_string(),
+            },
+        };
+
+        // ensure the bridge exists, creating it if necessary
+        let bridge = if let Some(bridge) = handle
+            .link()
+            .get()
+            .match_name(common.bridge.clone())
+            .execute()
+            .next()
+            .await
+        {
+            bridge.wrap_err_with(|| format!("failed to query bridge {}", common.bridge))?
+        } else {
+            info!(bridge = %common.bridge, "creating new bridge");
+            let new_bridge = LinkBridge::new(&common.bridge).up().build();
+            handle
+                .link()
+                .add(new_bridge)
+                .execute()
+                .await
+                .wrap_err_with(|| format!("failed to create bridge {}", common.bridge))?;
+
+            handle
+                .link()
+                .get()
+                .match_name(common.bridge.clone())
+                .execute()
+                .next()
+                .await
+                .ok_or_else(|| eyre!("bridge {} was not found after creation", common.bridge))?
+                .wrap_err_with(|| {
+                    format!("failed to query bridge {} after creation", common.bridge)
+                })?
+        };
+
+        match args.network_mode.clone() {
+            NetworkMode::HostonlyNat {
+                bridge: _,
+                subnet,
+                gateway,
+                upstream_iface: _,
+            }
+            | NetworkMode::Bridged {
+                bridge: _,
+                subnet,
+                gateway,
+            } => {
+                ensure_address(
+                    &handle,
+                    bridge.header.index,
+                    &common.bridge,
+                    gateway,
+                    subnet.prefix_len(),
+                )
+                .await
+                .wrap_err_with(|| {
+                    format!(
+                        "failed to ensure gateway {}/{} exists on bridge {}",
+                        gateway,
+                        subnet.prefix_len(),
+                        common.bridge
+                    )
+                })?;
+            }
+        }
+
+        // let link_bridge = LinkBridge::new(arg)
+
+        let dhcp_actor = if let Some(dhcp_config) = &args.dhcp_config {
+            Some(DhcpActor::spawn_link(&actor_ref, dhcp_config.clone()).await)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            config: args,
+            common,
+            dhcp_actor,
+            netlink_thread,
+            netlink_handle: handle,
+        })
+    }
+
+    async fn on_stop(
+        &mut self,
+        _actor_ref: WeakActorRef<Self>,
+        reason: ActorStopReason,
+    ) -> std::result::Result<(), Self::Error> {
+        match reason {
+            ActorStopReason::Normal => {
+                info!(bridge = %self.common.bridge, "stopping network agent");
+            }
+            ActorStopReason::Killed => {
+                info!(bridge = %self.common.bridge, "network agent killed");
+            }
+            ActorStopReason::Panicked(err) => {
+                info!(bridge = %self.common.bridge, ?err, "network agent panicked");
+            }
+            _ => {
+                info!(bridge = %self.common.bridge, "network agent stopping");
+            }
+        }
+
+        if let Some(dhcp_actor) = self.dhcp_actor.take() {
+            dhcp_actor.stop_gracefully().await?;
+        }
+
+        self.netlink_thread.abort();
+        let _ = (&mut self.netlink_thread).await;
+
+        Ok(())
+    }
+}
+
+impl Message<AttachTap> for NetworkAgentActor {
+    type Reply = Result<(), Report>;
+
+    async fn handle(
+        &mut self,
+        msg: AttachTap,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let bridge = self
+            .lookup_link_by_name(&self.common.bridge)
+            .await
+            .wrap_err_with(|| {
+                format!(
+                    "failed to resolve bridge {} before attaching tap {}",
+                    self.common.bridge, msg.tap_name
+                )
+            })?;
+
+        let tap = self
+            .lookup_link_by_name(&msg.tap_name)
+            .await
+            .wrap_err_with(|| {
+                format!("failed to resolve tap {} for vm {}", msg.tap_name, msg.vmid)
+            })?;
+
+        info!(
+            vmid = %msg.vmid,
+            tap = %msg.tap_name,
+            bridge = %self.common.bridge,
+            "attaching tap to bridge"
+        );
+
+        self.netlink_handle
+            .link()
+            .set(
+                LinkUnspec::new_with_index(tap.header.index)
+                    .controller(bridge.header.index)
+                    .build(),
+            )
+            .execute()
+            .await
+            .wrap_err_with(|| {
+                format!(
+                    "failed to attach tap {} to bridge {}",
+                    msg.tap_name, self.common.bridge
+                )
+            })?;
+
+        self.netlink_handle
+            .link()
+            .set(LinkUnspec::new_with_index(tap.header.index).up().build())
+            .execute()
+            .await
+            .wrap_err_with(|| format!("failed to bring tap {} up", msg.tap_name))?;
+
+        info!(
+            vmid = %msg.vmid,
+            tap = %msg.tap_name,
+            bridge = %self.common.bridge,
+            "tap attached to bridge successfully"
+        );
+
+        Ok(())
+    }
+}
+
+impl Message<DetachTap> for NetworkAgentActor {
+    type Reply = Result<(), Report>;
+
+    async fn handle(
+        &mut self,
+        msg: DetachTap,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let tap = self
+            .lookup_link_by_name(&msg.tap_name)
+            .await
+            .wrap_err_with(|| {
+                format!(
+                    "failed to resolve tap {} for detach on vm {}",
+                    msg.tap_name, msg.vmid
+                )
+            })?;
+
+        info!(
+            vmid = %msg.vmid,
+            tap = %msg.tap_name,
+            bridge = %self.common.bridge,
+            "detaching tap from bridge"
+        );
+
+        self.netlink_handle
+            .link()
+            .set(
+                LinkUnspec::new_with_index(tap.header.index)
+                    .nocontroller()
+                    .build(),
+            )
+            .execute()
+            .await
+            .wrap_err_with(|| {
+                format!(
+                    "failed to detach tap {} from bridge {}",
+                    msg.tap_name, self.common.bridge
+                )
+            })?;
+
+        info!(
+            vmid = %msg.vmid,
+            tap = %msg.tap_name,
+            bridge = %self.common.bridge,
+            "tap detached from bridge successfully"
+        );
+
+        Ok(())
+    }
+}
