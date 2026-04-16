@@ -200,9 +200,36 @@ impl NetworkAgentActor {
     /// NAT/NAT66 policy as well. That is a larger design decision than this
     /// hook should make on its own. Until odorobo has an intentional IPv6
     /// guest-networking story, we keep host-only NAT scoped to IPv4.
+    /// 
+    // todo: IPv6, refer to libvirt's impl:
+    // ```nft
+    // table ip6 libvirt_network {
+    //         chain forward {
+    //                 type filter hook forward priority filter; policy accept;
+    //                 counter packets 0 bytes 0 jump guest_cross
+    //                 counter packets 0 bytes 0 jump guest_input
+    //                 counter packets 0 bytes 0 jump guest_output
+    //         }
+    
+    //         chain guest_output {
+    //         }
+    
+    //         chain guest_input {
+    //         }
+    
+    //         chain guest_cross {
+    //         }
+    
+    //         chain guest_nat {
+    //                 type nat hook postrouting priority srcnat; policy accept;
+    //         }
+    // }
+    // ```
+    
+
     fn ensure_nat_rules(_bridge: &str, _subnet: &str, upstream_iface: &str) -> Result<(), Report> {
         const TABLE_NAME: &str = "odorobo";
-        const CHAIN_NAME: &str = "postrouting";
+        const CHAIN_NAME: &str = "guest_nat";
 
         let table_exists = Self::nft_table_exists(TABLE_NAME)?;
         let chain_exists = if table_exists {
@@ -219,7 +246,7 @@ impl NetworkAgentActor {
 
         let table = Table::new(c"odorobo", ProtoFamily::Ipv4);
 
-        let mut postrouting_chain = nftnl::Chain::new(c"postrouting", &table);
+        let mut postrouting_chain = nftnl::Chain::new(c"guest_nat", &table);
         postrouting_chain.set_type(nftnl::ChainType::Nat);
         postrouting_chain.set_hook(Hook::PostRouting, 100);
 
