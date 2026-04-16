@@ -15,6 +15,8 @@ use tracing::info;
 
 pub struct DhcpActor {
     pub config: DhcpConfig,
+    bridge: String,
+    dnsmasq_process: Option<tokio::process::Child>,
 }
 
 pub struct NetworkConfigCommon {
@@ -23,11 +25,49 @@ pub struct NetworkConfigCommon {
 }
 
 impl Actor for DhcpActor {
-    type Args = DhcpConfig;
+    type Args = (DhcpConfig, String);
     type Error = Report;
     async fn on_start(args: Self::Args, _actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
-        // todo: actually run dnsmasq on startup
-        Ok(Self { config: args })
+        let (config, bridge) = args;
+        let dhcp_range = format!(
+            "{},{},{},{}",
+            config.range.0,
+            config.range.1,
+            config.subnet.netmask(),
+            config.lease_time
+        );
+
+        let dnsmasq_process = tokio::process::Command::new("dnsmasq")
+            .arg("--interface")
+            .arg(&bridge)
+            .arg("--bind-interfaces")
+            .arg("--dhcp-range")
+            .arg(&dhcp_range)
+            .arg("--no-daemon")
+            .spawn()
+            .wrap_err_with(|| format!("failed to start dnsmasq on bridge {bridge}"))?;
+
+        Ok(Self {
+            config,
+            bridge,
+            dnsmasq_process: Some(dnsmasq_process),
+        })
+    }
+
+    async fn on_stop(
+        &mut self,
+        _actor_ref: WeakActorRef<Self>,
+        _reason: ActorStopReason,
+    ) -> std::result::Result<(), Self::Error> {
+        if let Some(mut dnsmasq_process) = self.dnsmasq_process.take() {
+            dnsmasq_process
+                .start_kill()
+                .wrap_err_with(|| format!("failed to stop dnsmasq on bridge {}", self.bridge))?;
+
+            let _ = dnsmasq_process.wait().await;
+        }
+
+        Ok(())
     }
 }
 
@@ -200,7 +240,7 @@ impl NetworkAgentActor {
     /// NAT/NAT66 policy as well. That is a larger design decision than this
     /// hook should make on its own. Until odorobo has an intentional IPv6
     /// guest-networking story, we keep host-only NAT scoped to IPv4.
-    /// 
+    ///
     // todo: IPv6, refer to libvirt's impl:
     // ```nft
     // table ip6 libvirt_network {
@@ -210,22 +250,21 @@ impl NetworkAgentActor {
     //                 counter packets 0 bytes 0 jump guest_input
     //                 counter packets 0 bytes 0 jump guest_output
     //         }
-    
+
     //         chain guest_output {
     //         }
-    
+
     //         chain guest_input {
     //         }
-    
+
     //         chain guest_cross {
     //         }
-    
+
     //         chain guest_nat {
     //                 type nat hook postrouting priority srcnat; policy accept;
     //         }
     // }
     // ```
-    
 
     fn ensure_nat_rules(_bridge: &str, _subnet: &str, upstream_iface: &str) -> Result<(), Report> {
         const TABLE_NAME: &str = "odorobo";
@@ -337,7 +376,10 @@ impl Actor for NetworkAgentActor {
         };
 
         let dhcp_actor = if let Some(dhcp_config) = &args.dhcp_config {
-            Some(DhcpActor::spawn_link(&actor_ref, dhcp_config.clone()).await)
+            Some(
+                DhcpActor::spawn_link(&actor_ref, (dhcp_config.clone(), common.bridge.clone()))
+                    .await,
+            )
         } else {
             None
         };

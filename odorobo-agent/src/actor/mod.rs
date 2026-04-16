@@ -73,7 +73,7 @@ fn default_upstream_iface() -> String {
 pub struct DhcpConfig {
     pub upstream_iface: String,
     pub range: (Ipv4Addr, Ipv4Addr),
-    pub mask: Ipv4Net,
+    pub subnet: Ipv4Net,
     /// lease time for DHCP clients
     ///
     /// example: 12h, 6h, 30m
