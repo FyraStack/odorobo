@@ -2710,6 +2710,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "mnl"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "528ab362254419b09757228dc96e0d834e75392c52870d759df2274753007065"
+dependencies = [
+ "libc",
+ "log",
+ "mnl-sys",
+]
+
+[[package]]
 name = "mnl-sys"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3005,6 +3016,7 @@ dependencies = [
  "kameo",
  "libc",
  "libp2p",
+ "mnl",
  "nftnl",
  "odorobo-shared",
  "random-port",

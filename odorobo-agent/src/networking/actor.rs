@@ -3,10 +3,13 @@ use crate::networking::messages::{AttachTap, DetachTap};
 use futures_util::{StreamExt, TryStreamExt};
 
 use kameo::{message::Context, prelude::*};
-use nftnl::{Batch, FinalizedBatch, Hook, MsgType, ProtoFamily, Rule, Table, nft_expr};
+use nftnl::{
+    Batch, FinalizedBatch, Hook, MsgType, ProtoFamily, Rule, Table, expr::InterfaceName, nft_expr,
+};
 use rtnetlink::{Error as NetlinkError, Handle, LinkBridge, LinkUnspec};
 use stable_eyre::Report;
 use stable_eyre::eyre::{Context as EyreContext, eyre};
+use std::ffi::CString;
 use tracing::info;
 
 pub struct DhcpActor {
@@ -93,7 +96,6 @@ pub struct NetworkAgentActor {
     // netlink_handle:
     netlink_thread: tokio::task::JoinHandle<()>,
     netlink_handle: Handle,
-    nft_socket: mnl::Socket,
 }
 
 impl NetworkAgentActor {
@@ -112,10 +114,12 @@ impl NetworkAgentActor {
             .wrap_err_with(|| format!("failed to query link {}", link_name))
     }
 
-    fn send_nft_batch(&mut self, batch: &FinalizedBatch) -> Result<(), Report> {
-        let portid = self.nft_socket.portid();
+    fn send_nft_batch(batch: &FinalizedBatch) -> Result<(), Report> {
+        let socket = mnl::Socket::new(mnl::Bus::Netfilter)
+            .wrap_err("failed to create netfilter netlink socket")?;
+        let portid = socket.portid();
 
-        self.nft_socket
+        socket
             .send_all(batch)
             .wrap_err("failed to send nftables batch to netfilter")?;
 
@@ -123,8 +127,7 @@ impl NetworkAgentActor {
         let mut expected_seqs = batch.sequence_numbers();
 
         while !expected_seqs.is_empty() {
-            for message in self
-                .nft_socket
+            for message in socket
                 .recv(&mut buffer[..])
                 .wrap_err("failed to receive nftables netlink acknowledgement")?
             {
@@ -141,12 +144,23 @@ impl NetworkAgentActor {
         Ok(())
     }
 
-    fn ensure_nat_rules(
-        &mut self,
-        _bridge: &str,
-        _subnet: &str,
-        upstream_iface: &str,
-    ) -> Result<(), Report> {
+    /// Ensures the host-only NAT masquerade rule exists for the configured
+    /// upstream interface.
+    ///
+    /// This is intentionally IPv4-only for now.
+    ///
+    /// The current host-only networking model is built around IPv4 guest
+    /// addressing and an IPv4 bridge gateway:
+    /// - guest subnet config uses `Ipv4Net`
+    /// - bridge gateway config uses `Ipv4Addr`
+    /// - bridge address assignment is currently IPv4-only
+    ///
+    /// Although nftables can match by interface in `inet` tables, switching
+    /// this masquerade rule to dual-stack would implicitly opt us into IPv6
+    /// NAT/NAT66 policy as well. That is a larger design decision than this
+    /// hook should make on its own. Until odorobo has an intentional IPv6
+    /// guest-networking story, we keep host-only NAT scoped to IPv4.
+    fn ensure_nat_rules(_bridge: &str, _subnet: &str, upstream_iface: &str) -> Result<(), Report> {
         let table = Table::new(c"nat", ProtoFamily::Ipv4);
 
         let mut postrouting_chain = nftnl::Chain::new(c"postrouting", &table);
@@ -158,14 +172,18 @@ impl NetworkAgentActor {
         batch.add(&postrouting_chain, MsgType::Add);
 
         let mut postrouting_rule = Rule::new(&postrouting_chain);
+        let upstream_iface = InterfaceName::Exact(
+            CString::new(upstream_iface)
+                .wrap_err("upstream interface name contained interior NUL")?,
+        );
         postrouting_rule.add_expr(&nft_expr!(meta oifname));
-        postrouting_rule.add_expr(&nft_expr!(cmp == upstream_iface));
+        postrouting_rule.add_expr(&nft_expr!(cmp == &upstream_iface));
         postrouting_rule.add_expr(&nft_expr!(masquerade));
         batch.add(&postrouting_rule, MsgType::Add);
 
         let finalized = batch.finalize();
-        self.send_nft_batch(&finalized).wrap_err_with(|| {
-            format!("failed to apply nftables postrouting masquerade for {upstream_iface}")
+        Self::send_nft_batch(&finalized).wrap_err_with(|| {
+            format!("failed to apply nftables postrouting masquerade for {upstream_iface:?}")
         })?;
 
         Ok(())
@@ -180,8 +198,6 @@ impl Actor for NetworkAgentActor {
 
         let (connection, handle, _) = rtnetlink::new_connection()?;
         let netlink_thread = tokio::spawn(connection);
-        let nft_socket = mnl::Socket::new(mnl::Bus::Netfilter)
-            .wrap_err("failed to create netfilter netlink socket")?;
 
         let common = match args.network_mode.clone() {
             NetworkMode::HostonlyNat {
@@ -239,14 +255,16 @@ impl Actor for NetworkAgentActor {
             None
         };
 
-        let mut actor = Self {
+        let actor = Self {
             config: args,
             common,
             dhcp_actor,
             netlink_thread,
             netlink_handle: handle,
-            nft_socket,
         };
+
+        let common_bridge = actor.common.bridge.clone();
+        let common_subnet = actor.common.subnet.clone();
 
         match actor.config.network_mode.clone() {
             NetworkMode::HostonlyNat {
@@ -272,12 +290,11 @@ impl Actor for NetworkAgentActor {
                     )
                 })?;
 
-                actor
-                    .ensure_nat_rules(&actor.common.bridge, &actor.common.subnet, &upstream_iface)
+                Self::ensure_nat_rules(&common_bridge, &common_subnet, &upstream_iface)
                     .wrap_err_with(|| {
                         format!(
                             "failed to ensure nftables NAT rules for bridge {} and upstream {}",
-                            actor.common.bridge, upstream_iface
+                            common_bridge, upstream_iface
                         )
                     })?;
             }

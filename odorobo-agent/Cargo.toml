@@ -48,4 +48,5 @@ ulid = { workspace = true }
 ipnet = { workspace = true }
 rtnetlink = "0.20.0"
 nftnl = { version = "0.9.1", features = ["nftnl-1-1-3"] }
+mnl = "0.3.1"
 
