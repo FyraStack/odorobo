@@ -10,6 +10,7 @@ use rtnetlink::{Error as NetlinkError, Handle, LinkBridge, LinkUnspec};
 use stable_eyre::Report;
 use stable_eyre::eyre::{Context as EyreContext, eyre};
 use std::ffi::CString;
+use std::process::Command;
 use tracing::info;
 
 pub struct DhcpActor {
@@ -144,6 +145,45 @@ impl NetworkAgentActor {
         Ok(())
     }
 
+    // use the nft CLI instead because doing full introspection is kind of a pain
+    fn nft_table_exists(table: &str) -> Result<bool, Report> {
+        let output = Command::new("nft")
+            .args(["list", "table", "ip", table])
+            .output()
+            .wrap_err_with(|| format!("failed to query nft table ip {table}"))?;
+
+        Ok(output.status.success())
+    }
+
+    fn nft_chain_exists(table: &str, chain: &str) -> Result<bool, Report> {
+        let output = Command::new("nft")
+            .args(["list", "chain", "ip", table, chain])
+            .output()
+            .wrap_err_with(|| format!("failed to query nft chain ip {table} {chain}"))?;
+
+        Ok(output.status.success())
+    }
+
+    fn nft_postrouting_masquerade_exists(
+        table: &str,
+        chain: &str,
+        upstream_iface: &str,
+    ) -> Result<bool, Report> {
+        let output = Command::new("nft")
+            .args(["list", "chain", "ip", table, chain])
+            .output()
+            .wrap_err_with(|| format!("failed to inspect nft chain ip {table} {chain}"))?;
+
+        if !output.status.success() {
+            return Ok(false);
+        }
+
+        let stdout = String::from_utf8(output.stdout)
+            .wrap_err_with(|| format!("failed to decode nft output for ip {table} {chain}"))?;
+
+        Ok(stdout.contains(&format!("oifname \"{upstream_iface}\" masquerade")))
+    }
+
     /// Ensures the host-only NAT masquerade rule exists for the configured
     /// upstream interface.
     ///
@@ -161,15 +201,35 @@ impl NetworkAgentActor {
     /// hook should make on its own. Until odorobo has an intentional IPv6
     /// guest-networking story, we keep host-only NAT scoped to IPv4.
     fn ensure_nat_rules(_bridge: &str, _subnet: &str, upstream_iface: &str) -> Result<(), Report> {
-        let table = Table::new(c"nat", ProtoFamily::Ipv4);
+        const TABLE_NAME: &str = "odorobo";
+        const CHAIN_NAME: &str = "postrouting";
+
+        let table_exists = Self::nft_table_exists(TABLE_NAME)?;
+        let chain_exists = if table_exists {
+            Self::nft_chain_exists(TABLE_NAME, CHAIN_NAME)?
+        } else {
+            false
+        };
+
+        if chain_exists
+            && Self::nft_postrouting_masquerade_exists(TABLE_NAME, CHAIN_NAME, upstream_iface)?
+        {
+            return Ok(());
+        }
+
+        let table = Table::new(c"odorobo", ProtoFamily::Ipv4);
 
         let mut postrouting_chain = nftnl::Chain::new(c"postrouting", &table);
         postrouting_chain.set_type(nftnl::ChainType::Nat);
         postrouting_chain.set_hook(Hook::PostRouting, 100);
 
         let mut batch = Batch::new();
-        batch.add(&table, MsgType::Add);
-        batch.add(&postrouting_chain, MsgType::Add);
+        if !table_exists {
+            batch.add(&table, MsgType::Add);
+        }
+        if !chain_exists {
+            batch.add(&postrouting_chain, MsgType::Add);
+        }
 
         let mut postrouting_rule = Rule::new(&postrouting_chain);
         let upstream_iface = InterfaceName::Exact(
