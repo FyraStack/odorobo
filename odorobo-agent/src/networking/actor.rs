@@ -3,6 +3,7 @@ use crate::networking::messages::{AttachTap, DetachTap};
 use futures_util::{StreamExt, TryStreamExt};
 
 use kameo::{message::Context, prelude::*};
+use nftnl::{Batch, FinalizedBatch, Hook, MsgType, ProtoFamily, Rule, Table, nft_expr};
 use rtnetlink::{Error as NetlinkError, Handle, LinkBridge, LinkUnspec};
 use stable_eyre::Report;
 use stable_eyre::eyre::{Context as EyreContext, eyre};
@@ -21,6 +22,7 @@ impl Actor for DhcpActor {
     type Args = DhcpConfig;
     type Error = Report;
     async fn on_start(args: Self::Args, _actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
+        // todo: actually run dnsmasq on startup
         Ok(Self { config: args })
     }
 }
@@ -82,6 +84,7 @@ async fn ensure_address(
         }),
     }
 }
+
 #[derive(RemoteActor)]
 pub struct NetworkAgentActor {
     pub config: NetworkConfig,
@@ -90,6 +93,7 @@ pub struct NetworkAgentActor {
     // netlink_handle:
     netlink_thread: tokio::task::JoinHandle<()>,
     netlink_handle: Handle,
+    nft_socket: mnl::Socket,
 }
 
 impl NetworkAgentActor {
@@ -107,6 +111,65 @@ impl NetworkAgentActor {
             .ok_or_else(|| eyre!("link {} not found", link_name))?
             .wrap_err_with(|| format!("failed to query link {}", link_name))
     }
+
+    fn send_nft_batch(&mut self, batch: &FinalizedBatch) -> Result<(), Report> {
+        let portid = self.nft_socket.portid();
+
+        self.nft_socket
+            .send_all(batch)
+            .wrap_err("failed to send nftables batch to netfilter")?;
+
+        let mut buffer = vec![0; nftnl::nft_nlmsg_maxsize() as usize];
+        let mut expected_seqs = batch.sequence_numbers();
+
+        while !expected_seqs.is_empty() {
+            for message in self
+                .nft_socket
+                .recv(&mut buffer[..])
+                .wrap_err("failed to receive nftables netlink acknowledgement")?
+            {
+                let message = message.wrap_err("failed to decode nft ack message")?;
+                let expected_seq = expected_seqs
+                    .next()
+                    .ok_or_else(|| eyre!("received unexpected nftables acknowledgement"))?;
+
+                mnl::cb_run(message, expected_seq, portid)
+                    .wrap_err("nftables batch acknowledgement failed")?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn ensure_nat_rules(
+        &mut self,
+        _bridge: &str,
+        _subnet: &str,
+        upstream_iface: &str,
+    ) -> Result<(), Report> {
+        let table = Table::new(c"nat", ProtoFamily::Ipv4);
+
+        let mut postrouting_chain = nftnl::Chain::new(c"postrouting", &table);
+        postrouting_chain.set_type(nftnl::ChainType::Nat);
+        postrouting_chain.set_hook(Hook::PostRouting, 100);
+
+        let mut batch = Batch::new();
+        batch.add(&table, MsgType::Add);
+        batch.add(&postrouting_chain, MsgType::Add);
+
+        let mut postrouting_rule = Rule::new(&postrouting_chain);
+        postrouting_rule.add_expr(&nft_expr!(meta oifname));
+        postrouting_rule.add_expr(&nft_expr!(cmp == upstream_iface));
+        postrouting_rule.add_expr(&nft_expr!(masquerade));
+        batch.add(&postrouting_rule, MsgType::Add);
+
+        let finalized = batch.finalize();
+        self.send_nft_batch(&finalized).wrap_err_with(|| {
+            format!("failed to apply nftables postrouting masquerade for {upstream_iface}")
+        })?;
+
+        Ok(())
+    }
 }
 
 impl Actor for NetworkAgentActor {
@@ -117,6 +180,8 @@ impl Actor for NetworkAgentActor {
 
         let (connection, handle, _) = rtnetlink::new_connection()?;
         let netlink_thread = tokio::spawn(connection);
+        let nft_socket = mnl::Socket::new(mnl::Bus::Netfilter)
+            .wrap_err("failed to create netfilter netlink socket")?;
 
         let common = match args.network_mode.clone() {
             NetworkMode::HostonlyNat {
@@ -168,22 +233,32 @@ impl Actor for NetworkAgentActor {
                 })?
         };
 
-        match args.network_mode.clone() {
+        let dhcp_actor = if let Some(dhcp_config) = &args.dhcp_config {
+            Some(DhcpActor::spawn_link(&actor_ref, dhcp_config.clone()).await)
+        } else {
+            None
+        };
+
+        let mut actor = Self {
+            config: args,
+            common,
+            dhcp_actor,
+            netlink_thread,
+            netlink_handle: handle,
+            nft_socket,
+        };
+
+        match actor.config.network_mode.clone() {
             NetworkMode::HostonlyNat {
                 bridge: _,
                 subnet,
                 gateway,
-                upstream_iface: _,
-            }
-            | NetworkMode::Bridged {
-                bridge: _,
-                subnet,
-                gateway,
+                upstream_iface,
             } => {
                 ensure_address(
-                    &handle,
+                    &actor.netlink_handle,
                     bridge.header.index,
-                    &common.bridge,
+                    &actor.common.bridge,
                     gateway,
                     subnet.prefix_len(),
                 )
@@ -193,27 +268,44 @@ impl Actor for NetworkAgentActor {
                         "failed to ensure gateway {}/{} exists on bridge {}",
                         gateway,
                         subnet.prefix_len(),
-                        common.bridge
+                        actor.common.bridge
+                    )
+                })?;
+
+                actor
+                    .ensure_nat_rules(&actor.common.bridge, &actor.common.subnet, &upstream_iface)
+                    .wrap_err_with(|| {
+                        format!(
+                            "failed to ensure nftables NAT rules for bridge {} and upstream {}",
+                            actor.common.bridge, upstream_iface
+                        )
+                    })?;
+            }
+            NetworkMode::Bridged {
+                bridge: _,
+                subnet,
+                gateway,
+            } => {
+                ensure_address(
+                    &actor.netlink_handle,
+                    bridge.header.index,
+                    &actor.common.bridge,
+                    gateway,
+                    subnet.prefix_len(),
+                )
+                .await
+                .wrap_err_with(|| {
+                    format!(
+                        "failed to ensure gateway {}/{} exists on bridge {}",
+                        gateway,
+                        subnet.prefix_len(),
+                        actor.common.bridge
                     )
                 })?;
             }
         }
 
-        // let link_bridge = LinkBridge::new(arg)
-
-        let dhcp_actor = if let Some(dhcp_config) = &args.dhcp_config {
-            Some(DhcpActor::spawn_link(&actor_ref, dhcp_config.clone()).await)
-        } else {
-            None
-        };
-
-        Ok(Self {
-            config: args,
-            common,
-            dhcp_actor,
-            netlink_thread,
-            netlink_handle: handle,
-        })
+        Ok(actor)
     }
 
     async fn on_stop(
