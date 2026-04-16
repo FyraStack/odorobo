@@ -1141,7 +1141,7 @@
           },
           "iommu_address_width": {
             "type": "integer",
-            "format": "uint8"
+            "format": "int8"
           },
           "serial_number": {
             "type": "string"
@@ -1596,7 +1596,7 @@
           "queue_size": {
             "type": "array",
             "items": {
-              "type": "uint16"
+              "type": "int16"
             }
           },
           "pci_segment": {
@@ -1604,7 +1604,7 @@
             "format": "int16"
           },
           "virtio_id": {
-            "type": "uint32"
+            "type": "int32"
           }
         }
       },
