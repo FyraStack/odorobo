@@ -6,6 +6,7 @@ use stable_eyre::{
     Result,
     eyre::{WrapErr, eyre},
 };
+use tracing::info;
 use ulid::Ulid;
 
 use crate::networking::{
@@ -32,6 +33,7 @@ fn tap_names(info: &VmInfo) -> Vec<String> {
         .as_ref()
         .map(|nets| {
             nets.iter()
+                .filter(|net| net.id.as_deref().is_some_and(|id| id.starts_with("net://")))
                 .filter_map(|net| net.tap.clone())
                 .collect::<Vec<_>>()
         })
@@ -40,15 +42,21 @@ fn tap_names(info: &VmInfo) -> Vec<String> {
 
 #[async_trait]
 impl ProvisioningHook for NetworkProvisioningHook {
-    // CH auto-generates TAP names for each network device and create them if they don't
-    // already exist, so we are okay with the tap names we get from the VM config
+    // Only Odorobo-managed `net://` network IDs participate in bridge attach/detach
+    // handling here. Other network devices are left alone.
     async fn after_boot(&self, vmid: &str, config: &VmInfo) -> Result<()> {
         let vmid = Ulid::from_string(vmid)
             .map_err(|err| eyre!("invalid vmid {vmid}: {err}"))
             .wrap_err("failed to parse vmid for networking hook")?;
 
         let taps = tap_names(config);
+        info!(
+            vmid = %vmid,
+            tap_count = taps.len(),
+            "networking after_boot hook invoked for Odorobo-managed net:// TAP devices"
+        );
         if taps.is_empty() {
+            info!(vmid = %vmid, "no TAP devices present after boot, skipping network attach");
             return Ok(());
         }
 
@@ -57,6 +65,7 @@ impl ProvisioningHook for NetworkProvisioningHook {
             .wrap_err("failed to look up network actor")?;
 
         for tap_name in taps {
+            info!(vmid = %vmid, tap = %tap_name, "sending AttachTap to network actor");
             network_actor
                 .ask(AttachTap {
                     vmid,
@@ -76,7 +85,13 @@ impl ProvisioningHook for NetworkProvisioningHook {
             .wrap_err("failed to parse vmid for networking hook")?;
 
         let taps = tap_names(config);
+        info!(
+            vmid = %vmid,
+            tap_count = taps.len(),
+            "networking before_stop hook invoked for Odorobo-managed net:// TAP devices"
+        );
         if taps.is_empty() {
+            info!(vmid = %vmid, "no TAP devices present before stop, skipping network detach");
             return Ok(());
         }
 
@@ -85,6 +100,7 @@ impl ProvisioningHook for NetworkProvisioningHook {
             .wrap_err("failed to look up network actor")?;
 
         for tap_name in taps {
+            info!(vmid = %vmid, tap = %tap_name, "sending DetachTap to network actor");
             network_actor
                 .ask(DetachTap {
                     vmid,

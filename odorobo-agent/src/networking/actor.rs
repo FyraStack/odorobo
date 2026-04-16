@@ -22,6 +22,7 @@ pub struct DhcpActor {
 pub struct NetworkConfigCommon {
     pub bridge: String,
     pub subnet: String,
+    pub upstream_iface: Option<String>,
 }
 
 impl Actor for DhcpActor {
@@ -35,6 +36,15 @@ impl Actor for DhcpActor {
             config.range.1,
             config.subnet.netmask(),
             config.lease_time
+        );
+
+        info!(
+            bridge = %bridge,
+            range_start = %config.range.0,
+            range_end = %config.range.1,
+            subnet = %config.subnet,
+            lease_time = %config.lease_time,
+            "starting dnsmasq for guest DHCP"
         );
 
         let dnsmasq_process = tokio::process::Command::new("dnsmasq")
@@ -160,6 +170,8 @@ impl NetworkAgentActor {
             .wrap_err("failed to create netfilter netlink socket")?;
         let portid = socket.portid();
 
+        info!("sending nftables batch to netfilter");
+
         socket
             .send_all(batch)
             .wrap_err("failed to send nftables batch to netfilter")?;
@@ -270,6 +282,13 @@ impl NetworkAgentActor {
         const TABLE_NAME: &str = "odorobo";
         const CHAIN_NAME: &str = "guest_nat";
 
+        info!(
+            table = TABLE_NAME,
+            chain = CHAIN_NAME,
+            upstream_iface = upstream_iface,
+            "ensuring host-only NAT masquerade rule exists"
+        );
+
         let table_exists = Self::nft_table_exists(TABLE_NAME)?;
         let chain_exists = if table_exists {
             Self::nft_chain_exists(TABLE_NAME, CHAIN_NAME)?
@@ -280,6 +299,12 @@ impl NetworkAgentActor {
         if chain_exists
             && Self::nft_postrouting_masquerade_exists(TABLE_NAME, CHAIN_NAME, upstream_iface)?
         {
+            info!(
+                table = TABLE_NAME,
+                chain = CHAIN_NAME,
+                upstream_iface = upstream_iface,
+                "existing NAT masquerade rule already present"
+            );
             return Ok(());
         }
 
@@ -291,9 +316,15 @@ impl NetworkAgentActor {
 
         let mut batch = Batch::new();
         if !table_exists {
+            info!(table = TABLE_NAME, "creating odorobo nftables table");
             batch.add(&table, MsgType::Add);
         }
         if !chain_exists {
+            info!(
+                table = TABLE_NAME,
+                chain = CHAIN_NAME,
+                "creating odorobo nftables chain"
+            );
             batch.add(&postrouting_chain, MsgType::Add);
         }
 
@@ -330,49 +361,83 @@ impl Actor for NetworkAgentActor {
                 bridge,
                 subnet,
                 gateway: _,
-                upstream_iface: _,
-            }
-            | NetworkMode::Bridged {
+                upstream_iface,
+            } => NetworkConfigCommon {
+                bridge,
+                subnet: subnet.to_string(),
+                upstream_iface: Some(upstream_iface),
+            },
+            NetworkMode::Bridged {
                 bridge,
                 subnet,
                 gateway: _,
             } => NetworkConfigCommon {
                 bridge,
                 subnet: subnet.to_string(),
+                upstream_iface: None,
             },
         };
 
         // ensure the bridge exists, creating it if necessary
-        let bridge = if let Some(bridge) = handle
+        let bridge_lookup = handle
             .link()
             .get()
             .match_name(common.bridge.clone())
             .execute()
             .next()
-            .await
-        {
-            bridge.wrap_err_with(|| format!("failed to query bridge {}", common.bridge))?
-        } else {
-            info!(bridge = %common.bridge, "creating new bridge");
-            let new_bridge = LinkBridge::new(&common.bridge).up().build();
-            handle
-                .link()
-                .add(new_bridge)
-                .execute()
-                .await
-                .wrap_err_with(|| format!("failed to create bridge {}", common.bridge))?;
+            .await;
 
-            handle
-                .link()
-                .get()
-                .match_name(common.bridge.clone())
-                .execute()
-                .next()
-                .await
-                .ok_or_else(|| eyre!("bridge {} was not found after creation", common.bridge))?
-                .wrap_err_with(|| {
-                    format!("failed to query bridge {} after creation", common.bridge)
-                })?
+        let bridge = match bridge_lookup {
+            Some(Ok(bridge)) => bridge,
+            Some(Err(err)) if matches!(err, NetlinkError::NetlinkError(ref nl_err) if nl_err.raw_code() == -libc::ENODEV) =>
+            {
+                info!(bridge = %common.bridge, "bridge not found during lookup, creating it");
+                let new_bridge = LinkBridge::new(&common.bridge).up().build();
+                handle
+                    .link()
+                    .add(new_bridge)
+                    .execute()
+                    .await
+                    .wrap_err_with(|| format!("failed to create bridge {}", common.bridge))?;
+
+                handle
+                    .link()
+                    .get()
+                    .match_name(common.bridge.clone())
+                    .execute()
+                    .next()
+                    .await
+                    .ok_or_else(|| eyre!("bridge {} was not found after creation", common.bridge))?
+                    .wrap_err_with(|| {
+                        format!("failed to query bridge {} after creation", common.bridge)
+                    })?
+            }
+            Some(Err(err)) => {
+                return Err(err)
+                    .wrap_err_with(|| format!("failed to query bridge {}", common.bridge));
+            }
+            None => {
+                info!(bridge = %common.bridge, "creating new bridge");
+                let new_bridge = LinkBridge::new(&common.bridge).up().build();
+                handle
+                    .link()
+                    .add(new_bridge)
+                    .execute()
+                    .await
+                    .wrap_err_with(|| format!("failed to create bridge {}", common.bridge))?;
+
+                handle
+                    .link()
+                    .get()
+                    .match_name(common.bridge.clone())
+                    .execute()
+                    .next()
+                    .await
+                    .ok_or_else(|| eyre!("bridge {} was not found after creation", common.bridge))?
+                    .wrap_err_with(|| {
+                        format!("failed to query bridge {} after creation", common.bridge)
+                    })?
+            }
         };
 
         let dhcp_actor = if let Some(dhcp_config) = &args.dhcp_config {
@@ -395,13 +460,27 @@ impl Actor for NetworkAgentActor {
         let common_bridge = actor.common.bridge.clone();
         let common_subnet = actor.common.subnet.clone();
 
+        info!(
+            bridge = %common_bridge,
+            subnet = %common_subnet,
+            upstream_iface = ?actor.common.upstream_iface,
+            "network actor startup configuration resolved"
+        );
+
         match actor.config.network_mode.clone() {
             NetworkMode::HostonlyNat {
                 bridge: _,
                 subnet,
                 gateway,
-                upstream_iface,
+                upstream_iface: _,
             } => {
+                info!(
+                    bridge = %actor.common.bridge,
+                    gateway = %gateway,
+                    prefix_len = subnet.prefix_len(),
+                    "ensuring host-only NAT bridge gateway address"
+                );
+
                 ensure_address(
                     &actor.netlink_handle,
                     bridge.header.index,
@@ -419,7 +498,18 @@ impl Actor for NetworkAgentActor {
                     )
                 })?;
 
-                Self::ensure_nat_rules(&common_bridge, &common_subnet, &upstream_iface)
+                let upstream_iface =
+                    actor.common.upstream_iface.as_deref().ok_or_else(|| {
+                        eyre!("host-only NAT mode requires an upstream interface")
+                    })?;
+
+                info!(
+                    bridge = %common_bridge,
+                    upstream_iface = upstream_iface,
+                    "host-only NAT uses routed upstream interface rather than bridge master"
+                );
+
+                Self::ensure_nat_rules(&common_bridge, &common_subnet, upstream_iface)
                     .wrap_err_with(|| {
                         format!(
                             "failed to ensure nftables NAT rules for bridge {} and upstream {}",
@@ -432,6 +522,13 @@ impl Actor for NetworkAgentActor {
                 subnet,
                 gateway,
             } => {
+                info!(
+                    bridge = %actor.common.bridge,
+                    gateway = %gateway,
+                    prefix_len = subnet.prefix_len(),
+                    "ensuring bridged mode host address on bridge"
+                );
+
                 ensure_address(
                     &actor.netlink_handle,
                     bridge.header.index,

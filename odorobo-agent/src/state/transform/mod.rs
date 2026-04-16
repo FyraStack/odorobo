@@ -12,9 +12,11 @@ pub trait ConfigTransform: Send + Sync {
 }
 
 pub mod console;
+pub mod networking;
 pub mod path_verify;
 pub mod storage;
 pub use console::ConsoleTransform;
+pub use networking::NetworkTransform;
 pub use path_verify::PathVerify;
 use tracing::trace;
 
@@ -58,6 +60,7 @@ impl Default for TransformChain {
         Self::new()
             .add(storage::StorageDriverTransformer::default())
             .add(ConsoleTransform)
+            .add(NetworkTransform)
             .add(PathVerify)
     }
 }

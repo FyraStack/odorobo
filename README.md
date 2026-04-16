@@ -62,14 +62,19 @@ Now apply the [Cloud Hypervisor VM spec](https://github.com/cloud-hypervisor/clo
 odoroboctl create my-vm --boot ./my-vm.json
 ```
 
-To connect directly on the host, look up the PTY path from the VM info:
+To connect directly on the host, connect to the VM's serial console socket in its runtime directory:
 
 ```bash
-odoroboctl info my-vm  # find config.serial.file, e.g. /dev/pts/3
-screen /dev/pts/3
+sudo socat -,rawer UNIX-CONNECT:/run/odorobo/vms/01KPBBXKK0R0M09VN7G6R6R3JF/console.sock
 ```
 
-See [docs/console.md](docs/console.md) for WebSocket console usage and integration details.
+Replace the VM ID in the socket path with your VM's ID. The serial console socket is created at:
+
+```text
+/run/odorobo/vms/<vmid>/console.sock
+```
+
+See [docs/console.md](docs/console.md) for direct serial socket access, WebSocket console usage, and integration details.
 
 For more advanced usage, Odorobo Agent also exposes a passthrough route for the local Cloud Hypervisor API, allowing you to call the full Cloud Hypervisor API directly through the agent's REST API
 

@@ -7,6 +7,7 @@ use odorobo_shared::{
     messages::{Ping, Pong, debug::PanicAgent, vm::*},
     utils::vm_actor_id,
 };
+use rtnetlink::packet_route::route::RouteMessage;
 use serde::{Deserialize, Serialize};
 use stable_eyre::{Report, Result};
 use std::ops::ControlFlow;
@@ -58,9 +59,19 @@ fn default_subnet() -> Ipv4Net {
 fn default_gateway() -> Ipv4Addr {
     "10.0.0.1".parse().unwrap()
 }
-
+/// Infers the default upstream interface from the system's default route
 fn default_upstream_iface() -> String {
-    "eth0".into()
+    // ip route
+    let out = std::process::Command::new("ip")
+        .arg("route")
+        .output()
+        .unwrap();
+    let output = String::from_utf8(out.stdout).unwrap();
+
+    let default_route = output.lines().find(|l| l.starts_with("default")).unwrap();
+    let iface = default_route.split_whitespace().nth(4).unwrap();
+    info!("inferring default upstream interface: {}", iface);
+    iface.into()
 }
 
 /// DHCP server config
@@ -71,7 +82,6 @@ fn default_upstream_iface() -> String {
 // --no-daemon
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DhcpConfig {
-    pub upstream_iface: String,
     pub range: (Ipv4Addr, Ipv4Addr),
     pub subnet: Ipv4Net,
     /// lease time for DHCP clients
@@ -131,7 +141,7 @@ impl Default for NetworkMode {
 
 // The infra team wants a config file on the box where they can set info specific for the box its on.
 // TODO: Double check with infra team (katherine) if they want any other config on the box.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Default)]
 pub struct Config {
     /// The hostname of the agent. Defaults to the system hostname
     /// if not specified in the config file.
@@ -389,4 +399,29 @@ impl Message<PanicAgent> for AgentActor {
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+    #[test]
+    fn test_config_serialize() {
+        let config = Config {
+            network: NetworkConfig {
+                dhcp_config: Some(DhcpConfig {
+                    range: (Ipv4Addr::new(10, 10, 1, 100), Ipv4Addr::new(10, 10, 1, 200)),
+                    subnet: Ipv4Net::new(Ipv4Addr::new(10, 10, 1, 0), 24).unwrap(),
+                    lease_time: "12h".to_string(),
+                }),
+                network_mode: NetworkMode::HostonlyNat {
+                    bridge: "vmbr0".to_string(),
+                    gateway: Ipv4Addr::new(10, 10, 100, 1),
+                    subnet: Ipv4Net::new(Ipv4Addr::new(10, 10, 100, 0), 24).unwrap(),
+                    upstream_iface: default_upstream_iface(),
+                },
+            },
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string_pretty(&config).unwrap();
+        // assert_eq!(json, )
+        println!("{}", json);
+    }
+}

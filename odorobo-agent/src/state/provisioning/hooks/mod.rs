@@ -10,6 +10,7 @@
 use async_trait::async_trait;
 use cloud_hypervisor_client::models::{VmConfig, VmInfo};
 use stable_eyre::Result;
+use tracing::info;
 
 mod machined;
 mod networking;
@@ -76,16 +77,28 @@ impl HookManager {
     }
 
     pub async fn before_boot(&self, vmid: &str, config: &VmConfig) -> Result<()> {
+        info!(
+            vmid = vmid,
+            hook_count = self.hooks.len(),
+            "running before_boot hooks"
+        );
         for hook in &self.hooks {
             hook.before_boot(vmid, config).await?;
         }
+        info!(vmid = vmid, "completed before_boot hooks");
         Ok(())
     }
 
     pub async fn after_boot(&self, vmid: &str, config: &VmInfo) -> Result<()> {
+        info!(
+            vmid = vmid,
+            hook_count = self.hooks.len(),
+            "running after_boot hooks"
+        );
         for hook in &self.hooks {
             hook.after_boot(vmid, config).await?;
         }
+        info!(vmid = vmid, "completed after_boot hooks");
         Ok(())
     }
 }
