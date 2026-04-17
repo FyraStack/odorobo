@@ -28,6 +28,9 @@ Odorobo Agent is meant to be run as a system agent on each bare-metal node (or a
 Build the Agent binary with `cargo build --release` and run it on the host machine. The Agent will listen for commands from the Gateway to create, manage, and delete VMs.
 
 ```bash
+# Install dependencies (fedora)
+sudo dnf in -y libmnl-devel libnftnl-devel clang-devel
+
 # Build the Agent
 cargo build --release
 # Run the Agent (requires write permissions to /run/odorobo, and access to systemd's system session bus

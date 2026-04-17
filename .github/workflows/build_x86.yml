@@ -19,7 +19,8 @@ jobs:
     - uses: rui314/setup-mold@v1
     - name: Run sccache-cache
       uses: mozilla-actions/sccache-action@v0.0.9
-    
+    - name: Install dependencies
+      run: apt-get install -y libmnl-dev libnftnl-dev clang
     - name: Build
       run: cargo build --verbose --release
     - name: Upload artifact - agent

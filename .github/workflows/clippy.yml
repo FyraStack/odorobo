@@ -13,8 +13,7 @@ on:
   push:
   pull_request:
   schedule:
-    - cron: '39 6 * * 6'
-
+    - cron: "39 6 * * 6"
 
 env:
   CARGO_TERM_COLOR: always
@@ -33,6 +32,9 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Install dependencies
+        run: apt-get install -y libmnl-dev libnftnl-dev clang
+
       - name: Install Rust toolchain
         uses: actions-rs/toolchain@16499b5e05bf2e26879000db0c1d13f7e13fa3af #@v1
         with:
@@ -41,18 +43,15 @@ jobs:
           components: clippy
           override: true
 
-  
       - uses: rui314/setup-mold@v1
       - name: Run sccache-cache
         uses: mozilla-actions/sccache-action@v0.0.9
-
 
       - name: Install required cargo
         run: cargo install clippy-sarif sarif-fmt
 
       - name: Run rust-clippy
-        run:
-          cargo clippy
+        run: cargo clippy
           --all-features
           --message-format=json | clippy-sarif | tee rust-clippy-results.sarif | sarif-fmt
         continue-on-error: true
