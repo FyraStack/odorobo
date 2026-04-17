@@ -4,7 +4,7 @@
 	"features": {
   "ghcr.io/devcontainers/features/rust:1": {},
  },
- "name": "Existing Dockerfile",
+ "name": "Dev",
 	"build": {
 		// Sets the run context to one level up instead of the .devcontainer folder.
 		"context": ".",
