@@ -159,7 +159,7 @@ mod tests {
 
         let net = &config.net.as_ref().unwrap()[0];
         assert_eq!(net.id.as_deref(), Some("net://devnet"));
-        assert_eq!(net.tap.as_deref(), Some("vmtap-7mhwt-vnet"));
+        assert_eq!(net.tap.as_deref(), Some("vmtap-mhwt-vnet"));
     }
 
     #[test]
