@@ -3,14 +3,17 @@ use crate::networking::messages::{AttachTap, DetachTap};
 use futures_util::{StreamExt, TryStreamExt};
 
 use kameo::{message::Context, prelude::*};
-use nftnl::{
-    Batch, FinalizedBatch, Hook, MsgType, ProtoFamily, Rule, Table, expr::InterfaceName, nft_expr,
+use nftables::{
+    batch::Batch as NftBatch,
+    expr::{Expression, Meta, MetaKey, NamedExpression},
+    helper::{apply_ruleset, get_current_ruleset},
+    schema::{Chain as NftChain, NfListObject, NfObject, Rule as NftRule, Table as NftTable},
+    stmt::{Match as NftMatch, Operator, Statement},
+    types::{NfChainPolicy, NfChainType, NfFamily, NfHook},
 };
 use rtnetlink::{Error as NetlinkError, Handle, LinkBridge, LinkUnspec};
 use stable_eyre::Report;
 use stable_eyre::eyre::{Context as EyreContext, eyre};
-use std::ffi::CString;
-use std::process::Command;
 use tracing::info;
 
 pub struct DhcpActor {
@@ -165,75 +168,50 @@ impl NetworkAgentActor {
             .wrap_err_with(|| format!("failed to query link {}", link_name))
     }
 
-    fn send_nft_batch(batch: &FinalizedBatch) -> Result<(), Report> {
-        let socket = mnl::Socket::new(mnl::Bus::Netfilter)
-            .wrap_err("failed to create netfilter netlink socket")?;
-        let portid = socket.portid();
-
-        info!("sending nftables batch to netfilter");
-
-        socket
-            .send_all(batch)
-            .wrap_err("failed to send nftables batch to netfilter")?;
-
-        let mut buffer = vec![0; nftnl::nft_nlmsg_maxsize() as usize];
-        let mut expected_seqs = batch.sequence_numbers();
-
-        while !expected_seqs.is_empty() {
-            for message in socket
-                .recv(&mut buffer[..])
-                .wrap_err("failed to receive nftables netlink acknowledgement")?
-            {
-                let message = message.wrap_err("failed to decode nft ack message")?;
-                let expected_seq = expected_seqs
-                    .next()
-                    .ok_or_else(|| eyre!("received unexpected nftables acknowledgement"))?;
-
-                mnl::cb_run(message, expected_seq, portid)
-                    .wrap_err("nftables batch acknowledgement failed")?;
+    fn nft_table_exists(objects: &[NfObject<'_>], table: &str) -> bool {
+        objects.iter().any(|object| match object {
+            NfObject::ListObject(NfListObject::Table(existing)) => {
+                existing.family == NfFamily::IP && existing.name.as_ref() == table
             }
-        }
-
-        Ok(())
+            _ => false,
+        })
     }
 
-    // use the nft CLI instead because doing full introspection is kind of a pain
-    fn nft_table_exists(table: &str) -> Result<bool, Report> {
-        let output = Command::new("nft")
-            .args(["list", "table", "ip", table])
-            .output()
-            .wrap_err_with(|| format!("failed to query nft table ip {table}"))?;
-
-        Ok(output.status.success())
-    }
-
-    fn nft_chain_exists(table: &str, chain: &str) -> Result<bool, Report> {
-        let output = Command::new("nft")
-            .args(["list", "chain", "ip", table, chain])
-            .output()
-            .wrap_err_with(|| format!("failed to query nft chain ip {table} {chain}"))?;
-
-        Ok(output.status.success())
+    fn nft_chain_exists(objects: &[NfObject<'_>], table: &str, chain: &str) -> bool {
+        objects.iter().any(|object| match object {
+            NfObject::ListObject(NfListObject::Chain(existing)) => {
+                existing.family == NfFamily::IP
+                    && existing.table.as_ref() == table
+                    && existing.name.as_ref() == chain
+            }
+            _ => false,
+        })
     }
 
     fn nft_postrouting_masquerade_exists(
+        objects: &[NfObject<'_>],
         table: &str,
         chain: &str,
         upstream_iface: &str,
-    ) -> Result<bool, Report> {
-        let output = Command::new("nft")
-            .args(["list", "chain", "ip", table, chain])
-            .output()
-            .wrap_err_with(|| format!("failed to inspect nft chain ip {table} {chain}"))?;
-
-        if !output.status.success() {
-            return Ok(false);
-        }
-
-        let stdout = String::from_utf8(output.stdout)
-            .wrap_err_with(|| format!("failed to decode nft output for ip {table} {chain}"))?;
-
-        Ok(stdout.contains(&format!("oifname \"{upstream_iface}\" masquerade")))
+    ) -> bool {
+        objects.iter().any(|object| match object {
+            NfObject::ListObject(NfListObject::Rule(existing)) => {
+                existing.family == NfFamily::IP
+                    && existing.table.as_ref() == table
+                    && existing.chain.as_ref() == chain
+                    && matches!(
+                        existing.expr.as_ref(),
+                        [Statement::Match(NftMatch { left, right, op }), Statement::Masquerade(_)]
+                            if *op == Operator::EQ
+                                && matches!(
+                                    left,
+                                    Expression::Named(NamedExpression::Meta(Meta { key: MetaKey::Oifname }))
+                                )
+                                && matches!(right, Expression::String(iface) if iface.as_ref() == upstream_iface)
+                    )
+            }
+            _ => false,
+        })
     }
 
     /// Ensures the host-only NAT masquerade rule exists for the configured
@@ -289,16 +267,19 @@ impl NetworkAgentActor {
             "ensuring host-only NAT masquerade rule exists"
         );
 
-        let table_exists = Self::nft_table_exists(TABLE_NAME)?;
-        let chain_exists = if table_exists {
-            Self::nft_chain_exists(TABLE_NAME, CHAIN_NAME)?
-        } else {
-            false
-        };
+        let ruleset = get_current_ruleset().wrap_err("failed to fetch current nftables ruleset")?;
+        let objects = ruleset.objects.as_ref();
 
-        if chain_exists
-            && Self::nft_postrouting_masquerade_exists(TABLE_NAME, CHAIN_NAME, upstream_iface)?
-        {
+        let table_exists = Self::nft_table_exists(objects, TABLE_NAME);
+        let chain_exists = Self::nft_chain_exists(objects, TABLE_NAME, CHAIN_NAME);
+        let rule_exists = Self::nft_postrouting_masquerade_exists(
+            objects,
+            TABLE_NAME,
+            CHAIN_NAME,
+            upstream_iface,
+        );
+
+        if rule_exists {
             info!(
                 table = TABLE_NAME,
                 chain = CHAIN_NAME,
@@ -308,39 +289,62 @@ impl NetworkAgentActor {
             return Ok(());
         }
 
-        let table = Table::new(c"odorobo", ProtoFamily::Ipv4);
+        let mut batch = NftBatch::new();
 
-        let mut postrouting_chain = nftnl::Chain::new(c"guest_nat", &table);
-        postrouting_chain.set_type(nftnl::ChainType::Nat);
-        postrouting_chain.set_hook(Hook::PostRouting, 100);
-
-        let mut batch = Batch::new();
         if !table_exists {
             info!(table = TABLE_NAME, "creating odorobo nftables table");
-            batch.add(&table, MsgType::Add);
+            batch.add(NfListObject::Table(NftTable {
+                family: NfFamily::IP,
+                name: TABLE_NAME.into(),
+                handle: None,
+            }));
         }
+
         if !chain_exists {
             info!(
                 table = TABLE_NAME,
                 chain = CHAIN_NAME,
                 "creating odorobo nftables chain"
             );
-            batch.add(&postrouting_chain, MsgType::Add);
+            batch.add(NfListObject::Chain(NftChain {
+                family: NfFamily::IP,
+                table: TABLE_NAME.into(),
+                name: CHAIN_NAME.into(),
+                newname: None,
+                handle: None,
+                _type: Some(NfChainType::NAT),
+                hook: Some(NfHook::Postrouting),
+                prio: Some(100),
+                dev: None,
+                policy: Some(NfChainPolicy::Accept),
+            }));
         }
 
-        let mut postrouting_rule = Rule::new(&postrouting_chain);
-        let upstream_iface = InterfaceName::Exact(
-            CString::new(upstream_iface)
-                .wrap_err("upstream interface name contained interior NUL")?,
-        );
-        postrouting_rule.add_expr(&nft_expr!(meta oifname));
-        postrouting_rule.add_expr(&nft_expr!(cmp == &upstream_iface));
-        postrouting_rule.add_expr(&nft_expr!(masquerade));
-        batch.add(&postrouting_rule, MsgType::Add);
+        batch.add(NfListObject::Rule(NftRule {
+            family: NfFamily::IP,
+            table: TABLE_NAME.into(),
+            chain: CHAIN_NAME.into(),
+            expr: vec![
+                Statement::Match(NftMatch {
+                    left: Expression::Named(NamedExpression::Meta(Meta {
+                        key: MetaKey::Oifname,
+                    })),
+                    right: Expression::String(upstream_iface.into()),
+                    op: Operator::EQ,
+                }),
+                Statement::Masquerade(None),
+            ]
+            .into(),
+            handle: None,
+            index: None,
+            comment: Some("odorobo host-only NAT".into()),
+        }));
 
-        let finalized = batch.finalize();
-        Self::send_nft_batch(&finalized).wrap_err_with(|| {
-            format!("failed to apply nftables postrouting masquerade for {upstream_iface:?}")
+        let batch = batch.to_nftables();
+        apply_ruleset(&batch).wrap_err_with(|| {
+            format!(
+                "failed to apply nftables postrouting masquerade for upstream interface {upstream_iface}"
+            )
         })?;
 
         Ok(())

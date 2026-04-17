@@ -4,9 +4,7 @@ RUN apk add \
 	gcc \
 	musl-dev \
 	rustup \
-	zig \
-	libnftnl-dev \
-	libmnl-dev
+	zig
 RUN rustup-init \
 	--profile minimal \
 	--target riscv64a23-unknown-linux-gnu \

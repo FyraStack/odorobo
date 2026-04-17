@@ -33,7 +33,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install dependencies
-        run: apt-get install -y libmnl-dev libnftnl-dev clang
+        run: apt-get install -y clang
 
       - name: Install Rust toolchain
         uses: actions-rs/toolchain@16499b5e05bf2e26879000db0c1d13f7e13fa3af #@v1
