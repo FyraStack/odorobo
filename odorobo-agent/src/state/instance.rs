@@ -198,7 +198,6 @@ impl VMInstance {
 
         let receive_migration_data = models::ReceiveMigrationData {
             receiver_url: receiver_uri.clone(),
-            ..Default::default()
         };
 
         let vm_id = self.vm_id().to_string();

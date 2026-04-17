@@ -214,23 +214,6 @@ impl NetworkAgentActor {
         })
     }
 
-    /// Ensures the host-only NAT masquerade rule exists for the configured
-    /// upstream interface.
-    ///
-    /// This is intentionally IPv4-only for now.
-    ///
-    /// The current host-only networking model is built around IPv4 guest
-    /// addressing and an IPv4 bridge gateway:
-    /// - guest subnet config uses `Ipv4Net`
-    /// - bridge gateway config uses `Ipv4Addr`
-    /// - bridge address assignment is currently IPv4-only
-    ///
-    /// Although nftables can match by interface in `inet` tables, switching
-    /// this masquerade rule to dual-stack would implicitly opt us into IPv6
-    /// NAT/NAT66 policy as well. That is a larger design decision than this
-    /// hook should make on its own. Until odorobo has an intentional IPv6
-    /// guest-networking story, we keep host-only NAT scoped to IPv4.
-    ///
     // todo: IPv6, refer to libvirt's impl:
     // ```nft
     // table ip6 libvirt_network {
@@ -255,6 +238,23 @@ impl NetworkAgentActor {
     //         }
     // }
     // ```
+    /// Ensures the host-only NAT masquerade rule exists for the configured
+    /// upstream interface.
+    ///
+    /// This is intentionally IPv4-only for now.
+    ///
+    /// The current host-only networking model is built around IPv4 guest
+    /// addressing and an IPv4 bridge gateway:
+    /// - guest subnet config uses `Ipv4Net`
+    /// - bridge gateway config uses `Ipv4Addr`
+    /// - bridge address assignment is currently IPv4-only
+    ///
+    /// Although nftables can match by interface in `inet` tables, switching
+    /// this masquerade rule to dual-stack would implicitly opt us into IPv6
+    /// NAT/NAT66 policy as well. That is a larger design decision than this
+    /// hook should make on its own. Until odorobo has an intentional IPv6
+    /// guest-networking story, we keep host-only NAT scoped to IPv4.
+    ///
 
     fn ensure_nat_rules(_bridge: &str, _subnet: &str, upstream_iface: &str) -> Result<(), Report> {
         const TABLE_NAME: &str = "odorobo";
@@ -393,7 +393,7 @@ impl Actor for NetworkAgentActor {
 
         let bridge = match bridge_lookup {
             Some(Ok(bridge)) => bridge,
-            Some(Err(err)) if matches!(err, NetlinkError::NetlinkError(ref nl_err) if nl_err.raw_code() == -libc::ENODEV) =>
+            Some(Err(NetlinkError::NetlinkError(ref nl_err))) if nl_err.raw_code() == -libc::ENODEV =>
             {
                 info!(bridge = %common.bridge, "bridge not found during lookup, creating it");
                 let new_bridge = LinkBridge::new(&common.bridge).up().build();

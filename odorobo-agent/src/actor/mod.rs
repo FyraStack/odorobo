@@ -7,7 +7,6 @@ use odorobo_shared::{
     messages::{Ping, Pong, debug::PanicAgent, vm::*},
     utils::vm_actor_id,
 };
-use rtnetlink::packet_route::route::RouteMessage;
 use serde::{Deserialize, Serialize};
 use stable_eyre::{Report, Result};
 use std::ops::ControlFlow;
