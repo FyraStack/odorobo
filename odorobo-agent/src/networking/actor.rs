@@ -254,7 +254,6 @@ impl NetworkAgentActor {
     /// NAT/NAT66 policy as well. That is a larger design decision than this
     /// hook should make on its own. Until odorobo has an intentional IPv6
     /// guest-networking story, we keep host-only NAT scoped to IPv4.
-
     fn ensure_nat_rules(_bridge: &str, _subnet: &str, upstream_iface: &str) -> Result<(), Report> {
         const TABLE_NAME: &str = "odorobo";
         const CHAIN_NAME: &str = "guest_nat";
