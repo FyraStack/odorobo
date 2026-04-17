@@ -1,6 +1,7 @@
-use crate::state::provisioning::actor::VMActor;
+use crate::{networking::actor::NetworkAgentActor, state::provisioning::actor::VMActor};
 use ahash::AHashMap;
 use bytesize::ByteSize;
+use ipnet::Ipv4Net;
 use kameo::prelude::*;
 use odorobo_shared::{
     messages::{Ping, Pong, debug::PanicAgent, vm::*},
@@ -8,8 +9,8 @@ use odorobo_shared::{
 };
 use serde::{Deserialize, Serialize};
 use stable_eyre::{Report, Result};
-use std::fs;
 use std::ops::ControlFlow;
+use std::{fs, net::Ipv4Addr};
 use sysinfo::System;
 use tracing::{error, info, trace, warn};
 use ulid::Ulid;
@@ -22,6 +23,7 @@ pub struct AgentActor {
     pub memory: ByteSize,
     pub config: Config,
     pub vms: AHashMap<Ulid, ActorRef<VMActor>>,
+    // pub network_actor: ActorRef<NetworkAgentActor>,
 }
 
 /// Gets the system hostname
@@ -45,9 +47,100 @@ fn default_region() -> String {
     "Local".into()
 }
 
+fn default_bridge_name() -> String {
+    "vmbr0".into()
+}
+
+fn default_subnet() -> Ipv4Net {
+    "10.0.0.0/24".parse().unwrap()
+}
+
+fn default_gateway() -> Ipv4Addr {
+    "10.0.0.1".parse().unwrap()
+}
+/// Infers the default upstream interface from the system's default route
+fn default_upstream_iface() -> String {
+    // ip route
+    let out = std::process::Command::new("ip")
+        .arg("route")
+        .output()
+        .unwrap();
+    let output = String::from_utf8(out.stdout).unwrap();
+
+    let default_route = output.lines().find(|l| l.starts_with("default")).unwrap();
+    let iface = default_route.split_whitespace().nth(4).unwrap();
+    info!("inferring default upstream interface: {}", iface);
+    iface.into()
+}
+
+/// DHCP server config
+///
+/// config options for dnsmasq
+///
+/// this configures what options
+// --no-daemon
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct DhcpConfig {
+    pub range: (Ipv4Addr, Ipv4Addr),
+    pub subnet: Ipv4Net,
+    /// lease time for DHCP clients
+    ///
+    /// example: 12h, 6h, 30m
+    pub lease_time: String,
+}
+
+// TODO: move config into a separate module
+#[derive(Serialize, Deserialize, Default, Clone)]
+pub struct NetworkConfig {
+    pub dhcp_config: Option<DhcpConfig>,
+    pub network_mode: NetworkMode,
+}
+
+/// L3 routing configuration for guests
+#[derive(Serialize, Deserialize, Clone)]
+pub enum NetworkMode {
+    /// Private guest bridge with host-side gateway and outbound NAT.
+    HostonlyNat {
+        #[serde(default = "default_bridge_name")]
+        bridge: String,
+        #[serde(default = "default_subnet")]
+        subnet: Ipv4Net,
+        #[serde(default = "default_gateway")]
+        gateway: Ipv4Addr,
+        #[serde(default = "default_upstream_iface")]
+        upstream_iface: String,
+    },
+    /// Flat bridge mode for operator-managed uplinks.
+    ///
+    /// The agent should only ensure that the bridge exists, is up, and has the
+    /// configured host address on it. It should not automatically enslave a
+    /// physical uplink into the bridge. Operators are expected to attach the
+    /// upstream interface themselves and handle any host networking migration
+    /// required for their environment.
+    ///
+    /// Per-VM TAP devices can still be attached to this bridge in the same way
+    /// as NAT mode.
+    Bridged {
+        bridge: String,
+        subnet: Ipv4Net,
+        gateway: Ipv4Addr,
+    },
+}
+
+impl Default for NetworkMode {
+    fn default() -> Self {
+        Self::HostonlyNat {
+            bridge: default_bridge_name(),
+            subnet: default_subnet(),
+            gateway: default_gateway(),
+            upstream_iface: default_upstream_iface(),
+        }
+    }
+}
+
 // The infra team wants a config file on the box where they can set info specific for the box its on.
 // TODO: Double check with infra team (katherine) if they want any other config on the box.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Default)]
 pub struct Config {
     /// The hostname of the agent. Defaults to the system hostname
     /// if not specified in the config file.
@@ -69,6 +162,8 @@ pub struct Config {
     /// Arbitrary annotations that can be used
     #[serde(default)]
     pub annotations: AHashMap<String, String>,
+    #[serde(default)]
+    pub network: NetworkConfig,
 }
 
 impl AgentActor {
@@ -84,10 +179,15 @@ impl Actor for AgentActor {
     type Args = ();
     type Error = Report;
 
-    async fn on_start(_state: Self::Args, _actor_ref: ActorRef<Self>) -> Result<Self> {
+    async fn on_start(_state: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self> {
         // TODO: ask infra team where they want this on the box
         let file = fs::File::open("config.json").expect("file should open read only");
         let config: Config = serde_json::from_reader(file).expect("file should be proper JSON");
+
+        // spawn networking actor
+        let network_actor: ActorRef<NetworkAgentActor> =
+            NetworkAgentActor::spawn_link(&actor_ref, config.network.clone()).await;
+        network_actor.register("network_actor").await?;
 
         let sys = System::new_all();
 
@@ -298,4 +398,29 @@ impl Message<PanicAgent> for AgentActor {
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+    #[test]
+    fn test_config_serialize() {
+        let config = Config {
+            network: NetworkConfig {
+                dhcp_config: Some(DhcpConfig {
+                    range: (Ipv4Addr::new(10, 10, 1, 100), Ipv4Addr::new(10, 10, 1, 200)),
+                    subnet: Ipv4Net::new(Ipv4Addr::new(10, 10, 1, 0), 24).unwrap(),
+                    lease_time: "12h".to_string(),
+                }),
+                network_mode: NetworkMode::HostonlyNat {
+                    bridge: "vmbr0".to_string(),
+                    gateway: Ipv4Addr::new(10, 10, 100, 1),
+                    subnet: Ipv4Net::new(Ipv4Addr::new(10, 10, 100, 0), 24).unwrap(),
+                    upstream_iface: default_upstream_iface(),
+                },
+            },
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string_pretty(&config).unwrap();
+        // assert_eq!(json, )
+        println!("{}", json);
+    }
+}

@@ -106,10 +106,12 @@ impl VMInstance {
 
         let vm_config = self.info().await?.config;
 
+        debug!(vmid = self.vm_id(), "before_boot hooks invoked");
         self.hook_manager
             .before_boot(self.vm_id(), &vm_config)
             .await?;
 
+        debug!(vmid = self.vm_id(), "boot_vm invoked");
         self.conn()
             .boot_vm()
             .await
@@ -120,6 +122,7 @@ impl VMInstance {
 
         let vm_info_postboot = self.info().await?;
 
+        debug!(vmid = self.vm_id(), "after_boot hooks invoked");
         self.hook_manager
             .after_boot(self.vm_id(), &vm_info_postboot)
             .await?;
@@ -195,7 +198,6 @@ impl VMInstance {
 
         let receive_migration_data = models::ReceiveMigrationData {
             receiver_url: receiver_uri.clone(),
-            ..Default::default()
         };
 
         let vm_id = self.vm_id().to_string();
@@ -396,6 +398,7 @@ impl VMInstance {
         );
         if let Ok(info) = self.info().await {
             trace!(vm_id = self.vm_id(), state = ?info.state, "Checking VM state before destroy");
+            self.hook_manager.before_stop(self.vm_id(), &info).await?;
             if matches!(
                 info.state,
                 models::VmState::Running | models::VmState::Paused
@@ -497,7 +500,7 @@ impl VMInstance {
                 self.vm_id()
             ))?;
 
-        // self.save_config(&config)?;
+        self.vm_config = Some(transformed_config.clone());
 
         trace!(vm_id = self.vm_id(), "Creating VM via CH API");
         self.conn()

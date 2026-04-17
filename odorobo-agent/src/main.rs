@@ -1,5 +1,6 @@
 pub mod actor;
 mod api;
+pub mod networking;
 mod state;
 mod util;
 use kameo::actor::Spawn;

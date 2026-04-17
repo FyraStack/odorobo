@@ -45,3 +45,6 @@ sysinfo = "0.38.4"
 bytesize = "2.3.1"
 odorobo-shared = { workspace = true }
 ulid = { workspace = true }
+ipnet = { workspace = true }
+rtnetlink = "0.20.0"
+nftables = { version = "0.6.3", features = ["tokio"] }

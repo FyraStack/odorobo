@@ -13,8 +13,7 @@ on:
   push:
   pull_request:
   schedule:
-    - cron: '39 6 * * 6'
-
+    - cron: "39 6 * * 6"
 
 env:
   CARGO_TERM_COLOR: always
@@ -41,18 +40,15 @@ jobs:
           components: clippy
           override: true
 
-  
       - uses: rui314/setup-mold@v1
       - name: Run sccache-cache
         uses: mozilla-actions/sccache-action@v0.0.9
-
 
       - name: Install required cargo
         run: cargo install clippy-sarif sarif-fmt
 
       - name: Run rust-clippy
-        run:
-          cargo clippy
+        run: cargo clippy
           --all-features
           --message-format=json | clippy-sarif | tee rust-clippy-results.sarif | sarif-fmt
         continue-on-error: true
