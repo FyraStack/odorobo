@@ -12,7 +12,7 @@ use tracing::{info, warn};
 
 #[derive(RemoteActor)]
 pub struct SchedulerActor {
-    pub agent_actor: Option<RemoteActorRef<AgentActor>>,
+    pub agent_actors: Vec<RemoteActorRef<AgentActor>>, // this might need to be a hashmap or have lookup tables or something. not sure.
 }
 
 impl SchedulerActor {
@@ -51,6 +51,12 @@ impl SchedulerActor {
         self.agent_actor = Some(new_agent.clone());
         Ok(new_agent)
     }
+
+    async fn update_agents(
+        &mut self
+    ) -> Result<(), Report> {
+        // get all agents via lookup_all and update the list that is held internally.
+    }
 }
 
 impl Actor for SchedulerActor {
@@ -61,6 +67,7 @@ impl Actor for SchedulerActor {
         let peer_id = *actor_ref.id().peer_id().unwrap();
 
         info!("Actor started! Scheduler peer id: {peer_id}");
+
 
         let agent_actor = Self::lookup_agent(&actor_ref).await?;
 
@@ -77,7 +84,7 @@ impl Actor for SchedulerActor {
         });
 
         Ok(Self {
-            agent_actor: Some(agent_actor),
+            agent_actors: Some(agent_actor),
         })
     }
 
