@@ -3039,6 +3039,7 @@ dependencies = [
 name = "odorobo-shared"
 version = "0.1.0"
 dependencies = [
+ "bytesize",
  "cloud-hypervisor-client",
  "kameo",
  "libp2p",

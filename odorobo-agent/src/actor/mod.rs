@@ -4,7 +4,7 @@ use bytesize::ByteSize;
 use ipnet::Ipv4Net;
 use kameo::prelude::*;
 use odorobo_shared::{
-    messages::{Ping, Pong, debug::PanicAgent, vm::*},
+    messages::{Ping, Pong, agent::{AgentStatus, GetAgentStatus}, debug::PanicAgent, vm::*},
     utils::vm_actor_id,
 };
 use serde::{Deserialize, Serialize};
@@ -394,6 +394,24 @@ impl Message<PanicAgent> for AgentActor {
     ) -> Self::Reply {
         tracing::info!("panicking");
         panic!();
+    }
+}
+
+#[remote_message]
+impl Message<GetAgentStatus> for AgentActor {
+    type Reply = AgentStatus;
+    
+    async fn handle(
+        &mut self,
+        _msg: GetAgentStatus,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        
+        AgentStatus { 
+            hostname: self.config.hostname.clone(), 
+            vcpus: self.vcpus, 
+            ram: self.memory
+        }
     }
 }
 

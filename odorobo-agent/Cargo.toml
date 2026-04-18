@@ -42,7 +42,7 @@ kameo = { workspace = true }
 libp2p = { version = "0.56.0", features = ["yamux", "serde", "mdns"] }
 ahash = { workspace = true }
 sysinfo = "0.38.4"
-bytesize = "2.3.1"
+bytesize = { workspace = true }
 odorobo-shared = { workspace = true }
 ulid = { workspace = true }
 ipnet = { workspace = true }
