@@ -1,61 +1,158 @@
 use std::ops::ControlFlow;
+use std::sync::Arc;
 use std::time::Duration;
 
+use ahash::AHashMap;
 use kameo::prelude::*;
+use libp2p::futures::TryStreamExt;
 use odorobo_agent::actor::AgentActor;
 use odorobo_agent::state::provisioning::actor::VMActor;
 use odorobo_shared::messages::vm::*;
+use odorobo_shared::messages::agent::*;
 use odorobo_shared::messages::{Ping, Pong};
 use odorobo_shared::utils::vm_actor_id;
 use stable_eyre::{Report, Result, eyre::eyre};
-use tracing::{info, warn};
+use tokio::sync::Mutex;
+use tracing::{info, warn, trace, debug};
+use ulid::Ulid;
+
+// this arguably should be renamed or something, but I wasn't sure what data to use here.
+pub struct AgentActorDataCache {
+    pub actor_ref: RemoteActorRef<AgentActor>,
+    pub keepalive_task: Option<tokio::task::JoinHandle<()>>,
+    pub metadata: AgentStatus,
+
+}
+
+// this arguably should be renamed or something, but I wasn't sure what data to use here.
+pub struct VMActorDataCache {
+    pub vm_actor_ref: RemoteActorRef<VMActor>,
+    // task that constantly looks up every agent and updates status for it
+    pub keepalive_task: Option<tokio::task::JoinHandle<()>>,
+}
 
 #[derive(RemoteActor)]
 pub struct SchedulerActor {
-    pub agent_actors: Vec<RemoteActorRef<AgentActor>>, // this might need to be a hashmap or have lookup tables or something. not sure.
+    pub agent_actors: Arc<Mutex<AHashMap<ActorId, AgentActorDataCache>>>,
+    pub vms: AHashMap<Ulid, VMActorDataCache>,
+    pub keepalive_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl SchedulerActor {
-    async fn lookup_agent(
-        actor_ref: &ActorRef<Self>,
-    ) -> Result<RemoteActorRef<AgentActor>, Report> {
-        loop {
-            let agent_actor_option = RemoteActorRef::<AgentActor>::lookup("agent").await?;
+    // async fn lookup_agent(
+    //     &self,
+    //     actor_ref: &ActorRef<Self>,
+    // ) -> Result<RemoteActorRef<AgentActor>, Report> {
 
-            let Some(agent_actor) = agent_actor_option else {
-                warn!("No agent actor currently registered, retrying lookup");
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                continue;
-            };
+    //         let agent_actor_option = RemoteActorRef::<AgentActor>::lookup("agent").await?;
 
-            let agent_actor_peer_id = *agent_actor.id().peer_id().unwrap();
-            info!("Using agent actor peer id: {agent_actor_peer_id}");
+    //         let Some(agent_actor) = agent_actor_option else {
+    //             warn!("No agent actor currently registered, retrying lookup");
+    //             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    //             return self.lookup_agent(actor_ref).await;
+    //         };
 
-            // remotely link actor, on link death it will be automatically unlinked
-            info!("Linking agent actor: {agent_actor_peer_id}");
-            actor_ref.link_remote(&agent_actor).await?;
+    //         let agent_actor_peer_id = *agent_actor.id().peer_id().unwrap();
+    //         info!("Using agent actor peer id: {agent_actor_peer_id}");
 
-            return Ok(agent_actor);
-        }
-    }
+    //         // remotely link actor, on link death it will be automatically unlinked
+    //         info!("Linking agent actor: {agent_actor_peer_id}");
+    //         actor_ref.link_remote(&agent_actor).await?;
 
-    async fn ensure_agent(
+    //         return Ok(agent_actor);
+
+    // }
+
+    async fn lookup_by_actor_id(
         &mut self,
-        actor_ref: &ActorRef<Self>,
-    ) -> Result<RemoteActorRef<AgentActor>, Report> {
-        if let Some(agent_actor) = &self.agent_actor {
-            return Ok(agent_actor.clone());
-        }
-
-        let new_agent = Self::lookup_agent(actor_ref).await?;
-        self.agent_actor = Some(new_agent.clone());
-        Ok(new_agent)
+        actor_id: &ActorId,
+    ) -> Option<RemoteActorRef<AgentActor>> {
+        self.agent_actors.lock().await.get(actor_id).map(|data| data.actor_ref.clone())
     }
 
-    async fn update_agents(
+    async fn lookup_by_hostname(
+        &mut self,
+        hostname: &str,
+    ) -> Option<RemoteActorRef<AgentActor>> {
+        self.agent_actors.lock().await.values().find(|data| data.metadata.hostname == hostname).map(|data| data.actor_ref.clone())
+    }
+
+    async fn schedule_agent(
+        &mut self,
+        msg: &CreateVM
+    ) -> RemoteActorRef<AgentActor> {
+
+        let agents: Vec<&AgentActorDataCache> = self.agent_actors.lock().await.values().collect();
+
+        // warn!("randomly selecting agent");
+        let agent_index = 0; // todo: im lazy. make this random or something i guess.
+        // random::
+
+        agents[agent_index].actor_ref
+    }
+    /*
+
+    async fn update_vms(
         &mut self
     ) -> Result<(), Report> {
-        // get all agents via lookup_all and update the list that is held internally.
+        let mut vm_actors = RemoteActorRef::<VMActor>::lookup_all("agent");
+        let mut get_vm_info_set = JoinSet::new();
+
+        while let Some(vm_actor) = vm_actors.try_next().await? {
+            get_vm_info_set.spawn(async move {
+                tracing::trace!("AgentListVMs: vm_actor={:?}", vm_actor);
+
+                vm_actor.ask(&GetVMInfo { vmid: ulid::Ulid::nil() }).await
+            })
+        }
+    }
+
+    */
+
+}
+/// Periodically sends a keepalive request to all agent actors and updates their metadata.
+async fn keepalive_agents(
+    agent_actors: Arc<Mutex<AHashMap<ActorId, AgentActorDataCache>>>
+) -> Result<(), Report> {
+    loop {
+        let mut agent_actors_lookup = RemoteActorRef::<AgentActor>::lookup_all("agent");
+
+        while let Some(agent_actor) = agent_actors_lookup.try_next().await? {
+            tracing::trace!("UpdateAgents: agent_actor={:?}", agent_actor);
+            let metadata = agent_actor.ask(&GetAgentStatus).await?;
+
+            let mut locked_agent_actors = agent_actors.lock().await;
+
+            if !locked_agent_actors.contains_key(&agent_actor.id()) {
+                let cloned_agent_actor = agent_actor.clone();
+                let task = tokio::spawn(async move {
+                    update_agent(cloned_agent_actor).await
+                });
+
+
+                locked_agent_actors.insert(
+                    agent_actor.id(),
+                    AgentActorDataCache {
+                        actor_ref: agent_actor,
+                        keepalive_task: Some(task),
+                        metadata,
+                    }
+                );
+            } else {
+                locked_agent_actors.get_mut(&agent_actor.id()).unwrap().metadata = metadata;
+            }
+        }
+    }
+}
+
+async fn update_agent(
+    agent_actor_ref: RemoteActorRef<AgentActor>
+) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        if let Err(_) = agent_actor_ref.ask(&Ping).await {
+            break;
+        }
     }
 }
 
@@ -68,25 +165,23 @@ impl Actor for SchedulerActor {
 
         info!("Actor started! Scheduler peer id: {peer_id}");
 
+        let agent_actors = Arc::new(Mutex::new(AHashMap::new()));
 
-        let agent_actor = Self::lookup_agent(&actor_ref).await?;
+        let mut finished_actor = Self {
+            agent_actors: Arc::clone(&agent_actors),
+            vms: AHashMap::new(),
+            keepalive_task: None
+        };
 
-        let ping_actor = agent_actor.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(1));
-            loop {
-                interval.tick().await;
-                if let Err(err) = ping_actor.ask(&Ping).await {
-                    warn!("Periodic ping to agent failed: {err}");
-                    break;
-                }
-            }
+        let keepalive_task = tokio::spawn(async move {
+            keepalive_agents(agent_actors);
         });
 
-        Ok(Self {
-            agent_actors: Some(agent_actor),
-        })
+        finished_actor.keepalive_task = Some(keepalive_task);
+
+        Ok(finished_actor)
     }
+
 
     async fn on_link_died(
         &mut self,
@@ -96,53 +191,46 @@ impl Actor for SchedulerActor {
     ) -> Result<ControlFlow<ActorStopReason>, Self::Error> {
         warn!("Linked actor {id:?} died with reason {reason:?}");
 
-        self.agent_actor = None;
-
         let Some(actor_ref) = actor_ref.upgrade() else {
             return Ok(ControlFlow::Break(ActorStopReason::Killed));
         };
 
-        let new_agent = Self::lookup_agent(&actor_ref).await?;
+        let mut locked_agent_actors = self.agent_actors.lock().await;
 
-        let ping_actor = new_agent.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(1));
-            loop {
-                interval.tick().await;
-                if let Err(err) = ping_actor.ask(&Ping).await {
-                    warn!("Periodic ping to agent failed: {err}");
-                    break;
-                }
-            }
-        });
+        let Some(agent_actor_data) = locked_agent_actors.get_mut(&id) else {
+            return Ok(ControlFlow::Break(ActorStopReason::Killed));
+        };
 
-        self.agent_actor = Some(new_agent);
+        if let Some(task) = agent_actor_data.keepalive_task.take() {
+            trace!("Aborting keepalive task for agent {id:?}");
+            task.abort();
+        }
+
+        locked_agent_actors.remove(&id);
 
         Ok(ControlFlow::Continue(()))
     }
 }
 
+
+
+
 impl Message<CreateVM> for SchedulerActor {
     type Reply = Result<CreateVMReply, Report>;
 
-    async fn handle(&mut self, msg: CreateVM, ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
-        let actor_ref = ctx.actor_ref();
+    async fn handle(&mut self, msg: CreateVM, _ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
+        loop {
+            let target_agent = self.schedule_agent(&msg).await;
 
-        let first_agent = self.ensure_agent(actor_ref).await?;
-        match first_agent.ask(&msg).await {
-            Ok(reply) => Ok(reply),
-            Err(first_err) => {
-                warn!(
-                    "CreateVM forwarding failed, clearing cached agent and retrying lookup: {first_err}"
-                );
-                self.agent_actor = None;
-
-                let retry_agent = self.ensure_agent(actor_ref).await?;
-                retry_agent.ask(&msg).await.map_err(|retry_err| {
-                    eyre!(
-                        "failed to forward CreateVM to agent actor after reconnect; first error: {first_err}; retry error: {retry_err}"
-                    )
-                })
+            match target_agent.ask(&msg).await {
+                Ok(reply) => {
+                    return Ok(reply)
+                },
+                Err(err) => {
+                    warn!(
+                        "CreateVM forwarding failed, trying again: {err}"
+                    );
+                }
             }
         }
     }
@@ -230,6 +318,8 @@ impl Message<AgentListVMs> for SchedulerActor {
         }
     }
 }
+
+
 
 impl Message<Ping> for SchedulerActor {
     type Reply = Pong;
