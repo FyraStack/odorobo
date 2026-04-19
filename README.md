@@ -33,6 +33,10 @@ sudo dnf in -y clang-devel nftables
 
 # Build the Agent
 cargo build --release
+
+# create basic config
+echo "{}" >> config.json
+
 # Run the Agent (requires write permissions to /run/odorobo, and access to systemd's system session bus
 sudo ./target/release/odorobo-agent
 ```

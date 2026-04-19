@@ -54,30 +54,6 @@ pub struct SchedulerActor {
 }
 
 impl SchedulerActor {
-    // async fn lookup_agent(
-    //     &self,
-    //     actor_ref: &ActorRef<Self>,
-    // ) -> Result<RemoteActorRef<AgentActor>, Report> {
-
-    //         let agent_actor_option = RemoteActorRef::<AgentActor>::lookup("agent").await?;
-
-    //         let Some(agent_actor) = agent_actor_option else {
-    //             warn!("No agent actor currently registered, retrying lookup");
-    //             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    //             return self.lookup_agent(actor_ref).await;
-    //         };
-
-    //         let agent_actor_peer_id = *agent_actor.id().peer_id().unwrap();
-    //         info!("Using agent actor peer id: {agent_actor_peer_id}");
-
-    //         // remotely link actor, on link death it will be automatically unlinked
-    //         info!("Linking agent actor: {agent_actor_peer_id}");
-    //         actor_ref.link_remote(&agent_actor).await?;
-
-    //         return Ok(agent_actor);
-
-    // }
-
     async fn lookup_by_actor_id(
         &mut self,
         actor_id: &ActorId,
@@ -101,10 +77,10 @@ impl SchedulerActor {
 
         let agents: Vec<&CachedAgentActor> = locked_agent_actor_cache.values().collect();
 
-        // warn!("randomly selecting agent");
-        let agent_index = 0; // todo: im lazy. make this random or something i guess.
-        // todo: long term make this actually like make good decisions about where to schedule
-        // random::
+        warn!("randomly selecting agent");
+        // random agent selection, so basically round robin
+        // todo: improve this with something that like actually schedules agents properly
+        let agent_index = rand::random_range(0..agents.len());
 
         agents[agent_index].actor_ref.clone()
     }
@@ -191,6 +167,7 @@ impl Actor for SchedulerActor {
         let Some(agent_actor_keepalive) = locked_agent_actors.get_mut(&id) else {
             return Ok(ControlFlow::Break(ActorStopReason::Killed));
         };
+
 
         if let Some(task) = agent_actor_keepalive.keepalive_task.take() {
             trace!("Aborting keepalive task for agent {id:?}");

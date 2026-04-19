@@ -39,3 +39,4 @@ odorobo-shared = { workspace = true }
 stable-eyre = { workspace = true }
 odorobo-agent = { workspace = true }
 async-trait = "0.1.89"
+rand = "0.10.1"
