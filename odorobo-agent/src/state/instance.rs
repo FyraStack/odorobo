@@ -93,6 +93,14 @@ impl VMInstance {
         }
     }
 
+
+    /// Takes the child process out of this instance, transferring ownership to the caller.
+    /// Useful for watching the process lifecycle externally (e.g. in an actor watcher task).
+    /// After calling this, `destroy()` will skip the child-kill step.
+    pub fn take_child_process(&mut self) -> Option<tokio::process::Child> {
+        self.child_process.take()
+    }
+
     /// Get a VM instance by its ID through the filesystem database
     ///
     /// Not reliable as of 0.2

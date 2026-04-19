@@ -8,7 +8,7 @@ use odorobo_shared::messages::vm::{
 use serde::{Deserialize, Serialize};
 use stable_eyre::{Report, Result};
 use tokio::task::JoinHandle;
-use tracing::{error, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 /*
 use std::process::Command;
 
@@ -43,27 +43,34 @@ impl Actor for VMActor {
     type Error = Report;
 
     #[tracing::instrument(skip_all)]
-    async fn on_start((vmid, vm_config): Self::Args, _actor_ref: ActorRef<Self>) -> Result<Self> {
-        // let ch_sock_path = VMInstance::runtime_dir_for(&vmid.to_string()).join("ch.sock");
+    async fn on_start((vmid, vm_config): Self::Args, actor_ref: ActorRef<Self>) -> Result<Self> {
+        let mut vminstance = VMInstance::spawn(&vmid.to_string(), vm_config, None).await?;
 
-        // // no transform chain
-
-        // tracing::warn!("no-op");
-        // // spawn CH instance
-        // // this probably is not an ideal way to do this, but we want a minimal thing
-        // // so let's spawn CH as a child
-        // //
-        // // ...or we go back to that systemd way
-
-        // // ownership quirk
-        // // let value = ch_sock_path.clone();
-        // let ch_process = tokio::process::Command::new("cloud-hypervisor")
-        //     .arg("--api-socket")
-        //     .arg(&ch_sock_path)
-        //     .spawn()?;
-        // tokio::spawn(async move {
-
-        let vminstance = VMInstance::spawn(&vmid.to_string(), vm_config, None).await?;
+        // Take the child process out so we can watch for unexpected death.
+        // destroy() handles a missing child_process gracefully.
+        if let Some(mut child_process) = vminstance.take_child_process() {
+            let actor_ref = actor_ref.clone();
+            tokio::spawn(async move {
+                debug!(%vmid, "watching child process to handle actor cleanup");
+                match child_process.wait().await {
+                    Ok(status) => {
+                        if !status.success() {
+                            error!(%vmid, ?status, "child process exited unexpectedly, killing actor");
+                            let _ = actor_ref.kill();
+                        } else {
+                            warn!(%vmid, "child process exited outside of actor teardown");
+                        }
+                        let _ = actor_ref.stop_gracefully().await;
+                    }
+                    Err(err) => {
+                        error!(%vmid, ?err, "failed to wait on child process, killing actor");
+                        actor_ref.kill();
+                    }
+                };
+            });
+        } else {
+            warn!(%vmid, "VMInstance has no child process to watch");
+        }
 
         Ok(Self {
             vmid,

@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["odorobo-agent", "odoroboctl", "odorobo-manager", "odorobo-shared"]
+[workspace.package]
 rust-version = "1.95.0"
 [workspace.dependencies]
 stable-eyre = "0.2.2"
