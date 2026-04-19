@@ -59,8 +59,8 @@ impl Actor for VMActor {
                             let _ = actor_ref.kill();
                         } else {
                             warn!(%vmid, "child process exited outside of actor teardown");
+                            let _ = actor_ref.stop_gracefully().await;
                         }
-                        let _ = actor_ref.stop_gracefully().await;
                     }
                     Err(err) => {
                         error!(%vmid, ?err, "failed to wait on child process, killing actor");
