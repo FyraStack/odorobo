@@ -400,17 +400,18 @@ impl Message<PanicAgent> for AgentActor {
 #[remote_message]
 impl Message<GetAgentStatus> for AgentActor {
     type Reply = AgentStatus;
-    
+
     async fn handle(
         &mut self,
         _msg: GetAgentStatus,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        
-        AgentStatus { 
-            hostname: self.config.hostname.clone(), 
-            vcpus: self.vcpus, 
-            ram: self.memory
+
+        AgentStatus {
+            hostname: self.config.hostname.clone(),
+            vcpus: self.vcpus,
+            ram: self.memory,
+            vms: vec![Ulid::new()], // todo
         }
     }
 }

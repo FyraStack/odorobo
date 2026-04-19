@@ -3012,6 +3012,7 @@ version = "0.1.0"
 dependencies = [
  "ahash",
  "aide",
+ "async-trait",
  "axum",
  "bytesize",
  "clap",
