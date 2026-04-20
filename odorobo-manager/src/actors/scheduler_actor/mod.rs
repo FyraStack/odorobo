@@ -131,11 +131,12 @@ impl Actor for SchedulerActor {
 
         //let vm_actors = Arc::new(Mutex::new(AHashMap::new()));
 
+        let actor_ref_clone = actor_ref.clone();
         let agent_actors_clone = Arc::clone(&agent_actors);
         let agent_actors_keepalives_clone = Arc::clone(&agent_actors_keepalives);
 
         let agent_keepalive_task = tokio::spawn(async move {
-            keepalive_agents(agent_actors_clone, agent_actors_keepalives_clone).await;
+            keepalive_agents(actor_ref_clone, agent_actors_clone, agent_actors_keepalives_clone).await;
         });
 
         Ok(Self {
@@ -162,19 +163,31 @@ impl Actor for SchedulerActor {
             return Ok(ControlFlow::Break(ActorStopReason::Killed));
         };
 
-        let mut locked_agent_actors = self.agent_actor_keepalive_tasks.lock().await;
+        let printed_pre_keepalives = self.agent_actor_keepalive_tasks.lock().await;
+        let printed_pre_cache = self.agent_actor_cache.lock().await;
 
-        let Some(agent_actor_keepalive) = locked_agent_actors.get_mut(&id) else {
-            return Ok(ControlFlow::Break(ActorStopReason::Killed));
+        info!("agent actor cache data pre removal");
+        info!("keepalives: {printed_pre_keepalives:?}");
+        info!("actor_cache: {printed_pre_cache:?}");
+
+        drop(printed_pre_cache);
+        drop(printed_pre_keepalives);
+
+        if let Some(mut agent_actor_keepalive) = self.agent_actor_keepalive_tasks.lock().await.remove(&id) {
+            if let Some(task) = agent_actor_keepalive.keepalive_task.take() {
+                trace!("Aborting keepalive task for agent {id:?}");
+                task.abort();
+            }
         };
 
+        self.agent_actor_cache.lock().await.remove(&id);
 
-        if let Some(task) = agent_actor_keepalive.keepalive_task.take() {
-            trace!("Aborting keepalive task for agent {id:?}");
-            task.abort();
-        }
+        let printed_post_keepalives = self.agent_actor_keepalive_tasks.lock().await;
+        let printed_post_cache = self.agent_actor_cache.lock().await;
 
-        locked_agent_actors.remove(&id);
+        info!("agent actor cache data post removal");
+        info!("keepalives: {printed_post_keepalives:?}");
+        info!("actor_cache: {printed_post_cache:?}");
 
         Ok(ControlFlow::Continue(()))
     }

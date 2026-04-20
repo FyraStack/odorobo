@@ -17,13 +17,17 @@ use tokio::sync::Mutex;
 use tracing::{info, warn, trace, debug};
 use ulid::Ulid;
 
+use crate::actors::scheduler_actor::SchedulerActor;
 
+#[derive(Debug)]
 pub struct ActorAgentKeepalive {
     pub keepalive_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// Periodically sends a keepalive request to all agent actors and updates their metadata.
+/// todo: i think this will crash if any of the Results error. likely need to wrap it in a closure so we can just ignore errors and keep trying.
 pub async fn keepalive_agents(
+    actor_ref: ActorRef<SchedulerActor>,
     agent_actors: Arc<Mutex<AHashMap<ActorId, CachedAgentActor>>>,
     agent_actors_keepalives: Arc<Mutex<AHashMap<ActorId, ActorAgentKeepalive>>>
 ) -> Result<(), Report> {
@@ -36,6 +40,8 @@ pub async fn keepalive_agents(
             let mut locked_agent_actors_keepalives = agent_actors_keepalives.lock().await;
 
             if !locked_agent_actors_keepalives.contains_key(&agent_actor.id()) {
+                actor_ref.link_remote(&agent_actor).await?;
+
                 locked_agent_actors_keepalives.insert(
                     agent_actor.id(),
                     ActorAgentKeepalive::new(agent_actor, Arc::clone(&agent_actors))
@@ -75,17 +81,19 @@ impl ActorAgentKeepalive {
     }
 }
 
+#[derive(Debug)]
 pub struct VMAgentKeepalive {
     pub keepalive_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 
+#[derive(Debug)]
 pub struct CachedAgentActor {
     pub actor_ref: RemoteActorRef<AgentActor>,
     pub metadata: AgentStatus,
 }
 
-
+#[derive(Debug)]
 pub struct CachedVMActor {
     pub vm_actor_ref: RemoteActorRef<VMActor>,
     pub agent_actor_ref: RemoteActorRef<AgentActor>,
