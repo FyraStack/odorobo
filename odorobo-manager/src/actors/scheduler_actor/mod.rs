@@ -84,6 +84,19 @@ impl SchedulerActor {
 
         agents[agent_index].actor_ref.clone()
     }
+
+    async fn print_agent_caches(&self) {
+        let keepalives = self.agent_actor_keepalive_tasks.lock().await;
+        let cache = self.agent_actor_cache.lock().await;
+
+        info!("agent actor cache data");
+        for keepalive in keepalives.iter() {
+            info!("keepalive: {keepalive:?}");
+        }
+        for actor in cache.iter() {
+            info!("actor: {actor:?}");
+        }
+    }
     /*
 
     async fn update_vms(
@@ -103,18 +116,6 @@ impl SchedulerActor {
 
     */
 
-}
-
-
-async fn update_agent(
-    agent_actor_ref: RemoteActorRef<AgentActor>
-) {
-    loop {
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        if let Err(_) = agent_actor_ref.ask(&Ping).await {
-            break;
-        }
-    }
 }
 
 impl Actor for SchedulerActor {
@@ -163,15 +164,9 @@ impl Actor for SchedulerActor {
             return Ok(ControlFlow::Break(ActorStopReason::Killed));
         };
 
-        let printed_pre_keepalives = self.agent_actor_keepalive_tasks.lock().await;
-        let printed_pre_cache = self.agent_actor_cache.lock().await;
+        self.print_agent_caches().await;
 
-        info!("agent actor cache data pre removal");
-        info!("keepalives: {printed_pre_keepalives:?}");
-        info!("actor_cache: {printed_pre_cache:?}");
-
-        drop(printed_pre_cache);
-        drop(printed_pre_keepalives);
+        info!("removing agent actor from cache {id:?}");
 
         if let Some(mut agent_actor_keepalive) = self.agent_actor_keepalive_tasks.lock().await.remove(&id) {
             if let Some(task) = agent_actor_keepalive.keepalive_task.take() {
@@ -182,12 +177,7 @@ impl Actor for SchedulerActor {
 
         self.agent_actor_cache.lock().await.remove(&id);
 
-        let printed_post_keepalives = self.agent_actor_keepalive_tasks.lock().await;
-        let printed_post_cache = self.agent_actor_cache.lock().await;
-
-        info!("agent actor cache data post removal");
-        info!("keepalives: {printed_post_keepalives:?}");
-        info!("actor_cache: {printed_post_cache:?}");
+        self.print_agent_caches().await;
 
         Ok(ControlFlow::Continue(()))
     }
@@ -266,8 +256,6 @@ impl Message<AgentListVMs> for SchedulerActor {
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         let actor_ref = ctx.actor_ref();
-
-        //let agent_actor_refs: Vec<&CachedAgentActor> = self.agent_actor_cache.lock().await.values().collect();
 
         let mut vms = Vec::new();
 
