@@ -36,12 +36,30 @@ mod opt_bytesize_as_u64 {
 
 // Newtype so aide can generate a path parameter schema for Ulid.
 /// VM ID, in the format of ULID
+#[repr(transparent)]
 #[derive(Serialize, Deserialize, Debug, JsonSchema, OperationIo, Default, Clone)]
 pub struct VmId(#[schemars(with = "String")] pub Ulid);
 
 /// Volume ID, in the format of ULID
+#[repr(transparent)]
 #[derive(Serialize, Deserialize, Debug, JsonSchema, OperationIo, Default, Clone)]
 pub struct VolumeId(#[schemars(with = "String")] pub Ulid);
+
+/// A URI pointing to the volume's location, e.g an iSCSI URL in `iscsi-inq` format, a local file, or an RBD image.
+/// 
+/// examples:
+/// - `iscsi://[<username>[%<password>]@]<host>[:<port>]/<target-iqn-name>/<lun>`
+/// - `file:///path/to/volume.img`
+/// - `rbd://<pool>/<image>`
+#[repr(transparent)]
+#[derive(Serialize, Deserialize, Debug, JsonSchema, OperationIo, Clone)]
+pub struct StorageUri(#[schemars(with = "String")] pub url::Url);
+
+impl Default for StorageUri {
+    fn default() -> Self {
+        StorageUri(url::Url::parse("file:///tmp").unwrap())
+    }
+}
 
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Default, Clone)]
 pub struct CreateVMRequest {
@@ -50,6 +68,7 @@ pub struct CreateVMRequest {
     /// Whether to boot the VM immediately after creation
     pub boot: bool,
 }
+
 
 /// An internal, debug-only request for creating a VM.
 ///
@@ -148,8 +167,16 @@ pub struct Volume {
     #[schemars(with = "u64")]
     #[serde(with = "bytesize_as_u64")]
     pub size: ByteSize,
+    
+    /// A URI pointing to the volume's location, e.g an iSCSI URL in `iscsi-inq` format, a local file, or an RBD image.
+    /// 
+    /// examples:
+    /// - `iscsi://[<username>[%<password>]@]<host>[:<port>]/<target-iqn-name>/<lun>`
+    /// - `file:///path/to/volume.img`
+    /// - `rbd://<pool>/<image>`
+    /// 
+    pub uri: StorageUri,
 }
-
 // for now
 pub type CreateVolumeRequest = Volume;
 

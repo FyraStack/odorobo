@@ -33,6 +33,7 @@ ulid = { workspace = true }
 libp2p = { version = "0.56.0", features = ["yamux", "serde", "mdns"] }
 reqwest = { version = "0.13", features = ["json"] }
 ahash = { version = "0.8.12", features = ["serde"] }
+url = { workspace = true }
 # utoipa = { version = "5.4.0", features = ["uuid"] }
 odorobo-shared = { workspace = true }
 stable-eyre = { workspace = true }
