@@ -2,9 +2,9 @@ use std::{marker::PhantomData, sync::Arc, time::Duration};
 
 use ahash::AHashMap;
 use async_trait::async_trait;
-use kameo::{actor, prelude::*};
+use kameo::{prelude::*};
 use tokio::{sync::{Mutex, MutexGuard}, task::JoinHandle};
-use stable_eyre::{Report, Result, eyre::eyre};
+use stable_eyre::{Report, Result};
 use tracing::{info, trace};
 
 use std::fmt;

@@ -1,8 +1,5 @@
 use std::ops::ControlFlow;
-use std::sync::Arc;
-use std::time::Duration;
 
-use ahash::AHashMap;
 use async_trait::async_trait;
 use kameo::prelude::*;
 use libp2p::futures::TryStreamExt;
@@ -15,10 +12,7 @@ use odorobo_shared::messages::agent::*;
 use odorobo_shared::messages::{Ping, Pong};
 use odorobo_shared::utils::vm_actor_id;
 use stable_eyre::{Report, Result, eyre::eyre};
-use tokio::sync::Mutex;
-use tokio::task::JoinSet;
-use tracing::{info, warn, trace, debug};
-use ulid::Ulid;
+use tracing::{info, warn};
 
 
 #[derive(RemoteActor)]
@@ -145,14 +139,14 @@ impl Actor for SchedulerActor {
     ) -> Result<ControlFlow<ActorStopReason>, Self::Error> {
         warn!("Linked actor {id:?} died with reason {reason:?}");
 
-        let Some(actor_ref) = actor_ref.upgrade() else {
+        let Some(_) = actor_ref.upgrade() else {
             return Ok(ControlFlow::Break(ActorStopReason::Killed));
         };
-        
+
         self.agent_actor_cache.info().await;
 
         self.agent_actor_cache.on_link_died(id).await;
-        
+
         self.agent_actor_cache.info().await;
 
         Ok(ControlFlow::Continue(()))
@@ -228,11 +222,9 @@ impl Message<AgentListVMs> for SchedulerActor {
 
     async fn handle(
         &mut self,
-        msg: AgentListVMs,
-        ctx: &mut Context<Self, Self::Reply>,
+        _msg: AgentListVMs,
+        _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        let actor_ref = ctx.actor_ref();
-
         let mut vms = Vec::new();
 
         for agent in self.agent_actor_cache.lock_data_cache().await.values() {
