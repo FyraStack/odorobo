@@ -7,7 +7,20 @@ use tokio::{sync::{Mutex, MutexGuard}, task::JoinHandle};
 use stable_eyre::{Report, Result, eyre::eyre};
 use tracing::{info, trace};
 
-// the selfs here are because
+// future refactor TODO because I don't know how to do it now.
+// The best way to make this would be that you crate a struct with #[derive(ActorCache)]
+// and then you impl ActorCache with setting the ChildActor and Data as types similar to https://github.com/tqwewe/kameo/blob/1d498c0566b613b9afe6d54965c4b191c84432e0/src/actor.rs#L122
+// you could then just implement these get_actor_ref and on_update methods during that.
+// we also would likely want default methods that just let you lookup_all for a specific actor string.
+// you would also likely want to change get_actor_refs to return an iterator during this if you are doing this anyway.
+// the problem is to do this you need to write a derive macro and I have no clue how to do that.
+// and learning that now is not something i should spend tiem doing.
+// so unfortunately instead I have to use self inside of the ActorCacheUpdater trait to make it work.
+// Which I hate
+// this would also make it where we dont need two structs, one for data and one for the update function hooks.
+// I thnk it would also likely make a lot of the generic types simpler.
+
+
 #[async_trait]
 pub trait ActorCacheUpdater<ChildActor: Actor + RemoteActor, Data: Clone + Send + Sync + 'static>: Sync + Send + Copy + 'static {
     // todo: this could probably be better if it was an iterator, but I am lazy and don't want to right now.
@@ -36,6 +49,23 @@ pub struct ActorCache<ChildActor: Actor + RemoteActor, Data: Clone + Send + Sync
 }
 
 // todo: impl Drop to automatically kill all the keepalive_tasks and the actor_finder task.
+
+/*
+ /// todo: implement display
+async fn print_agent_caches(&self) {
+    let keepalives = self.agent_actor_keepalive_tasks.lock().await;
+    let cache = self.agent_actor_cache.lock().await;
+
+    info!("agent actor cache data");
+    for keepalive in keepalives.iter() {
+        info!("keepalive: {keepalive:?}");
+    }
+    for actor in cache.iter() {
+        info!("actor: {actor:?}");
+    }
+}
+
+ */
 
 impl<ChildActor: Actor + RemoteActor, Data: Clone + Send + Sync + 'static> ActorCache<ChildActor, Data> {
     pub fn new(
@@ -171,20 +201,4 @@ impl<ChildActor: Actor + RemoteActor, Data: Clone + Send + Sync + 'static> Actor
             interval.tick().await;
         }
     }
-
-    /*
-     /// todo: implement display
-    async fn print_agent_caches(&self) {
-        let keepalives = self.agent_actor_keepalive_tasks.lock().await;
-        let cache = self.agent_actor_cache.lock().await;
-
-        info!("agent actor cache data");
-        for keepalive in keepalives.iter() {
-            info!("keepalive: {keepalive:?}");
-        }
-        for actor in cache.iter() {
-            info!("actor: {actor:?}");
-        }
-    }
-    */
 }
