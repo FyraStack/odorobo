@@ -164,20 +164,7 @@ impl Actor for SchedulerActor {
             return Ok(ControlFlow::Break(ActorStopReason::Killed));
         };
 
-        self.print_agent_caches().await;
-
-        info!("removing agent actor from cache {id:?}");
-
-        if let Some(mut agent_actor_keepalive) = self.agent_actor_keepalive_tasks.lock().await.remove(&id) {
-            if let Some(task) = agent_actor_keepalive.keepalive_task.take() {
-                trace!("Aborting keepalive task for agent {id:?}");
-                task.abort();
-            }
-        };
-
-        self.agent_actor_cache.lock().await.remove(&id);
-
-        self.print_agent_caches().await;
+        
 
         Ok(ControlFlow::Continue(()))
     }

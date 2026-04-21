@@ -1,6 +1,7 @@
 pub mod error;
 pub mod messages;
 pub mod utils;
+pub mod actor_cache;
 use kameo::prelude::*;
 use libp2p::futures::StreamExt;
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
