@@ -1,5 +1,3 @@
-pub mod actor_keepalive;
-
 use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,16 +20,10 @@ use tokio::task::JoinSet;
 use tracing::{info, warn, trace, debug};
 use ulid::Ulid;
 
-use crate::actors::scheduler_actor::actor_keepalive::ActorAgentKeepalive;
-//use crate::actors::scheduler_actor::actor_keepalive::CachedAgentActor;
-use crate::actors::scheduler_actor::actor_keepalive::CachedVMActor;
-use crate::actors::scheduler_actor::actor_keepalive::keepalive_agents;
-
-
 
 #[derive(RemoteActor)]
 pub struct SchedulerActor {
-    pub agent_actor_cache: ActorCache<AgentActor, CachedAgentActor>
+    pub agent_actor_cache: ActorCache<SchedulerActor, AgentActor, CachedAgentActor>
 
     //pub vm_actor_cache: Arc<Mutex<AHashMap<ActorId, CachedVMActor>>>,
     //pub vm_keepalive_task: Option<tokio::task::JoinHandle<()>>,
@@ -140,7 +132,7 @@ impl Actor for SchedulerActor {
         info!("Actor started! Scheduler peer id: {peer_id}");
 
         Ok(Self {
-            agent_actor_cache: ActorCache::new(AgentActorCacheUpdater)?,
+            agent_actor_cache: ActorCache::new(actor_ref, AgentActorCacheUpdater)?,
         })
     }
 
@@ -156,8 +148,12 @@ impl Actor for SchedulerActor {
         let Some(actor_ref) = actor_ref.upgrade() else {
             return Ok(ControlFlow::Break(ActorStopReason::Killed));
         };
+        
+        self.agent_actor_cache.info().await;
 
-        self.agent_actor_cache.on_link_died(id);
+        self.agent_actor_cache.on_link_died(id).await;
+        
+        self.agent_actor_cache.info().await;
 
         Ok(ControlFlow::Continue(()))
     }

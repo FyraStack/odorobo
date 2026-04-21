@@ -7,6 +7,8 @@ use tokio::{sync::{Mutex, MutexGuard}, task::JoinHandle};
 use stable_eyre::{Report, Result, eyre::eyre};
 use tracing::{info, trace};
 
+use std::fmt;
+
 // future refactor TODO because I don't know how to do it now.
 // The best way to make this would be that you crate a struct with #[derive(ActorCache)]
 // and then you impl ActorCache with setting the ChildActor and Data as types similar to https://github.com/tqwewe/kameo/blob/1d498c0566b613b9afe6d54965c4b191c84432e0/src/actor.rs#L122
@@ -18,11 +20,11 @@ use tracing::{info, trace};
 // so unfortunately instead I have to use self inside of the ActorCacheUpdater trait to make it work.
 // Which I hate
 // this would also make it where we dont need two structs, one for data and one for the update function hooks.
-// I thnk it would also likely make a lot of the generic types simpler.
+// I thnk it would also likely make a lot of the generic types simpler since hopefully their trait bounds would only be in one place.
 
 
 #[async_trait]
-pub trait ActorCacheUpdater<ChildActor: Actor + RemoteActor, Data: Clone + Send + Sync + 'static>: Sync + Send + Copy + 'static {
+pub trait ActorCacheUpdater<ChildActor: Actor + RemoteActor, Data: Clone + Send + Sync + 'static + fmt::Debug>: Sync + Send + Copy + 'static {
     // todo: this could probably be better if it was an iterator, but I am lazy and don't want to right now.
     async fn get_actor_refs(&self) -> Result<Vec<RemoteActorRef<ChildActor>>>;
     async fn on_update(&self, actor_ref: &RemoteActorRef<ChildActor>, previous_value: Option<Data>) -> Result<Data, Report>;
@@ -40,7 +42,8 @@ pub trait ActorCacheUpdater<ChildActor: Actor + RemoteActor, Data: Clone + Send 
 // I am leaving it this way because I just wanted to get things working. We may need to change the way the data is stored in the future.
 // My suggestions are either replacing it with a concurrent map, or using a RwLock. Either one might help, but I am not dealing with it now.
 #[derive(Debug)]
-pub struct ActorCache<ChildActor: Actor + RemoteActor, Data: Clone + Send + Sync + 'static> {
+pub struct ActorCache<ParentActor: Actor + RemoteActor, ChildActor: Actor + RemoteActor, Data: Clone + Send + Sync + 'static + fmt::Debug> {
+    parent_actor_ref: ActorRef<ParentActor>,
     data_cache: Arc<Mutex<AHashMap<ActorId, Data>>>,
     keepalive_tasks: Arc<Mutex<AHashMap<ActorId, JoinHandle<()>>>>,
     actor_finder: Option<JoinHandle<()>>,
@@ -50,25 +53,9 @@ pub struct ActorCache<ChildActor: Actor + RemoteActor, Data: Clone + Send + Sync
 
 // todo: impl Drop to automatically kill all the keepalive_tasks and the actor_finder task.
 
-/*
- /// todo: implement display
-async fn print_agent_caches(&self) {
-    let keepalives = self.agent_actor_keepalive_tasks.lock().await;
-    let cache = self.agent_actor_cache.lock().await;
-
-    info!("agent actor cache data");
-    for keepalive in keepalives.iter() {
-        info!("keepalive: {keepalive:?}");
-    }
-    for actor in cache.iter() {
-        info!("actor: {actor:?}");
-    }
-}
-
- */
-
-impl<ChildActor: Actor + RemoteActor, Data: Clone + Send + Sync + 'static> ActorCache<ChildActor, Data> {
+impl<ParentActor: Actor + RemoteActor, ChildActor: Actor + RemoteActor, Data: Clone + Send + Sync + 'static + fmt::Debug> ActorCache<ParentActor, ChildActor, Data> {
     pub fn new(
+        parent_actor_ref: ActorRef<ParentActor>,
         updater: impl ActorCacheUpdater<ChildActor, Data>
     ) -> Result<Self, Report> {
 
@@ -76,6 +63,7 @@ impl<ChildActor: Actor + RemoteActor, Data: Clone + Send + Sync + 'static> Actor
         let keepalive_tasks = Arc::new(Mutex::new(AHashMap::new()));
 
         let actor_cache = ActorCache {
+            parent_actor_ref: parent_actor_ref.clone(),
             data_cache: data_cache,
             keepalive_tasks: keepalive_tasks,
             actor_finder: None,
@@ -83,7 +71,7 @@ impl<ChildActor: Actor + RemoteActor, Data: Clone + Send + Sync + 'static> Actor
             child_actor_type: PhantomData
         };
 
-        actor_cache.start_actor_finder(updater);
+        actor_cache.start_actor_finder(parent_actor_ref, updater);
 
         Ok(actor_cache)
     }
@@ -112,31 +100,39 @@ impl<ChildActor: Actor + RemoteActor, Data: Clone + Send + Sync + 'static> Actor
         self.data_cache.lock().await
     }
 
-    // todo: this needs a refactor because holy crap the indention.
     fn start_actor_finder(
         &self,
+        parent_actor_ref: ActorRef<ParentActor>,
         updater: impl ActorCacheUpdater<ChildActor, Data>
     ) {
         let keepalive_tasks_clone = Arc::clone(&self.keepalive_tasks);
         let data_cache_clone = Arc::clone(&self.data_cache);
 
         tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
             loop {
+                info!("running actor_finder");
                 let _ = Self::actor_finder(
+                    parent_actor_ref.clone(),
                     Arc::clone(&keepalive_tasks_clone),
                     Arc::clone(&data_cache_clone),
                     updater
-                );
+                ).await;
+
+                interval.tick().await;
             }
         });
     }
 
     async fn actor_finder(
+        parent_actor_ref: ActorRef<ParentActor>,
         keepalive_tasks: Arc<Mutex<AHashMap<ActorId, JoinHandle<()>>>>,
         data_cache: Arc<Mutex<AHashMap<ActorId, Data>>>,
         updater: impl ActorCacheUpdater<ChildActor, Data>
     ) -> Result<(), Report> {
         let actor_refs = updater.get_actor_refs().await?;
+
+        info!("actor_finder actor_refs: {actor_refs:?}");
 
         for actor_ref in actor_refs {
             tracing::trace!("UpdateAgents: agent_actor={:?}", actor_ref);
@@ -144,7 +140,8 @@ impl<ChildActor: Actor + RemoteActor, Data: Clone + Send + Sync + 'static> Actor
             let mut locked_agent_actors_keepalives = keepalive_tasks.lock().await;
 
             if !locked_agent_actors_keepalives.contains_key(&actor_ref.id()) {
-                actor_ref.link_remote(&actor_ref).await?;
+
+                parent_actor_ref.link_remote(&actor_ref).await?;
 
                 let actor_ref_clone = actor_ref.clone();
                 let data_cache_clone = Arc::clone(&data_cache);
@@ -199,6 +196,20 @@ impl<ChildActor: Actor + RemoteActor, Data: Clone + Send + Sync + 'static> Actor
             }
 
             interval.tick().await;
+        }
+    }
+
+    // todo: get cappy to tell me how you are supposed to do this properly
+    pub async fn info(&self) {
+        let keepalives = self.keepalive_tasks.lock().await;
+        let cache = self.data_cache.lock().await;
+
+        info!("agent actor cache data");
+        for keepalive in keepalives.iter() {
+            info!("keepalive: {keepalive:?}");
+        }
+        for data in cache.iter() {
+            info!("data: {data:?}");
         }
     }
 }
