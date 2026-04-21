@@ -7,7 +7,7 @@ use ulid::Ulid;
 #[derive(Serialize, Deserialize)]
 pub struct GetAgentStatus;
 
-#[derive(Serialize, Deserialize, Reply, Debug)]
+#[derive(Serialize, Deserialize, Reply, Debug, Clone)]
 pub struct AgentStatus {
     pub hostname: String,
     pub vcpus: u32,
