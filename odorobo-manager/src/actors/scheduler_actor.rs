@@ -7,9 +7,11 @@ use odorobo_agent::actor::AgentActor;
 use odorobo_agent::state::provisioning::actor::VMActor;
 use odorobo_shared::actor_cache::ActorCache;
 use odorobo_shared::actor_cache::ActorCacheUpdater;
+use odorobo_shared::actor_names::VM;
 use odorobo_shared::messages::vm::*;
 use odorobo_shared::messages::agent::*;
 use odorobo_shared::messages::{Ping, Pong};
+use odorobo_shared::actor_names::AGENT;
 use odorobo_shared::utils::vm_actor_id;
 use stable_eyre::{Report, Result, eyre::eyre};
 use tracing::{info, warn};
@@ -17,7 +19,8 @@ use tracing::{info, warn};
 
 #[derive(RemoteActor)]
 pub struct SchedulerActor {
-    pub agent_actor_cache: ActorCache<SchedulerActor, AgentActor, CachedAgentActor>
+    pub agent_actor_cache: ActorCache<SchedulerActor, AgentActor, CachedAgentActor>,
+    pub vm_actor_cache: ActorCache<SchedulerActor, VMActor, CachedVMActor>
 
     //pub vm_actor_cache: Arc<Mutex<AHashMap<ActorId, CachedVMActor>>>,
     //pub vm_keepalive_task: Option<tokio::task::JoinHandle<()>>,
@@ -91,7 +94,7 @@ pub struct CachedAgentActor {
 #[async_trait]
 impl ActorCacheUpdater<AgentActor, CachedAgentActor> for AgentActorCacheUpdater {
     async fn get_actor_refs(&self) -> Result<Vec<RemoteActorRef<AgentActor>>> {
-        let mut agent_actors_lookup = RemoteActorRef::<AgentActor>::lookup_all("agent");
+        let mut agent_actors_lookup = RemoteActorRef::<AgentActor>::lookup_all(AGENT);
         let mut actor_ref_vec = Vec::new();
 
         while let Some(agent_actor) = agent_actors_lookup.try_next().await? {
@@ -115,6 +118,43 @@ impl ActorCacheUpdater<AgentActor, CachedAgentActor> for AgentActorCacheUpdater 
 }
 
 
+// todo: this code is really bad, and we should not have effectively two copies of ths same thing.
+#[derive(Copy, Clone)]
+struct VMActorCacheUpdater;
+
+#[derive(Debug, Clone)]
+pub struct CachedVMActor {
+    pub actor_ref: RemoteActorRef<VMActor>,
+    pub metadata: GetVMInfoReply,
+}
+
+#[async_trait]
+impl ActorCacheUpdater<VMActor, CachedVMActor> for VMActorCacheUpdater {
+    async fn get_actor_refs(&self) -> Result<Vec<RemoteActorRef<VMActor>>> {
+        let mut agent_actors_lookup = RemoteActorRef::<VMActor>::lookup_all(VM);
+        let mut actor_ref_vec = Vec::new();
+
+        while let Some(agent_actor) = agent_actors_lookup.try_next().await? {
+            actor_ref_vec.push(agent_actor);
+        }
+
+        Ok(actor_ref_vec)
+    }
+
+    async fn on_update(&self, actor_ref: &RemoteActorRef<VMActor>, previous_value: Option<CachedVMActor>) -> Result<CachedVMActor, Report> {
+        let output_actor_ref = match previous_value {
+            Some(value) => value.actor_ref,
+            _ => actor_ref.clone(),
+        };
+
+        Ok(CachedVMActor {
+            actor_ref: output_actor_ref,
+            metadata: actor_ref.ask(&GetVMInfo {vmid: None}).await?
+        })
+    }
+}
+
+
 
 impl Actor for SchedulerActor {
     type Args = ();
@@ -126,7 +166,8 @@ impl Actor for SchedulerActor {
         info!("Actor started! Scheduler peer id: {peer_id}");
 
         Ok(Self {
-            agent_actor_cache: ActorCache::new(actor_ref, AgentActorCacheUpdater)?,
+            agent_actor_cache: ActorCache::new(actor_ref.clone(), AgentActorCacheUpdater)?,
+            vm_actor_cache: ActorCache::new(actor_ref, VMActorCacheUpdater)?
         })
     }
 
@@ -143,11 +184,14 @@ impl Actor for SchedulerActor {
             return Ok(ControlFlow::Break(ActorStopReason::Killed));
         };
 
-        self.agent_actor_cache.info().await;
+        //self.agent_actor_cache.info().await;
+        self.vm_actor_cache.info().await;
 
         self.agent_actor_cache.on_link_died(id).await;
+        self.vm_actor_cache.on_link_died(id).await;
 
-        self.agent_actor_cache.info().await;
+        self.vm_actor_cache.info().await;
+        //self.agent_actor_cache.info().await;
 
         Ok(ControlFlow::Continue(()))
     }

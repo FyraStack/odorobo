@@ -4,7 +4,7 @@ pub mod networking;
 mod state;
 mod util;
 use kameo::actor::Spawn;
-use odorobo_shared::connect_to_swarm;
+use odorobo_shared::{connect_to_swarm, actor_names::AGENT};
 use stable_eyre::Result;
 // use odorobo_shared::
 use crate::actor::AgentActor;
@@ -35,7 +35,7 @@ async fn main() -> Result<()> {
     tracing::info!(?local_peer_id, "Peer ID");
 
     let actor_ref = AgentActor::spawn(());
-    actor_ref.register("agent").await?;
+    actor_ref.register(AGENT).await?;
 
     actor_ref.wait_for_shutdown().await;
 

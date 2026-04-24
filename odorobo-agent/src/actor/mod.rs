@@ -4,8 +4,7 @@ use bytesize::ByteSize;
 use ipnet::Ipv4Net;
 use kameo::prelude::*;
 use odorobo_shared::{
-    messages::{Ping, Pong, agent::{AgentStatus, GetAgentStatus}, debug::PanicAgent, vm::*},
-    utils::vm_actor_id,
+    actor_names::VM, messages::{Ping, Pong, agent::{AgentStatus, GetAgentStatus}, debug::PanicAgent, vm::*}, utils::vm_actor_id
 };
 use serde::{Deserialize, Serialize};
 use stable_eyre::{Report, Result};
@@ -240,7 +239,7 @@ impl Message<CreateVM> for AgentActor {
             VMActor::spawn_link(ctx.actor_ref(), (vmid, Some(msg.config.clone()))).await;
 
         let _ = actor_ref.register(vm_actor_id(vmid)).await;
-        let _ = actor_ref.register("vm").await;
+        let _ = actor_ref.register(VM).await;
         self.vms.insert(vmid, actor_ref.clone());
 
         info!(?vmid, "VM Spawned successfully");
@@ -263,7 +262,7 @@ impl Message<MigrateVMReceive> for AgentActor {
         let actor_ref = VMActor::spawn_link(ctx.actor_ref(), (vmid, None)).await;
 
         let _ = actor_ref.register(vm_actor_id(vmid)).await;
-        let _ = actor_ref.register("vm").await;
+        let _ = actor_ref.register(VM).await;
         self.vms.insert(vmid, actor_ref.clone());
 
         // now ask the VM actor to handle the migration receive
@@ -337,13 +336,20 @@ impl Message<GetVMInfo> for AgentActor {
         msg: GetVMInfo,
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        let vmid = msg.vmid;
-
-        match Self::lookup_vm_actor(vmid).await {
-            Some(actor_ref) => ctx.forward(&actor_ref, msg).await,
+        // todo: caleb, i think this code can be cleaned up most likely, but im not sure what the best way to write it is unfortunately.
+        match msg.vmid {
+            Some(vmid) => {
+                match Self::lookup_vm_actor(vmid).await {
+                    Some(actor_ref) => ctx.forward(&actor_ref, msg).await,
+                    None => {
+                        warn!(vm_id = %vmid, "VM actor not found for info lookup");
+                        ForwardedReply::from_ok(GetVMInfoReply { vmid, config: None })
+                    }
+                }
+            },
             None => {
-                warn!(vm_id = %vmid, "VM actor not found for info lookup");
-                ForwardedReply::from_ok(GetVMInfoReply { vmid, config: None })
+                warn!("No vmid provided for Agent Actor GetVMInfo forwarding");
+                ForwardedReply::from_ok(GetVMInfoReply { vmid: Ulid::nil(), config: None })
             }
         }
     }
