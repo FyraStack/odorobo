@@ -13,6 +13,7 @@ use odorobo_shared::messages::agent::*;
 use odorobo_shared::messages::{Ping, Pong};
 use odorobo_shared::actor_names::AGENT;
 use odorobo_shared::utils::vm_actor_id;
+use stable_eyre::eyre::OptionExt;
 use stable_eyre::{Report, Result, eyre::eyre};
 use tracing::{info, warn};
 
@@ -25,6 +26,11 @@ pub struct SchedulerActor {
     //pub vm_actor_cache: Arc<Mutex<AHashMap<ActorId, CachedVMActor>>>,
     //pub vm_keepalive_task: Option<tokio::task::JoinHandle<()>>,
 }
+
+// todo: this might need to be a runtime thing but this makes it easy to write for now and could easily be switched out later.
+static VCPU_OVERPROVISIONMENT_NUMERATOR: u32 = 2;
+static VCPU_OVERPROVISIONMENT_DENOMINATOR: u32 = 1;
+
 
 impl SchedulerActor {
     async fn lookup_by_actor_id(
@@ -41,43 +47,69 @@ impl SchedulerActor {
         self.agent_actor_cache.lock_data_cache().await.values().find(|data| data.metadata.hostname == hostname).map(|data| data.actor_ref.clone())
     }
 
+    /// current scheduling algo info:
+    /// this is vaguely based on https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/
+    /// when a vm is attempted to be scheduled, we loop through every agent and score it based on some rules
+    /// there are hard rules that will simply throw out an agent entirely.
+    /// otherwise, we take whatever the best agent we can find is.
+    ///
+    /// additionally, because caleb is way too performance brained, he used integer math for the entire scoring algorithm just so we didnt have to convert to floats.
     async fn schedule_agent(
         &mut self,
         msg: &CreateVM
-    ) -> RemoteActorRef<AgentActor> {
-
+    ) -> Result<RemoteActorRef<AgentActor>, Report> {
         let locked_agent_actor_cache = self.agent_actor_cache.lock_data_cache().await;
 
-        let agents: Vec<&CachedAgentActor> = locked_agent_actor_cache.values().collect();
+        let mut best_agent = None;
+        let mut best_agent_score = 0u32;
 
-        warn!("randomly selecting agent");
-        // random agent selection, so basically round robin
-        // todo: improve this with something that like actually schedules agents properly
-        let agent_index = rand::random_range(0..agents.len());
+        // todo: this arguably could be done as map-reduce. is that better?
+        for agent in locked_agent_actor_cache.values() {
+            info!("{agent:?}");
 
-        agents[agent_index].actor_ref.clone()
-    }
+            let mut agent_score = 0u32;
+
+            let agent_max_vcpus = agent.metadata.vcpus * VCPU_OVERPROVISIONMENT_NUMERATOR / VCPU_OVERPROVISIONMENT_DENOMINATOR;
 
 
-    /*
 
-    async fn update_vms(
-        &mut self
-    ) -> Result<(), Report> {
-        let mut vm_actors = RemoteActorRef::<VMActor>::lookup_all("agent");
-        let mut get_vm_info_set = JoinSet::new();
+            if agent.metadata.used_vcpus >= agent_max_vcpus {
+                continue;
+            }
 
-        while let Some(vm_actor) = vm_actors.try_next().await? {
-            get_vm_info_set.spawn(async move {
-                tracing::trace!("AgentListVMs: vm_actor={:?}", vm_actor);
+            agent_score += agent.metadata.used_vcpus * 1024 / agent_max_vcpus;
 
-                vm_actor.ask(&GetVMInfo { vmid: ulid::Ulid::nil() }).await
-            })
+
+            // todo: add ram overprovisionment.     not adding this to scheduler until it works on the hypervisor side.
+            let agent_max_ram = agent.metadata.ram;
+
+            if agent.metadata.used_ram >= agent_max_ram {
+                continue;
+            }
+
+            agent_score += (agent.metadata.used_ram.as_u64() * 1024 / agent_max_ram.as_u64()) as u32;
+
+
+            // todo: https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/
+
+
+
+            // todo (future): possibly keep a percent of agents completely empty, to be able to be converted to dedis automatically.
+            // they would have their agent score set to 1, so they can be scheduled to if there is no other avaliable agents.
+            // rough pseudo code to implement this:
+            // if agent.metadata.vms.len() == 0 && hash(agent.config.hostname) % total_chance < threshold {
+            //     agent_score = 1;
+            // }
+
+
+            if agent_score > best_agent_score {
+                best_agent = Some(agent.actor_ref.clone());
+                best_agent_score = agent_score;
+            }
         }
+
+        best_agent.ok_or_eyre("No valid agents found.")
     }
-
-    */
-
 }
 
 
@@ -205,7 +237,7 @@ impl Message<CreateVM> for SchedulerActor {
 
     async fn handle(&mut self, msg: CreateVM, _ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
         loop {
-            let target_agent = self.schedule_agent(&msg).await;
+            let target_agent = self.schedule_agent(&msg).await?;
 
             match target_agent.ask(&msg).await {
                 Ok(reply) => {

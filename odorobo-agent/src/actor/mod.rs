@@ -435,7 +435,7 @@ impl Message<GetAgentStatus> for AgentActor {
             .map(|(_, vm)| vm.config.cpus.as_ref().map(|cpu_config| cpu_config.boot_vcpus).unwrap_or(0))
             .reduce(|acc, cpus| acc + cpus)
             .unwrap_or(0) as u32;
-        
+
         let ram_used_by_vms = self.vms.iter()
             .map(|(_, vm)| vm.config.memory.as_ref().map(|memory_config| memory_config.size).unwrap_or(0))
             .reduce(|acc, memory| acc + memory)
@@ -446,7 +446,7 @@ impl Message<GetAgentStatus> for AgentActor {
             vcpus: self.vcpus,
             ram: self.memory,
             vms: self.vms.keys().copied().collect(),
-            used_vcpus: vcpus_used_by_vms - self.config.reserved_vcpus,
+            used_vcpus: vcpus_used_by_vms + self.config.reserved_vcpus,
             used_ram: ByteSize::b(ram_used_by_vms)
         }
     }
