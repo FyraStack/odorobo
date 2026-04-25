@@ -417,7 +417,7 @@ impl Message<GetAgentStatus> for AgentActor {
             hostname: self.config.hostname.clone(),
             vcpus: self.vcpus,
             ram: self.memory,
-            vms: vec![Ulid::new()], // todo
+            vms: self.vms.keys().copied().collect(),
         }
     }
 }

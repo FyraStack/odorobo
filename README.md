@@ -29,7 +29,7 @@ Build the Agent binary with `cargo build --release` and run it on the host machi
 
 ```bash
 # Install dependencies (fedora)
-sudo dnf in -y clang-devel nftables
+sudo dnf in -y clang-devel nftables cloud-hypervisor
 
 # Build the Agent
 cargo build --release

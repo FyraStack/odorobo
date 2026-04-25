@@ -259,8 +259,9 @@ impl Message<ShutdownVM> for SchedulerActor {
     }
 }
 
-/// this only gets data from the cache.
+/// this only gets data from the cache from agents
 /// we may need a different message that actually forcibly runs/updates everything.
+/// and/or messages that get data directly from the VMActors.
 impl Message<AgentListVMs> for SchedulerActor {
     type Reply = Result<AgentListVMsReply, Report>;
 
