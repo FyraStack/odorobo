@@ -354,22 +354,17 @@ impl Message<GetVMInfo> for AgentActor {
         msg: GetVMInfo,
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        // todo: caleb, i think this code can be cleaned up most likely, but im not sure what the best way to write it is unfortunately.
-        match msg.vmid {
-            Some(vmid) => {
-                match Self::lookup_vm_actor(vmid).await {
-                    Some(actor_ref) => ctx.forward(&actor_ref, msg).await,
-                    None => {
-                        warn!(vm_id = %vmid, "VM actor not found for info lookup");
-                        ForwardedReply::from_ok(GetVMInfoReply { vmid, config: None })
-                    }
-                }
-            },
-            None => {
-                warn!("No vmid provided for Agent Actor GetVMInfo forwarding");
-                ForwardedReply::from_ok(GetVMInfoReply { vmid: Ulid::nil(), config: None })
-            }
-        }
+        let Some(vmid) = msg.vmid else {
+            warn!("No vmid provided for Agent Actor GetVMInfo forwarding");
+            return ForwardedReply::from_ok(GetVMInfoReply { vmid: Ulid::nil(), config: None })
+        };
+
+        let Some(actor_ref) = Self::lookup_vm_actor(vmid).await else {
+            warn!(vm_id = %vmid, "VM actor not found for info lookup");
+            return ForwardedReply::from_ok(GetVMInfoReply { vmid, config: None })
+        };
+
+        ctx.forward(&actor_ref, msg).await
     }
 }
 
