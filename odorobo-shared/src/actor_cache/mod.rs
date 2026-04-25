@@ -77,7 +77,6 @@ impl<ParentActor: Actor + RemoteActor, ChildActor: Actor + RemoteActor, Data: Cl
     }
 
     /// run this function inside of the on_link_died of the ParentActor
-
     pub async fn on_link_died(
         &self,
         id: ActorId
