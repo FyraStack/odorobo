@@ -105,6 +105,9 @@ pub struct VMData {
     /// List of volumes to attach to the VM.
     #[serde(default)]
     pub volumes: Vec<Volume>,
+    /// List of Network IDs.
+    #[serde(default)]
+    pub networks: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Default)]
