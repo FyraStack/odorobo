@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::{net::Ipv4Addr};
 use sysinfo::System;
 use tracing::{ info, warn};
+use clap::Parser;
 
 /// Gets the system hostname
 pub fn hostname() -> String {
@@ -117,6 +118,15 @@ impl Default for NetworkMode {
     }
 }
 
+/// Additional runtime options for the agent that aren't applicable to a JSON config file
+#[derive(Parser)]
+pub struct CliConfig {
+    
+    /// Whether the manager should be enabled on this instance
+    #[clap(long, default_value = "false", env = "ODOROBO_MANAGER_ENABLED")]
+    pub manager_enabled: bool,
+}
+
 // The infra team wants a config file on the box where they can set info specific for the box its on.
 // TODO: Double check with infra team (katherine) if they want any other config on the box.
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
@@ -141,9 +151,7 @@ pub struct Config {
     /// Arbitrary annotations that can be used
     #[serde(default)]
     pub annotations: AHashMap<String, String>,
-    /// Is manager enabled
-    #[serde(default)]
-    pub manager_enabled: bool,
+
     #[serde(default)]
     pub network: NetworkConfig,
 }

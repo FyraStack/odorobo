@@ -1,7 +1,6 @@
 {
   "datacenter": "Dev",
   "region": "Dev",
-  "manager_enabled": true,
   "network": {
     "dhcp_config": {
       "range": ["10.10.100.100", "10.10.100.200"],

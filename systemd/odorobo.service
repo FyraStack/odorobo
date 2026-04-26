@@ -1,17 +1,16 @@
 [Unit]
-Description=Odorobo Agent
+Description=Odorobo Service
 Documentation=https://github.com/FyraStack/odorobo
 After=network-online.target
 Wants=network-online.target
-#Requires=odorobo-agent.service
 
 [Service]
 Type=simple
 User=root
 Group=root
 
-
-ExecStart=/usr/bin/odorobo-agent
+EnvironmentFile=/etc/odorobo/config.env
+ExecStart=/usr/bin/odorobo
 
 
 Restart=always

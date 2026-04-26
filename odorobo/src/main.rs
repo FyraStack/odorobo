@@ -9,6 +9,7 @@ pub mod config;
 
 use std::fs;
 
+use clap::Parser;
 use kameo::actor::Spawn;
 use stable_eyre::Result;
 
@@ -21,24 +22,28 @@ use crate::actors::agent_actor::AgentActor;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli_config = config::CliConfig::parse();
     // TODO: ask infra team where they want this on the box
-    let file = fs::File::open("config.json").expect("file should open read only");
-    let config: Config = serde_json::from_reader(file).expect("file should be proper JSON");
+    let config: Config = if let Ok(file) = fs::File::open("config.json") {
+        serde_json::from_reader(file).expect("unable to parse config.json")
+    } else {
+        Config::default()
+    };
 
     init(Some("odorobo"))?;
 
     tracing::info!(?config, "Starting odorobo");
+
 
     let local_peer_id = connect_to_swarm().unwrap();
     tracing::info!(?local_peer_id, "Peer ID");
 
 
     // start agents
-
     let agent_actor = AgentActor::spawn(config.clone());
     agent_actor.register(AGENT).await?;
 
-    if config.manager_enabled {
+    if cli_config.manager_enabled {
         let scheduler_actor = SchedulerActor::spawn(());
         let http_actor = HTTPActor::spawn(scheduler_actor.clone());
 

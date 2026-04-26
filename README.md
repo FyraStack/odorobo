@@ -34,14 +34,14 @@ sudo dnf in -y clang-devel nftables cloud-hypervisor
 # Build the Agent
 cargo build --release
 
-# Move to odorobo directory because the default config is there and the binary expects a config.json in the working directory.
-cd odorobo 
+# Run the Agent & Manager (requires write permissions to /run/odorobo)
+sudo ./target/release/odorobo --manager-enabled=true # or set ODOROBO_MANAGER_ENABLED=true
 
-# Run the Agent (requires write permissions to /run/odorobo, and access to systemd's system session bus
-sudo ./../target/release/odorobo
+# Run on other boxes
+sudo ./target/release/odorobo
 ```
 
-It is recommended to set manager_enabled to false in the config file if you are going to run agents on multiple physical servers. You can run multiple managers for load balancing and HA, but it is not required.
+You can run multiple managers for load balancing and HA, but it is not required.
 
 Install the CLI helper
 
