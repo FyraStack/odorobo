@@ -19,3 +19,4 @@ tracing = { workspace = true }
 bytesize = { workspace = true }
 async-trait = { workspace = true }
 ahash = { workspace = true }
+dashmap = { workspace = true }

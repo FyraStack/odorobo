@@ -15,6 +15,7 @@ use odorobo_shared::actor_names::AGENT;
 use odorobo_shared::utils::vm_actor_id;
 use stable_eyre::eyre::OptionExt;
 use stable_eyre::{Report, Result, eyre::eyre};
+use tracing::info_span;
 use tracing::{info, warn};
 
 
@@ -37,14 +38,14 @@ impl SchedulerActor {
         &mut self,
         actor_id: &ActorId,
     ) -> Option<RemoteActorRef<AgentActor>> {
-        self.agent_actor_cache.lock_data_cache().await.get(actor_id).map(|data| data.actor_ref.clone())
+        self.agent_actor_cache.data_cache.get(actor_id).map(|data| data.actor_ref.clone())
     }
 
     async fn lookup_by_hostname(
         &mut self,
         hostname: &str,
     ) -> Option<RemoteActorRef<AgentActor>> {
-        self.agent_actor_cache.lock_data_cache().await.values().find(|data| data.metadata.hostname == hostname).map(|data| data.actor_ref.clone())
+        self.agent_actor_cache.data_cache.iter().find(|data| data.metadata.hostname == hostname).map(|data| data.actor_ref.clone())
     }
 
     /// current scheduling algo info:
@@ -58,55 +59,57 @@ impl SchedulerActor {
         &mut self,
         msg: &CreateVM
     ) -> Result<RemoteActorRef<AgentActor>, Report> {
-        let locked_agent_actor_cache = self.agent_actor_cache.lock_data_cache().await;
-
         let mut best_agent = None;
         let mut best_agent_score = 0u32;
 
         // todo: this arguably could be done as map-reduce. is that better?
-        for agent in locked_agent_actor_cache.values() {
-            info!("{agent:?}");
+        let span = info_span!("schedule_agent");
+            span.in_scope(|| {
+            for agent in self.agent_actor_cache.data_cache.iter() {
+                let mut agent_score = 0u32;
 
-            let mut agent_score = 0u32;
-
-            let agent_max_vcpus = agent.metadata.vcpus * VCPU_OVERPROVISIONMENT_NUMERATOR / VCPU_OVERPROVISIONMENT_DENOMINATOR;
+                let agent_max_vcpus = agent.metadata.vcpus * VCPU_OVERPROVISIONMENT_NUMERATOR / VCPU_OVERPROVISIONMENT_DENOMINATOR;
 
 
 
-            if agent.metadata.used_vcpus >= agent_max_vcpus {
-                continue;
+                if agent.metadata.used_vcpus >= agent_max_vcpus {
+                    continue;
+                }
+
+                agent_score += (agent_max_vcpus - agent.metadata.used_vcpus) * 1024 / agent_max_vcpus;
+
+
+                // todo: add ram overprovisionment.     not adding this to scheduler until it works on the hypervisor side.
+                let agent_max_ram = agent.metadata.ram;
+
+                if agent.metadata.used_ram >= agent_max_ram {
+                    continue;
+                }
+
+                agent_score += ((agent_max_ram.as_u64() - agent.metadata.used_ram.as_u64()) * 1024 / agent_max_ram.as_u64()) as u32;
+
+
+                // todo: https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/
+
+
+
+                // todo (future): possibly keep a percent of agents completely empty, to be able to be converted to dedis automatically.
+                // they would have their agent score set to 1, so they can be scheduled to if there is no other avaliable agents.
+                // rough pseudo code to implement this:
+                // if agent.metadata.vms.len() == 0 && hash(agent.config.hostname) % total_chance < threshold {
+                //     agent_score = 1;
+                // }
+
+
+
+                info!(agent=?agent.value(), score=agent_score);
+
+                if agent_score > best_agent_score {
+                    best_agent = Some(agent.actor_ref.clone());
+                    best_agent_score = agent_score;
+                }
             }
-
-            agent_score += agent.metadata.used_vcpus * 1024 / agent_max_vcpus;
-
-
-            // todo: add ram overprovisionment.     not adding this to scheduler until it works on the hypervisor side.
-            let agent_max_ram = agent.metadata.ram;
-
-            if agent.metadata.used_ram >= agent_max_ram {
-                continue;
-            }
-
-            agent_score += (agent.metadata.used_ram.as_u64() * 1024 / agent_max_ram.as_u64()) as u32;
-
-
-            // todo: https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/
-
-
-
-            // todo (future): possibly keep a percent of agents completely empty, to be able to be converted to dedis automatically.
-            // they would have their agent score set to 1, so they can be scheduled to if there is no other avaliable agents.
-            // rough pseudo code to implement this:
-            // if agent.metadata.vms.len() == 0 && hash(agent.config.hostname) % total_chance < threshold {
-            //     agent_score = 1;
-            // }
-
-
-            if agent_score > best_agent_score {
-                best_agent = Some(agent.actor_ref.clone());
-                best_agent_score = agent_score;
-            }
-        }
+        });
 
         best_agent.ok_or_eyre("No valid agents found.")
     }
@@ -217,12 +220,12 @@ impl Actor for SchedulerActor {
         };
 
         //self.agent_actor_cache.info().await;
-        self.vm_actor_cache.info().await;
+        info!(vm_actor_cache=?self.vm_actor_cache.data_cache, "vm actor cache");
 
         self.agent_actor_cache.on_link_died(id).await;
         self.vm_actor_cache.on_link_died(id).await;
 
-        self.vm_actor_cache.info().await;
+        info!(vm_actor_cache=?self.vm_actor_cache.data_cache, "vm actor cache");
         //self.agent_actor_cache.info().await;
 
         Ok(ControlFlow::Continue(()))
@@ -262,7 +265,7 @@ impl Message<DeleteVM> for SchedulerActor {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         let vm = RemoteActorRef::<VMActor>::lookup(vm_actor_id(msg.vmid)).await?;
-        tracing::trace!("DeleteVM: vm={:?}", vm);
+        tracing::trace!(?vm, "DeleteVM");
         if let Some(vm) = vm {
             vm.tell(&msg).send()?;
             Ok(DeleteVMReply)
@@ -281,7 +284,7 @@ impl Message<ShutdownVM> for SchedulerActor {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         let vm = RemoteActorRef::<VMActor>::lookup(vm_actor_id(msg.vmid)).await?;
-        tracing::trace!("ShutdownVM: vm={:?}", vm);
+        tracing::trace!(?vm, "ShutdownVM");
         if let Some(vm) = vm {
             vm.tell(&msg).send()?;
             Ok(ShutdownVMReply)
@@ -304,7 +307,7 @@ impl Message<AgentListVMs> for SchedulerActor {
     ) -> Self::Reply {
         let mut vms = Vec::new();
 
-        for agent in self.agent_actor_cache.lock_data_cache().await.values() {
+        for agent in self.agent_actor_cache.data_cache.iter() {
             vms.extend_from_slice(agent.metadata.vms.as_slice());
         }
 
