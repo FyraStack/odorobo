@@ -34,20 +34,14 @@ sudo dnf in -y clang-devel nftables cloud-hypervisor
 # Build the Agent
 cargo build --release
 
-# create basic config
-echo "{}" >> config.json
+# Move to odorobo directory because the default config is there and the binary expects a config.json in the working directory.
+cd odorobo 
 
 # Run the Agent (requires write permissions to /run/odorobo, and access to systemd's system session bus
-sudo ./target/release/odorobo-agent
+sudo ./../target/release/odorobo
 ```
 
-You will now be required to run the manager process:
-```
-# Build the Manager
-cargo build --release -p odorobo-manager
-# Run the Manager
-./target/release/odorobo-manager
-```
+It is recommended to set manager_enabled to false in the config file if you are going to run agents on multiple physical servers. You can run multiple managers for load balancing and HA, but it is not required.
 
 Install the CLI helper
 
@@ -55,18 +49,12 @@ Install the CLI helper
 cargo install --path odoroboctl
 ```
 
-You can then use `odoroboctl` to directly interact with the Agent, for example to spawn a VM instance
-
-```bash
-odoroboctl spawn my-vm
-```
+You can then use `odoroboctl` to directly interact with the Manager, for example to spawn a VM instance
 
 Now apply the [Cloud Hypervisor VM spec](https://github.com/cloud-hypervisor/cloud-hypervisor/blob/main/docs/api.md#create-a-virtual-machine) to the instance, for example with a simple configuration that boots from a disk image
 
 ```bash
-# the `--boot` flag additionally also tells Cloud Hypervisor to boot the VM after applying the configuration, otherwise it will stay
-# in the "Created" state, requiring a separate `odoroboctl boot` call to start it.
-odoroboctl create my-vm --boot ./my-vm.json
+odoroboctl create vm.json
 ```
 
 To connect directly on the host, connect to the VM's serial console socket in its runtime directory:

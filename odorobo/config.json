@@ -1,0 +1,19 @@
+{
+  "datacenter": "Dev",
+  "region": "Dev",
+  "manager_enabled": true,
+  "network": {
+    "dhcp_config": {
+      "range": ["10.10.100.100", "10.10.100.200"],
+      "subnet": "10.10.100.0/24",
+      "lease_time": "12h"
+    },
+    "network_mode": {
+      "HostonlyNat": {
+        "bridge": "vmbr0",
+        "subnet": "10.10.100.0/24",
+        "gateway": "10.10.100.1"
+      }
+    }
+  }
+}
