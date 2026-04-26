@@ -29,10 +29,14 @@ Build the Agent binary with `cargo build --release` and run it on the host machi
 
 ```bash
 # Install dependencies (fedora)
-sudo dnf in -y clang-devel nftables
+sudo dnf in -y clang-devel nftables cloud-hypervisor
 
 # Build the Agent
 cargo build --release
+
+# create basic config
+echo "{}" >> config.json
+
 # Run the Agent (requires write permissions to /run/odorobo, and access to systemd's system session bus
 sudo ./target/release/odorobo-agent
 ```

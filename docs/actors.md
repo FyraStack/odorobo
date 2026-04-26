@@ -1,4 +1,8 @@
-manager:
+# Kameo Actors
+
+List of all kameo actors contained in these two crates.
+
+## odorobo-manager:
 
 http server (mvp)
 websocket server for serial terminal (mvp)
@@ -13,8 +17,7 @@ scheduler_other_clusters (future roadmap)
 scheduler_to_other_manager (future roadmap)
 
 
+# odorobo-agent:
 
-agent:
-server actor (mvp) (needs to be a trait so we can swap for other things in the future)
+agent actor (mvp) (needs to be a trait so we can swap for other things in the future)
 vm actor (mvp) (needs to be a trait so we can swap for other things in the future
-

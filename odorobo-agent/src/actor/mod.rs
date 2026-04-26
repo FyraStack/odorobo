@@ -1,11 +1,11 @@
 use crate::{networking::actor::NetworkAgentActor, state::provisioning::actor::VMActor};
 use ahash::AHashMap;
 use bytesize::ByteSize;
+use cloud_hypervisor_client::models::VmConfig;
 use ipnet::Ipv4Net;
 use kameo::prelude::*;
 use odorobo_shared::{
-    messages::{Ping, Pong, debug::PanicAgent, vm::*},
-    utils::vm_actor_id,
+    actor_names::VM, messages::{Ping, Pong, agent::{AgentStatus, GetAgentStatus}, debug::PanicAgent, vm::*}, utils::vm_actor_id
 };
 use serde::{Deserialize, Serialize};
 use stable_eyre::{Report, Result};
@@ -17,12 +17,17 @@ use ulid::Ulid;
 
 use kameo::error::PanicError;
 
+pub struct VMCacheData {
+    actor_ref: ActorRef<VMActor>,
+    config: VmConfig
+}
+
 #[derive(RemoteActor)]
 pub struct AgentActor {
     pub vcpus: u32,
     pub memory: ByteSize,
     pub config: Config,
-    pub vms: AHashMap<Ulid, ActorRef<VMActor>>,
+    pub vms: AHashMap<Ulid, VMCacheData>,
     // pub network_actor: ActorRef<NetworkAgentActor>,
 }
 
@@ -223,7 +228,7 @@ impl Actor for AgentActor {
     ) -> Result<ControlFlow<ActorStopReason>> {
         warn!("Linked actor {id:?} died with reason {reason:?}");
 
-        self.vms.retain(|_, actor_ref| actor_ref.id() != id);
+        self.vms.retain(|_, vm| vm.actor_ref.id() != id);
 
         Ok(ControlFlow::Continue(()))
     }
@@ -240,8 +245,14 @@ impl Message<CreateVM> for AgentActor {
             VMActor::spawn_link(ctx.actor_ref(), (vmid, Some(msg.config.clone()))).await;
 
         let _ = actor_ref.register(vm_actor_id(vmid)).await;
-        let _ = actor_ref.register("vm").await;
-        self.vms.insert(vmid, actor_ref.clone());
+        let _ = actor_ref.register(VM).await;
+        self.vms.insert(
+            vmid,
+            VMCacheData {
+                actor_ref: actor_ref.clone(),
+                config: msg.config.clone()
+            }
+        );
 
         info!(?vmid, "VM Spawned successfully");
         CreateVMReply {
@@ -263,8 +274,14 @@ impl Message<MigrateVMReceive> for AgentActor {
         let actor_ref = VMActor::spawn_link(ctx.actor_ref(), (vmid, None)).await;
 
         let _ = actor_ref.register(vm_actor_id(vmid)).await;
-        let _ = actor_ref.register("vm").await;
-        self.vms.insert(vmid, actor_ref.clone());
+        let _ = actor_ref.register(VM).await;
+        self.vms.insert(
+            vmid,
+            VMCacheData {
+                actor_ref: actor_ref.clone(),
+                config: msg.config.clone()
+            }
+        );
 
         // now ask the VM actor to handle the migration receive
         actor_ref
@@ -284,12 +301,12 @@ impl Message<DeleteVM> for AgentActor {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         match self.vms.remove(&msg.vmid) {
-            Some(actor_ref) => {
-                let res = actor_ref.tell(msg.clone()).await;
+            Some(cache_data) => {
+                let res = cache_data.actor_ref.tell(msg.clone()).await;
                 if let Err(err) = res {
                     // probably a bad way to do this
                     warn!(vm_id = %msg.vmid, ?err, "failed to stop VM actor gracefully, killing");
-                    actor_ref.kill();
+                    cache_data.actor_ref.kill();
                 }
             }
             None => {
@@ -337,15 +354,17 @@ impl Message<GetVMInfo> for AgentActor {
         msg: GetVMInfo,
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        let vmid = msg.vmid;
+        let Some(vmid) = msg.vmid else {
+            warn!("No vmid provided for Agent Actor GetVMInfo forwarding");
+            return ForwardedReply::from_ok(GetVMInfoReply { vmid: Ulid::nil(), config: None })
+        };
 
-        match Self::lookup_vm_actor(vmid).await {
-            Some(actor_ref) => ctx.forward(&actor_ref, msg).await,
-            None => {
-                warn!(vm_id = %vmid, "VM actor not found for info lookup");
-                ForwardedReply::from_ok(GetVMInfoReply { vmid, config: None })
-            }
-        }
+        let Some(actor_ref) = Self::lookup_vm_actor(vmid).await else {
+            warn!(vm_id = %vmid, "VM actor not found for info lookup");
+            return ForwardedReply::from_ok(GetVMInfoReply { vmid, config: None })
+        };
+
+        ctx.forward(&actor_ref, msg).await
     }
 }
 
@@ -394,6 +413,37 @@ impl Message<PanicAgent> for AgentActor {
     ) -> Self::Reply {
         tracing::info!("panicking");
         panic!();
+    }
+}
+
+#[remote_message]
+impl Message<GetAgentStatus> for AgentActor {
+    type Reply = AgentStatus;
+
+    async fn handle(
+        &mut self,
+        _msg: GetAgentStatus,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+
+        let vcpus_used_by_vms = self.vms.values()
+            .map(|vm| vm.config.cpus.as_ref().map(|cpu_config| cpu_config.boot_vcpus).unwrap_or(0))
+            .reduce(|acc, cpus| acc + cpus)
+            .unwrap_or(0) as u32;
+
+        let ram_used_by_vms = self.vms.values()
+            .map(|vm| vm.config.memory.as_ref().map(|memory_config| memory_config.size).unwrap_or(0))
+            .reduce(|acc, memory| acc + memory)
+            .unwrap_or(0) as u64;
+
+        AgentStatus {
+            hostname: self.config.hostname.clone(),
+            vcpus: self.vcpus,
+            ram: self.memory,
+            vms: self.vms.keys().copied().collect(),
+            used_vcpus: vcpus_used_by_vms + self.config.reserved_vcpus,
+            used_ram: ByteSize::b(ram_used_by_vms)
+        }
     }
 }
 

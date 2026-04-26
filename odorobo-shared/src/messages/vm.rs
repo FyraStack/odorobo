@@ -90,10 +90,10 @@ pub struct AgentListVMsReply {
 /// Get VM info
 #[derive(Serialize, Deserialize, Debug)]
 pub struct GetVMInfo {
-    pub vmid: Ulid,
+    pub vmid: Option<Ulid>,
 }
 
-#[derive(Serialize, Deserialize, Reply, Debug)]
+#[derive(Serialize, Deserialize, Reply, Debug, Clone)]
 pub struct GetVMInfoReply {
     pub vmid: Ulid,
     pub config: Option<VmConfig>,

@@ -38,3 +38,5 @@ url = { workspace = true }
 odorobo-shared = { workspace = true }
 stable-eyre = { workspace = true }
 odorobo-agent = { workspace = true }
+async-trait = { workspace = true }
+rand = "0.10.1"

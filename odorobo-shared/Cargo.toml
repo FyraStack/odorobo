@@ -16,3 +16,7 @@ ulid = { workspace = true }
 cloud-hypervisor-client = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 tracing = { workspace = true }
+bytesize = { workspace = true }
+async-trait = { workspace = true }
+ahash = { workspace = true }
+dashmap = { workspace = true }
