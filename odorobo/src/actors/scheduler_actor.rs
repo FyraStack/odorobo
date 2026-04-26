@@ -216,14 +216,10 @@ impl Actor for SchedulerActor {
             return Ok(ControlFlow::Break(ActorStopReason::Killed));
         };
 
-        //self.agent_actor_cache.info().await;
-        info!(vm_actor_cache=?self.vm_actor_cache.data_cache, "vm actor cache");
-
         self.agent_actor_cache.on_link_died(id).await;
         self.vm_actor_cache.on_link_died(id).await;
 
-        info!(vm_actor_cache=?self.vm_actor_cache.data_cache, "vm actor cache");
-        //self.agent_actor_cache.info().await;
+        info!(vm_actor_cache=?self.agent_actor_cache.data_cache, agent_actor_cache=?self.vm_actor_cache.data_cache, "data caches post actor removal");
 
         Ok(ControlFlow::Continue(()))
     }
