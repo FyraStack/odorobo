@@ -11,7 +11,6 @@ use crate::http_api::types::CreateVMRequest;
 use super::scheduler_actor::SchedulerActor;
 
 const EXTERNAL_HTTP_ADDRESS: &str = "0.0.0.0:3000";
-const EXTERNAL_HTTP_URL: &str = "http://localhost:3000"; // TODO: mak
 /// HTTP REST API service
 #[derive(RemoteActor)]
 pub struct HTTPActor {
