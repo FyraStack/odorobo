@@ -58,6 +58,7 @@ async fn create_vm(
         data: vm_data,
         node: None,
         status: VMStatus::Provisioning,
+        ..Default::default()
     }))
 }
 

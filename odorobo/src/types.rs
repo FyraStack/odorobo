@@ -164,6 +164,7 @@ pub struct VirtualMachine {
     pub metadata: Option<ObjectMetadata>,
 
     // placement stuff....
+    
 }
 
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Default)]
