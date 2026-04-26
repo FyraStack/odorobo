@@ -29,7 +29,7 @@ pub fn router() -> ApiRouter<ActorRef<HTTPActor>> {
 }
 
 async fn list_vms(State(state): State<ActorRef<HTTPActor>>) -> Result<impl IntoApiResponse, OdoroboError> {
-    let reply = state.ask(AgentListVMs).await.unwrap();
+    let reply = state.ask(AgentListVMs).await?;
 
     Ok(Json(VMListResponse {
         vms: reply.vms.into_iter().map(VmId).collect(),
@@ -52,7 +52,7 @@ async fn create_vm(
     let vm_data = request.data.clone();
     let message = HTTPActor::create_vm_message(request);
 
-    let _reply = state.ask(message).await.unwrap();
+    let _reply = state.ask(message).await?;
 
     Ok(Json(VirtualMachine {
         data: vm_data,
@@ -72,7 +72,7 @@ async fn debug_create_vm(
         config: request.vm_config,
     };
 
-    let _reply = state.ask(message).await.unwrap();
+    let _reply = state.ask(message).await?;
 
     Ok(Json(VirtualMachine {
         status: VMStatus::Provisioning,
@@ -97,7 +97,7 @@ async fn shutdown_vm(
     State(state): State<ActorRef<HTTPActor>>,
     Path(VmId(vmid)): Path<VmId>,
 ) -> Result<impl IntoApiResponse, OdoroboError> {
-    let _reply = state.ask(ShutdownVM { vmid }).await.unwrap();
+    let _reply = state.ask(ShutdownVM { vmid }).await?;
 
     Ok(Json(()))
 }
