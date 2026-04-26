@@ -23,9 +23,6 @@ use tracing::{info, warn};
 pub struct SchedulerActor {
     pub agent_actor_cache: ActorCache<SchedulerActor, AgentActor, CachedAgentActor>,
     pub vm_actor_cache: ActorCache<SchedulerActor, VMActor, CachedVMActor>
-
-    //pub vm_actor_cache: Arc<Mutex<AHashMap<ActorId, CachedVMActor>>>,
-    //pub vm_keepalive_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 // todo: this might need to be a runtime thing but this makes it easy to write for now and could easily be switched out later.

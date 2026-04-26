@@ -6,7 +6,6 @@ mod util;
 use kameo::actor::Spawn;
 use odorobo_shared::{connect_to_swarm, actor_names::AGENT};
 use stable_eyre::Result;
-// use odorobo_shared::
 use crate::actor::AgentActor;
 
 #[tokio::main]

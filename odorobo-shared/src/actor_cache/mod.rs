@@ -1,27 +1,27 @@
 use std::{marker::PhantomData, sync::Arc, time::Duration};
 
-use ahash::AHashMap;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use kameo::{prelude::*};
-use tokio::{sync::{Mutex, MutexGuard}, task::JoinHandle};
+use tokio::task::JoinHandle;
 use stable_eyre::{Report, Result};
 use tracing::{info, instrument, trace};
 
 use std::fmt;
 
-// future refactor TODO because I don't know how to do it now.
-// The best way to make this would be that you crate a struct with #[derive(ActorCache)]
-// and then you impl ActorCache with setting the ChildActor and Data as types similar to https://github.com/tqwewe/kameo/blob/1d498c0566b613b9afe6d54965c4b191c84432e0/src/actor.rs#L122
-// you could then just implement these get_actor_ref and on_update methods during that.
-// we also would likely want default methods that just let you lookup_all for a specific actor string.
-// you would also likely want to change get_actor_refs to return an iterator during this if you are doing this anyway.
-// the problem is to do this you need to write a derive macro and I have no clue how to do that.
-// and learning that now is not something i should spend tiem doing.
-// so unfortunately instead I have to use self inside of the ActorCacheUpdater trait to make it work.
-// Which I hate
-// this would also make it where we dont need two structs, one for data and one for the update function hooks.
-// I thnk it would also likely make a lot of the generic types simpler since hopefully their trait bounds would only be in one place.
+// TODO: refactor to use derive macro, but I (caleb) don't know how to write a derive macro.
+//
+// The best way to write this would be using a derive similar to kameo
+// so you would create a struct with #[derive(ActorCache)].
+// Then you would set the types and then write get_actor_refs and on_update.
+// This would combine everything into one struct and make it a lot easier to work with.
+//
+// similar to: https://github.com/tqwewe/kameo/blob/1d498c0566b613b9afe6d54965c4b191c84432e0/src/actor.rs#L122
+//
+//
+// other things we might want:
+// - a default get_actor_refs that just finds all actor_refs with a specific actor string.
+// - change get_actor_refs to use an iterator
 
 
 #[async_trait]
@@ -41,22 +41,6 @@ pub struct ActorCache<ParentActor: Actor + RemoteActor, ChildActor: Actor + Remo
 
     child_actor_type: PhantomData<ChildActor>
 }
-
-/*
-// todo: get cappy to tell me how you are supposed to do this properly
-pub async fn info(&self) {
-    let keepalives = self.keepalive_tasks.lock().await;
-    let cache = self.data_cache.lock().await;
-
-    info!("agent actor cache data");
-    for keepalive in keepalives.iter() {
-        info!("keepalive: {keepalive:?}");
-    }
-    for data in cache.iter() {
-        info!("data: {data:?}");
-    }
-}
- */
 
 // todo: impl Drop to automatically kill all the keepalive_tasks and the actor_finder task.
 
@@ -88,8 +72,6 @@ impl<ParentActor: Actor + RemoteActor, ChildActor: Actor + RemoteActor, Data: Cl
         &self,
         id: ActorId
     ) {
-        //self.print_agent_caches().await;
-
         info!("removing agent actor from cache {id:?}");
 
         if let Some(actor_keepalive_task) = self.keepalive_tasks.remove(&id) {
@@ -98,8 +80,6 @@ impl<ParentActor: Actor + RemoteActor, ChildActor: Actor + RemoteActor, Data: Cl
         };
 
         self.data_cache.remove(&id);
-
-        //self.print_agent_caches().await;
     }
 
     fn start_actor_finder(

@@ -1,6 +1,5 @@
 use stable_eyre::Result;
-// use tracing::
-use tracing_subscriber::{EnvFilter, filter::LevelFilter, prelude::*};
+use tracing_subscriber::{EnvFilter, filter::LevelFilter};
 use ulid::Ulid;
 
 pub fn env_filter(debug_target: Option<&str>) -> EnvFilter {
