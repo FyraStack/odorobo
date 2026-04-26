@@ -6,6 +6,7 @@ mod state;
 mod utils;
 pub mod messages;
 pub mod config;
+pub mod types;
 
 use std::fs;
 

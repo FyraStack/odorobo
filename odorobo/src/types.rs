@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use aide::OperationIo;
 use bytesize::ByteSize;
 use cloud_hypervisor_client::models::VmConfig;
@@ -46,7 +48,7 @@ pub struct VmId(#[schemars(with = "String")] pub Ulid);
 pub struct VolumeId(#[schemars(with = "String")] pub Ulid);
 
 /// A URI pointing to the volume's location, e.g an iSCSI URL in `iscsi-inq` format, a local file, or an RBD image.
-/// 
+///
 /// examples:
 /// - `iscsi://[<username>[%<password>]@]<host>[:<port>]/<target-iqn-name>/<lun>`
 /// - `file:///path/to/volume.img`
@@ -134,9 +136,18 @@ pub enum VMStatus {
     Error(String), // error message
 }
 
-/// Detailed information about a running VM
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Default)]
-pub struct VMInfo {
+pub struct ObjectMetadata {
+    /// Labels associated with the object.
+    pub labels: BTreeMap<String, String>,
+    /// Annotations associated with the object.
+    pub annotations: BTreeMap<String, String>,
+}
+
+/// Detailed information about a running VM
+// probably move this somewhere else
+#[derive(Serialize, Deserialize, Debug, JsonSchema, Default)]
+pub struct VirtualMachine {
     /// VM configuration
     pub data: VMData,
 
@@ -148,6 +159,11 @@ pub struct VMInfo {
     pub node: Option<String>,
     /// Current status of the VM
     pub status: VMStatus,
+
+    /// Metadata
+    pub metadata: Option<ObjectMetadata>,
+
+    // placement stuff....
 }
 
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Default)]
@@ -167,14 +183,14 @@ pub struct Volume {
     #[schemars(with = "u64")]
     #[serde(with = "bytesize_as_u64")]
     pub size: ByteSize,
-    
+
     /// A URI pointing to the volume's location, e.g an iSCSI URL in `iscsi-inq` format, a local file, or an RBD image.
-    /// 
+    ///
     /// examples:
     /// - `iscsi://[<username>[%<password>]@]<host>[:<port>]/<target-iqn-name>/<lun>`
     /// - `file:///path/to/volume.img`
     /// - `rbd://<pool>/<image>`
-    /// 
+    ///
     pub uri: StorageUri,
 }
 // for now

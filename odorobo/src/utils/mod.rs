@@ -1,7 +1,8 @@
 pub mod actor_names;
 pub mod actor_cache;
 
-use stable_eyre::{Result};
+use aide::OperationIo;
+use stable_eyre::{Result, Report};
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::EnvFilter;
 use thiserror::Error;
@@ -9,14 +10,59 @@ use kameo::prelude::*;
 use libp2p::futures::StreamExt;
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::{PeerId, mdns, noise, tcp, yamux};
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
+use api_error::ApiError;
 
-#[derive(Error, Debug)]
+// todo: wrap with axum-responses, return this type on request failure
+#[derive(Error, Debug, ApiError, OperationIo)]
+#[aide(output)]
 pub enum OdoroboError {
     #[error("{0}")]
-    Report(#[from] stable_eyre::Report),
+    #[api_error(status_code = 500, message = "{0}")]
+    Report(#[from] Report),
 }
 
+impl<M> From<kameo::error::SendError<M, Report>> for OdoroboError {
+    fn from(value: kameo::error::SendError<M, Report>) -> Self {
+        let kameo_error = value.to_string();
+        error!(?value);
+        OdoroboError::Report(value.err().unwrap_or_else(|| {
+            Report::msg(format!("could not unwrap kameo error: {kameo_error}"))
+        }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{
+        http::StatusCode,
+        body::Body, http::Request,
+        routing::get,
+        Router,
+    };
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    async fn handler() -> Result<(), OdoroboError> {
+        Err(OdoroboError::Report(Report::msg("error!")))
+    }
+
+    #[tokio::test]
+    async fn test_error() {
+        let response = Router::new().route("/", get(handler))
+            .oneshot(Request::get("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = response.into_body();
+        let bytes = body.collect().await.unwrap().to_bytes();
+        let html = String::from_utf8(bytes.to_vec()).unwrap();
+
+        assert_eq!(html, "{\"message\":\"error!\"}");
+    }
+}
 
 
 pub fn env_filter(debug_target: Option<&str>) -> EnvFilter {

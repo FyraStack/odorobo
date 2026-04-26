@@ -46,6 +46,9 @@ ipnet = {version = "2.12", features = ["serde", "schemars08"]}
 url = { version = "2.5", features = ["serde"] }
 async-trait = "0.1"
 dashmap = "6.1"
+api-error = { version = "0.1.3", features = ["axum"] }
+http = "1"
+tower = "0.5"
 
 aide = { version = "0.15", features = [
     "axum",
@@ -58,5 +61,7 @@ aide = { version = "0.15", features = [
 ] }
 # aide needs an older version of schemars
 schemars = "0.9"
+
+
 
 cloud-hypervisor-client = { git = "https://github.com/FyraStack/cloud-hypervisor-client.git" }

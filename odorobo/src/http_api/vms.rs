@@ -1,9 +1,9 @@
 //! VM management API handlers.
 use crate::{
     actors::http_actor::HTTPActor,
-    http_api::types::{
-        CreateVMRequest, DebugCreateVMRequest, UpdateVMRequest, VMData, VMInfo, VMListResponse, VMStatus, VmId
-    }, messages::vm::CreateVM,
+    types::{
+        CreateVMRequest, DebugCreateVMRequest, UpdateVMRequest, VMData, VirtualMachine, VMListResponse, VMStatus, VmId
+    }, messages::vm::CreateVM, utils::OdoroboError,
 };
 use aide::axum::{
     ApiRouter, IntoApiResponse,
@@ -28,43 +28,43 @@ pub fn router() -> ApiRouter<ActorRef<HTTPActor>> {
         .api_route("/{vmid}/shutdown", put(shutdown_vm))
 }
 
-async fn list_vms(State(state): State<ActorRef<HTTPActor>>) -> impl IntoApiResponse {
+async fn list_vms(State(state): State<ActorRef<HTTPActor>>) -> Result<impl IntoApiResponse, OdoroboError> {
     let reply = state.ask(AgentListVMs).await.unwrap();
 
-    Json(VMListResponse {
+    Ok(Json(VMListResponse {
         vms: reply.vms.into_iter().map(VmId).collect(),
-    })
+    }))
 }
 
 /// Get detailed information about a specific VM
 async fn vm_info(
     State(_state): State<ActorRef<HTTPActor>>,
     Path(VmId(_vmid)): Path<VmId>,
-) -> impl IntoApiResponse {
+) -> Result<impl IntoApiResponse, OdoroboError> {
     // stub,
-    Json(VMInfo::default())
+    Ok(Json(VirtualMachine::default()))
 }
 
 async fn create_vm(
     State(state): State<ActorRef<HTTPActor>>,
     Json(request): Json<CreateVMRequest>,
-) -> impl IntoApiResponse {
+) -> Result<impl IntoApiResponse, OdoroboError> {
     let vm_data = request.data.clone();
     let message = HTTPActor::create_vm_message(request);
 
     let _reply = state.ask(message).await.unwrap();
 
-    Json(VMInfo {
+    Ok(Json(VirtualMachine {
         data: vm_data,
         node: None,
         status: VMStatus::Provisioning,
-    })
+    }))
 }
 
 async fn debug_create_vm(
     State(state): State<ActorRef<HTTPActor>>,
     Json(request): Json<DebugCreateVMRequest>,
-) -> impl IntoApiResponse {
+) -> Result<impl IntoApiResponse, OdoroboError> {
     let ulid = ulid::Ulid::new();
     let message = CreateVM {
         vmid: ulid,
@@ -73,32 +73,32 @@ async fn debug_create_vm(
 
     let _reply = state.ask(message).await.unwrap();
 
-    Json(VMInfo {
+    Ok(Json(VirtualMachine {
         status: VMStatus::Provisioning,
         data: VMData {
             id: ulid,
             ..Default::default()
         },
         ..Default::default()
-    })
+    }))
 }
 
 async fn delete_vm(
     State(state): State<ActorRef<HTTPActor>>,
     Path(VmId(vmid)): Path<VmId>,
-) -> impl IntoApiResponse {
-    let _reply = state.ask(DeleteVM { vmid }).await;
+) -> Result<impl IntoApiResponse, OdoroboError> {
+    let reply = state.ask(DeleteVM { vmid }).await?;
 
-    Json(())
+    Ok(Json(()))
 }
 
 async fn shutdown_vm(
     State(state): State<ActorRef<HTTPActor>>,
     Path(VmId(vmid)): Path<VmId>,
-) -> impl IntoApiResponse {
+) -> Result<impl IntoApiResponse, OdoroboError> {
     let _reply = state.ask(ShutdownVM { vmid }).await.unwrap();
 
-    Json(())
+    Ok(Json(()))
 }
 
 /// Update an existing VM's configuration (e.g. resize, change resources, etc.)
@@ -108,8 +108,8 @@ async fn update_vm(
     State(_state): State<ActorRef<HTTPActor>>,
     Path(VmId(_vmid)): Path<VmId>,
     Json(_request): Json<UpdateVMRequest>,
-) -> impl IntoApiResponse {
+) -> Result<impl IntoApiResponse, OdoroboError> {
     // stub
 
-    Json(VMInfo::default())
+    Ok(Json(VirtualMachine::default()))
 }

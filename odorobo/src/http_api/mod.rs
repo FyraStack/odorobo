@@ -1,5 +1,4 @@
 pub mod nodes;
-pub mod types;
 pub mod vms;
 pub mod volumes;
 use aide::{
@@ -10,7 +9,7 @@ use aide::{
 use axum::{Extension, Json, Router};
 use kameo::actor::ActorRef;
 
-use crate::actors::http_actor::HTTPActor;
+use crate::{actors::http_actor::HTTPActor, utils::OdoroboError};
 
 /// Build the full app: finalizes the OpenAPI spec and attaches it as an extension.
 pub fn build(state: ActorRef<HTTPActor>) -> Router {
@@ -32,12 +31,6 @@ pub fn build(state: ActorRef<HTTPActor>) -> Router {
         .layer(Extension(openapi))
 }
 
-// todo: error handling
-//
-// see odorobo-agent's old API for error handling patterns,
-// use `thiserror` and `axum_responses` to create consistent error responses across the API
-// - cappy
-
 /// Main router for the API
 fn router<S>(state: ActorRef<HTTPActor>) -> ApiRouter<S>
 where
@@ -54,8 +47,8 @@ where
 }
 
 /// Serve the OpenAPI spec as JSON
-async fn serve_api(Extension(api): Extension<OpenApi>) -> impl IntoApiResponse {
-    Json(api)
+async fn serve_api(Extension(api): Extension<OpenApi>) -> Result<impl IntoApiResponse, OdoroboError> {
+    Ok(Json(api))
 }
 
 /// Simple health check endpoint

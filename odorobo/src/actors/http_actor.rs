@@ -6,7 +6,7 @@ use crate::messages::vm::{
     };
 use stable_eyre::{Report, Result};
 
-use crate::http_api::types::CreateVMRequest;
+use crate::types::CreateVMRequest;
 
 use super::scheduler_actor::SchedulerActor;
 
