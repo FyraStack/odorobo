@@ -1,0 +1,22 @@
+[Unit]
+Description=Odorobo Service
+Documentation=https://github.com/FyraStack/odorobo
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+
+EnvironmentFile=/etc/odorobo/config.env
+ExecStart=/usr/bin/odorobo
+
+
+Restart=always
+RestartSec=3s
+RestartPreventExitStatus=0
+TimeoutStopSec=30s
+
+[Install]
+WantedBy=multi-user.target
