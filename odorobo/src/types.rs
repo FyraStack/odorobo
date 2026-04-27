@@ -166,8 +166,58 @@ pub struct VirtualMachine {
     /// Metadata
     pub metadata: Option<ObjectMetadata>,
 
-    // placement stuff....
-    
+    /// List of Affinity rules for scheduling. These are ANDed / summed together depending on the strictness.
+    pub affinity: Vec<AffinityRule>
+}
+
+
+#[derive(Serialize, Deserialize, Debug, JsonSchema)]
+pub struct AffinityRule {
+    pub strictness: AffinityStrictness,
+    pub affinity_type: AffinityType,
+    pub direction: AffinityDirection,
+    /// ORed together
+    pub requirements: Vec<AffinityRequirement>
+}
+
+#[derive(Serialize, Deserialize, Debug, JsonSchema)]
+pub enum AffinityStrictness {
+    Required,
+    Preferred { weight: i64 }
+}
+
+#[derive(Serialize, Deserialize, Debug, JsonSchema)]
+pub enum AffinityType {
+    VirtualMachine,
+    Agent
+}
+
+#[derive(Serialize, Deserialize, Debug, JsonSchema)]
+pub enum AffinityDirection {
+    Normal,
+    Anti
+}
+
+#[derive(Serialize, Deserialize, Debug, JsonSchema)]
+pub struct AffinityRequirement {
+    pub key: String,
+    pub table: MetadataTable,
+    pub operator: Operator,
+    pub values: Vec<String>
+}
+
+#[derive(Serialize, Deserialize, Debug, JsonSchema)]
+pub enum MetadataTable {
+    Label,
+    Annotation
+}
+
+#[derive(Serialize, Deserialize, Debug, JsonSchema)]
+pub enum Operator {
+    In,
+    NotIn,
+    Lt,
+    Gt,
 }
 
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Default)]
