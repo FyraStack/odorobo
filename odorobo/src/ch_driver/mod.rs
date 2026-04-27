@@ -8,5 +8,6 @@ pub mod devices;
 pub mod instance;
 pub mod provisioning;
 pub mod transform;
+pub mod actor;
 
 pub use instance::{VMInstance};

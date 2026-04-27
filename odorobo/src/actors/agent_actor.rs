@@ -1,4 +1,4 @@
-use crate::{config::Config, types::ObjectMetadata, messages::{Ping, Pong, agent::{AgentStatus, GetAgentStatus}, debug::PanicAgent, vm::*}, networking::actor::NetworkAgentActor, state::provisioning::actor::VMActor, utils::actor_names::{NETWORK, VM, vm_actor_id}};
+use crate::{config::Config, types::ObjectMetadata, messages::{Ping, Pong, agent::{AgentStatus, GetAgentStatus}, debug::PanicAgent, vm::*}, networking::actor::NetworkAgentActor, ch_driver::actor::VMActor, utils::actor_names::{NETWORK, VM, vm_actor_id}};
 use ahash::AHashMap;
 use bytesize::ByteSize;
 use cloud_hypervisor_client::models::VmConfig;

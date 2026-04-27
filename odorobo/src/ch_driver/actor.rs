@@ -1,5 +1,5 @@
-use crate::state::VMInstance;
-use cloud_hypervisor_client::models::VmConfig;
+use crate::{ch_driver::VMInstance, types::VirtualMachine};
+use cloud_hypervisor_client::models::{ConsoleConfig, ConsoleMode, CpusConfig, DebugConsoleConfig, DiskConfig, MemoryConfig, NetConfig, PayloadConfig, PlatformConfig, RngConfig, VmConfig};
 use kameo::prelude::*;
 use crate::messages::vm::{
     DeleteVM, GetVMInfo, GetVMInfoReply, MigrateVMReceive, MigrateVMReceiveReply, PrepMigration,
@@ -9,14 +9,7 @@ use serde::{Deserialize, Serialize};
 use stable_eyre::{Report, Result};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, trace, warn};
-/*
-use std::process::Command;
 
-let output = Command::new("echo")
-.arg("Hello world")
-.output()
-.expect("Failed to execute command");
- */
 /// A migration state that holds the listening address and VM config for a migration,
 /// used to pass live migration data between actors.
 pub struct MigrationState {
@@ -39,11 +32,13 @@ pub struct VMActor {
 
 impl Actor for VMActor {
     // tuple of VM ID and optional config
-    type Args = (ulid::Ulid, Option<VmConfig>);
+    type Args = (ulid::Ulid, Option<VirtualMachine>);
     type Error = Report;
 
     #[tracing::instrument(skip_all)]
     async fn on_start((vmid, vm_config): Self::Args, actor_ref: ActorRef<Self>) -> Result<Self> {
+
+
         let mut vminstance = VMInstance::spawn(&vmid.to_string(), vm_config, None).await?;
 
         // Take the child process out so we can watch for unexpected death.
@@ -104,6 +99,84 @@ impl Actor for VMActor {
         // info!(vmid = %self.vmid, ?res, "VM process exited");
 
         Ok(())
+    }
+}
+
+impl From<VirtualMachine> for VmConfig {
+    fn from(vm: VirtualMachine) -> Self {
+        VmConfig {
+            cpus: Some(CpusConfig {
+                boot_vcpus: todo!(),
+                max_vcpus: todo!(),
+                topology: todo!(),
+                kvm_hyperv: todo!(),
+                max_phys_bits: todo!(),
+                nested: todo!(),
+                affinity: todo!(),
+                features: todo!(),
+                core_scheduling: todo!(),
+            }),
+            memory: Some(MemoryConfig {
+                size: todo!(),
+                hotplug_size: todo!(),
+                hotplugged_size: todo!(),
+                mergeable: todo!(),
+                hotplug_method: todo!(),
+                shared: todo!(),
+                hugepages: todo!(),
+                hugepage_size: todo!(),
+                prefault: todo!(),
+                thp: todo!(),
+                zones: todo!(),
+            }),
+            payload: PayloadConfig {
+                firmware: todo!(),
+                kernel: None,
+                cmdline: todo!(),
+                initramfs: todo!(),
+                igvm: todo!(),
+                host_data: todo!(),
+            },
+            disks: Some(vec![
+                DiskConfig {
+                    ..Default::default()
+                }
+            ]),
+            net: Some(vec![
+                NetConfig {
+                    ..Default::default()
+                }
+            ]),
+            rng: Some(
+                RngConfig {
+                    src: "/dev/urandom".to_string(),
+                    iommu: Some(false)
+                }
+            ),
+            serial: Some(
+                ConsoleConfig {
+                    mode: ConsoleMode::Null,
+                    iommu: Some(false),
+                    ..Default::default()
+                }
+            ),
+            debug_console: Some(
+                DebugConsoleConfig {
+                    mode: ConsoleMode::Off,
+                    iobase: Some(233),
+                    ..Default::default()
+                }
+            ),
+            iommu: Some(false),
+            watchdog: Some(false),
+            pvpanic: Some(false),
+            platform: Some(PlatformConfig {
+                serial_number: Some("ds=nocloud".to_string()),
+                ..Default::default()
+            }),
+            landlock_enable: Some(false),
+            ..Default::default()
+        }
     }
 }
 
