@@ -104,8 +104,8 @@ impl From<VirtualMachine> for VmConfig {
     fn from(vm: VirtualMachine) -> Self {
         VmConfig {
             cpus: Some(CpusConfig {
-                boot_vcpus: 4,
-                max_vcpus: 4,
+                boot_vcpus: vm.data.vcpus as i32,
+                max_vcpus: vm.data.max_vcpus.unwrap_or(vm.data.vcpus) as i32,
                 kvm_hyperv: Some(false),
                 max_phys_bits: Some(46),
                 nested: Some(false),
@@ -115,7 +115,7 @@ impl From<VirtualMachine> for VmConfig {
                 ..Default::default()
             }),
             memory: Some(MemoryConfig {
-                size: 4294967296,
+                size: vm.data.memory.as_u64() as i64,
                 mergeable: Some(false),
                 hotplug_method: Some("Acpi".to_string()),
                 shared: Some(true),
@@ -132,7 +132,7 @@ impl From<VirtualMachine> for VmConfig {
             disks: Some(vec![
                 DiskConfig {
                     // todo: the json i was given by cappy had disable_io_uring and disable_aio in this config, but I can't find these. I assume they were just a mistake.
-                    path: Some("/var/lib/odorobo/f43.raw".to_string()),
+                    path: Some(vm.data.image),
                     readonly: Some(false),
                     direct: Some(false),
                     iommu: Some(false),

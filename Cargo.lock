@@ -2939,13 +2939,16 @@ dependencies = [
 name = "odoroboctl"
 version = "0.1.0"
 dependencies = [
+ "bytesize",
  "chrono",
  "clap",
+ "odorobo",
  "reqwest",
  "serde",
  "serde_json",
  "stable-eyre",
  "tokio",
+ "ulid",
 ]
 
 [[package]]

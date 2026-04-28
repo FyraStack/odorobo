@@ -2,7 +2,7 @@
 use crate::{
     actors::http_actor::HTTPActor,
     types::{
-        CreateVMRequest, DebugCreateVMRequest, UpdateVMRequest, VMData, VirtualMachine, VMListResponse, VMStatus, VmId
+        CreateVMRequest, UpdateVMRequest, VMData, VirtualMachine, VMListResponse, VMStatus, VmId
     }, messages::vm::CreateVM, utils::OdoroboError,
 };
 use aide::axum::{
@@ -20,8 +20,6 @@ pub fn router() -> ApiRouter<ActorRef<HTTPActor>> {
     ApiRouter::new()
         .api_route("/", get(list_vms))
         .api_route("/", post(create_vm))
-        // undocumented debug route, do not use in prod
-        .route("/", axum::routing::put(debug_create_vm))
         .api_route("/{vmid}", get(vm_info))
         .api_route("/{vmid}", patch(update_vm))
         .api_route("/{vmid}", delete(delete_vm))
@@ -50,34 +48,13 @@ async fn create_vm(
     Json(request): Json<CreateVMRequest>,
 ) -> Result<impl IntoApiResponse, OdoroboError> {
     let message = CreateVM {
-        vmid: request.data.data.id,
-        config: request.data.clone(),
+        vmid: request.vm.data.id,
+        config: request.vm,
     };
 
-    let _reply = state.ask(message).await?;
+    let reply = state.ask(message).await?;
 
-    Ok(Json(request))
-}
-
-async fn debug_create_vm(
-    State(state): State<ActorRef<HTTPActor>>,
-) -> Result<impl IntoApiResponse, OdoroboError> {
-    let ulid = ulid::Ulid::new();
-    let message = CreateVM {
-        vmid: ulid,
-        config: Default::default(),
-    };
-
-    let _reply = state.ask(message).await?;
-
-    Ok(Json(VirtualMachine {
-        status: VMStatus::Provisioning,
-        data: VMData {
-            id: ulid,
-            ..Default::default()
-        },
-        ..Default::default()
-    }))
+    Ok(Json(reply))
 }
 
 async fn delete_vm(

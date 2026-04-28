@@ -1,6 +1,7 @@
 //! VM-related messages
 use cloud_hypervisor_client::models::VmConfig;
 use kameo::prelude::*;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
@@ -25,7 +26,7 @@ pub struct CreateVM {
     pub config: VirtualMachine,
 }
 
-#[derive(Serialize, Deserialize, Reply, Debug)]
+#[derive(Serialize, Deserialize, Reply, Debug, JsonSchema)]
 pub struct CreateVMReply {
     pub config: Option<VirtualMachine>,
 }

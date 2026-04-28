@@ -66,7 +66,7 @@ impl Default for StorageUri {
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Default, Clone)]
 pub struct CreateVMRequest {
     /// Data of the VM to create
-    pub data: VirtualMachine,
+    pub vm: VirtualMachine,
     /// Whether to boot the VM immediately after creation
     pub boot: bool,
 }
@@ -167,7 +167,7 @@ pub struct VirtualMachine {
     pub metadata: Option<ObjectMetadata>,
 
     /// List of Affinity rules for scheduling. These are ANDed / summed together depending on the strictness.
-    pub affinity: Vec<AffinityRule>
+    pub affinity: Option<Vec<AffinityRule>>
 }
 
 

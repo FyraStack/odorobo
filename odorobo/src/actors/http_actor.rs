@@ -1,12 +1,9 @@
-use cloud_hypervisor_client::models::{CpusConfig, MemoryConfig, PayloadConfig, VmConfig};
 use kameo::prelude::*;
 use crate::messages::vm::{
         AgentListVMs, AgentListVMsReply, CreateVM, CreateVMReply, DeleteVM, DeleteVMReply,
         ShutdownVM, ShutdownVMReply,
     };
 use stable_eyre::{Report, Result};
-
-use crate::types::CreateVMRequest;
 
 use super::scheduler_actor::SchedulerActor;
 

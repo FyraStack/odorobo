@@ -4,6 +4,9 @@ use clap::{Parser, Subcommand};
 use reqwest::{Client, Response};
 use serde::{Deserialize, Serialize};
 use stable_eyre::Result;
+use odorobo::types::{CreateVMRequest, VMData, VirtualMachine};
+use ulid::Ulid;
+use bytesize::ByteSize;
 
 #[derive(Parser)]
 #[command(
@@ -43,12 +46,6 @@ pub enum Command {
         /// VM ID in ULID format
         vmid: String,
     },
-}
-
-#[derive(Debug, Serialize)]
-struct DebugCreateVMRequest {
-    vm_config: serde_json::Value,
-    boot: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -102,8 +99,28 @@ pub async fn run_command(cli: Cli) -> Result<()> {
 
     match cli.command {
         Command::Create => {
+            let vm = VirtualMachine {
+                data: VMData {
+                    id: Ulid::new(),
+                    name: "test_vm".to_string(),
+                    vcpus: 4,
+                    max_vcpus: None,
+                    memory: ByteSize::gib(4),
+                    image: "/var/lib/odorobo/f43.raw".to_string(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+
+            let request = CreateVMRequest {
+                vm,
+                boot: true
+            };
+
             let url = format!("{}/vms", base_url);
-            let response = client.put(&url).send().await?;
+            let response = client.post(&url).json(&request).send().await?;
+
+            println!("{:?}", response.url());
 
             print_message_response(response, "VM create request sent successfully").await?;
         }
