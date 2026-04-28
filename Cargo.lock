@@ -668,6 +668,7 @@ dependencies = [
  "iana-time-zone",
  "js-sys",
  "num-traits",
+ "serde",
  "wasm-bindgen",
  "windows-link",
 ]
@@ -2932,6 +2933,19 @@ dependencies = [
  "tracing-subscriber",
  "ulid",
  "url",
+]
+
+[[package]]
+name = "odoroboctl"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "clap",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "stable-eyre",
+ "tokio",
 ]
 
 [[package]]

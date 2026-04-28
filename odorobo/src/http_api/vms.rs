@@ -49,27 +49,23 @@ async fn create_vm(
     State(state): State<ActorRef<HTTPActor>>,
     Json(request): Json<CreateVMRequest>,
 ) -> Result<impl IntoApiResponse, OdoroboError> {
-    let vm_data = request.data.clone();
-    let message = HTTPActor::create_vm_message(request);
+    let message = CreateVM {
+        vmid: request.data.data.id,
+        config: request.data.clone(),
+    };
 
     let _reply = state.ask(message).await?;
 
-    Ok(Json(VirtualMachine {
-        data: vm_data,
-        node: None,
-        status: VMStatus::Provisioning,
-        ..Default::default()
-    }))
+    Ok(Json(request))
 }
 
 async fn debug_create_vm(
     State(state): State<ActorRef<HTTPActor>>,
-    Json(request): Json<DebugCreateVMRequest>,
 ) -> Result<impl IntoApiResponse, OdoroboError> {
     let ulid = ulid::Ulid::new();
     let message = CreateVM {
         vmid: ulid,
-        config: request.vm_config,
+        config: Default::default(),
     };
 
     let _reply = state.ask(message).await?;

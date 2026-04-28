@@ -17,34 +17,6 @@ pub struct HTTPActor {
     pub scheduler: ActorRef<SchedulerActor>,
 }
 
-impl HTTPActor {
-    pub fn create_vm_message(request: CreateVMRequest) -> CreateVM {
-        CreateVM {
-            vmid: request.data.id,
-            config: VmConfig {
-                cpus: Some(CpusConfig {
-                    boot_vcpus: request.data.vcpus as i32,
-                    max_vcpus: request
-                        .data
-                        .max_vcpus
-                        .map(|v| v as i32)
-                        .unwrap_or(request.data.vcpus as i32),
-                    ..Default::default()
-                }),
-                memory: Some(MemoryConfig {
-                    size: request.data.memory.as_u64() as i64,
-                    ..Default::default()
-                }),
-                payload: PayloadConfig {
-                    kernel: Some(request.data.image),
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-        }
-    }
-}
-
 impl Actor for HTTPActor {
     type Args = ActorRef<SchedulerActor>;
     type Error = Report;

@@ -4,6 +4,8 @@ use kameo::prelude::*;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
+use crate::types::VirtualMachine;
+
 // TODO: when scheduler does createVM it also stores which server we put the Ulid on so it can do a in memory cache and doesn't need to hit the Server
 //  for failover, the new node when it fails over will need to rebuild this cache via hitting a GetAllVMs message on every server
 //  additionally, when the VmConfig is created, this determines the MAC address of the server. meaning as soon as we have this info, we need to hit the router via the scheduler, because the router might be slow.
@@ -20,12 +22,12 @@ pub struct CreateVM {
     /// node-specific, paths, i.e attach LUNs, networking?
     ///
     /// this data would go to state::instance::spawn()
-    pub config: VmConfig,
+    pub config: VirtualMachine,
 }
 
 #[derive(Serialize, Deserialize, Reply, Debug)]
 pub struct CreateVMReply {
-    pub config: Option<VmConfig>,
+    pub config: Option<VirtualMachine>,
 }
 
 /// Message to delete a VM's config from the agent, shutting it down

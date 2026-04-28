@@ -1,5 +1,5 @@
 use crate::{ch_driver::VMInstance, types::VirtualMachine};
-use cloud_hypervisor_client::models::{ConsoleConfig, ConsoleMode, CpusConfig, DebugConsoleConfig, DiskConfig, MemoryConfig, NetConfig, PayloadConfig, PlatformConfig, RngConfig, VmConfig};
+use cloud_hypervisor_client::models::{ConsoleConfig, ConsoleMode, CpuFeatures, CpusConfig, DebugConsoleConfig, DiskConfig, ImageType, MemoryConfig, NetConfig, PayloadConfig, PlatformConfig, RngConfig, VmConfig};
 use kameo::prelude::*;
 use crate::messages::vm::{
     DeleteVM, GetVMInfo, GetVMInfoReply, MigrateVMReceive, MigrateVMReceiveReply, PrepMigration,
@@ -37,9 +37,7 @@ impl Actor for VMActor {
 
     #[tracing::instrument(skip_all)]
     async fn on_start((vmid, vm_config): Self::Args, actor_ref: ActorRef<Self>) -> Result<Self> {
-
-
-        let mut vminstance = VMInstance::spawn(&vmid.to_string(), vm_config, None).await?;
+        let mut vminstance = VMInstance::spawn(&vmid.to_string(), vm_config.map(VmConfig::from), None).await?;
 
         // Take the child process out so we can watch for unexpected death.
         // destroy() handles a missing child_process gracefully.
@@ -106,44 +104,53 @@ impl From<VirtualMachine> for VmConfig {
     fn from(vm: VirtualMachine) -> Self {
         VmConfig {
             cpus: Some(CpusConfig {
-                boot_vcpus: todo!(),
-                max_vcpus: todo!(),
-                topology: todo!(),
-                kvm_hyperv: todo!(),
-                max_phys_bits: todo!(),
-                nested: todo!(),
-                affinity: todo!(),
-                features: todo!(),
-                core_scheduling: todo!(),
+                boot_vcpus: 4,
+                max_vcpus: 4,
+                kvm_hyperv: Some(false),
+                max_phys_bits: Some(46),
+                nested: Some(false),
+                features: Some(CpuFeatures {
+                    amx: Some(false)
+                }),
+                ..Default::default()
             }),
             memory: Some(MemoryConfig {
-                size: todo!(),
-                hotplug_size: todo!(),
-                hotplugged_size: todo!(),
-                mergeable: todo!(),
-                hotplug_method: todo!(),
-                shared: todo!(),
-                hugepages: todo!(),
-                hugepage_size: todo!(),
-                prefault: todo!(),
-                thp: todo!(),
-                zones: todo!(),
+                size: 4294967296,
+                mergeable: Some(false),
+                hotplug_method: Some("Acpi".to_string()),
+                shared: Some(true),
+                hugepages: Some(false),
+                prefault: Some(false),
+                thp: Some(true),
+                ..Default::default()
             }),
             payload: PayloadConfig {
-                firmware: todo!(),
-                kernel: None,
-                cmdline: todo!(),
-                initramfs: todo!(),
-                igvm: todo!(),
-                host_data: todo!(),
+                firmware: Some("/var/lib/odorobo/CLOUDHV.fd".to_string()),
+                cmdline: Some("odorobo.test=1".to_string()),
+                ..Default::default()
             },
             disks: Some(vec![
                 DiskConfig {
+                    // todo: the json i was given by cappy had disable_io_uring and disable_aio in this config, but I can't find these. I assume they were just a mistake.
+                    path: Some("/var/lib/odorobo/f43.raw".to_string()),
+                    readonly: Some(false),
+                    direct: Some(false),
+                    iommu: Some(false),
+                    num_queues: Some(1),
+                    queue_size: Some(128),
+                    vhost_user: Some(false),
+                    id: Some("_disk0".to_string()),
+                    pci_segment: Some(0),
+                    backing_files: Some(false),
+                    sparse: Some(true),
+                    image_type: Some(ImageType::Raw),
                     ..Default::default()
                 }
             ]),
             net: Some(vec![
                 NetConfig {
+                    id: Some("net://devnet".to_string()),
+                    mac: Some("46:59:52:67:67:67".to_string()),
                     ..Default::default()
                 }
             ]),

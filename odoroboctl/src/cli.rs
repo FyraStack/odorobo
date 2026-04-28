@@ -27,15 +27,7 @@ pub struct Cli {
 pub enum Command {
     /// Create a VM via the scheduler debug endpoint,
     /// optionally also booting it immediately after creation (if `--boot` is specified).
-    Create {
-        /// Path to the VM config file
-        /// (in Cloud Hypervisor JSON format)
-        config: PathBuf,
-
-        /// Boot the VM after creation
-        #[arg(long)]
-        boot: bool,
-    },
+    Create,
 
     /// List VMs currently known by the manager/agent.
     List,
@@ -109,12 +101,9 @@ pub async fn run_command(cli: Cli) -> Result<()> {
     let base_url = cli.manager_addr;
 
     match cli.command {
-        Command::Create { config, boot } => {
+        Command::Create => {
             let url = format!("{}/vms", base_url);
-            let vm_config =
-                serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(&config)?)?;
-            let body = DebugCreateVMRequest { vm_config, boot };
-            let response = client.put(&url).json(&body).send().await?;
+            let response = client.put(&url).send().await?;
 
             print_message_response(response, "VM create request sent successfully").await?;
         }

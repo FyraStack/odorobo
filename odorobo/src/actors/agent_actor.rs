@@ -1,7 +1,6 @@
-use crate::{config::Config, types::ObjectMetadata, messages::{Ping, Pong, agent::{AgentStatus, GetAgentStatus}, debug::PanicAgent, vm::*}, networking::actor::NetworkAgentActor, ch_driver::actor::VMActor, utils::actor_names::{NETWORK, VM, vm_actor_id}};
+use crate::{ch_driver::actor::VMActor, config::Config, messages::{Ping, Pong, agent::{AgentStatus, GetAgentStatus}, debug::PanicAgent, vm::*}, networking::actor::NetworkAgentActor, types::{ObjectMetadata, VirtualMachine}, utils::actor_names::{NETWORK, VM, vm_actor_id}};
 use ahash::AHashMap;
 use bytesize::ByteSize;
-use cloud_hypervisor_client::models::VmConfig;
 use kameo::prelude::*;
 use stable_eyre::{Report, Result};
 use std::ops::ControlFlow;
@@ -13,7 +12,7 @@ use kameo::error::PanicError;
 
 pub struct VMCacheData {
     actor_ref: ActorRef<VMActor>,
-    config: VmConfig
+    config: VirtualMachine
 }
 
 #[derive(RemoteActor)]
@@ -137,7 +136,7 @@ impl Message<MigrateVMReceive> for AgentActor {
             vmid,
             VMCacheData {
                 actor_ref: actor_ref.clone(),
-                config: msg.config.clone()
+                config: Default::default()
             }
         );
 
@@ -285,12 +284,12 @@ impl Message<GetAgentStatus> for AgentActor {
     ) -> Self::Reply {
 
         let vcpus_used_by_vms = self.vms.values()
-            .map(|vm| vm.config.cpus.as_ref().map(|cpu_config| cpu_config.boot_vcpus).unwrap_or(0))
+            .map(|vm| vm.config.data.vcpus)
             .reduce(|acc, cpus| acc + cpus)
             .unwrap_or(0) as u32;
 
         let ram_used_by_vms = self.vms.values()
-            .map(|vm| vm.config.memory.as_ref().map(|memory_config| memory_config.size).unwrap_or(0))
+            .map(|vm| vm.config.data.memory.as_u64())
             .reduce(|acc, memory| acc + memory)
             .unwrap_or(0) as u64;
 
