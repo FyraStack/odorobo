@@ -2,7 +2,7 @@
 use crate::{
     actors::http_actor::HTTPActor,
     types::{
-        CreateVMRequest, UpdateVMRequest, VMData, VirtualMachine, VMListResponse, VMStatus, VmId
+        CreateVMRequest, UpdateVMRequest, VirtualMachine, VMListResponse, VmId
     }, messages::vm::CreateVM, utils::OdoroboError,
 };
 use aide::axum::{

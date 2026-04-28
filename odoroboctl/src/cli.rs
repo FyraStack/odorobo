@@ -1,8 +1,6 @@
-use std::path::PathBuf;
-
 use clap::{Parser, Subcommand};
 use reqwest::{Client, Response};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize};
 use stable_eyre::Result;
 use odorobo::types::{CreateVMRequest, VMData, VirtualMachine};
 use ulid::Ulid;
