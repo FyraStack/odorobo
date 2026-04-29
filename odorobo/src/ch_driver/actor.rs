@@ -1,5 +1,5 @@
 use crate::{ch_driver::VMInstance, types::VirtualMachine};
-use cloud_hypervisor_client::models::{ConsoleConfig, ConsoleMode, CpuFeatures, CpusConfig, DebugConsoleConfig, DiskConfig, ImageType, MemoryConfig, NetConfig, PayloadConfig, PlatformConfig, RngConfig, VmConfig};
+use cloud_hypervisor_client::models::{CpuFeatures, CpusConfig, DiskConfig, ImageType, MemoryConfig, NetConfig, PayloadConfig, PlatformConfig, VmConfig};
 use kameo::prelude::*;
 use crate::messages::vm::{
     DeleteVM, GetVMInfo, GetVMInfoReply, MigrateVMReceive, MigrateVMReceiveReply, PrepMigration,
@@ -108,7 +108,6 @@ impl From<VirtualMachine> for VmConfig {
                 boot_vcpus: vm.data.vcpus as i32,
                 max_vcpus: vm.data.max_vcpus.unwrap_or(vm.data.vcpus) as i32,
                 kvm_hyperv: Some(false),
-                max_phys_bits: Some(46),
                 nested: Some(false),
                 features: Some(CpuFeatures {
                     amx: Some(false)
@@ -130,7 +129,7 @@ impl From<VirtualMachine> for VmConfig {
                 ..Default::default()
             },
             disks: Some(vec![
-                DiskConfig {
+                DiskConfig { // todo: get cappy to make this auto generate this via the manifest's volumes atribute.
                     // todo: the json i was given by cappy had disable_io_uring and disable_aio in this config, but I can't find these. I assume they were just a mistake.
                     path: Some(vm.data.image),
                     readonly: Some(false),
@@ -154,17 +153,6 @@ impl From<VirtualMachine> for VmConfig {
                     ..Default::default()
                 }
             ]),
-            rng: Some(
-                RngConfig {
-                    src: "/dev/urandom".to_string(),
-                    iommu: Some(false)
-                }
-            ),
-            serial: None,
-            debug_console: None,
-            iommu: Some(false),
-            watchdog: Some(false),
-            pvpanic: Some(false),
             platform: Some(PlatformConfig {
                 serial_number: Some("ds=nocloud".to_string()),
                 ..Default::default()

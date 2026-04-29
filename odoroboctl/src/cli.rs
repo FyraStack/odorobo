@@ -26,7 +26,7 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Create a VM via the scheduler debug endpoint,
+    /// Create a VM via the scheduler endpoint,
     /// optionally also booting it immediately after creation (if `--boot` is specified).
     Create,
 
