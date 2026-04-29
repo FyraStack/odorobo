@@ -100,6 +100,7 @@ impl Actor for VMActor {
     }
 }
 
+// todo: improve a lot of these config options. most of them should be set by the manifest
 impl From<VirtualMachine> for VmConfig {
     fn from(vm: VirtualMachine) -> Self {
         VmConfig {
@@ -126,7 +127,6 @@ impl From<VirtualMachine> for VmConfig {
             }),
             payload: PayloadConfig {
                 firmware: Some("/var/lib/odorobo/CLOUDHV.fd".to_string()),
-                cmdline: Some("odorobo.test=1".to_string()),
                 ..Default::default()
             },
             disks: Some(vec![
@@ -160,20 +160,8 @@ impl From<VirtualMachine> for VmConfig {
                     iommu: Some(false)
                 }
             ),
-            serial: Some(
-                ConsoleConfig {
-                    mode: ConsoleMode::Null,
-                    iommu: Some(false),
-                    ..Default::default()
-                }
-            ),
-            debug_console: Some(
-                DebugConsoleConfig {
-                    mode: ConsoleMode::Off,
-                    iobase: Some(233),
-                    ..Default::default()
-                }
-            ),
+            serial: None,
+            debug_console: None,
             iommu: Some(false),
             watchdog: Some(false),
             pvpanic: Some(false),

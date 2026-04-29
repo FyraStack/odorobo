@@ -96,7 +96,7 @@ pub async fn run_command(cli: Cli) -> Result<()> {
     let base_url = cli.manager_addr;
 
     match cli.command {
-        Command::Create => {
+        Command::Create => { // TODO: setup actual cli args for these parameters. or just take in arbitrary json and serialize it into a VirtualMachine.
             let vm = VirtualMachine {
                 data: VMData {
                     id: Ulid::new(),

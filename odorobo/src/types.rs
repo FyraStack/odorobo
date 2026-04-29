@@ -212,6 +212,7 @@ pub enum MetadataTable {
     Annotation
 }
 
+// todo: possibly replace with std::ops
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
 pub enum Operator {
     In,
