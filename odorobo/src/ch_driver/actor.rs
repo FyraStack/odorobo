@@ -107,21 +107,10 @@ impl From<VirtualMachine> for VmConfig {
             cpus: Some(CpusConfig {
                 boot_vcpus: vm.data.vcpus as i32,
                 max_vcpus: vm.data.max_vcpus.unwrap_or(vm.data.vcpus) as i32,
-                kvm_hyperv: Some(false),
-                nested: Some(false),
-                features: Some(CpuFeatures {
-                    amx: Some(false)
-                }),
                 ..Default::default()
             }),
             memory: Some(MemoryConfig {
                 size: vm.data.memory.as_u64() as i64,
-                mergeable: Some(false),
-                hotplug_method: Some("Acpi".to_string()),
-                shared: Some(true),
-                hugepages: Some(false),
-                prefault: Some(false),
-                thp: Some(true),
                 ..Default::default()
             }),
             payload: PayloadConfig {
@@ -130,34 +119,22 @@ impl From<VirtualMachine> for VmConfig {
             },
             disks: Some(vec![
                 DiskConfig { // todo: get cappy to make this auto generate this via the manifest's volumes atribute.
-                    // todo: the json i was given by cappy had disable_io_uring and disable_aio in this config, but I can't find these. I assume they were just a mistake.
                     path: Some(vm.data.image),
-                    readonly: Some(false),
-                    direct: Some(false),
-                    iommu: Some(false),
-                    num_queues: Some(1),
-                    queue_size: Some(128),
-                    vhost_user: Some(false),
-                    id: Some("_disk0".to_string()),
-                    pci_segment: Some(0),
-                    backing_files: Some(false),
-                    sparse: Some(true),
                     image_type: Some(ImageType::Raw),
                     ..Default::default()
                 }
             ]),
-            net: Some(vec![
-                NetConfig {
-                    id: Some("net://devnet".to_string()),
-                    mac: Some("46:59:52:67:67:67".to_string()),
-                    ..Default::default()
-                }
-            ]),
+            // todo: generate from VM network field
+            // net: Some(vec![
+            //     NetConfig {
+            //         id: Some("net://devnet".to_string()),
+            //         ..Default::default()
+            //     }
+            // ]),
             platform: Some(PlatformConfig {
                 serial_number: Some("ds=nocloud".to_string()),
                 ..Default::default()
             }),
-            landlock_enable: Some(false),
             ..Default::default()
         }
     }
