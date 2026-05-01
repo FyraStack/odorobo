@@ -99,5 +99,5 @@ pub struct GetVMInfo {
 #[derive(Serialize, Deserialize, Reply, Debug, Clone)]
 pub struct GetVMInfoReply {
     pub vmid: Ulid,
-    pub config: Option<VmConfig>,
+    pub config: Option<VirtualMachine>,
 }
