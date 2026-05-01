@@ -1,17 +1,16 @@
-pub mod actor_cache;
 pub mod actor_names;
 
 use aide::OperationIo;
-use api_error::ApiError;
+use stable_eyre::{Result, Report};
+use tracing::level_filters::LevelFilter;
+use tracing_subscriber::EnvFilter;
+use thiserror::Error;
 use kameo::prelude::*;
 use libp2p::futures::StreamExt;
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::{PeerId, mdns, noise, tcp, yamux};
-use stable_eyre::{Report, Result};
-use thiserror::Error;
-use tracing::level_filters::LevelFilter;
 use tracing::{debug, error, info, trace, warn};
-use tracing_subscriber::EnvFilter;
+use api_error::ApiError;
 
 // todo: wrap with axum-responses, return this type on request failure
 #[derive(Error, Debug, ApiError, OperationIo)]
@@ -26,18 +25,21 @@ impl<M> From<kameo::error::SendError<M, Report>> for OdoroboError {
     fn from(value: kameo::error::SendError<M, Report>) -> Self {
         let kameo_error = value.to_string();
         error!(?value);
-        OdoroboError::Report(
-            value.err().unwrap_or_else(|| {
-                Report::msg(format!("could not unwrap kameo error: {kameo_error}"))
-            }),
-        )
+        OdoroboError::Report(value.err().unwrap_or_else(|| {
+            Report::msg(format!("could not unwrap kameo error: {kameo_error}"))
+        }))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{Router, body::Body, http::Request, http::StatusCode, routing::get};
+    use axum::{
+        http::StatusCode,
+        body::Body, http::Request,
+        routing::get,
+        Router,
+    };
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
@@ -47,8 +49,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_error() {
-        let response = Router::new()
-            .route("/", get(handler))
+        let response = Router::new().route("/", get(handler))
             .oneshot(Request::get("/").body(Body::empty()).unwrap())
             .await
             .unwrap();
@@ -61,6 +62,7 @@ mod tests {
         assert_eq!(html, "{\"message\":\"error!\"}");
     }
 }
+
 
 pub fn env_filter(debug_target: Option<&str>) -> EnvFilter {
     let env = std::env::var("ODOROBO_LOG").unwrap_or_else(|_| "".into());
@@ -103,13 +105,11 @@ pub fn init(debug_target: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-#[expect(
-    dead_code,
-    reason = "convenience initializer for binaries/tests that do not need a debug target"
-)]
 pub fn init_default() -> Result<()> {
     init(None)
 }
+
+
 
 #[derive(NetworkBehaviour)]
 pub struct ProductionBehaviour {
