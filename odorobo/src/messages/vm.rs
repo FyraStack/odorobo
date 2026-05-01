@@ -1,4 +1,5 @@
 //! VM-related messages
+use cloud_hypervisor_client::models::VmConfig;
 use kameo::prelude::*;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -98,5 +99,5 @@ pub struct GetVMInfo {
 #[derive(Serialize, Deserialize, Reply, Debug, Clone)]
 pub struct GetVMInfoReply {
     pub vmid: Ulid,
-    pub config: VirtualMachine,
+    pub config: Option<VirtualMachine>,
 }
