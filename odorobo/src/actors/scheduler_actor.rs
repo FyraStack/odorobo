@@ -26,11 +26,14 @@ use tokio::task::JoinHandle;
 pub struct CachedAgentActor {
     pub actor_ref: RemoteActorRef<AgentActor>,
     pub metadata: AgentStatus,
+    /// this is a list of all VMs that may be on an agent. it is used for rules such as affinity to make sure we don't schedule things in ways that arent allowed
+    /// We don't know for a fact these VMs are scheduled due to latency and boot up delay, but they may be scheduled.
+    pub extended_vm_list: Vec<Ulid>,
 }
 
 #[derive(Debug, Clone)]
 pub struct CachedVMActor {
-    pub actor_ref: RemoteActorRef<VMActor>,
+    pub actor_ref: Option<RemoteActorRef<VMActor>>,
     pub metadata: GetVMInfoReply,
 }
 
@@ -49,6 +52,9 @@ pub struct SchedulerActor {
     //  i dont really love that option either though cause it feels overkill.
     //  maybe we sure just be using a proper database entirely?
     //  idk. will figure it out later.
+    //
+    //  new related problem: i just realized vmids/ulids and actorids dont have to be unique.
+    //  if a vm is migrating from one actor to another, there might be two actors with the same vmid.
     pub vm_actorid_ulid_map: Arc<DashMap<ActorId, Ulid>>,
     pub vm_data_cache: Arc<DashMap<Ulid, CachedVMActor>>,
     pub vm_keepalive_tasks: Arc<DashMap<ActorId, JoinHandle<()>>>,
@@ -130,7 +136,7 @@ impl SchedulerActor {
                 data_cache.insert(
                     vmid,
                     CachedVMActor {
-                        actor_ref: actor_ref.clone(),
+                        actor_ref: Some(actor_ref.clone()),
                         metadata: metadata
                     }
                 );
@@ -189,13 +195,25 @@ impl SchedulerActor {
         let mut fails = 0;
         loop {
             if let Ok(metadata) = actor_ref.ask(&GetAgentStatus).await {
-                data_cache.insert(
-                    actor_ref.id(),
-                    CachedAgentActor {
-                        actor_ref: actor_ref.clone(),
-                        metadata: metadata
-                    }
-                );
+                if data_cache.contains_key(&actor_ref.id()) {
+                    data_cache.alter(
+                        &actor_ref.id(),
+                        |_, mut v| {
+                            v.metadata = metadata;
+
+                            v
+                        }
+                    );
+                } else {
+                    data_cache.insert(
+                        actor_ref.id(),
+                        CachedAgentActor {
+                            actor_ref: actor_ref.clone(),
+                            metadata,
+                            extended_vm_list: vec![]
+                        }
+                    );
+                }
 
                 fails = 0;
             } else {
@@ -292,7 +310,7 @@ impl SchedulerActor {
 
 
                 // todo (future): possibly keep a percent of agents completely empty, to be able to be converted to dedis automatically.
-                // they would have their agent score set to 1, so they can be scheduled to if there is no other avaliable agents.
+                // they would have their agent score set to like f32::MIN, so they can be scheduled to if there is no other avaliable agents.
                 // rough pseudo code to implement this:
                 // if agent.metadata.vms.len() == 0 && hash(agent.config.hostname) % total_chance < threshold {
                 //     agent_score = 1;
@@ -390,21 +408,37 @@ impl Message<CreateVM> for SchedulerActor {
         let target_agent = self.schedule_agent(&msg).await?;
 
         // we add to cache first, because we want to make sure future requests assume this vm exists. if the message fails, we clean it up afterward.
-
-        // massive problem for me to fix later: the metadata can be auto updated. so this change won't be persisted and we need to continue to know this vm is likely scheduled on this device.
-        // we likely need to create a new vec of likey? vms or something and then match against that too during scheduling for example.
-
         if let Some(mut cached_data) = self.agent_data_cache.get_mut(&target_agent.id()) {
-            cached_data.metadata.vms.push(msg.vmid);
+            cached_data.extended_vm_list.push(msg.vmid);
         } else {
             return Err(eyre!("target agent is not in data cache"))
         }
+        
+        self.vm_data_cache.insert(
+            msg.vmid,
+            CachedVMActor { 
+                actor_ref: None, 
+                metadata: GetVMInfoReply { 
+                    vmid: msg.vmid, 
+                    config: Some(msg.config.clone())
+                }
+            });
+        
+        
 
         let reply = target_agent.ask(&msg).await;
 
+        
+        // remove from caches if we fail to schedule
         if reply.is_err() {
-            // remove from caches
+            self.agent_data_cache.alter(&target_agent.id(), |_,mut v| {
+                v.extended_vm_list.retain(|&vmid| vmid != msg.vmid);
+                
+                v
+            });
+            self.vm_data_cache.remove(&msg.vmid);
         }
+        
 
         Ok(reply?)
     }
