@@ -387,20 +387,26 @@ impl Message<CreateVM> for SchedulerActor {
     type Reply = Result<CreateVMReply, Report>;
 
     async fn handle(&mut self, msg: CreateVM, _ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
-        loop {
-            let target_agent = self.schedule_agent(&msg).await?;
+        let target_agent = self.schedule_agent(&msg).await?;
 
-            match target_agent.ask(&msg).await {
-                Ok(reply) => {
-                    return Ok(reply)
-                },
-                Err(err) => {
-                    warn!(
-                        "CreateVM forwarding failed, trying again: {err}"
-                    );
-                }
-            }
+        // we add to cache first, because we want to make sure future requests assume this vm exists. if the message fails, we clean it up afterward.
+
+        // massive problem for me to fix later: the metadata can be auto updated. so this change won't be persisted and we need to continue to know this vm is likely scheduled on this device.
+        // we likely need to create a new vec of likey? vms or something and then match against that too during scheduling for example.
+
+        if let Some(mut cached_data) = self.agent_data_cache.get_mut(&target_agent.id()) {
+            cached_data.metadata.vms.push(msg.vmid);
+        } else {
+            return Err(eyre!("target agent is not in data cache"))
         }
+
+        let reply = target_agent.ask(&msg).await;
+
+        if reply.is_err() {
+            // remove from caches
+        }
+
+        Ok(reply?)
     }
 }
 
@@ -416,6 +422,7 @@ impl Message<DeleteVM> for SchedulerActor {
         tracing::trace!(?vm, "DeleteVM");
         if let Some(vm) = vm {
             vm.tell(&msg).send()?;
+            // todo: update cache
             Ok(DeleteVMReply)
         } else {
             Err(eyre!("VM not found"))
@@ -435,6 +442,9 @@ impl Message<ShutdownVM> for SchedulerActor {
         tracing::trace!(?vm, "ShutdownVM");
         if let Some(vm) = vm {
             vm.tell(&msg).send()?;
+
+            // todo: update cache
+
             Ok(ShutdownVMReply)
         } else {
             Err(eyre!("VM not found"))
