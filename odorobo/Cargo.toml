@@ -13,6 +13,8 @@ serde_json = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+ulid = { workspace = true }
+bytesize = { workspace = true }
 
 http-body-util = "0.1"
 hyper = { version = "1.9", features = ["full"] }
@@ -39,9 +41,7 @@ axum-extra = "0.12"
 tower-http = { version = "0.6", features = ["trace"] }
 kameo = { version = "0.20", features = ["remote"] }
 ahash = { version = "0.8", features = ["serde"] }
-ulid = { version = "1.2", features = ["serde", "uuid"] }
 dirs = "6"
-bytesize = { version = "2.3", features = ["serde"] }
 ipnet = {version = "2.12", features = ["serde", "schemars08"]}
 url = { version = "2.5", features = ["serde"] }
 async-trait = "0.1"

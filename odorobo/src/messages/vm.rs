@@ -1,8 +1,11 @@
 //! VM-related messages
 use cloud_hypervisor_client::models::VmConfig;
 use kameo::prelude::*;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
+
+use crate::types::VirtualMachine;
 
 // TODO: when scheduler does createVM it also stores which server we put the Ulid on so it can do a in memory cache and doesn't need to hit the Server
 //  for failover, the new node when it fails over will need to rebuild this cache via hitting a GetAllVMs message on every server
@@ -20,12 +23,12 @@ pub struct CreateVM {
     /// node-specific, paths, i.e attach LUNs, networking?
     ///
     /// this data would go to state::instance::spawn()
-    pub config: VmConfig,
+    pub config: VirtualMachine,
 }
 
-#[derive(Serialize, Deserialize, Reply, Debug)]
+#[derive(Serialize, Deserialize, Reply, Debug, JsonSchema)]
 pub struct CreateVMReply {
-    pub config: Option<VmConfig>,
+    pub config: Option<VirtualMachine>,
 }
 
 /// Message to delete a VM's config from the agent, shutting it down

@@ -1,5 +1,5 @@
-use crate::state::VMInstance;
-use cloud_hypervisor_client::models::VmConfig;
+use crate::{ch_driver::VMInstance, types::VirtualMachine};
+use cloud_hypervisor_client::models::{CpusConfig, DiskConfig, ImageType, MemoryConfig, PayloadConfig, PlatformConfig, VmConfig};
 use kameo::prelude::*;
 use crate::messages::vm::{
     DeleteVM, GetVMInfo, GetVMInfoReply, MigrateVMReceive, MigrateVMReceiveReply, PrepMigration,
@@ -9,14 +9,7 @@ use serde::{Deserialize, Serialize};
 use stable_eyre::{Report, Result};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, trace, warn};
-/*
-use std::process::Command;
 
-let output = Command::new("echo")
-.arg("Hello world")
-.output()
-.expect("Failed to execute command");
- */
 /// A migration state that holds the listening address and VM config for a migration,
 /// used to pass live migration data between actors.
 pub struct MigrationState {
@@ -39,12 +32,12 @@ pub struct VMActor {
 
 impl Actor for VMActor {
     // tuple of VM ID and optional config
-    type Args = (ulid::Ulid, Option<VmConfig>);
+    type Args = (ulid::Ulid, Option<VirtualMachine>);
     type Error = Report;
 
     #[tracing::instrument(skip_all)]
     async fn on_start((vmid, vm_config): Self::Args, actor_ref: ActorRef<Self>) -> Result<Self> {
-        let mut vminstance = VMInstance::spawn(&vmid.to_string(), vm_config, None).await?;
+        let mut vminstance = VMInstance::spawn(&vmid.to_string(), vm_config.map(VmConfig::from), None).await?;
 
         // Take the child process out so we can watch for unexpected death.
         // destroy() handles a missing child_process gracefully.
@@ -104,6 +97,46 @@ impl Actor for VMActor {
         // info!(vmid = %self.vmid, ?res, "VM process exited");
 
         Ok(())
+    }
+}
+
+// todo: improve a lot of these config options. most of them should be set by the manifest
+impl From<VirtualMachine> for VmConfig {
+    fn from(vm: VirtualMachine) -> Self {
+        VmConfig {
+            cpus: Some(CpusConfig {
+                boot_vcpus: vm.data.vcpus as i32,
+                max_vcpus: vm.data.max_vcpus.unwrap_or(vm.data.vcpus) as i32,
+                ..Default::default()
+            }),
+            memory: Some(MemoryConfig {
+                size: vm.data.memory.as_u64() as i64,
+                ..Default::default()
+            }),
+            payload: PayloadConfig {
+                firmware: Some("/var/lib/odorobo/CLOUDHV.fd".to_string()),
+                ..Default::default()
+            },
+            disks: Some(vec![
+                DiskConfig { // todo: get cappy to make this auto generate this via the manifest's volumes atribute.
+                    path: Some(vm.data.image),
+                    image_type: Some(ImageType::Raw),
+                    ..Default::default()
+                }
+            ]),
+            // todo: generate from VM network field
+            // net: Some(vec![
+            //     NetConfig {
+            //         id: Some("net://devnet".to_string()),
+            //         ..Default::default()
+            //     }
+            // ]),
+            platform: Some(PlatformConfig {
+                serial_number: Some("ds=nocloud".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
     }
 }
 

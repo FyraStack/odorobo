@@ -66,7 +66,7 @@ impl Default for StorageUri {
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Default, Clone)]
 pub struct CreateVMRequest {
     /// Data of the VM to create
-    pub data: VMData,
+    pub vm: VirtualMachine,
     /// Whether to boot the VM immediately after creation
     pub boot: bool,
 }
@@ -105,6 +105,9 @@ pub struct VMData {
     /// List of volumes to attach to the VM.
     #[serde(default)]
     pub volumes: Vec<Volume>,
+    /// List of Network IDs.
+    #[serde(default)]
+    pub networks: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Default)]
@@ -124,7 +127,7 @@ pub struct UpdateVMRequest {
     pub volumes: Vec<Volume>,
 }
 
-#[derive(Serialize, Deserialize, Debug, JsonSchema, Default)]
+#[derive(Serialize, Deserialize, Debug, JsonSchema, Default, Clone)]
 pub enum VMStatus {
     /// VM is currently running and operational.
     Running,
@@ -136,7 +139,7 @@ pub enum VMStatus {
     Error(String), // error message
 }
 
-#[derive(Serialize, Deserialize, Debug, JsonSchema, Default)]
+#[derive(Serialize, Deserialize, Debug, JsonSchema, Default, Clone)]
 pub struct ObjectMetadata {
     /// Labels associated with the object.
     pub labels: BTreeMap<String, String>,
@@ -146,7 +149,7 @@ pub struct ObjectMetadata {
 
 /// Detailed information about a running VM
 // probably move this somewhere else
-#[derive(Serialize, Deserialize, Debug, JsonSchema, Default)]
+#[derive(Serialize, Deserialize, Debug, JsonSchema, Default, Clone)]
 pub struct VirtualMachine {
     /// VM configuration
     pub data: VMData,
@@ -163,8 +166,59 @@ pub struct VirtualMachine {
     /// Metadata
     pub metadata: Option<ObjectMetadata>,
 
-    // placement stuff....
-    
+    /// List of Affinity rules for scheduling. These are ANDed / summed together depending on the strictness.
+    pub affinity: Option<Vec<AffinityRule>>
+}
+
+
+#[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
+pub struct AffinityRule {
+    pub strictness: AffinityStrictness,
+    pub affinity_type: AffinityType,
+    pub direction: AffinityDirection,
+    /// ORed together
+    pub requirements: Vec<AffinityRequirement>
+}
+
+#[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
+pub enum AffinityStrictness {
+    Required,
+    Preferred { weight: i64 }
+}
+
+#[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
+pub enum AffinityType {
+    VirtualMachine,
+    Agent
+}
+
+#[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
+pub enum AffinityDirection {
+    Normal,
+    Anti
+}
+
+#[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
+pub struct AffinityRequirement {
+    pub key: String,
+    pub table: MetadataTable,
+    pub operator: Operator,
+    pub values: Vec<String>
+}
+
+#[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
+pub enum MetadataTable {
+    Label,
+    Annotation
+}
+
+// todo: possibly replace with std::ops
+#[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
+pub enum Operator {
+    In,
+    NotIn,
+    Lt,
+    Gt,
 }
 
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Default)]

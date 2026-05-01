@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["odorobo"]
+members = ["odorobo", "odoroboctl"]
 
 [workspace.package]
 rust-version = "1.95.0"
@@ -18,6 +18,8 @@ tracing-subscriber = { version = "0.3", features = [
     "fmt",
     "json",
 ] }
+ulid = { version = "1.2", features = ["serde", "uuid"] }
+bytesize = { version = "2.3", features = ["serde"] }
 
 
 # our crates
