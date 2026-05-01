@@ -28,16 +28,17 @@ pub struct VMActor {
     /// path to the Cloud Hypervisor socket, in /run/odorobo/vms/<VMID>/ch.sock
     pub vm_instance: VMInstance,
     pub migration_state: Option<MigrationState>,
+    pub manifest: VirtualMachine
 }
 
 impl Actor for VMActor {
-    // tuple of VM ID and optional config
-    type Args = (ulid::Ulid, Option<VirtualMachine>);
+    // tuple of VM ID and manifest
+    type Args = (ulid::Ulid, VirtualMachine);
     type Error = Report;
 
     #[tracing::instrument(skip_all)]
-    async fn on_start((vmid, vm_config): Self::Args, actor_ref: ActorRef<Self>) -> Result<Self> {
-        let mut vminstance = VMInstance::spawn(&vmid.to_string(), vm_config.map(VmConfig::from), None).await?;
+    async fn on_start((vmid, vm_manifest): Self::Args, actor_ref: ActorRef<Self>) -> Result<Self> {
+        let mut vminstance = VMInstance::spawn(&vmid.to_string(), Some(VmConfig::from(vm_manifest.clone())), None).await?;
 
         // Take the child process out so we can watch for unexpected death.
         // destroy() handles a missing child_process gracefully.
@@ -69,6 +70,7 @@ impl Actor for VMActor {
             vmid,
             vm_instance: vminstance,
             migration_state: None,
+            manifest: vm_manifest
         })
     }
 
@@ -157,7 +159,7 @@ impl Message<GetVMInfo> for VMActor {
     ) -> Self::Reply {
         GetVMInfoReply {
             vmid: self.vmid,
-            config: self.vm_instance.vm_config.clone(),
+            config: self.manifest.clone(), // we likely dont want to send the entire manifest on every update, but some of this data is required and this is easier for now.
         }
     }
 }
