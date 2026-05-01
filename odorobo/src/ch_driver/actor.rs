@@ -1,5 +1,5 @@
 use crate::{ch_driver::VMInstance, types::VirtualMachine};
-use cloud_hypervisor_client::models::{CpuFeatures, CpusConfig, DiskConfig, ImageType, MemoryConfig, NetConfig, PayloadConfig, PlatformConfig, VmConfig};
+use cloud_hypervisor_client::models::{CpusConfig, DiskConfig, ImageType, MemoryConfig, PayloadConfig, PlatformConfig, VmConfig};
 use kameo::prelude::*;
 use crate::messages::vm::{
     DeleteVM, GetVMInfo, GetVMInfoReply, MigrateVMReceive, MigrateVMReceiveReply, PrepMigration,
