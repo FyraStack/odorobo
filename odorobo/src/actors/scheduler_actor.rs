@@ -252,39 +252,39 @@ impl SchedulerActor {
     /// when a vm is attempted to be scheduled, we loop through every agent and score it based on some rules
     /// there are hard rules that will simply throw out an agent entirely.
     /// otherwise, we take whatever the best agent we can find is.
-    ///
-    /// additionally, because caleb is way too performance brained, he used integer math for the entire scoring algorithm just so we didnt have to convert to floats.
     async fn schedule_agent(
         &mut self,
         msg: &CreateVM
     ) -> Result<RemoteActorRef<AgentActor>, Report> {
         let mut best_agent = None;
-        let mut best_agent_score = 0u32;
+        let mut best_agent_score = 0.0f32;
 
         // todo: this arguably could be done as map-reduce. is that better?
         let span = info_span!("schedule_agent");
-            span.in_scope(|| {
+        span.in_scope(|| {
             for agent in self.agent_data_cache.iter() {
-                let mut agent_score = 0u32;
+                let mut agent_score = 0.0f32;
 
                 let agent_max_vcpus = agent.metadata.vcpus * VCPU_OVERPROVISIONMENT_NUMERATOR / VCPU_OVERPROVISIONMENT_DENOMINATOR;
+                // todo: do we care about VMData.max_vcpus?
+                let agent_used_vcpus = agent.metadata.used_vcpus + msg.config.data.vcpus;
 
-
-                if agent.metadata.used_vcpus >= agent_max_vcpus {
+                if agent_used_vcpus >= agent_max_vcpus {
                     continue;
                 }
 
-                agent_score += (agent_max_vcpus - agent.metadata.used_vcpus) * 1024 / agent_max_vcpus;
+                agent_score += (agent_max_vcpus - agent_used_vcpus) as f32 / agent_max_vcpus as f32;
 
 
                 // todo: add ram overprovisionment.     not adding this to scheduler until it works on the hypervisor side.
                 let agent_max_ram = agent.metadata.ram;
+                let agent_used_ram = agent.metadata.used_ram + msg.config.data.memory;
 
-                if agent.metadata.used_ram >= agent_max_ram {
+                if agent_used_ram >= agent_max_ram {
                     continue;
                 }
 
-                agent_score += ((agent_max_ram.as_u64() - agent.metadata.used_ram.as_u64()) * 1024 / agent_max_ram.as_u64()) as u32;
+                agent_score += (agent_max_ram.as_u64() - agent.metadata.used_ram.as_u64()) as f32 / agent_max_ram.as_u64() as f32;
 
 
                 // todo: https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/
