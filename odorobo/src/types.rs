@@ -190,9 +190,11 @@ pub enum AffinityStrictness {
 
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
 pub enum AffinityType {
-    VirtualMachine,
+    VirtualMachine(Zone),
     Agent
 }
+
+pub type Zone = String;
 
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
 pub struct AffinityRequirement {
@@ -208,7 +210,6 @@ pub enum MetadataTable {
     Annotation
 }
 
-// todo: possibly replace with std::ops
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
 pub enum Operator {
     In,
