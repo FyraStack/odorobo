@@ -12,6 +12,7 @@ use ulid::Ulid;
 use crate::actors::agent_actor::AgentActor;
 use crate::ch_driver::actor::VMActor;
 use crate::types::AffinityStrictness;
+use crate::types::AffinityType;
 use crate::utils::actor_names::VM;
 use crate::messages::vm::*;
 use crate::messages::agent::*;
@@ -144,7 +145,7 @@ impl SchedulerActor {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         let mut fails = 0;
         loop {
-            if let Ok(metadata) = actor_ref.ask(&GetVMInfo {vmid: None}).await { // todo: replace with kameo stream
+            if let Ok(metadata) = actor_ref.ask(&GetVMInfo {vmid: None}).await { // todo: replace with kameo stream, (only send full data once, then send changes from there on)
                 let vmid = metadata.vmid;
 
                 vm_actorid_ulid_map.insert(actor_ref.id(), vmid); // should we be doing this on every loop? idk. but we at least need to do it on the first iteration given we don't know the mapping before that
@@ -307,11 +308,92 @@ impl SchedulerActor {
         //  I suspect there is a map-reduce operation that does the exact scoring thing I am trying to do.
         //  I also assume there is a better function for the and_then
         let best_agent = self.agent_data_cache.iter()
-            .map(|agent| (agent.actor_ref.clone(), score_agent(msg, &agent)))
+            .map(|agent| (agent.actor_ref.clone(), self.score_agent(msg, &agent)))
             .reduce(|best, new| if new.1 > best.1 { new } else { best })
             .and_then(|best| if best.1 == AgentScore::REJECTED { None } else { Some(best.0) });
 
         best_agent.ok_or_eyre("No valid agents found.")
+    }
+
+    // this function intentionally only checks against the cache. this has some positives and negatives:
+    // positive: it will never trigger any network requests so its very fast, and having to do network requests for scoring whenever we want to schedule a vm is likely a bad idea
+    // negative: it technically has a delayed view of the cluster, meaning that some things that happened in the future, may not exist yet. so we need to be careful about how this is done so affinity rules are not accidentally broken. mostly this means, if we do anything that could affect the outcome of an affinity rule (ex: network request to an agent), we need to update the cache, before we do the action.
+    fn score_agent(
+        &self,
+        msg: &CreateVM,
+        agent: &RefMulti<'_, ActorId, CachedAgentActor>
+    ) -> AgentScore {
+        let mut score = AgentScore::default();
+
+        let agent_max_vcpus = agent.metadata.vcpus * VCPU_OVERPROVISIONMENT_NUMERATOR / VCPU_OVERPROVISIONMENT_DENOMINATOR;
+        // todo: do we care about VMData.max_vcpus?
+        let agent_used_vcpus = agent.metadata.used_vcpus + msg.config.data.vcpus;
+
+        if agent_used_vcpus >= agent_max_vcpus {
+            return AgentScore::REJECTED;
+        }
+
+        score.general += (agent_max_vcpus - agent_used_vcpus) as f32 / agent_max_vcpus as f32;
+
+
+        // todo: add ram overprovisionment.     not adding this to scheduler until it works on the hypervisor side.
+        let agent_max_ram = agent.metadata.ram;
+        let agent_used_ram = agent.metadata.used_ram + msg.config.data.memory;
+
+        if agent_used_ram >= agent_max_ram {
+            return AgentScore::REJECTED;
+        }
+
+        score.general += (agent_max_ram.as_u64() - agent.metadata.used_ram.as_u64()) as f32 / agent_max_ram.as_u64() as f32;
+
+
+        // todo: https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/
+
+
+        if let Some(affinity_rules) = &msg.config.affinity {
+            for rule in affinity_rules {
+                let mut meets_requirements = false;
+
+                let lhs_values: Vec<String> = Vec::with_capacity(1);
+
+                match &rule.affinity_type {
+                    AffinityType::VirtualMachine(zone) => todo!(),
+                    AffinityType::Agent => lhs_values.push(agent.metadata.), // todo: this should be object metadata, but I just realized that field isnt included in the data we have in the cache
+                }
+
+                // in theory the next bit of this could would loop through all the lhs values and all the requirements and then actually do the computation, but I got busy with other work.
+
+                for requirement in &rule.requirements {
+                    let requirement_outcome = true; // todo: set this based on requirement
+
+                    if requirement_outcome {
+                        meets_requirements = true;
+                        break;
+                    }
+                }
+
+                let follows_rule = meets_requirements ^ rule.inverse;
+
+                match (rule.strictness, follows_rule) {
+                    (AffinityStrictness::Required, false) => return AgentScore::REJECTED,
+                    (AffinityStrictness::Required, true) => {}, // specifically do nothing
+                    (AffinityStrictness::Preferred { weight }, follows_rule) => {
+                        score.affinity += follows_rule as i64 * weight;
+                    },
+                }
+            }
+        }
+
+
+
+        // todo (future): possibly keep a percent of agents completely empty, to be able to be converted to dedis automatically.
+        // they would have their agent score set to like f32::MIN, so they can be scheduled to if there is no other available agents.
+        // rough pseudo code to implement this:
+        // if agent.metadata.vms.len() == 0 && hash(agent.config.hostname) % total_chance < threshold {
+        //     agent_score = 1;
+        // }
+
+        score
     }
 }
 
@@ -349,74 +431,6 @@ impl PartialOrd for AgentScore {
     }
 }
 
-
-fn score_agent(
-    msg: &CreateVM,
-    agent: &RefMulti<'_, ActorId, CachedAgentActor>
-) -> AgentScore {
-    let mut score = AgentScore::default();
-
-    let agent_max_vcpus = agent.metadata.vcpus * VCPU_OVERPROVISIONMENT_NUMERATOR / VCPU_OVERPROVISIONMENT_DENOMINATOR;
-    // todo: do we care about VMData.max_vcpus?
-    let agent_used_vcpus = agent.metadata.used_vcpus + msg.config.data.vcpus;
-
-    if agent_used_vcpus >= agent_max_vcpus {
-        return AgentScore::REJECTED;
-    }
-
-    score.general += (agent_max_vcpus - agent_used_vcpus) as f32 / agent_max_vcpus as f32;
-
-
-    // todo: add ram overprovisionment.     not adding this to scheduler until it works on the hypervisor side.
-    let agent_max_ram = agent.metadata.ram;
-    let agent_used_ram = agent.metadata.used_ram + msg.config.data.memory;
-
-    if agent_used_ram >= agent_max_ram {
-        return AgentScore::REJECTED;
-    }
-
-    score.general += (agent_max_ram.as_u64() - agent.metadata.used_ram.as_u64()) as f32 / agent_max_ram.as_u64() as f32;
-
-
-    // todo: https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/
-
-
-    if let Some(affinity_rules) = &msg.config.affinity {
-        for rule in affinity_rules {
-            let mut meets_requirements = false;
-
-            for requirement in &rule.requirements {
-                let requirement_outcome = true; // todo: set this based on requirement
-
-                if requirement_outcome {
-                    meets_requirements = true;
-                    break;
-                }
-            }
-
-            let follows_rule = meets_requirements ^ rule.inverse;
-
-            match (rule.strictness, follows_rule) {
-                (AffinityStrictness::Required, false) => return AgentScore::REJECTED,
-                (AffinityStrictness::Required, true) => {}, // specifically do nothing
-                (AffinityStrictness::Preferred { weight }, follows_rule) => {
-                    score.affinity += follows_rule as i64 * weight;
-                },
-            }
-        }
-    }
-
-
-
-    // todo (future): possibly keep a percent of agents completely empty, to be able to be converted to dedis automatically.
-    // they would have their agent score set to like f32::MIN, so they can be scheduled to if there is no other available agents.
-    // rough pseudo code to implement this:
-    // if agent.metadata.vms.len() == 0 && hash(agent.config.hostname) % total_chance < threshold {
-    //     agent_score = 1;
-    // }
-
-    score
-}
 
 
 

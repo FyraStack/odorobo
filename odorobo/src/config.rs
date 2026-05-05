@@ -143,13 +143,10 @@ pub struct Config {
     /// The number of VCPUs reserved for the agent. Defaults to 2.
     #[serde(default = "default_reserved_vcpus")]
     pub reserved_vcpus: u32,
-    /// this is just arbitrary data that will be shown but does no config
-    /// Arbitrary labels that can be used
+    
+    /// Arbitrary data that the infra team can set for notes for themselves. odorobo does not directly use these, but does include them in  that can be used
     #[serde(default)]
     pub labels: AHashMap<String, String>,
-    /// Arbitrary annotations that can be used
-    #[serde(default)]
-    pub annotations: AHashMap<String, String>,
 
     #[serde(default)]
     pub network: NetworkConfig,
