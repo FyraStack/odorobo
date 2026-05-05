@@ -175,12 +175,14 @@ pub struct VirtualMachine {
 pub struct AffinityRule {
     pub strictness: AffinityStrictness,
     pub affinity_type: AffinityType,
-    pub direction: AffinityDirection,
+    /// if true, the outcome of the requirements is inverted
+    #[serde(default)]
+    pub inverse: bool,
     /// ORed together
     pub requirements: Vec<AffinityRequirement>
 }
 
-#[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
+#[derive(Serialize, Deserialize, Debug, JsonSchema, Clone, Copy)]
 pub enum AffinityStrictness {
     Required,
     Preferred { weight: i64 }
@@ -190,12 +192,6 @@ pub enum AffinityStrictness {
 pub enum AffinityType {
     VirtualMachine,
     Agent
-}
-
-#[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
-pub enum AffinityDirection {
-    Normal,
-    Anti
 }
 
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
