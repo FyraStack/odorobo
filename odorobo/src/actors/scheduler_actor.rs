@@ -1,13 +1,17 @@
 use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::time::Duration;
+use std::cmp::Ordering;
 
+use ahash::AHashSet;
+use dashmap::mapref::multiple::RefMulti;
 use kameo::prelude::*;
 use libp2p::futures::TryStreamExt;
 use tracing::trace;
 use ulid::Ulid;
 use crate::actors::agent_actor::AgentActor;
 use crate::ch_driver::actor::VMActor;
+use crate::types::AffinityStrictness;
 use crate::utils::actor_names::VM;
 use crate::messages::vm::*;
 use crate::messages::agent::*;
@@ -26,9 +30,9 @@ use tokio::task::JoinHandle;
 pub struct CachedAgentActor {
     pub actor_ref: RemoteActorRef<AgentActor>,
     pub metadata: AgentStatus,
-    /// this is a list of all VMs that may be on an agent. it is used for rules such as affinity to make sure we don't schedule things in ways that arent allowed
+    /// this is a set of all VMs that may be on an agent. it is used for rules such as affinity to make sure we don't schedule things in ways that arent allowed
     /// We don't know for a fact these VMs are scheduled due to latency and boot up delay, but they may be scheduled.
-    pub extended_vm_list: Vec<Ulid>,
+    pub extended_vm_set: AHashSet<Ulid>,
 }
 
 #[derive(Debug, Clone)]
@@ -38,23 +42,35 @@ pub struct CachedVMActor {
 }
 
 
-
+// todo: i dont like the way this cache is setup. I think we may need to change it later, but it is hard to figure out what the optimal solution is without doing it at least once.
+//  especially when we haven't fully made decisions about some other things.
 #[derive(RemoteActor)]
 pub struct SchedulerActor {
     pub agent_data_cache: Arc<DashMap<ActorId, CachedAgentActor>>,
     pub agent_keepalive_tasks: Arc<DashMap<ActorId, JoinHandle<()>>>,
 
     // todo: we might need a better way to store this.
-    //  we are likely going to want to store vms even if we don't know their actorid (ex: actor hasn't been started or is shutdown)
-    //  but we also might want ot be able to store them without a ulid, possibly
+    //  we 100% need a way to store vms even if we don't know their actorid (ex: actor hasn't been started or is shutdown)
+    //  we also might want to be able to store them without a ulid, possibly
     //  so we might need a vec of vms and then to just store maps/indexes of actorid and ulid to vector index
     //  and then like a freelist or something.
     //  i dont really love that option either though cause it feels overkill.
     //  maybe we sure just be using a proper database entirely?
     //  idk. will figure it out later.
     //
-    //  new related problem: i just realized vmids/ulids and actorids dont have to be unique.
+    //  new related problem: i just realized vmid, actorid pairs dont have to be unique.
     //  if a vm is migrating from one actor to another, there might be two actors with the same vmid.
+    //
+    //  additional context (05/05/2026): we almost may need a way to store them without a ulid, due to how CH migration works.
+    //  the question becomes if we want to abstract CH migration away entirely from the scheduler.
+    //  we could also possibly ignore it for the non-HA scheduler.
+    //  I (caleb) want to ask cappy (and possibly Lea) about these problems.
+    //
+    //  the best solution for at least some of this is almost certainly having an external reliable DB (such as etcd) to store some of these things permanently.
+    //  we will need that specifically for what VMs are supposed to be running, because if a large percentage of the cluster goes down, including the manager, we need a way to recover.
+    //  and i dont think leaving that on dashboard which could have high latency is a good idea.
+    //  alternatively we could have the other manager nodes try to keep track of that data, but i think we are going to run into issues with keeping the state consistent between all nodes.
+    //  we may need to make some architecture designs about db consistency vs uptime vs speed in that situation, and im not doing that on my own.
     pub vm_actorid_ulid_map: Arc<DashMap<ActorId, Ulid>>,
     pub vm_data_cache: Arc<DashMap<Ulid, CachedVMActor>>,
     pub vm_keepalive_tasks: Arc<DashMap<ActorId, JoinHandle<()>>>,
@@ -128,7 +144,7 @@ impl SchedulerActor {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         let mut fails = 0;
         loop {
-            if let Ok(metadata) = actor_ref.ask(&GetVMInfo {vmid: None}).await {
+            if let Ok(metadata) = actor_ref.ask(&GetVMInfo {vmid: None}).await { // todo: replace with kameo stream
                 let vmid = metadata.vmid;
 
                 vm_actorid_ulid_map.insert(actor_ref.id(), vmid); // should we be doing this on every loop? idk. but we at least need to do it on the first iteration given we don't know the mapping before that
@@ -194,12 +210,14 @@ impl SchedulerActor {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         let mut fails = 0;
         loop {
-            if let Ok(metadata) = actor_ref.ask(&GetAgentStatus).await {
+            if let Ok(metadata) = actor_ref.ask(&GetAgentStatus).await { // todo: replace with kameo stream
                 if data_cache.contains_key(&actor_ref.id()) {
                     data_cache.alter(
                         &actor_ref.id(),
                         |_, mut v| {
                             v.metadata = metadata;
+
+                            v.extended_vm_set.extend(v.metadata.vms.iter());
 
                             v
                         }
@@ -210,7 +228,7 @@ impl SchedulerActor {
                         CachedAgentActor {
                             actor_ref: actor_ref.clone(),
                             metadata,
-                            extended_vm_list: vec![]
+                            extended_vm_set: AHashSet::new()
                         }
                     );
                 }
@@ -261,74 +279,143 @@ impl SchedulerActor {
                 }
             })
         );
-
     }
 
-
-    /// current scheduling algo info:
-    /// this is vaguely based on https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/
-    /// when a vm is attempted to be scheduled, we loop through every agent and score it based on some rules
-    /// there are hard rules that will simply throw out an agent entirely.
-    /// otherwise, we take whatever the best agent we can find is.
-    async fn schedule_agent(
+    /// Determine the best agent to schedule a specific VM creation request to.
+    ///
+    /// Rough explanation of the algorithm:
+    ///     Loop through every known agent.
+    ///         Go through a set of rules to determine if the VM can be scheduled on this agent at all, and an affinity score and a general score.
+    ///
+    ///     Based on these scores, pick the best agent.
+    ///         First the affinity score is used, because these are things the customer specifically wanted.
+    ///         If the affinity score is tied, we use the general score as a tie breaker.
+    ///         The general score uses things like resource utilization to not over load any specific agent.
+    ///
+    ///
+    /// Affinity rules are roughly based on https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/
+    ///
+    /// todo:
+    ///  - the cache likely needs to be updated automatically when a new vm is scheduled for info like used resources, because otherwise we have to deal with latency on that data we are using
+    ///    and then if someone tries to schedule lets say 10 VMs in a batch, we could end up scheduling them all to the same agent because the metadata hasn't updated.
+    ///    - there are a few solutions for this but they all kinda suck, mostly due to also making sure we deal with latency properly. I am ignoring the issue for now.
+    fn schedule_agent(
         &mut self,
         msg: &CreateVM
     ) -> Result<RemoteActorRef<AgentActor>, Report> {
-        let mut best_agent = None;
-        let mut best_agent_score = 0.0f32;
-
-        // todo: this arguably could be done as map-reduce. is that better?
-        let span = info_span!("schedule_agent");
-        span.in_scope(|| {
-            for agent in self.agent_data_cache.iter() {
-                let mut agent_score = 0.0f32;
-
-                let agent_max_vcpus = agent.metadata.vcpus * VCPU_OVERPROVISIONMENT_NUMERATOR / VCPU_OVERPROVISIONMENT_DENOMINATOR;
-                // todo: do we care about VMData.max_vcpus?
-                let agent_used_vcpus = agent.metadata.used_vcpus + msg.config.data.vcpus;
-
-                if agent_used_vcpus >= agent_max_vcpus {
-                    continue;
-                }
-
-                agent_score += (agent_max_vcpus - agent_used_vcpus) as f32 / agent_max_vcpus as f32;
-
-
-                // todo: add ram overprovisionment.     not adding this to scheduler until it works on the hypervisor side.
-                let agent_max_ram = agent.metadata.ram;
-                let agent_used_ram = agent.metadata.used_ram + msg.config.data.memory;
-
-                if agent_used_ram >= agent_max_ram {
-                    continue;
-                }
-
-                agent_score += (agent_max_ram.as_u64() - agent.metadata.used_ram.as_u64()) as f32 / agent_max_ram.as_u64() as f32;
-
-
-                // todo: https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/
-
-
-
-                // todo (future): possibly keep a percent of agents completely empty, to be able to be converted to dedis automatically.
-                // they would have their agent score set to like f32::MIN, so they can be scheduled to if there is no other avaliable agents.
-                // rough pseudo code to implement this:
-                // if agent.metadata.vms.len() == 0 && hash(agent.config.hostname) % total_chance < threshold {
-                //     agent_score = 1;
-                // }
-
-
-
-                info!(agent=?agent.value(), score=agent_score);
-
-                if agent_score > best_agent_score {
-                    best_agent = Some(agent.actor_ref.clone());
-                    best_agent_score = agent_score;
-                }
-            }
-        });
+        // todo: this could likely be better idiomatic rust.
+        //  I suspect there is a map-reduce operation that does the exact scoring thing I am trying to do.
+        //  I also assume there is a better function for the and_then
+        let best_agent = self.agent_data_cache.iter()
+            .map(|agent| (agent.actor_ref.clone(), score_agent(msg, &agent)))
+            .reduce(|best, new| if new.1 > best.1 { new } else { best })
+            .and_then(|best| if best.1 == AgentScore::REJECTED { None } else { Some(best.0) });
 
         best_agent.ok_or_eyre("No valid agents found.")
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct AgentScore {
+    general: f32,
+    affinity: i64
+}
+
+impl AgentScore {
+    pub const REJECTED: Self = Self {
+        general: f32::NEG_INFINITY,
+        affinity: i64::MIN
+    };
+}
+
+impl Default for AgentScore {
+    fn default() -> Self {
+        Self {
+            general: 0.0,
+            affinity: 0
+        }
+    }
+}
+
+impl PartialOrd for AgentScore {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        let affinity_cmp = self.affinity.cmp(&other.affinity);
+
+        if affinity_cmp != Ordering::Equal {
+            return Some(affinity_cmp);
+        }
+
+        self.general.partial_cmp(&other.general)
+    }
+}
+
+
+fn score_agent(
+    msg: &CreateVM,
+    agent: &RefMulti<'_, ActorId, CachedAgentActor>
+) -> AgentScore {
+    let mut score = AgentScore::default();
+
+    let agent_max_vcpus = agent.metadata.vcpus * VCPU_OVERPROVISIONMENT_NUMERATOR / VCPU_OVERPROVISIONMENT_DENOMINATOR;
+    // todo: do we care about VMData.max_vcpus?
+    let agent_used_vcpus = agent.metadata.used_vcpus + msg.config.data.vcpus;
+
+    if agent_used_vcpus >= agent_max_vcpus {
+        return AgentScore::REJECTED;
+    }
+
+    score.general += (agent_max_vcpus - agent_used_vcpus) as f32 / agent_max_vcpus as f32;
+
+
+    // todo: add ram overprovisionment.     not adding this to scheduler until it works on the hypervisor side.
+    let agent_max_ram = agent.metadata.ram;
+    let agent_used_ram = agent.metadata.used_ram + msg.config.data.memory;
+
+    if agent_used_ram >= agent_max_ram {
+        return AgentScore::REJECTED;
+    }
+
+    score.general += (agent_max_ram.as_u64() - agent.metadata.used_ram.as_u64()) as f32 / agent_max_ram.as_u64() as f32;
+
+
+    // todo: https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/
+
+
+    if let Some(affinity_rules) = &msg.config.affinity {
+        for rule in affinity_rules {
+            let mut meets_requirements = false;
+
+            for requirement in &rule.requirements {
+                let requirement_outcome = true; // todo: set this based on requirement
+
+                if requirement_outcome {
+                    meets_requirements = true;
+                    break;
+                }
+            }
+
+            let follows_rule = meets_requirements ^ rule.inverse;
+
+            match (rule.strictness, follows_rule) {
+                (AffinityStrictness::Required, false) => return AgentScore::REJECTED,
+                (AffinityStrictness::Required, true) => {}, // specifically do nothing
+                (AffinityStrictness::Preferred { weight }, follows_rule) => {
+                    score.affinity += follows_rule as i64 * weight;
+                },
+            }
+        }
+    }
+
+
+
+    // todo (future): possibly keep a percent of agents completely empty, to be able to be converted to dedis automatically.
+    // they would have their agent score set to like f32::MIN, so they can be scheduled to if there is no other available agents.
+    // rough pseudo code to implement this:
+    // if agent.metadata.vms.len() == 0 && hash(agent.config.hostname) % total_chance < threshold {
+    //     agent_score = 1;
+    // }
+
+    score
 }
 
 
@@ -376,10 +463,8 @@ impl Actor for SchedulerActor {
             keepalive_task.abort();
         };
 
-
         self.agent_data_cache.remove(&actor_id);
 
-        // todo: attempt vm migration or restart or whatever on agent death.
 
         if let Some((_, keepalive_task)) = self.vm_keepalive_tasks.remove(&actor_id) {
             trace!(?actor_id, "Aborting vm keepalive task");
@@ -387,11 +472,22 @@ impl Actor for SchedulerActor {
         };
 
         if let Some((_, vmid)) = self.vm_actorid_ulid_map.remove(&actor_id) {
+            // todo: this solution definitely isn't optimal. we likely should be storing which agent actor, this specific actor id is scheduled on and specifically removing it from that one.
+            //  especially because things get iffy with migration, but im ignoring that for the moment.
+            for mut agent in self.agent_data_cache.iter_mut() {
+                agent.extended_vm_set.remove(&vmid);
+            }
+
             // todo: we likely should keep a copy of the VirtualMachine manifest in the cache.
             //  instead of removing the vm entirely, we should just modify the status to shutdown or crashed or something.
+            //
+            //  another potential issue is that the link dying doesn't guarantee that the vm is dead. if there is a networking partition, things get iffy.
             trace!(?actor_id, ?vmid, "Removing vm from vm_data_cache");
             self.vm_data_cache.remove(&vmid);
         }
+
+
+        // todo: attempt vm restarts if necessary.
 
 
         Ok(ControlFlow::Continue(()))
@@ -405,40 +501,40 @@ impl Message<CreateVM> for SchedulerActor {
     type Reply = Result<CreateVMReply, Report>;
 
     async fn handle(&mut self, msg: CreateVM, _ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
-        let target_agent = self.schedule_agent(&msg).await?;
+        let target_agent = self.schedule_agent(&msg)?;
 
         // we add to cache first, because we want to make sure future requests assume this vm exists. if the message fails, we clean it up afterward.
         if let Some(mut cached_data) = self.agent_data_cache.get_mut(&target_agent.id()) {
-            cached_data.extended_vm_list.push(msg.vmid);
+            cached_data.extended_vm_set.insert(msg.vmid);
         } else {
             return Err(eyre!("target agent is not in data cache"))
         }
-        
+
         self.vm_data_cache.insert(
             msg.vmid,
-            CachedVMActor { 
-                actor_ref: None, 
-                metadata: GetVMInfoReply { 
-                    vmid: msg.vmid, 
+            CachedVMActor {
+                actor_ref: None,
+                metadata: GetVMInfoReply {
+                    vmid: msg.vmid,
                     config: Some(msg.config.clone())
                 }
             });
-        
-        
+
+
 
         let reply = target_agent.ask(&msg).await;
 
-        
+
         // remove from caches if we fail to schedule
         if reply.is_err() {
             self.agent_data_cache.alter(&target_agent.id(), |_,mut v| {
-                v.extended_vm_list.retain(|&vmid| vmid != msg.vmid);
-                
+                v.extended_vm_set.remove(&msg.vmid);
+
                 v
             });
             self.vm_data_cache.remove(&msg.vmid);
         }
-        
+
 
         Ok(reply?)
     }
@@ -454,9 +550,8 @@ impl Message<DeleteVM> for SchedulerActor {
     ) -> Self::Reply {
         let vm = RemoteActorRef::<VMActor>::lookup(vm_actor_id(msg.vmid)).await?;
         tracing::trace!(?vm, "DeleteVM");
-        if let Some(vm) = vm {
+        if let Some(vm) = vm { // don't update cache, because we rely on link dying and updater task to remove from cache once the VM is fully down.
             vm.tell(&msg).send()?;
-            // todo: update cache
             Ok(DeleteVMReply)
         } else {
             Err(eyre!("VM not found"))
@@ -474,11 +569,8 @@ impl Message<ShutdownVM> for SchedulerActor {
     ) -> Self::Reply {
         let vm = RemoteActorRef::<VMActor>::lookup(vm_actor_id(msg.vmid)).await?;
         tracing::trace!(?vm, "ShutdownVM");
-        if let Some(vm) = vm {
+        if let Some(vm) = vm { // don't update cache, because we rely on link dying and updater task to remove from cache once the VM is fully down.
             vm.tell(&msg).send()?;
-
-            // todo: update cache
-
             Ok(ShutdownVMReply)
         } else {
             Err(eyre!("VM not found"))
