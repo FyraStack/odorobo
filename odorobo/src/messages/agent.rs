@@ -3,6 +3,8 @@ use kameo::Reply;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
+use crate::types::ObjectMetadata;
+
 
 #[derive(Serialize, Deserialize)]
 pub struct GetAgentStatus;
@@ -16,5 +18,6 @@ pub struct AgentStatus {
     pub ram: ByteSize,
     pub used_vcpus: u32,
     pub used_ram: ByteSize,
-    pub vms: Vec<Ulid>
+    pub vms: Vec<Ulid>,
+    pub metadata: ObjectMetadata
 }

@@ -1,3 +1,4 @@
+use std::iter;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,8 +12,13 @@ use tracing::trace;
 use ulid::Ulid;
 use crate::actors::agent_actor::AgentActor;
 use crate::ch_driver::actor::VMActor;
+use crate::types::AffinityRequirement;
+use crate::types::AffinityRule;
 use crate::types::AffinityStrictness;
 use crate::types::AffinityType;
+use crate::types::MetadataTable;
+use crate::types::ObjectMetadata;
+use crate::types::Operator;
 use crate::utils::actor_names::VM;
 use crate::messages::vm::*;
 use crate::messages::agent::*;
@@ -30,7 +36,7 @@ use tokio::task::JoinHandle;
 #[derive(Debug, Clone)]
 pub struct CachedAgentActor {
     pub actor_ref: RemoteActorRef<AgentActor>,
-    pub metadata: AgentStatus,
+    pub data: AgentStatus,
     /// this is a set of all VMs that may be on an agent. it is used for rules such as affinity to make sure we don't schedule things in ways that arent allowed
     /// We don't know for a fact these VMs are scheduled due to latency and boot up delay, but they may be scheduled.
     pub extended_vm_set: AHashSet<Ulid>,
@@ -39,12 +45,20 @@ pub struct CachedAgentActor {
 #[derive(Debug, Clone)]
 pub struct CachedVMActor {
     pub actor_ref: Option<RemoteActorRef<VMActor>>,
-    pub metadata: GetVMInfoReply,
+    pub data: GetVMInfoReply,
 }
 
 
 // todo: i dont like the way this cache is setup. I think we may need to change it later, but it is hard to figure out what the optimal solution is without doing it at least once.
 //  especially when we haven't fully made decisions about some other things.
+//
+// todo: we should improve the cache to not have agents and vms send the full data on every update.
+//  I looked at kameo streams to make this better, but they aren't really intended for this kind of long term update use case.
+//  They use rust futures::stream which seems to be more intended for you have an iterator for example that will create data, but not like full on sending messages.
+//  This could likely be done pretty easily by having two get data messages.
+//   Option 1: One that creates a session and sends the full data and then only sends diffs after that.
+//   Option 2: we can have one that sends full data, and then another that only sends data that changes.
+//  Option 2 is easier to write and uses less compute, but uses more network bandwidth.
 #[derive(RemoteActor)]
 pub struct SchedulerActor {
     pub agent_data_cache: Arc<DashMap<ActorId, CachedAgentActor>>,
@@ -96,7 +110,7 @@ impl SchedulerActor {
         &mut self,
         hostname: &str,
     ) -> Option<RemoteActorRef<AgentActor>> {
-        self.agent_data_cache.iter().find(|data| data.metadata.hostname == hostname).map(|data| data.actor_ref.clone())
+        self.agent_data_cache.iter().find(|data| data.data.hostname == hostname).map(|data| data.actor_ref.clone())
     }
 
 
@@ -145,8 +159,8 @@ impl SchedulerActor {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         let mut fails = 0;
         loop {
-            if let Ok(metadata) = actor_ref.ask(&GetVMInfo {vmid: None}).await { // todo: replace with kameo stream, (only send full data once, then send changes from there on)
-                let vmid = metadata.vmid;
+            if let Ok(data) = actor_ref.ask(&GetVMInfo {vmid: None}).await {
+                let vmid = data.vmid;
 
                 vm_actorid_ulid_map.insert(actor_ref.id(), vmid); // should we be doing this on every loop? idk. but we at least need to do it on the first iteration given we don't know the mapping before that
 
@@ -154,7 +168,7 @@ impl SchedulerActor {
                     vmid,
                     CachedVMActor {
                         actor_ref: Some(actor_ref.clone()),
-                        metadata: metadata
+                        data: data
                     }
                 );
 
@@ -211,14 +225,14 @@ impl SchedulerActor {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         let mut fails = 0;
         loop {
-            if let Ok(metadata) = actor_ref.ask(&GetAgentStatus).await { // todo: replace with kameo stream
+            if let Ok(data) = actor_ref.ask(&GetAgentStatus).await { // todo: replace with kameo stream
                 if data_cache.contains_key(&actor_ref.id()) {
                     data_cache.alter(
                         &actor_ref.id(),
                         |_, mut v| {
-                            v.metadata = metadata;
+                            v.data = data;
 
-                            v.extended_vm_set.extend(v.metadata.vms.iter());
+                            v.extended_vm_set.extend(v.data.vms.iter());
 
                             v
                         }
@@ -228,7 +242,7 @@ impl SchedulerActor {
                         actor_ref.id(),
                         CachedAgentActor {
                             actor_ref: actor_ref.clone(),
-                            metadata,
+                            data: data,
                             extended_vm_set: AHashSet::new()
                         }
                     );
@@ -325,9 +339,9 @@ impl SchedulerActor {
     ) -> AgentScore {
         let mut score = AgentScore::default();
 
-        let agent_max_vcpus = agent.metadata.vcpus * VCPU_OVERPROVISIONMENT_NUMERATOR / VCPU_OVERPROVISIONMENT_DENOMINATOR;
+        let agent_max_vcpus = agent.data.vcpus * VCPU_OVERPROVISIONMENT_NUMERATOR / VCPU_OVERPROVISIONMENT_DENOMINATOR;
         // todo: do we care about VMData.max_vcpus?
-        let agent_used_vcpus = agent.metadata.used_vcpus + msg.config.data.vcpus;
+        let agent_used_vcpus = agent.data.used_vcpus + msg.config.data.vcpus;
 
         if agent_used_vcpus >= agent_max_vcpus {
             return AgentScore::REJECTED;
@@ -337,42 +351,66 @@ impl SchedulerActor {
 
 
         // todo: add ram overprovisionment.     not adding this to scheduler until it works on the hypervisor side.
-        let agent_max_ram = agent.metadata.ram;
-        let agent_used_ram = agent.metadata.used_ram + msg.config.data.memory;
+        let agent_max_ram = agent.data.ram;
+        let agent_used_ram = agent.data.used_ram + msg.config.data.memory;
 
         if agent_used_ram >= agent_max_ram {
             return AgentScore::REJECTED;
         }
 
-        score.general += (agent_max_ram.as_u64() - agent.metadata.used_ram.as_u64()) as f32 / agent_max_ram.as_u64() as f32;
+        score.general += (agent_max_ram.as_u64() - agent.data.used_ram.as_u64()) as f32 / agent_max_ram.as_u64() as f32;
 
 
-        // todo: https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/
-
-
+        // roughly based on: https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/
         if let Some(affinity_rules) = &msg.config.affinity {
             for rule in affinity_rules {
-                let mut meets_requirements = false;
+                let mut metadata_tables: Vec<ObjectMetadata> = Vec::with_capacity(1);
 
-                let lhs_values: Vec<String> = Vec::with_capacity(1);
+                match rule.affinity_type {
+                    AffinityType::VirtualMachine => {
+                        for vmid in &agent.extended_vm_set {
+                            let Some(vm_data_cache_ref) = &self.vm_data_cache.get(vmid) else {
+                                continue;
+                            };
 
-                match &rule.affinity_type {
-                    AffinityType::VirtualMachine(zone) => todo!(),
-                    AffinityType::Agent => lhs_values.push(agent.metadata.), // todo: this should be object metadata, but I just realized that field isnt included in the data we have in the cache
-                }
+                            let Some(vm_manifest) = &vm_data_cache_ref.data.config else {
+                                continue;
+                            };
 
-                // in theory the next bit of this could would loop through all the lhs values and all the requirements and then actually do the computation, but I got busy with other work.
+                            if let Some(metadata) = &vm_manifest.metadata {
+                                metadata_tables.push(metadata.clone());
+                            }
+                        }
+                    },
+                    AffinityType::Agent => metadata_tables.push(agent.data.metadata.clone()),
+                };
+
+                let mut follows_rule = false;
 
                 for requirement in &rule.requirements {
-                    let requirement_outcome = true; // todo: set this based on requirement
+                    let mut requirement_outcome = true;
+
+                    for object_metadata in &metadata_tables {
+                        let table = match requirement.table {
+                            MetadataTable::Label => &object_metadata.labels,
+                            MetadataTable::Annotation => &object_metadata.annotations,
+                        };
+
+                        let value_option = table.get(&requirement.key);
+
+                        if !evaluate_table_value(&value_option, requirement) {
+                            requirement_outcome = false;
+                            break;
+                        }
+                    }
 
                     if requirement_outcome {
-                        meets_requirements = true;
-                        break;
+                        follows_rule = true;
+                        break
                     }
                 }
 
-                let follows_rule = meets_requirements ^ rule.inverse;
+                follows_rule ^= rule.inverse;
 
                 match (rule.strictness, follows_rule) {
                     (AffinityStrictness::Required, false) => return AgentScore::REJECTED,
@@ -395,6 +433,39 @@ impl SchedulerActor {
 
         score
     }
+}
+
+fn evaluate_table_value(
+    value_option: &Option<&String>,
+    requirement: &AffinityRequirement
+) -> bool {
+    let Some(value) = *value_option else {
+        return false;
+    };
+
+    match requirement.operator {
+        Operator::In => return requirement.values.iter().any(|e| *e == *value),
+        Operator::NotIn => return !requirement.values.iter().any(|e| *e == *value),
+        Operator::Lt | Operator::Gt => {
+            if requirement.values.len() != 1 {
+                return false;
+            }
+
+            let Ok(value_number): Result<f64, _> = value.parse() else {
+                return false;
+            };
+
+            let Ok(requirement_value_number): Result<f64, _> = requirement.values[0].parse() else {
+                return false;
+            };
+
+            if requirement.operator == Operator::Lt {
+                return value_number < requirement_value_number;
+            } else {
+                return value_number > requirement_value_number;
+            }
+        },
+    };
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -528,7 +599,7 @@ impl Message<CreateVM> for SchedulerActor {
             msg.vmid,
             CachedVMActor {
                 actor_ref: None,
-                metadata: GetVMInfoReply {
+                data: GetVMInfoReply {
                     vmid: msg.vmid,
                     config: Some(msg.config.clone())
                 }
@@ -606,7 +677,7 @@ impl Message<AgentListVMs> for SchedulerActor {
         let mut vms = Vec::new();
 
         for agent in self.agent_data_cache.iter() {
-            vms.extend_from_slice(agent.metadata.vms.as_slice());
+            vms.extend_from_slice(agent.data.vms.as_slice());
         }
 
         Ok(AgentListVMsReply { vms })

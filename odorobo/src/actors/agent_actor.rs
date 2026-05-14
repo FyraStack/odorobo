@@ -299,7 +299,8 @@ impl Message<GetAgentStatus> for AgentActor {
             ram: self.memory,
             vms: self.vms.keys().copied().collect(),
             used_vcpus: vcpus_used_by_vms + self.config.reserved_vcpus,
-            used_ram: ByteSize::b(ram_used_by_vms)
+            used_ram: ByteSize::b(ram_used_by_vms),
+            metadata: self.metadata.clone()
         }
     }
 }
