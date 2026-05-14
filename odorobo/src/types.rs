@@ -165,7 +165,8 @@ pub struct VirtualMachine {
     /// Metadata
     pub metadata: Option<ObjectMetadata>,
 
-    /// List of Affinity rules for scheduling. These are ANDed / summed together depending on the strictness.
+    /// List of Affinity rules for scheduling.
+    /// Affinity rules are ANDed or summed based on strictness.
     pub affinity: Option<Vec<AffinityRule>>,
 }
 
@@ -188,12 +189,12 @@ pub enum AffinityStrictness {
 
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
 pub enum AffinityType {
-    VirtualMachine(Zone),
+    VirtualMachine,
     Agent,
 }
 
-pub type Zone = String;
-
+/// if there are several metadata tables, their results will be ANDed together
+/// EX: if a requirement is checked against several VMs, it must pass all VMs for the requirement to be fulfilled.
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
 pub struct AffinityRequirement {
     pub key: String,
@@ -208,7 +209,7 @@ pub enum MetadataTable {
     Annotation,
 }
 
-#[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
+#[derive(Serialize, Deserialize, Debug, JsonSchema, Clone, PartialEq)]
 pub enum Operator {
     In,
     NotIn,

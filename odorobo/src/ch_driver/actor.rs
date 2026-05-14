@@ -167,6 +167,7 @@ impl Message<GetVMInfo> for VMActor {
     }
 }
 
+
 #[remote_message]
 impl Message<MigrateVMReceive> for VMActor {
     type Reply = MigrateVMReceiveReply;
