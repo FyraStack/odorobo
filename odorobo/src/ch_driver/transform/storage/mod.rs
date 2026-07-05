@@ -1,4 +1,4 @@
-use crate::state::transform::ConfigTransform;
+use crate::ch_driver::transform::ConfigTransform;
 use async_trait::async_trait;
 use cloud_hypervisor_client::models::VmConfig;
 use stable_eyre::Result;

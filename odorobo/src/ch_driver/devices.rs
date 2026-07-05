@@ -1,4 +1,4 @@
-use crate::state::VMInstance;
+use crate::ch_driver::VMInstance;
 use cloud_hypervisor_client::{
     apis::DefaultApi,
     models::{DeviceConfig, NetConfig, PciDeviceInfo, VmRemoveDevice},

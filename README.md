@@ -35,7 +35,7 @@ sudo dnf in -y clang-devel nftables cloud-hypervisor
 cargo build --release
 
 # Run the Agent & Manager (requires write permissions to /run/odorobo)
-sudo ./target/release/odorobo --manager-enabled=true # or set ODOROBO_MANAGER_ENABLED=true
+sudo ./target/release/odorobo --manager-enabled # or set ODOROBO_MANAGER_ENABLED=true
 
 # Run on other boxes
 sudo ./target/release/odorobo

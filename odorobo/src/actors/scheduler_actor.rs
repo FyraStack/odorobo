@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use kameo::prelude::*;
 use libp2p::futures::TryStreamExt;
 use crate::actors::agent_actor::AgentActor;
-use crate::state::provisioning::actor::VMActor;
+use crate::ch_driver::actor::VMActor;
 use crate::utils::actor_cache::ActorCache;
 use crate::utils::actor_cache::ActorCacheUpdater;
 use crate::utils::actor_names::VM;

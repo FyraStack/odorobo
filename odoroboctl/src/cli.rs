@@ -1,9 +1,10 @@
-use std::path::PathBuf;
-
 use clap::{Parser, Subcommand};
 use reqwest::{Client, Response};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize};
 use stable_eyre::Result;
+use odorobo::types::{CreateVMRequest, VMData, VirtualMachine};
+use ulid::Ulid;
+use bytesize::ByteSize;
 
 #[derive(Parser)]
 #[command(
@@ -25,17 +26,9 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Create a VM via the scheduler debug endpoint,
+    /// Create a VM via the scheduler endpoint,
     /// optionally also booting it immediately after creation (if `--boot` is specified).
-    Create {
-        /// Path to the VM config file
-        /// (in Cloud Hypervisor JSON format)
-        config: PathBuf,
-
-        /// Boot the VM after creation
-        #[arg(long)]
-        boot: bool,
-    },
+    Create,
 
     /// List VMs currently known by the manager/agent.
     List,
@@ -51,12 +44,6 @@ pub enum Command {
         /// VM ID in ULID format
         vmid: String,
     },
-}
-
-#[derive(Debug, Serialize)]
-struct DebugCreateVMRequest {
-    vm_config: serde_json::Value,
-    boot: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -109,12 +96,29 @@ pub async fn run_command(cli: Cli) -> Result<()> {
     let base_url = cli.manager_addr;
 
     match cli.command {
-        Command::Create { config, boot } => {
+        Command::Create => { // TODO: setup actual cli args for these parameters. or just take in arbitrary json and serialize it into a VirtualMachine.
+            let vm = VirtualMachine {
+                data: VMData {
+                    id: Ulid::new(),
+                    name: "test_vm".to_string(),
+                    vcpus: 4,
+                    max_vcpus: None,
+                    memory: ByteSize::gib(4),
+                    image: "/var/lib/odorobo/f43.raw".to_string(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+
+            let request = CreateVMRequest {
+                vm,
+                boot: true
+            };
+
             let url = format!("{}/vms", base_url);
-            let vm_config =
-                serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(&config)?)?;
-            let body = DebugCreateVMRequest { vm_config, boot };
-            let response = client.put(&url).json(&body).send().await?;
+            let response = client.post(&url).json(&request).send().await?;
+
+            println!("{:?}", response.url());
 
             print_message_response(response, "VM create request sent successfully").await?;
         }

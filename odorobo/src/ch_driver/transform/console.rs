@@ -2,7 +2,7 @@ use cloud_hypervisor_client::models::{ConsoleConfig, VmConfig};
 use stable_eyre::Result;
 use tracing::trace;
 
-use crate::state::VMInstance;
+use crate::ch_driver::VMInstance;
 
 use super::ConfigTransform;
 

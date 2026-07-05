@@ -11,4 +11,9 @@ tokio = { workspace = true, features = ["full"] }
 reqwest = { workspace = true, features = ["json"] }
 serde_json = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
+ulid = { workspace = true }
+bytesize = { workspace = true }
+
 chrono = { version = "0.4", features = ["serde"] }
+
+odorobo = { workspace = true }
