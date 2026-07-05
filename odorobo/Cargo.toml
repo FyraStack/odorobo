@@ -64,3 +64,4 @@ schemars = "0.9"
 
 
 cloud-hypervisor-client = { git = "https://github.com/FyraStack/cloud-hypervisor-client.git" }
+signal-hook = "0.4.4"
