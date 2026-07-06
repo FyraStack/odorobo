@@ -3,10 +3,163 @@ permissions:
   contents: read
 on:
   push:
+  workflow_call:
+    inputs:
+      test-runs-on:
+        description: "The runner type which the test job runs on"
+        required: false
+        default: ubuntu-latest
+        type: string
+      test-container:
+        description: "The container configuration for the test job, in JSON"
+        required: false
+        default: "null"
+        type: string
+      test-pre:
+        description: "Command to run before tests are executed, useful for installing system deps"
+        required: false
+        default: ""
+        type: string
+      test-cargo-flags:
+        description: "Additional flags to pass to cargo commands in the test step, useful for specifying features"
+        required: false
+        default: ""
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_TERM_VERBOSE: true
 
 jobs:
-  rust:
+  rustfmt:
+    if: (github.event_name != 'pull_request' && ! github.event.pull_request.head.repo.fork) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # v1.94.1
+        with:
+          toolchain: stable
+          components: rustfmt
+
+      - name: Run rustfmt
+        run: cargo fmt -- --check
+  clippy:
     permissions:
       security-events: write
-      contents: read
-    uses: FyraLabs/actions/.github/workflows/rust.yml@main
+    if: (github.event_name != 'pull_request' && ! github.event.pull_request.head.repo.fork) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # v1.94.1
+        with:
+          toolchain: stable
+          components: clippy
+
+      - name: Install required cargo
+        run: cargo install clippy-sarif sarif-fmt
+
+      - name: Run rust-clippy
+        run: cargo clippy
+          --all-features
+          --message-format=json | clippy-sarif | tee rust-clippy-results.sarif | sarif-fmt
+        continue-on-error: true
+        env:
+          CARGO_TERM_VERBOSE: false
+
+      - name: Upload analysis results to GitHub
+        uses: github/codeql-action/upload-sarif@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4.36.2
+        with:
+          sarif_file: rust-clippy-results.sarif
+          wait-for-processing: true
+  test-x86:
+    if: (github.event_name != 'pull_request' && ! github.event.pull_request.head.repo.fork) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork)
+    runs-on: ${{ inputs.test-runs-on }}
+    container: ${{ fromJSON(inputs.test-container) }}
+    steps:
+      - name: Run pre script
+        run: ${{ inputs.test-pre }}
+        if: ${{ inputs.test-pre != '' }}
+
+      - name: Checkout code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # v1.94.1
+        with:
+          toolchain: stable
+
+      - name: Fetch
+        run: cargo fetch --locked
+
+      - name: Build
+        run: cargo build --verbose --release
+
+      - name: Upload artifact - agent
+        uses: actions/upload-artifact@v7
+        with:
+          archive: false
+          name: odorobo-agent-x86
+          path: |
+            target/release/odorobo-agent
+
+      - name: Upload artifact - odoroboctl
+        uses: actions/upload-artifact@v7
+        with:
+          archive: false
+          name: odoroboctl-x86
+          path: |
+            target/release/odoroboctl
+
+      - name: Run tests
+        run: cargo test --verbose
+
+  test-riscv-rva23:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build image
+        run: podman build -t odorobo-builder:rva23 .
+
+      - name: Build binaries
+        run: podman run --rm -v ${{ github.workspace }}:/code -w /code odorobo-builder:rva23 cargo build --release --verbose
+
+      - name: Upload artifact - agent
+        uses: actions/upload-artifact@v7
+        with:
+          archive: false
+          name: odorobo-agent-riscv_rva23
+          path: |
+            target/riscv64a23-unknown-linux-gnu/release/odorobo-agent
+
+      - name: Upload artifact - odoroboctl
+        uses: actions/upload-artifact@v7
+        with:
+          archive: false
+          name: odoroboctl-riscv_rva23
+          path: |
+            target/riscv64a23-unknown-linux-gnu/release/odoroboctl
+
+      - name: Test
+        run: podman run --rm -v ${{ github.workspace }}:/code -w /code odorobo-builder:rva23 cargo test --verbose
