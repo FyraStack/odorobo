@@ -4,27 +4,6 @@ permissions:
 on:
   push:
   workflow_call:
-    inputs:
-      test-runs-on:
-        description: "The runner type which the test job runs on"
-        required: false
-        default: ubuntu-latest
-        type: string
-      test-container:
-        description: "The container configuration for the test job, in JSON"
-        required: false
-        default: "null"
-        type: string
-      test-pre:
-        description: "Command to run before tests are executed, useful for installing system deps"
-        required: false
-        default: ""
-        type: string
-      test-cargo-flags:
-        description: "Additional flags to pass to cargo commands in the test step, useful for specifying features"
-        required: false
-        default: ""
-        type: string
 
 env:
   CARGO_TERM_COLOR: always
