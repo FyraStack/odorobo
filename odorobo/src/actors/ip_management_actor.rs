@@ -21,18 +21,3 @@ fn test_calculate_mac_address() {
     let mac = calculate_mac_address(ip);
     assert_eq!(mac, [0x46, 0x59, 0x52, 168, 0x01, 0x01]);
 }
-
-/// HTTP REST API service
-#[derive(RemoteActor)]
-pub struct IPManagementActor;
-
-impl Actor for IPManagementActor {
-    type Args = ();
-    type Error = Report;
-
-    async fn on_start(_state: Self::Args, _actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
-        // if we need to like prep the router stuff
-
-        Ok(Self)
-    }
-}
