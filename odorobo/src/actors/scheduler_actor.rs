@@ -121,8 +121,11 @@ impl SchedulerActor {
         data_cache: Arc<DashMap<Ulid, CachedVMActor>>,
         keepalive_tasks: Arc<DashMap<ActorId, JoinHandle<()>>>
     ) -> Result<(), Report> {
+        trace!("running vm_actor_finder");
 
-        while let Some(vm_actor) = RemoteActorRef::<VMActor>::lookup_all(VM).try_next().await? {
+        let mut vm_actor_stream = RemoteActorRef::<VMActor>::lookup_all(VM);
+
+        while let Some(vm_actor) = vm_actor_stream.try_next().await? {
             if !keepalive_tasks.contains_key(&vm_actor.id()) {
                 trace!(?vm_actor, "starting vm_updater_task");
 
@@ -191,8 +194,11 @@ impl SchedulerActor {
         data_cache: Arc<DashMap<ActorId, CachedAgentActor>>,
         keepalive_tasks: Arc<DashMap<ActorId, JoinHandle<()>>>,
     ) -> Result<(), Report> {
-        info!("running agent_actor_finder");
-        while let Some(agent_actor) = RemoteActorRef::<AgentActor>::lookup_all(AGENT).try_next().await? {
+        trace!("running agent_actor_finder");
+
+        let mut agent_actor_stream = RemoteActorRef::<AgentActor>::lookup_all(AGENT);
+
+        while let Some(agent_actor) = agent_actor_stream.try_next().await? {
             if !keepalive_tasks.contains_key(&agent_actor.id()) {
                 trace!(?agent_actor, "starting agent_updater_task");
 
