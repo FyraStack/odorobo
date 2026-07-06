@@ -1,4 +1,4 @@
-FROM ghcr.io/ultramarine-linux/ultramarine:43
+FROM ghcr.io/ultramarine-linux/ultramarine:44
 
 # Install dependencies
 RUN dnf do -y --action=install \
@@ -10,6 +10,6 @@ RUN dnf do -y --action=install \
     git \
     zig \
     cloud-hypervisor-nightly
-    
+
 RUN mkdir -p /run/odorobo/vms
 RUN chmod -R 1777 /run/odorobo
