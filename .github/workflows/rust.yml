@@ -1,3 +1,5 @@
+# This is based on the normal Fyra Rust workflow, but modified to add RVA23 support. See https://github.com/FyraLabs/actions for more info.
+
 name: Rust
 permissions:
   contents: read
