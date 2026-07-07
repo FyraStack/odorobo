@@ -29,7 +29,8 @@ jobs:
 
       - name: Run rustfmt
         run: cargo fmt -- --check
-  clippy:
+
+  rust-clippy-analyze:
     permissions:
       security-events: write
     if: (github.event_name != 'pull_request' && ! github.event.pull_request.head.repo.fork) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork)
@@ -62,6 +63,7 @@ jobs:
         with:
           sarif_file: rust-clippy-results.sarif
           wait-for-processing: true
+
   test-x86:
     if: (github.event_name != 'pull_request' && ! github.event.pull_request.head.repo.fork) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork)
     runs-on: ubuntu-latest
