@@ -105,9 +105,7 @@ impl HookManager {
 impl Default for HookManager {
     fn default() -> Self {
         Self {
-            hooks: vec![
-                Box::new(networking::NetworkProvisioningHook),
-            ],
+            hooks: vec![Box::new(networking::NetworkProvisioningHook)],
         }
     }
 }

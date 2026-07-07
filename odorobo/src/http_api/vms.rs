@@ -1,9 +1,10 @@
 //! VM management API handlers.
+use crate::messages::vm::{AgentListVMs, DeleteVM, ShutdownVM};
 use crate::{
     actors::http_actor::HTTPActor,
-    types::{
-        CreateVMRequest, UpdateVMRequest, VirtualMachine, VMListResponse, VmId
-    }, messages::vm::CreateVM, utils::OdoroboError,
+    messages::vm::CreateVM,
+    types::{CreateVMRequest, UpdateVMRequest, VMListResponse, VirtualMachine, VmId},
+    utils::OdoroboError,
 };
 use aide::axum::{
     ApiRouter, IntoApiResponse,
@@ -14,7 +15,6 @@ use axum::{
     extract::{Path, State},
 };
 use kameo::actor::ActorRef;
-use crate::messages::vm::{AgentListVMs, DeleteVM, ShutdownVM};
 
 pub fn router() -> ApiRouter<ActorRef<HTTPActor>> {
     ApiRouter::new()
@@ -26,7 +26,9 @@ pub fn router() -> ApiRouter<ActorRef<HTTPActor>> {
         .api_route("/{vmid}/shutdown", put(shutdown_vm))
 }
 
-async fn list_vms(State(state): State<ActorRef<HTTPActor>>) -> Result<impl IntoApiResponse, OdoroboError> {
+async fn list_vms(
+    State(state): State<ActorRef<HTTPActor>>,
+) -> Result<impl IntoApiResponse, OdoroboError> {
     let reply = state.ask(AgentListVMs).await?;
 
     Ok(Json(VMListResponse {

@@ -391,7 +391,8 @@ impl Actor for NetworkAgentActor {
 
         let bridge = match bridge_lookup {
             Some(Ok(bridge)) => bridge,
-            Some(Err(NetlinkError::NetlinkError(ref nl_err))) if nl_err.raw_code() == -libc::ENODEV =>
+            Some(Err(NetlinkError::NetlinkError(ref nl_err)))
+                if nl_err.raw_code() == -libc::ENODEV =>
             {
                 info!(bridge = %common.bridge, "bridge not found during lookup, creating it");
                 let new_bridge = LinkBridge::new(&common.bridge).up().build();

@@ -93,7 +93,6 @@ impl VMInstance {
         }
     }
 
-
     /// Takes the child process out of this instance, transferring ownership to the caller.
     /// Useful for watching the process lifecycle externally (e.g. in an actor watcher task).
     /// After calling this, `destroy()` will skip the child-kill step.
