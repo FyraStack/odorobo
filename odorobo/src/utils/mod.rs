@@ -103,6 +103,10 @@ pub fn init(debug_target: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+#[expect(
+    dead_code,
+    reason = "convenience initializer for binaries/tests that do not need a debug target"
+)]
 pub fn init_default() -> Result<()> {
     init(None)
 }

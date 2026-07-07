@@ -63,7 +63,7 @@ async fn delete_vm(
     State(state): State<ActorRef<HTTPActor>>,
     Path(VmId(vmid)): Path<VmId>,
 ) -> Result<impl IntoApiResponse, OdoroboError> {
-    let reply = state.ask(DeleteVM { vmid }).await?;
+    let _reply = state.ask(DeleteVM { vmid }).await?;
 
     Ok(Json(()))
 }

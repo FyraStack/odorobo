@@ -42,11 +42,19 @@ pub struct HookManager {
 }
 
 impl HookManager {
+    #[expect(
+        dead_code,
+        reason = "hook registration API is used as provisioning integrations are added"
+    )]
     pub fn add_hook<T: ProvisioningHook + 'static>(mut self, hook: T) -> Self {
         self.hooks.push(Box::new(hook));
         self
     }
 
+    #[expect(
+        dead_code,
+        reason = "provisioning lifecycle method reserved for start-time integrations"
+    )]
     pub async fn before_start(&self, vmid: &str, config: &VmConfig) -> Result<()> {
         for hook in &self.hooks {
             hook.before_start(vmid, config).await?;
@@ -54,6 +62,10 @@ impl HookManager {
         Ok(())
     }
 
+    #[expect(
+        dead_code,
+        reason = "provisioning lifecycle method reserved for start-time integrations"
+    )]
     pub async fn after_start(&self, vmid: &str, config: &VmInfo, pid: i32) -> Result<()> {
         for hook in &self.hooks {
             hook.after_start(vmid, config, pid).await?;

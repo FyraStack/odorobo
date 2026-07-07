@@ -52,7 +52,7 @@ impl Actor for VMActor {
                     Ok(status) => {
                         if !status.success() {
                             error!(%vmid, ?status, "child process exited unexpectedly, killing actor");
-                            let _ = actor_ref.kill();
+                            actor_ref.kill();
                         } else {
                             warn!(%vmid, "child process exited outside of actor teardown");
                             let _ = actor_ref.stop_gracefully().await;

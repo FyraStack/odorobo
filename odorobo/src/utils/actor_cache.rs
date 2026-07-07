@@ -44,9 +44,17 @@ pub struct ActorCache<
     ChildActor: Actor + RemoteActor,
     Data: Clone + Send + Sync + 'static + fmt::Debug,
 > {
+    #[expect(
+        dead_code,
+        reason = "keeps the parent actor reference alive for cache-owned tasks"
+    )]
     parent_actor_ref: ActorRef<ParentActor>,
     pub data_cache: Arc<DashMap<ActorId, Data>>,
     keepalive_tasks: Arc<DashMap<ActorId, JoinHandle<()>>>,
+    #[expect(
+        dead_code,
+        reason = "retains the background finder task handle for future shutdown/drop handling"
+    )]
     actor_finder: Option<JoinHandle<()>>,
 
     child_actor_type: PhantomData<ChildActor>,
@@ -69,8 +77,8 @@ impl<
 
         let actor_cache = ActorCache {
             parent_actor_ref: parent_actor_ref.clone(),
-            data_cache: data_cache,
-            keepalive_tasks: keepalive_tasks,
+            data_cache,
+            keepalive_tasks,
             actor_finder: None,
 
             child_actor_type: PhantomData,

@@ -300,14 +300,14 @@ impl Message<GetAgentStatus> for AgentActor {
             .values()
             .map(|vm| vm.config.data.vcpus)
             .reduce(|acc, cpus| acc + cpus)
-            .unwrap_or(0) as u32;
+            .unwrap_or(0);
 
         let ram_used_by_vms = self
             .vms
             .values()
             .map(|vm| vm.config.data.memory.as_u64())
             .reduce(|acc, memory| acc + memory)
-            .unwrap_or(0) as u64;
+            .unwrap_or(0);
 
         AgentStatus {
             hostname: self.config.hostname.clone(),

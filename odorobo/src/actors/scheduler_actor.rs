@@ -29,6 +29,10 @@ static VCPU_OVERPROVISIONMENT_NUMERATOR: u32 = 2;
 static VCPU_OVERPROVISIONMENT_DENOMINATOR: u32 = 1;
 
 impl SchedulerActor {
+    #[expect(
+        dead_code,
+        reason = "scheduler lookup helper reserved for explicit placement by actor id"
+    )]
     async fn lookup_by_actor_id(
         &mut self,
         actor_id: &ActorId,
@@ -39,6 +43,10 @@ impl SchedulerActor {
             .map(|data| data.actor_ref.clone())
     }
 
+    #[expect(
+        dead_code,
+        reason = "scheduler lookup helper reserved for explicit placement by hostname"
+    )]
     async fn lookup_by_hostname(&mut self, hostname: &str) -> Option<RemoteActorRef<AgentActor>> {
         self.agent_actor_cache
             .data_cache
@@ -56,7 +64,7 @@ impl SchedulerActor {
     /// additionally, because caleb is way too performance brained, he used integer math for the entire scoring algorithm just so we didnt have to convert to floats.
     async fn schedule_agent(
         &mut self,
-        msg: &CreateVM,
+        _msg: &CreateVM,
     ) -> Result<RemoteActorRef<AgentActor>, Report> {
         let mut best_agent = None;
         let mut best_agent_score = 0u32;
