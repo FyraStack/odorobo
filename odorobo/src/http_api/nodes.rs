@@ -16,7 +16,9 @@ pub fn router() -> ApiRouter<ActorRef<HTTPActor>> {
         .api_route("/{nodeid}", get(node_info))
 }
 /// Drain a node of all VMs, migrating them away or shutting them down as needed. This is used for maintenance mode.
-async fn drain(State(_state): State<ActorRef<HTTPActor>>) -> Result<impl IntoApiResponse, OdoroboError> {
+async fn drain(
+    State(_state): State<ActorRef<HTTPActor>>,
+) -> Result<impl IntoApiResponse, OdoroboError> {
     // stub
     Ok(Json("Draining...".to_string()))
 }

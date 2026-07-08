@@ -4,8 +4,8 @@
 
 Stack Virtualization Platform - Powered by Cloud Hypervisor
 
-Odorobo<sup>(robot dance)</sup> is a hypervisor platform built on top of 
-[Cloud Hypervisor](https://www.cloudhypervisor.org/), a lightweight 
+Odorobo<sup>(robot dance)</sup> is a hypervisor platform built on top of
+[Cloud Hypervisor](https://www.cloudhypervisor.org/), a lightweight
 VMM built on rust-vmm, with a focus on providing lightweight,
 stateful, and portable virtual machines.
 
@@ -74,3 +74,7 @@ See [docs/console.md](docs/console.md) for direct serial socket access, WebSocke
 For more advanced usage, Odorobo Agent also exposes a passthrough route for the local Cloud Hypervisor API, allowing you to call the full Cloud Hypervisor API directly through the agent's REST API
 
 See `docs/ch-passthrough.md` for Cloud Hypervisor API passthrough usage.
+
+## Note about CI Tests
+
+Because we don't have an RVA23 runner, the `test-riscv-rva23` workflow will not actually run the test suite. It will only build the tests and verify they compile successfully.

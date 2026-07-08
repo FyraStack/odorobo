@@ -1,9 +1,9 @@
 use kameo::prelude::*;
 use serde::{Deserialize, Serialize};
 
-pub mod vm;
-pub mod debug;
 pub mod agent;
+pub mod debug;
+pub mod vm;
 
 /// A request to ping the server (keepalive)
 #[derive(Serialize, Deserialize, Debug)]

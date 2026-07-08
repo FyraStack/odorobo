@@ -1,10 +1,10 @@
 use ahash::AHashMap;
+use clap::Parser;
 use ipnet::Ipv4Net;
 use serde::{Deserialize, Serialize};
-use std::{net::Ipv4Addr};
+use std::net::Ipv4Addr;
 use sysinfo::System;
-use tracing::{ info, warn};
-use clap::Parser;
+use tracing::{info, warn};
 
 /// Gets the system hostname
 pub fn hostname() -> String {
@@ -121,7 +121,6 @@ impl Default for NetworkMode {
 /// Additional runtime options for the agent that aren't applicable to a JSON config file
 #[derive(Parser)]
 pub struct CliConfig {
-    
     /// Whether the manager should be enabled on this instance
     #[clap(long, default_value = "false", env = "ODOROBO_MANAGER_ENABLED")]
     pub manager_enabled: bool,

@@ -71,7 +71,6 @@ pub struct CreateVMRequest {
     pub boot: bool,
 }
 
-
 /// An internal, debug-only request for creating a VM.
 ///
 /// please don't use this in production, this is for debugging
@@ -167,9 +166,8 @@ pub struct VirtualMachine {
     pub metadata: Option<ObjectMetadata>,
 
     /// List of Affinity rules for scheduling. These are ANDed / summed together depending on the strictness.
-    pub affinity: Option<Vec<AffinityRule>>
+    pub affinity: Option<Vec<AffinityRule>>,
 }
-
 
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
 pub struct AffinityRule {
@@ -177,25 +175,25 @@ pub struct AffinityRule {
     pub affinity_type: AffinityType,
     pub direction: AffinityDirection,
     /// ORed together
-    pub requirements: Vec<AffinityRequirement>
+    pub requirements: Vec<AffinityRequirement>,
 }
 
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
 pub enum AffinityStrictness {
     Required,
-    Preferred { weight: i64 }
+    Preferred { weight: i64 },
 }
 
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
 pub enum AffinityType {
     VirtualMachine,
-    Agent
+    Agent,
 }
 
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
 pub enum AffinityDirection {
     Normal,
-    Anti
+    Anti,
 }
 
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
@@ -203,13 +201,13 @@ pub struct AffinityRequirement {
     pub key: String,
     pub table: MetadataTable,
     pub operator: Operator,
-    pub values: Vec<String>
+    pub values: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
 pub enum MetadataTable {
     Label,
-    Annotation
+    Annotation,
 }
 
 // todo: possibly replace with std::ops

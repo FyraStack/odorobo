@@ -1,48 +1,58 @@
 use std::ops::ControlFlow;
 
+use crate::actors::agent_actor::AgentActor;
+use crate::ch_driver::actor::VMActor;
+use crate::messages::agent::*;
+use crate::messages::vm::*;
+use crate::messages::{Ping, Pong};
+use crate::utils::actor_cache::ActorCache;
+use crate::utils::actor_cache::ActorCacheUpdater;
+use crate::utils::actor_names::AGENT;
+use crate::utils::actor_names::VM;
+use crate::utils::actor_names::vm_actor_id;
 use async_trait::async_trait;
 use kameo::prelude::*;
 use libp2p::futures::TryStreamExt;
-use crate::actors::agent_actor::AgentActor;
-use crate::ch_driver::actor::VMActor;
-use crate::utils::actor_cache::ActorCache;
-use crate::utils::actor_cache::ActorCacheUpdater;
-use crate::utils::actor_names::VM;
-use crate::messages::vm::*;
-use crate::messages::agent::*;
-use crate::messages::{Ping, Pong};
-use crate::utils::actor_names::AGENT;
-use crate::utils::actor_names::vm_actor_id;
 use stable_eyre::eyre::OptionExt;
 use stable_eyre::{Report, Result, eyre::eyre};
 use tracing::info_span;
 use tracing::{info, warn};
 
-
 #[derive(RemoteActor)]
 pub struct SchedulerActor {
     pub agent_actor_cache: ActorCache<SchedulerActor, AgentActor, CachedAgentActor>,
-    pub vm_actor_cache: ActorCache<SchedulerActor, VMActor, CachedVMActor>
+    pub vm_actor_cache: ActorCache<SchedulerActor, VMActor, CachedVMActor>,
 }
 
 // todo: this might need to be a runtime thing but this makes it easy to write for now and could easily be switched out later.
 static VCPU_OVERPROVISIONMENT_NUMERATOR: u32 = 2;
 static VCPU_OVERPROVISIONMENT_DENOMINATOR: u32 = 1;
 
-
 impl SchedulerActor {
+    #[expect(
+        dead_code,
+        reason = "scheduler lookup helper reserved for explicit placement by actor id"
+    )]
     async fn lookup_by_actor_id(
         &mut self,
         actor_id: &ActorId,
     ) -> Option<RemoteActorRef<AgentActor>> {
-        self.agent_actor_cache.data_cache.get(actor_id).map(|data| data.actor_ref.clone())
+        self.agent_actor_cache
+            .data_cache
+            .get(actor_id)
+            .map(|data| data.actor_ref.clone())
     }
 
-    async fn lookup_by_hostname(
-        &mut self,
-        hostname: &str,
-    ) -> Option<RemoteActorRef<AgentActor>> {
-        self.agent_actor_cache.data_cache.iter().find(|data| data.metadata.hostname == hostname).map(|data| data.actor_ref.clone())
+    #[expect(
+        dead_code,
+        reason = "scheduler lookup helper reserved for explicit placement by hostname"
+    )]
+    async fn lookup_by_hostname(&mut self, hostname: &str) -> Option<RemoteActorRef<AgentActor>> {
+        self.agent_actor_cache
+            .data_cache
+            .iter()
+            .find(|data| data.metadata.hostname == hostname)
+            .map(|data| data.actor_ref.clone())
     }
 
     /// current scheduling algo info:
@@ -54,27 +64,26 @@ impl SchedulerActor {
     /// additionally, because caleb is way too performance brained, he used integer math for the entire scoring algorithm just so we didnt have to convert to floats.
     async fn schedule_agent(
         &mut self,
-        msg: &CreateVM
+        _msg: &CreateVM,
     ) -> Result<RemoteActorRef<AgentActor>, Report> {
         let mut best_agent = None;
         let mut best_agent_score = 0u32;
 
         // todo: this arguably could be done as map-reduce. is that better?
         let span = info_span!("schedule_agent");
-            span.in_scope(|| {
+        span.in_scope(|| {
             for agent in self.agent_actor_cache.data_cache.iter() {
                 let mut agent_score = 0u32;
 
-                let agent_max_vcpus = agent.metadata.vcpus * VCPU_OVERPROVISIONMENT_NUMERATOR / VCPU_OVERPROVISIONMENT_DENOMINATOR;
-
-
+                let agent_max_vcpus = agent.metadata.vcpus * VCPU_OVERPROVISIONMENT_NUMERATOR
+                    / VCPU_OVERPROVISIONMENT_DENOMINATOR;
 
                 if agent.metadata.used_vcpus >= agent_max_vcpus {
                     continue;
                 }
 
-                agent_score += (agent_max_vcpus - agent.metadata.used_vcpus) * 1024 / agent_max_vcpus;
-
+                agent_score +=
+                    (agent_max_vcpus - agent.metadata.used_vcpus) * 1024 / agent_max_vcpus;
 
                 // todo: add ram overprovisionment.     not adding this to scheduler until it works on the hypervisor side.
                 let agent_max_ram = agent.metadata.ram;
@@ -83,12 +92,10 @@ impl SchedulerActor {
                     continue;
                 }
 
-                agent_score += ((agent_max_ram.as_u64() - agent.metadata.used_ram.as_u64()) * 1024 / agent_max_ram.as_u64()) as u32;
-
+                agent_score += ((agent_max_ram.as_u64() - agent.metadata.used_ram.as_u64()) * 1024
+                    / agent_max_ram.as_u64()) as u32;
 
                 // todo: https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/
-
-
 
                 // todo (future): possibly keep a percent of agents completely empty, to be able to be converted to dedis automatically.
                 // they would have their agent score set to 1, so they can be scheduled to if there is no other avaliable agents.
@@ -96,8 +103,6 @@ impl SchedulerActor {
                 // if agent.metadata.vms.len() == 0 && hash(agent.config.hostname) % total_chance < threshold {
                 //     agent_score = 1;
                 // }
-
-
 
                 info!(agent=?agent.value(), score=agent_score);
 
@@ -111,8 +116,6 @@ impl SchedulerActor {
         best_agent.ok_or_eyre("No valid agents found.")
     }
 }
-
-
 
 #[derive(Copy, Clone)]
 struct AgentActorCacheUpdater;
@@ -136,7 +139,11 @@ impl ActorCacheUpdater<AgentActor, CachedAgentActor> for AgentActorCacheUpdater 
         Ok(actor_ref_vec)
     }
 
-    async fn on_update(&self, actor_ref: &RemoteActorRef<AgentActor>, previous_value: Option<CachedAgentActor>) -> Result<CachedAgentActor, Report> {
+    async fn on_update(
+        &self,
+        actor_ref: &RemoteActorRef<AgentActor>,
+        previous_value: Option<CachedAgentActor>,
+    ) -> Result<CachedAgentActor, Report> {
         let output_actor_ref = match previous_value {
             Some(value) => value.actor_ref,
             _ => actor_ref.clone(),
@@ -144,11 +151,10 @@ impl ActorCacheUpdater<AgentActor, CachedAgentActor> for AgentActorCacheUpdater 
 
         Ok(CachedAgentActor {
             actor_ref: output_actor_ref,
-            metadata: actor_ref.ask(&GetAgentStatus).await?
+            metadata: actor_ref.ask(&GetAgentStatus).await?,
         })
     }
 }
-
 
 // todo: this code is really bad, and we should not have effectively two copies of ths same thing.
 #[derive(Copy, Clone)]
@@ -173,7 +179,11 @@ impl ActorCacheUpdater<VMActor, CachedVMActor> for VMActorCacheUpdater {
         Ok(actor_ref_vec)
     }
 
-    async fn on_update(&self, actor_ref: &RemoteActorRef<VMActor>, previous_value: Option<CachedVMActor>) -> Result<CachedVMActor, Report> {
+    async fn on_update(
+        &self,
+        actor_ref: &RemoteActorRef<VMActor>,
+        previous_value: Option<CachedVMActor>,
+    ) -> Result<CachedVMActor, Report> {
         let output_actor_ref = match previous_value {
             Some(value) => value.actor_ref,
             _ => actor_ref.clone(),
@@ -181,12 +191,10 @@ impl ActorCacheUpdater<VMActor, CachedVMActor> for VMActorCacheUpdater {
 
         Ok(CachedVMActor {
             actor_ref: output_actor_ref,
-            metadata: actor_ref.ask(&GetVMInfo {vmid: None}).await?
+            metadata: actor_ref.ask(&GetVMInfo { vmid: None }).await?,
         })
     }
 }
-
-
 
 impl Actor for SchedulerActor {
     type Args = ();
@@ -199,10 +207,9 @@ impl Actor for SchedulerActor {
 
         Ok(Self {
             agent_actor_cache: ActorCache::new(actor_ref.clone(), AgentActorCacheUpdater)?,
-            vm_actor_cache: ActorCache::new(actor_ref, VMActorCacheUpdater)?
+            vm_actor_cache: ActorCache::new(actor_ref, VMActorCacheUpdater)?,
         })
     }
-
 
     async fn on_link_died(
         &mut self,
@@ -225,24 +232,21 @@ impl Actor for SchedulerActor {
     }
 }
 
-
-
-
 impl Message<CreateVM> for SchedulerActor {
     type Reply = Result<CreateVMReply, Report>;
 
-    async fn handle(&mut self, msg: CreateVM, _ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
+    async fn handle(
+        &mut self,
+        msg: CreateVM,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
         loop {
             let target_agent = self.schedule_agent(&msg).await?;
 
             match target_agent.ask(&msg).await {
-                Ok(reply) => {
-                    return Ok(reply)
-                },
+                Ok(reply) => return Ok(reply),
                 Err(err) => {
-                    warn!(
-                        "CreateVM forwarding failed, trying again: {err}"
-                    );
+                    warn!("CreateVM forwarding failed, trying again: {err}");
                 }
             }
         }
@@ -307,8 +311,6 @@ impl Message<AgentListVMs> for SchedulerActor {
         Ok(AgentListVMsReply { vms })
     }
 }
-
-
 
 impl Message<Ping> for SchedulerActor {
     type Reply = Pong;
