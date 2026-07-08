@@ -3,7 +3,10 @@ use crate::messages::vm::{
     ShutdownVMReply,
 };
 use kameo::prelude::*;
-use stable_eyre::{Report, Result};
+use stable_eyre::{
+    Report, Result,
+    eyre::{WrapErr, eyre},
+};
 
 use super::scheduler_actor::SchedulerActor;
 
@@ -45,7 +48,11 @@ impl Message<CreateVM> for HTTPActor {
         msg: CreateVM,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        Ok(self.scheduler.ask(msg).await?)
+        self.scheduler
+            .ask(msg)
+            .await
+            .map_err(|err| eyre!(err.to_string()))
+            .wrap_err("failed to create VM via scheduler")
     }
 }
 
@@ -57,7 +64,11 @@ impl Message<DeleteVM> for HTTPActor {
         msg: DeleteVM,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        Ok(self.scheduler.ask(msg).await?)
+        self.scheduler
+            .ask(msg)
+            .await
+            .map_err(|err| eyre!(err.to_string()))
+            .wrap_err("failed to delete VM via scheduler")
     }
 }
 
@@ -69,7 +80,11 @@ impl Message<ShutdownVM> for HTTPActor {
         msg: ShutdownVM,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        Ok(self.scheduler.ask(msg).await?)
+        self.scheduler
+            .ask(msg)
+            .await
+            .map_err(|err| eyre!(err.to_string()))
+            .wrap_err("failed to shut down VM via scheduler")
     }
 }
 
@@ -81,6 +96,10 @@ impl Message<AgentListVMs> for HTTPActor {
         msg: AgentListVMs,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        Ok(self.scheduler.ask(msg).await?)
+        self.scheduler
+            .ask(msg)
+            .await
+            .map_err(|err| eyre!(err.to_string()))
+            .wrap_err("failed to list VMs via scheduler")
     }
 }
