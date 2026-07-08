@@ -58,7 +58,7 @@ aide = { version = "0.15", features = [
     "macros",
 ] }
 # aide needs an older version of schemars
-schemars = "0.9"
+schemars = "1.2"
 
 
 

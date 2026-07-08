@@ -2920,7 +2920,7 @@ dependencies = [
  "random-port",
  "reqwest",
  "rtnetlink 0.21.0",
- "schemars 0.9.0",
+ "schemars 1.2.1",
  "serde",
  "serde_json",
  "stable-eyre",
