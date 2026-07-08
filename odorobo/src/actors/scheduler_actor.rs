@@ -1,4 +1,3 @@
-use std::iter;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,7 +12,6 @@ use ulid::Ulid;
 use crate::actors::agent_actor::AgentActor;
 use crate::ch_driver::actor::VMActor;
 use crate::types::AffinityRequirement;
-use crate::types::AffinityRule;
 use crate::types::AffinityStrictness;
 use crate::types::AffinityType;
 use crate::types::MetadataTable;
@@ -27,7 +25,6 @@ use crate::utils::actor_names::AGENT;
 use crate::utils::actor_names::vm_actor_id;
 use stable_eyre::eyre::OptionExt;
 use stable_eyre::{Report, Result, eyre::eyre};
-use tracing::info_span;
 use tracing::{info, warn};
 use dashmap::DashMap;
 use tokio::task::JoinHandle;
@@ -436,6 +433,8 @@ impl SchedulerActor {
         // if agent.metadata.vms.len() == 0 && hash(agent.config.hostname) % total_chance < threshold {
         //     agent_score = 1;
         // }
+
+        info!(?score, agent_id=?(agent.key()), "scored agent");
 
         score
     }
