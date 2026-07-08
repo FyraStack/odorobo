@@ -1,5 +1,3 @@
-
-
 // idk if we ever agreed upon an OUI for fyra, but im reserving `FYR` for this
 // -cappy
 pub const FYRA_OUI: [u8; 3] = [0x46, 0x59, 0x52];
