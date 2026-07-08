@@ -1,0 +1,109 @@
+# This is based on the normal Fyra Rust workflow, but modified to add RVA23 support. See https://github.com/FyraLabs/actions for more info.
+
+name: Rust
+permissions:
+  contents: read
+on:
+  push:
+  workflow_call:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_TERM_VERBOSE: true
+
+jobs:
+  rustfmt:
+    if: (github.event_name != 'pull_request' && ! github.event.pull_request.head.repo.fork) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # v1.94.1
+        with:
+          toolchain: stable
+          components: rustfmt
+
+      - name: Run rustfmt
+        run: cargo fmt -- --check
+
+  test-x86:
+    if: (github.event_name != 'pull_request' && ! github.event.pull_request.head.repo.fork) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # v1.94.1
+        with:
+          toolchain: stable
+
+      - name: Fetch
+        run: cargo fetch --locked
+
+      - name: Build
+        run: cargo build --verbose --release
+
+      - name: Upload artifact - agent
+        uses: actions/upload-artifact@v7
+        with:
+          archive: false
+          name: odorobo-agent-x86
+          path: |
+            target/release/odorobo-agent
+
+      - name: Upload artifact - odoroboctl
+        uses: actions/upload-artifact@v7
+        with:
+          archive: false
+          name: odoroboctl-x86
+          path: |
+            target/release/odoroboctl
+
+      - name: Run tests
+        run: cargo test --verbose
+
+  test-riscv-rva23:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build image
+        run: podman build -t odorobo-builder:rva23 .
+
+      - name: Build binaries
+        run: podman run --rm -v ${{ github.workspace }}:/code -w /code odorobo-builder:rva23 cargo build --release --verbose
+
+      - name: Upload artifact - agent
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          archive: false
+          name: odorobo-agent-riscv_rva23
+          path: |
+            target/riscv64a23-unknown-linux-gnu/release/odorobo-agent
+
+      - name: Upload artifact - odoroboctl
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          archive: false
+          name: odoroboctl-riscv_rva23
+          path: |
+            target/riscv64a23-unknown-linux-gnu/release/odoroboctl
+
+      - name: Build tests
+        run: podman run --rm -v ${{ github.workspace }}:/code -w /code odorobo-builder:rva23 cargo test --verbose --no-run

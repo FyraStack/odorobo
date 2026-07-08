@@ -47,7 +47,9 @@ where
 }
 
 /// Serve the OpenAPI spec as JSON
-async fn serve_api(Extension(api): Extension<OpenApi>) -> Result<impl IntoApiResponse, OdoroboError> {
+async fn serve_api(
+    Extension(api): Extension<OpenApi>,
+) -> Result<impl IntoApiResponse, OdoroboError> {
     Ok(Json(api))
 }
 

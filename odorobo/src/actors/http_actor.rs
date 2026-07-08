@@ -1,8 +1,8 @@
-use kameo::prelude::*;
 use crate::messages::vm::{
-        AgentListVMs, AgentListVMsReply, CreateVM, CreateVMReply, DeleteVM, DeleteVMReply,
-        ShutdownVM, ShutdownVMReply,
-    };
+    AgentListVMs, AgentListVMsReply, CreateVM, CreateVMReply, DeleteVM, DeleteVMReply, ShutdownVM,
+    ShutdownVMReply,
+};
+use kameo::prelude::*;
 use stable_eyre::{Report, Result};
 
 use super::scheduler_actor::SchedulerActor;

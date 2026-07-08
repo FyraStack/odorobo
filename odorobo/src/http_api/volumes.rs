@@ -1,7 +1,8 @@
 //! Volume management API handlers.
 use crate::{
     actors::http_actor::HTTPActor,
-    types::{CreateVolumeRequest, VolumeId, VolumeInfo}, utils::OdoroboError,
+    types::{CreateVolumeRequest, VolumeId, VolumeInfo},
+    utils::OdoroboError,
 };
 use aide::axum::{
     ApiRouter, IntoApiResponse,
@@ -22,7 +23,9 @@ pub fn router() -> ApiRouter<ActorRef<HTTPActor>> {
 }
 
 /// Get detailed information about a specific volume
-async fn volume_info(Path(VolumeId(_volid)): Path<VolumeId>) -> Result<impl IntoApiResponse, OdoroboError> {
+async fn volume_info(
+    Path(VolumeId(_volid)): Path<VolumeId>,
+) -> Result<impl IntoApiResponse, OdoroboError> {
     // stub,
     Ok(Json(VolumeInfo::default()))
 }
