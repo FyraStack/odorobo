@@ -93,6 +93,10 @@ static VCPU_OVERPROVISIONMENT_NUMERATOR: u32 = 2;
 static VCPU_OVERPROVISIONMENT_DENOMINATOR: u32 = 1;
 
 impl SchedulerActor {
+    #[expect(
+        dead_code,
+        reason = "scheduler lookup helper reserved for explicit placement by actor id"
+    )]
     async fn lookup_agent_by_actor_id(
         &mut self,
         actor_id: &ActorId,
@@ -102,6 +106,10 @@ impl SchedulerActor {
             .map(|data| data.actor_ref.clone())
     }
 
+    #[expect(
+        dead_code,
+        reason = "scheduler lookup helper reserved for explicit placement by hostname"
+    )]
     async fn lookup_agent_by_hostname(
         &mut self,
         hostname: &str,
@@ -162,7 +170,7 @@ impl SchedulerActor {
                     vmid,
                     CachedVMActor {
                         actor_ref: Some(actor_ref.clone()),
-                        data: data,
+                        data,
                     },
                 );
 
@@ -231,7 +239,7 @@ impl SchedulerActor {
                         actor_ref.id(),
                         CachedAgentActor {
                             actor_ref: actor_ref.clone(),
-                            data: data,
+                            data,
                             extended_vm_set: AHashSet::new(),
                         },
                     );
@@ -433,8 +441,8 @@ fn evaluate_table_value(value_option: &Option<&String>, requirement: &AffinityRe
     };
 
     match requirement.operator {
-        Operator::In => return requirement.values.iter().any(|e| *e == *value),
-        Operator::NotIn => return !requirement.values.iter().any(|e| *e == *value),
+        Operator::In => requirement.values.contains(value),
+        Operator::NotIn => !requirement.values.contains(value),
         Operator::Lt | Operator::Gt => {
             if requirement.values.len() != 1 {
                 return false;
@@ -449,12 +457,12 @@ fn evaluate_table_value(value_option: &Option<&String>, requirement: &AffinityRe
             };
 
             if requirement.operator == Operator::Lt {
-                return value_number < requirement_value_number;
+                value_number < requirement_value_number
             } else {
-                return value_number > requirement_value_number;
+                value_number > requirement_value_number
             }
         }
-    };
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
