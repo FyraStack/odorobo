@@ -2040,9 +2040,9 @@ dependencies = [
 
 [[package]]
 name = "kameo"
-version = "0.20.0"
+version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1dfd134d7a2c6ec05ee696dcbf3f7a034bdb97ecc623e981014652dcd124d77"
+checksum = "e6eb1621a4848496e79d03fb7fb8b7578089a99edc596a7f3d6299f5f75fb22b"
 dependencies = [
  "const-fnv1a-hash",
  "const-str 1.1.0",
@@ -2052,7 +2052,6 @@ dependencies = [
  "futures",
  "kameo_macros",
  "libp2p",
- "libp2p-identity",
  "linkme",
  "rmp-serde",
  "serde",
@@ -2062,9 +2061,9 @@ dependencies = [
 
 [[package]]
 name = "kameo_macros"
-version = "0.20.0"
+version = "0.21.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "16c9002c9ecd16e1636f566c0bf62db48e70d86ed0d0a91b398955e883217a23"
+checksum = "f7566055976eb86ee8e8fbafa0fbdad985c5d7c3f4eed04fc11bb495f71e3856"
 dependencies = [
  "heck",
  "proc-macro2",
