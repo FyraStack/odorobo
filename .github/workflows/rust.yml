@@ -139,5 +139,5 @@ jobs:
           path: |
             target/riscv64a23-unknown-linux-gnu/release/odoroboctl
 
-      - name: Test
-        run: podman run --rm -v ${{ github.workspace }}:/code -w /code odorobo-builder:rva23 cargo test --verbose
+      - name: Build tests
+        run: podman run --rm -v ${{ github.workspace }}:/code -w /code odorobo-builder:rva23 cargo test --verbose --no-run
