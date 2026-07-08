@@ -5,6 +5,9 @@ members = ["odorobo", "odoroboctl"]
 [workspace.package]
 rust-version = "1.95.0"
 
+[patch.crates-io]
+libp2p-yamux = { path = "patches/libp2p-yamux" }
+
 [workspace.dependencies]
 stable-eyre = "0.2"
 clap = { version = "4", features = ["derive", "env"] }
