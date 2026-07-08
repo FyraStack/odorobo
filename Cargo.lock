@@ -177,9 +177,9 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
 name = "api-error"
-version = "0.1.3"
+version = "0.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8268700065d79df2f5cff1fa33b24caee27f4ca0c169151d15cb88ea30dc1e73"
+checksum = "59b63fbf0627e9b4548b2670333db15ed761250a7630b04a68b22198b4d788ba"
 dependencies = [
  "api-error-derive",
  "axum-core",
