@@ -115,25 +115,22 @@ pub async fn run_command(cli: Cli) -> Result<()> {
                 },
                 metadata: Some(ObjectMetadata {
                     labels: BTreeMap::new(),
-                    annotations: BTreeMap::from([
-                        (String::from("distribution"), String::from("different"))
-                    ]),
+                    annotations: BTreeMap::from([(
+                        String::from("distribution"),
+                        String::from("different"),
+                    )]),
                 }),
-                affinity: Some(vec![
-                    AffinityRule {
-                        strictness: AffinityStrictness::Required,
-                        affinity_type: AffinityType::VirtualMachine,
-                        inverse: false,
-                        requirements: vec![
-                            AffinityRequirement {
-                                key: String::from("distribution"),
-                                table: MetadataTable::Annotation,
-                                operator: Operator::NotIn,
-                                values: vec![String::from("different")]
-                            }
-                        ]
-                    }
-                ]),
+                affinity: Some(vec![AffinityRule {
+                    strictness: AffinityStrictness::Required,
+                    affinity_type: AffinityType::VirtualMachine,
+                    inverse: false,
+                    requirements: vec![AffinityRequirement {
+                        key: String::from("distribution"),
+                        table: MetadataTable::Annotation,
+                        operator: Operator::NotIn,
+                        values: vec![String::from("different")],
+                    }],
+                }]),
                 ..Default::default()
             };
 

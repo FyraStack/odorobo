@@ -30,7 +30,7 @@ pub struct VMActor {
     /// path to the Cloud Hypervisor socket, in /run/odorobo/vms/<VMID>/ch.sock
     pub vm_instance: VMInstance,
     pub migration_state: Option<MigrationState>,
-    pub manifest: Option<VirtualMachine>
+    pub manifest: Option<VirtualMachine>,
 }
 
 impl Actor for VMActor {
@@ -40,9 +40,12 @@ impl Actor for VMActor {
 
     #[tracing::instrument(skip_all)]
     async fn on_start((vmid, vm_manifest): Self::Args, actor_ref: ActorRef<Self>) -> Result<Self> {
-        let mut vminstance =
-            VMInstance::spawn(&vmid.to_string(), vm_manifest.clone().map(VmConfig::from), None)
-                .await?;
+        let mut vminstance = VMInstance::spawn(
+            &vmid.to_string(),
+            vm_manifest.clone().map(VmConfig::from),
+            None,
+        )
+        .await?;
 
         // Take the child process out so we can watch for unexpected death.
         // destroy() handles a missing child_process gracefully.
@@ -74,7 +77,7 @@ impl Actor for VMActor {
             vmid,
             vm_instance: vminstance,
             migration_state: None,
-            manifest: vm_manifest
+            manifest: vm_manifest,
         })
     }
 
@@ -166,7 +169,6 @@ impl Message<GetVMInfo> for VMActor {
         }
     }
 }
-
 
 #[remote_message]
 impl Message<MigrateVMReceive> for VMActor {
