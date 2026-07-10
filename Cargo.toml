@@ -24,7 +24,8 @@ bytesize = { version = "2.3", features = ["serde"] }
 
 # our crates
 odorobo = { path = "odorobo" }
-
+# fyra-proc-macros = { git = "https://github.com/FyraLabs/fyra-proc-macros" }
+fyra-proc-macros = { path = "../fyra-proc-macros/" }
 
 
 # these are for performance optimizations, based on https://nnethercote.github.io/perf-book/build-configuration.html#optimization-level
