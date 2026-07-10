@@ -7,4 +7,6 @@ permissions:
 jobs:
   mirror:
     uses: FyraLabs/actions/.github/workflows/mirror.yml@main
-    secrets: inherit
+    secrets:
+      GIT_USERNAME: ${{ secrets.GIT_USERNAME }}
+      GIT_PASSWORD: ${{ secrets.GIT_PASSWORD }}
