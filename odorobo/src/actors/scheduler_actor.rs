@@ -94,7 +94,6 @@ pub struct SchedulerActor {
 static VCPU_OVERPROVISIONMENT_NUMERATOR: u32 = 2;
 static VCPU_OVERPROVISIONMENT_DENOMINATOR: u32 = 1;
 
-
 impl SchedulerActor {
     async fn lookup_agent_by_actor_id(
         &mut self,
@@ -319,7 +318,7 @@ impl SchedulerActor {
     ///    - there are a few solutions for this but they all kinda suck, mostly due to also making sure we deal with latency properly. I am ignoring the issue for now.
     fn schedule_agent(
         &mut self,
-        msg: &CreateVM
+        _msg: &CreateVM,
     ) -> Result<RemoteActorRef<AgentActor>, Report> {
         // todo: this could likely be better idiomatic rust.
         //  I suspect there is a map-reduce operation that does the exact scoring thing I am trying to do.
@@ -533,7 +532,6 @@ impl Actor for SchedulerActor {
         Ok(scheduler_actor)
     }
 
-
     async fn on_link_died(
         &mut self,
         actor_ref: WeakActorRef<Self>,
@@ -583,9 +581,6 @@ impl Actor for SchedulerActor {
         Ok(ControlFlow::Continue(()))
     }
 }
-
-
-
 
 impl Message<CreateVM> for SchedulerActor {
     type Reply = Result<CreateVMReply, Report>;
@@ -688,8 +683,6 @@ impl Message<AgentListVMs> for SchedulerActor {
         Ok(AgentListVMsReply { vms })
     }
 }
-
-
 
 impl Message<Ping> for SchedulerActor {
     type Reply = Pong;

@@ -71,7 +71,6 @@ pub struct CreateVMRequest {
     pub boot: bool,
 }
 
-
 /// An internal, debug-only request for creating a VM.
 ///
 /// please don't use this in production, this is for debugging
@@ -171,7 +170,6 @@ pub struct VirtualMachine {
     pub affinity: Option<Vec<AffinityRule>>
 }
 
-
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
 pub struct AffinityRule {
     pub strictness: AffinityStrictness,
@@ -180,35 +178,41 @@ pub struct AffinityRule {
     #[serde(default)]
     pub inverse: bool,
     /// ORed together
-    pub requirements: Vec<AffinityRequirement>
+    pub requirements: Vec<AffinityRequirement>,
 }
 
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Clone, Copy)]
 pub enum AffinityStrictness {
     Required,
-    Preferred { weight: i64 }
+    Preferred { weight: i64 },
 }
 
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
 pub enum AffinityType {
     VirtualMachine,
-    Agent
+    Agent,
 }
 
 /// if there are several metadata tables, their results will be ANDed together
 /// EX: if a requirement is checked against several VMs, it must pass all VMs for the requirement to be fulfilled.
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
+pub enum AffinityDirection {
+    Normal,
+    Anti,
+}
+
+#[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
 pub struct AffinityRequirement {
     pub key: String,
     pub table: MetadataTable,
     pub operator: Operator,
-    pub values: Vec<String>
+    pub values: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
 pub enum MetadataTable {
     Label,
-    Annotation
+    Annotation,
 }
 
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Clone, PartialEq)]

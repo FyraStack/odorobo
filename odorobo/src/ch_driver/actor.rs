@@ -1,10 +1,12 @@
-use crate::{ch_driver::VMInstance, types::VirtualMachine};
-use cloud_hypervisor_client::models::{CpusConfig, DiskConfig, ImageType, MemoryConfig, PayloadConfig, PlatformConfig, VmConfig};
-use kameo::prelude::*;
 use crate::messages::vm::{
     DeleteVM, GetVMInfo, GetVMInfoReply, MigrateVMReceive, MigrateVMReceiveReply, PrepMigration,
     ShutdownVM,
 };
+use crate::{ch_driver::VMInstance, types::VirtualMachine};
+use cloud_hypervisor_client::models::{
+    CpusConfig, DiskConfig, ImageType, MemoryConfig, PayloadConfig, PlatformConfig, VmConfig,
+};
+use kameo::prelude::*;
 use serde::{Deserialize, Serialize};
 use stable_eyre::{Report, Result};
 use tokio::task::JoinHandle;
@@ -37,8 +39,9 @@ impl Actor for VMActor {
     type Error = Report;
 
     #[tracing::instrument(skip_all)]
-    async fn on_start((vmid, vm_manifest): Self::Args, actor_ref: ActorRef<Self>) -> Result<Self> {
-        let mut vminstance = VMInstance::spawn(&vmid.to_string(), vm_manifest.clone().map(VmConfig::from), None).await?;
+    async fn on_start((vmid, vm_config): Self::Args, actor_ref: ActorRef<Self>) -> Result<Self> {
+        let mut vminstance =
+            VMInstance::spawn(&vmid.to_string(), vm_config.map(VmConfig::from), None).await?;
 
         // Take the child process out so we can watch for unexpected death.
         // destroy() handles a missing child_process gracefully.
@@ -50,7 +53,7 @@ impl Actor for VMActor {
                     Ok(status) => {
                         if !status.success() {
                             error!(%vmid, ?status, "child process exited unexpectedly, killing actor");
-                            let _ = actor_ref.kill();
+                            actor_ref.kill();
                         } else {
                             warn!(%vmid, "child process exited outside of actor teardown");
                             let _ = actor_ref.stop_gracefully().await;
@@ -119,13 +122,12 @@ impl From<VirtualMachine> for VmConfig {
                 firmware: Some("/var/lib/odorobo/CLOUDHV.fd".to_string()),
                 ..Default::default()
             },
-            disks: Some(vec![
-                DiskConfig { // todo: get cappy to make this auto generate this via the manifest's volumes atribute.
-                    path: Some(vm.data.image),
-                    image_type: Some(ImageType::Raw),
-                    ..Default::default()
-                }
-            ]),
+            disks: Some(vec![DiskConfig {
+                // todo: get cappy to make this auto generate this via the manifest's volumes atribute.
+                path: Some(vm.data.image),
+                image_type: Some(ImageType::Raw),
+                ..Default::default()
+            }]),
             // todo: generate from VM network field
             // net: Some(vec![
             //     NetConfig {

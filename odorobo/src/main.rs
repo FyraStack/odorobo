@@ -1,11 +1,11 @@
 pub mod actors;
-pub mod http_api;
-pub mod networking;
 mod ch_driver;
-mod utils;
-pub mod messages;
 pub mod config;
+pub mod http_api;
+pub mod messages;
+pub mod networking;
 pub mod types;
+mod utils;
 
 use std::fs;
 
@@ -13,12 +13,12 @@ use clap::Parser;
 use kameo::actor::Spawn;
 use stable_eyre::Result;
 
+use crate::actors::agent_actor::AgentActor;
 use crate::actors::http_actor::HTTPActor;
 use crate::actors::scheduler_actor::SchedulerActor;
 use crate::config::Config;
 use crate::utils::actor_names::{HTTP_API_SERVER, SCHEDULER};
 use crate::utils::{actor_names::AGENT, connect_to_swarm, init};
-use crate::actors::agent_actor::AgentActor;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -34,10 +34,8 @@ async fn main() -> Result<()> {
 
     tracing::info!(?config, "Starting odorobo");
 
-
     let local_peer_id = connect_to_swarm().unwrap();
     tracing::info!(?local_peer_id, "Peer ID");
-
 
     // start agents
     let agent_actor = AgentActor::spawn(config.clone());
@@ -53,7 +51,6 @@ async fn main() -> Result<()> {
         scheduler_actor.wait_for_shutdown().await;
         http_actor.wait_for_shutdown().await;
     }
-
 
     agent_actor.wait_for_shutdown().await;
 

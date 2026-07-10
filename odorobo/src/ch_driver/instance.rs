@@ -93,7 +93,6 @@ impl VMInstance {
         }
     }
 
-
     /// Takes the child process out of this instance, transferring ownership to the caller.
     /// Useful for watching the process lifecycle externally (e.g. in an actor watcher task).
     /// After calling this, `destroy()` will skip the child-kill step.
@@ -106,7 +105,13 @@ impl VMInstance {
     /// Not reliable as of 0.2
     #[deprecated(since = "0.2.0")]
     pub fn get(vmid: &str) -> Option<Self> {
-        Self::list().ok()?.into_iter().find(|i| i.id == vmid)
+        #[expect(
+            deprecated,
+            reason = "deprecated filesystem getter is implemented in terms of the deprecated filesystem listing"
+        )]
+        let instances = Self::list().ok()?;
+
+        instances.into_iter().find(|i| i.id == vmid)
     }
 
     pub async fn boot(&self) -> Result<()> {

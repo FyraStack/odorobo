@@ -7,6 +7,12 @@ use stable_eyre::Result;
 use odorobo::types::{AffinityRequirement, AffinityRule, AffinityStrictness, AffinityType, CreateVMRequest, MetadataTable, ObjectMetadata, Operator, VMData, VirtualMachine};
 use ulid::Ulid;
 use bytesize::ByteSize;
+use clap::{Parser, Subcommand};
+use odorobo::types::{CreateVMRequest, VMData, VirtualMachine};
+use reqwest::{Client, Response};
+use serde::Deserialize;
+use stable_eyre::Result;
+use ulid::Ulid;
 
 #[derive(Parser)]
 #[command(
@@ -98,7 +104,8 @@ pub async fn run_command(cli: Cli) -> Result<()> {
     let base_url = cli.manager_addr;
 
     match cli.command {
-        Command::Create => { // TODO: setup actual cli args for these parameters. or just take in arbitrary json and serialize it into a VirtualMachine.
+        Command::Create => {
+            // TODO: setup actual cli args for these parameters. or just take in arbitrary json and serialize it into a VirtualMachine.
             let vm = VirtualMachine {
                 data: VMData {
                     id: Ulid::new(),
@@ -133,10 +140,7 @@ pub async fn run_command(cli: Cli) -> Result<()> {
                 ..Default::default()
             };
 
-            let request = CreateVMRequest {
-                vm,
-                boot: true
-            };
+            let request = CreateVMRequest { vm, boot: true };
 
             let url = format!("{}/vms", base_url);
             let response = client.post(&url).json(&request).send().await?;

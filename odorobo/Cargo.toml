@@ -32,14 +32,12 @@ libc = "0.2"
 random-port = "0.1"
 if-addrs = "0.15"
 libp2p = { version = "0.56", features = ["yamux", "serde", "mdns"] }
-sysinfo = "0.38"
-rtnetlink = "0.21"
-nftables = { version = "0.6", features = ["tokio"] }
+sysinfo = "0.38.1"
 rand = "0.10"
 axum = { version = "0.8", features = ["ws"] }
 axum-extra = "0.12"
-tower-http = { version = "0.6", features = ["trace"] }
-kameo = { version = "0.20", features = ["remote"] }
+tower-http = { version = "0.7", features = ["trace"] }
+kameo = { version = "0.22", features = ["remote"] }
 ahash = { version = "0.8", features = ["serde"] }
 dirs = "6"
 ipnet = {version = "2.12", features = ["serde", "schemars08"]}
@@ -50,7 +48,7 @@ api-error = { version = "0.1.3", features = ["axum"] }
 http = "1"
 tower = "0.5"
 
-aide = { version = "0.15", features = [
+aide = { version = "0.16.0-alpha.4", features = [
     "axum",
     "axum-json",
     "axum-extra",
@@ -59,9 +57,12 @@ aide = { version = "0.15", features = [
     "swagger",
     "macros",
 ] }
-# aide needs an older version of schemars
-schemars = "0.9"
+schemars = "1.2"
 
 
 
 cloud-hypervisor-client = { git = "https://github.com/FyraStack/cloud-hypervisor-client.git" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rtnetlink = "0.21"
+nftables = { version = "0.6", features = ["tokio"] }
