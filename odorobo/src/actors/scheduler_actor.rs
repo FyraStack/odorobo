@@ -301,7 +301,7 @@ impl SchedulerActor {
     ///  - the cache likely needs to be updated automatically when a new vm is scheduled for info like used resources, because otherwise we have to deal with latency on that data we are using
     ///    and then if someone tries to schedule lets say 10 VMs in a batch, we could end up scheduling them all to the same agent because the metadata hasn't updated.
     ///    - there are a few solutions for this but they all kinda suck, mostly due to also making sure we deal with latency properly. I am ignoring the issue for now.
-    fn schedule_agent(&mut self, _msg: &CreateVM) -> Result<RemoteActorRef<AgentActor>, Report> {
+    fn schedule_agent(&mut self, msg: &CreateVM) -> Result<RemoteActorRef<AgentActor>, Report> {
         // todo: this could likely be better idiomatic rust.
         //  I suspect there is a map-reduce operation that does the exact scoring thing I am trying to do.
         //  I also assume there is a better function for the and_then

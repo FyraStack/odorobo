@@ -2,19 +2,13 @@ use std::collections::BTreeMap;
 
 use bytesize::ByteSize;
 use clap::{Parser, Subcommand};
-use clap::{Parser, Subcommand};
 use odorobo::types::{
     AffinityRequirement, AffinityRule, AffinityStrictness, AffinityType, CreateVMRequest,
     MetadataTable, ObjectMetadata, Operator, VMData, VirtualMachine,
 };
-use odorobo::types::{CreateVMRequest, VMData, VirtualMachine};
-use reqwest::{Client, Response};
 use reqwest::{Client, Response};
 use serde::Deserialize;
-use serde::Deserialize;
 use stable_eyre::Result;
-use stable_eyre::Result;
-use ulid::Ulid;
 use ulid::Ulid;
 
 #[derive(Parser)]
