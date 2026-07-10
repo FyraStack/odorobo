@@ -1,34 +1,33 @@
+use std::cmp::Ordering;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::time::Duration;
-use std::cmp::Ordering;
 
-use ahash::AHashSet;
-use dashmap::mapref::multiple::RefMulti;
-use kameo::prelude::*;
-use libp2p::futures::TryStreamExt;
-use tracing::trace;
-use ulid::Ulid;
 use crate::actors::agent_actor::AgentActor;
 use crate::ch_driver::actor::VMActor;
+use crate::messages::agent::*;
+use crate::messages::vm::*;
+use crate::messages::{Ping, Pong};
 use crate::types::AffinityRequirement;
 use crate::types::AffinityStrictness;
 use crate::types::AffinityType;
 use crate::types::MetadataTable;
 use crate::types::ObjectMetadata;
 use crate::types::Operator;
-use crate::utils::actor_names::VM;
-use crate::messages::vm::*;
-use crate::messages::agent::*;
-use crate::messages::{Ping, Pong};
 use crate::utils::actor_names::AGENT;
+use crate::utils::actor_names::VM;
 use crate::utils::actor_names::vm_actor_id;
+use ahash::AHashSet;
+use dashmap::DashMap;
+use dashmap::mapref::multiple::RefMulti;
+use kameo::prelude::*;
+use libp2p::futures::TryStreamExt;
 use stable_eyre::eyre::OptionExt;
 use stable_eyre::{Report, Result, eyre::eyre};
-use tracing::{info, warn};
-use dashmap::DashMap;
 use tokio::task::JoinHandle;
-
+use tracing::trace;
+use tracing::{info, warn};
+use ulid::Ulid;
 
 #[derive(Debug, Clone)]
 pub struct CachedAgentActor {
@@ -44,7 +43,6 @@ pub struct CachedVMActor {
     pub actor_ref: Option<RemoteActorRef<VMActor>>,
     pub data: GetVMInfoReply,
 }
-
 
 // todo: i dont like the way this cache is setup. I think we may need to change it later, but it is hard to figure out what the optimal solution is without doing it at least once.
 //  especially when we haven't fully made decisions about some other things.
@@ -99,23 +97,27 @@ impl SchedulerActor {
         &mut self,
         actor_id: &ActorId,
     ) -> Option<RemoteActorRef<AgentActor>> {
-        self.agent_data_cache.get(actor_id).map(|data| data.actor_ref.clone())
+        self.agent_data_cache
+            .get(actor_id)
+            .map(|data| data.actor_ref.clone())
     }
 
     async fn lookup_agent_by_hostname(
         &mut self,
         hostname: &str,
     ) -> Option<RemoteActorRef<AgentActor>> {
-        self.agent_data_cache.iter().find(|data| data.data.hostname == hostname).map(|data| data.actor_ref.clone())
+        self.agent_data_cache
+            .iter()
+            .find(|data| data.data.hostname == hostname)
+            .map(|data| data.actor_ref.clone())
     }
-
 
     // someone should likely give caleb a firm talking to about code duplication due to this section, but things are just different enough that trying to make them one function requires usage of a lot of generics which feels even worse. so i dont know what to do. cappy please fix. i hate this.
     async fn vm_actor_finder(
         parent_actor_ref: RemoteActorRef<SchedulerActor>,
         vm_actorid_ulid_map: Arc<DashMap<ActorId, Ulid>>,
         data_cache: Arc<DashMap<Ulid, CachedVMActor>>,
-        keepalive_tasks: Arc<DashMap<ActorId, JoinHandle<()>>>
+        keepalive_tasks: Arc<DashMap<ActorId, JoinHandle<()>>>,
     ) -> Result<(), Report> {
         trace!("running vm_actor_finder");
 
@@ -132,22 +134,15 @@ impl SchedulerActor {
                 let vm_actorid_ulid_map_clone = Arc::clone(&vm_actorid_ulid_map);
                 let data_cache_clone = Arc::clone(&data_cache);
                 let updater_task = tokio::spawn(async move {
-                    Self::vm_updater_task(
-                        vm_actor,
-                        vm_actorid_ulid_map_clone,
-                        data_cache_clone
-                    ).await;
+                    Self::vm_updater_task(vm_actor, vm_actorid_ulid_map_clone, data_cache_clone)
+                        .await;
                 });
 
-                keepalive_tasks.insert(
-                    vm_actor_id,
-                    updater_task
-                );
+                keepalive_tasks.insert(vm_actor_id, updater_task);
             }
         }
 
         Ok(())
-
     }
 
     async fn vm_updater_task(
@@ -158,7 +153,7 @@ impl SchedulerActor {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         let mut fails = 0;
         loop {
-            if let Ok(data) = actor_ref.ask(&GetVMInfo {vmid: None}).await {
+            if let Ok(data) = actor_ref.ask(&GetVMInfo { vmid: None }).await {
                 let vmid = data.vmid;
 
                 vm_actorid_ulid_map.insert(actor_ref.id(), vmid); // should we be doing this on every loop? idk. but we at least need to do it on the first iteration given we don't know the mapping before that
@@ -167,8 +162,8 @@ impl SchedulerActor {
                     vmid,
                     CachedVMActor {
                         actor_ref: Some(actor_ref.clone()),
-                        data: data
-                    }
+                        data: data,
+                    },
                 );
 
                 fails = 0;
@@ -204,16 +199,10 @@ impl SchedulerActor {
 
                 let data_cache_clone = Arc::clone(&data_cache);
                 let updater_task = tokio::spawn(async move {
-                    Self::agent_updater_task(
-                        agent_actor,
-                        data_cache_clone
-                    ).await;
+                    Self::agent_updater_task(agent_actor, data_cache_clone).await;
                 });
 
-                keepalive_tasks.insert(
-                    agent_actor_id,
-                    updater_task
-                );
+                keepalive_tasks.insert(agent_actor_id, updater_task);
             }
         }
 
@@ -227,26 +216,24 @@ impl SchedulerActor {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         let mut fails = 0;
         loop {
-            if let Ok(data) = actor_ref.ask(&GetAgentStatus).await { // todo: replace with kameo stream
+            if let Ok(data) = actor_ref.ask(&GetAgentStatus).await {
+                // todo: replace with kameo stream
                 if data_cache.contains_key(&actor_ref.id()) {
-                    data_cache.alter(
-                        &actor_ref.id(),
-                        |_, mut v| {
-                            v.data = data;
+                    data_cache.alter(&actor_ref.id(), |_, mut v| {
+                        v.data = data;
 
-                            v.extended_vm_set.extend(v.data.vms.iter());
+                        v.extended_vm_set.extend(v.data.vms.iter());
 
-                            v
-                        }
-                    );
+                        v
+                    });
                 } else {
                     data_cache.insert(
                         actor_ref.id(),
                         CachedAgentActor {
                             actor_ref: actor_ref.clone(),
                             data: data,
-                            extended_vm_set: AHashSet::new()
-                        }
+                            extended_vm_set: AHashSet::new(),
+                        },
                     );
                 }
 
@@ -272,30 +259,28 @@ impl SchedulerActor {
         let vm_data_cache_arc_clone = Arc::clone(&self.vm_data_cache);
         let vm_keepalive_tasks_arc_clone = Arc::clone(&self.vm_keepalive_tasks);
 
-        self.cache_actor_finder = Some(
-            tokio::spawn(async move {
-                let mut interval = tokio::time::interval(Duration::from_secs(1));
-                loop {
-                    let vm_join_handle = Self::vm_actor_finder(
-                        actor_ref.clone(),
-                        Arc::clone(&vm_actorid_ulid_map_arc_clone),
-                        Arc::clone(&vm_data_cache_arc_clone),
-                        Arc::clone(&vm_keepalive_tasks_arc_clone),
-                    );
+        self.cache_actor_finder = Some(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                let vm_join_handle = Self::vm_actor_finder(
+                    actor_ref.clone(),
+                    Arc::clone(&vm_actorid_ulid_map_arc_clone),
+                    Arc::clone(&vm_data_cache_arc_clone),
+                    Arc::clone(&vm_keepalive_tasks_arc_clone),
+                );
 
-                    let agent_join_handle = Self::agent_actor_finder(
-                        actor_ref.clone(),
-                        Arc::clone(&agent_data_cache_arc_clone),
-                        Arc::clone(&agent_keepalive_tasks_arc_clone),
-                    );
+                let agent_join_handle = Self::agent_actor_finder(
+                    actor_ref.clone(),
+                    Arc::clone(&agent_data_cache_arc_clone),
+                    Arc::clone(&agent_keepalive_tasks_arc_clone),
+                );
 
-                    // intentionally ignoring results because we want to keep finding actors even if an attempt fails
-                    let _ = tokio::join!(vm_join_handle, agent_join_handle);
+                // intentionally ignoring results because we want to keep finding actors even if an attempt fails
+                let _ = tokio::join!(vm_join_handle, agent_join_handle);
 
-                    interval.tick().await;
-                }
-            })
-        );
+                interval.tick().await;
+            }
+        }));
     }
 
     /// Determine the best agent to schedule a specific VM creation request to.
@@ -316,17 +301,22 @@ impl SchedulerActor {
     ///  - the cache likely needs to be updated automatically when a new vm is scheduled for info like used resources, because otherwise we have to deal with latency on that data we are using
     ///    and then if someone tries to schedule lets say 10 VMs in a batch, we could end up scheduling them all to the same agent because the metadata hasn't updated.
     ///    - there are a few solutions for this but they all kinda suck, mostly due to also making sure we deal with latency properly. I am ignoring the issue for now.
-    fn schedule_agent(
-        &mut self,
-        _msg: &CreateVM,
-    ) -> Result<RemoteActorRef<AgentActor>, Report> {
+    fn schedule_agent(&mut self, _msg: &CreateVM) -> Result<RemoteActorRef<AgentActor>, Report> {
         // todo: this could likely be better idiomatic rust.
         //  I suspect there is a map-reduce operation that does the exact scoring thing I am trying to do.
         //  I also assume there is a better function for the and_then
-        let best_agent = self.agent_data_cache.iter()
+        let best_agent = self
+            .agent_data_cache
+            .iter()
             .map(|agent| (agent.actor_ref.clone(), self.score_agent(msg, &agent)))
             .reduce(|best, new| if new.1 > best.1 { new } else { best })
-            .and_then(|best| if best.1 == AgentScore::REJECTED { None } else { Some(best.0) });
+            .and_then(|best| {
+                if best.1 == AgentScore::REJECTED {
+                    None
+                } else {
+                    Some(best.0)
+                }
+            });
 
         best_agent.ok_or_eyre("No valid agents found.")
     }
@@ -337,11 +327,12 @@ impl SchedulerActor {
     fn score_agent(
         &self,
         msg: &CreateVM,
-        agent: &RefMulti<'_, ActorId, CachedAgentActor>
+        agent: &RefMulti<'_, ActorId, CachedAgentActor>,
     ) -> AgentScore {
         let mut score = AgentScore::default();
 
-        let agent_max_vcpus = agent.data.vcpus * VCPU_OVERPROVISIONMENT_NUMERATOR / VCPU_OVERPROVISIONMENT_DENOMINATOR;
+        let agent_max_vcpus = agent.data.vcpus * VCPU_OVERPROVISIONMENT_NUMERATOR
+            / VCPU_OVERPROVISIONMENT_DENOMINATOR;
         // todo: do we care about VMData.max_vcpus?
         let agent_used_vcpus = agent.data.used_vcpus + msg.config.data.vcpus;
 
@@ -351,7 +342,6 @@ impl SchedulerActor {
 
         score.general += (agent_max_vcpus - agent_used_vcpus) as f32 / agent_max_vcpus as f32;
 
-
         // todo: add ram overprovisionment.     not adding this to scheduler until it works on the hypervisor side.
         let agent_max_ram = agent.data.ram;
         let agent_used_ram = agent.data.used_ram + msg.config.data.memory;
@@ -360,8 +350,8 @@ impl SchedulerActor {
             return AgentScore::REJECTED;
         }
 
-        score.general += (agent_max_ram.as_u64() - agent.data.used_ram.as_u64()) as f32 / agent_max_ram.as_u64() as f32;
-
+        score.general += (agent_max_ram.as_u64() - agent.data.used_ram.as_u64()) as f32
+            / agent_max_ram.as_u64() as f32;
 
         // roughly based on: https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/
         if let Some(affinity_rules) = &msg.config.affinity {
@@ -383,7 +373,7 @@ impl SchedulerActor {
                                 metadata_tables.push(metadata.clone());
                             }
                         }
-                    },
+                    }
                     AffinityType::Agent => metadata_tables.push(agent.data.metadata.clone()),
                 };
 
@@ -408,7 +398,7 @@ impl SchedulerActor {
 
                     if requirement_outcome {
                         follows_rule = true;
-                        break
+                        break;
                     }
                 }
 
@@ -416,15 +406,13 @@ impl SchedulerActor {
 
                 match (rule.strictness, follows_rule) {
                     (AffinityStrictness::Required, false) => return AgentScore::REJECTED,
-                    (AffinityStrictness::Required, true) => {}, // specifically do nothing
+                    (AffinityStrictness::Required, true) => {} // specifically do nothing
                     (AffinityStrictness::Preferred { weight }, follows_rule) => {
                         score.affinity += follows_rule as i64 * weight;
-                    },
+                    }
                 }
             }
         }
-
-
 
         // todo (future): possibly keep a percent of agents completely empty, to be able to be converted to dedis automatically.
         // they would have their agent score set to like f32::MIN, so they can be scheduled to if there is no other available agents.
@@ -439,10 +427,7 @@ impl SchedulerActor {
     }
 }
 
-fn evaluate_table_value(
-    value_option: &Option<&String>,
-    requirement: &AffinityRequirement
-) -> bool {
+fn evaluate_table_value(value_option: &Option<&String>, requirement: &AffinityRequirement) -> bool {
     let Some(value) = *value_option else {
         return false;
     };
@@ -468,20 +453,20 @@ fn evaluate_table_value(
             } else {
                 return value_number > requirement_value_number;
             }
-        },
+        }
     };
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct AgentScore {
     general: f32,
-    affinity: i64
+    affinity: i64,
 }
 
 impl AgentScore {
     pub const REJECTED: Self = Self {
         general: f32::NEG_INFINITY,
-        affinity: i64::MIN
+        affinity: i64::MIN,
     };
 }
 
@@ -489,7 +474,7 @@ impl Default for AgentScore {
     fn default() -> Self {
         Self {
             general: 0.0,
-            affinity: 0
+            affinity: 0,
         }
     }
 }
@@ -505,9 +490,6 @@ impl PartialOrd for AgentScore {
         self.general.partial_cmp(&other.general)
     }
 }
-
-
-
 
 impl Actor for SchedulerActor {
     type Args = ();
@@ -545,14 +527,12 @@ impl Actor for SchedulerActor {
             return Ok(ControlFlow::Break(ActorStopReason::Killed));
         };
 
-
         if let Some((_, keepalive_task)) = self.agent_keepalive_tasks.remove(&actor_id) {
             trace!(?actor_id, "Aborting agent keepalive task");
             keepalive_task.abort();
         };
 
         self.agent_data_cache.remove(&actor_id);
-
 
         if let Some((_, keepalive_task)) = self.vm_keepalive_tasks.remove(&actor_id) {
             trace!(?actor_id, "Aborting vm keepalive task");
@@ -574,9 +554,7 @@ impl Actor for SchedulerActor {
             self.vm_data_cache.remove(&vmid);
         }
 
-
         // todo: attempt vm restarts if necessary.
-
 
         Ok(ControlFlow::Continue(()))
     }
@@ -585,14 +563,18 @@ impl Actor for SchedulerActor {
 impl Message<CreateVM> for SchedulerActor {
     type Reply = Result<CreateVMReply, Report>;
 
-    async fn handle(&mut self, msg: CreateVM, _ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
+    async fn handle(
+        &mut self,
+        msg: CreateVM,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
         let target_agent = self.schedule_agent(&msg)?;
 
         // we add to cache first, because we want to make sure future requests assume this vm exists. if the message fails, we clean it up afterward.
         if let Some(mut cached_data) = self.agent_data_cache.get_mut(&target_agent.id()) {
             cached_data.extended_vm_set.insert(msg.vmid);
         } else {
-            return Err(eyre!("target agent is not in data cache"))
+            return Err(eyre!("target agent is not in data cache"));
         }
 
         self.vm_data_cache.insert(
@@ -601,25 +583,22 @@ impl Message<CreateVM> for SchedulerActor {
                 actor_ref: None,
                 data: GetVMInfoReply {
                     vmid: msg.vmid,
-                    config: Some(msg.config.clone())
-                }
-            });
-
-
+                    config: Some(msg.config.clone()),
+                },
+            },
+        );
 
         let reply = target_agent.ask(&msg).await;
 
-
         // remove from caches if we fail to schedule
         if reply.is_err() {
-            self.agent_data_cache.alter(&target_agent.id(), |_,mut v| {
+            self.agent_data_cache.alter(&target_agent.id(), |_, mut v| {
                 v.extended_vm_set.remove(&msg.vmid);
 
                 v
             });
             self.vm_data_cache.remove(&msg.vmid);
         }
-
 
         Ok(reply?)
     }
@@ -635,7 +614,8 @@ impl Message<DeleteVM> for SchedulerActor {
     ) -> Self::Reply {
         let vm = RemoteActorRef::<VMActor>::lookup(vm_actor_id(msg.vmid)).await?;
         tracing::trace!(?vm, "DeleteVM");
-        if let Some(vm) = vm { // don't update cache, because we rely on link dying and updater task to remove from cache once the VM is fully down.
+        if let Some(vm) = vm {
+            // don't update cache, because we rely on link dying and updater task to remove from cache once the VM is fully down.
             vm.tell(&msg).send()?;
             Ok(DeleteVMReply)
         } else {
@@ -654,7 +634,8 @@ impl Message<ShutdownVM> for SchedulerActor {
     ) -> Self::Reply {
         let vm = RemoteActorRef::<VMActor>::lookup(vm_actor_id(msg.vmid)).await?;
         tracing::trace!(?vm, "ShutdownVM");
-        if let Some(vm) = vm { // don't update cache, because we rely on link dying and updater task to remove from cache once the VM is fully down.
+        if let Some(vm) = vm {
+            // don't update cache, because we rely on link dying and updater task to remove from cache once the VM is fully down.
             vm.tell(&msg).send()?;
             Ok(ShutdownVMReply)
         } else {

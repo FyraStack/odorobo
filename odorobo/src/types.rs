@@ -167,7 +167,7 @@ pub struct VirtualMachine {
 
     /// List of Affinity rules for scheduling.
     /// Affinity rules are ANDed or summed based on strictness
-    pub affinity: Option<Vec<AffinityRule>>
+    pub affinity: Option<Vec<AffinityRule>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
