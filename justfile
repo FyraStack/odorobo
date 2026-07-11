@@ -8,39 +8,33 @@ USRLIBDIR := PREFIX / "lib"
 # defaults to /etc, but can be overridden by setting SYSTEMD_UNITDIR to a different path
 # usually /usr/lib/systemd/system
 
-SYSTEMD_UNITDIR := "/etc"
+SYSTEMD_UNITDIR := "/usr/lib"
 
 build: build_agent build_cli
 
 build_agent:
-    cargo build --release -p odorobo-agent
+    cargo build --release -p odorobo
 
 build_cli:
     cargo build --release -p odoroboctl
 
-build_agent_debug:
-    cargo build -p odorobo-agent
+build_debug:
+    cargo build -p odorobo
 
-debug: build_agent_debug
-    sudo target/debug/odorobo-agent
+debug: build_debug
+    sudo target/debug/odorobo
 
-install: install_script install_unit install_agent install_cli
-
-install_script:
-    install -Dm755 systemd/scripts/odorobo-preflight {{ LIBEXECDIR }}/odorobo-preflight
-    install -Dm755 systemd/scripts/odorobo-postflight {{ LIBEXECDIR }}/odorobo-postflight
-    install -Dm755 systemd/scripts/odorobo-cleanup {{ LIBEXECDIR }}/odorobo-cleanup
+install: install_unit install_agent install_ctl
 
 install_unit:
-    install -Dm644 systemd/odorobo-ch@.service {{ SYSTEMD_UNITDIR }}/systemd/system/odorobo-ch@.service
-    install -Dm644 systemd/odorobo-agent.service {{ SYSTEMD_UNITDIR }}/systemd/system/odorobo-agent.service
+    install -Dm644 systemd/odorobo.service -t {{ SYSTEMD_UNITDIR }}/systemd/system/
     systemctl daemon-reload || true
 
 install_agent:
-    install -Dm755 target/release/odorobo-agent {{ BINDIR }}/odorobo-agent
+    install -Dm755 target/release/odorobo {{ BINDIR }}/odorobo
 
-install_cli:
+install_ctl:
     install -Dm755 target/release/odoroboctl {{ BINDIR }}/odoroboctl
 
-install_agent_debug:
-    install -Dm755 target/debug/odorobo-agent {{ BINDIR }}/odorobo-agent
+install_debug:
+    install -Dm755 target/debug/odorobo {{ BINDIR }}/odorobo
