@@ -110,7 +110,7 @@ pub async fn run_command(cli: Cli) -> Result<()> {
                     vcpus: 4,
                     max_vcpus: None,
                     memory: ByteSize::gib(4),
-                    image: "/var/lib/odorobo/f43.raw".to_string(),
+                    image: "/var/lib/odorobo/f43-1.raw".to_string(),
                     ..Default::default()
                 },
                 metadata: Some(ObjectMetadata {

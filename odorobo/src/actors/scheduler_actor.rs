@@ -44,6 +44,8 @@ pub struct CachedVMActor {
     pub data: GetVMInfoReply,
 }
 
+// todo: vms arent evicted from caches properly if the VM doesnt boot properly. need to determine why.
+
 // todo: i dont like the way this cache is setup. I think we may need to change it later, but it is hard to figure out what the optimal solution is without doing it at least once.
 //  especially when we haven't fully made decisions about some other things.
 //
@@ -278,6 +280,9 @@ impl SchedulerActor {
                 // intentionally ignoring results because we want to keep finding actors even if an attempt fails
                 let _ = tokio::join!(vm_join_handle, agent_join_handle);
 
+                //info!(?vm_data_cache_arc_clone);
+                //info!(?agent_data_cache_arc_clone);
+
                 interval.tick().await;
             }
         }));
@@ -302,21 +307,21 @@ impl SchedulerActor {
     ///    and then if someone tries to schedule lets say 10 VMs in a batch, we could end up scheduling them all to the same agent because the metadata hasn't updated.
     ///    - there are a few solutions for this but they all kinda suck, mostly due to also making sure we deal with latency properly. I am ignoring the issue for now.
     fn schedule_agent(&mut self, msg: &CreateVM) -> Result<RemoteActorRef<AgentActor>, Report> {
-        // todo: this could likely be better idiomatic rust.
-        //  I suspect there is a map-reduce operation that does the exact scoring thing I am trying to do.
-        //  I also assume there is a better function for the and_then
-        let best_agent = self
-            .agent_data_cache
-            .iter()
-            .map(|agent| (agent.actor_ref.clone(), self.score_agent(msg, &agent)))
-            .reduce(|best, new| if new.1 > best.1 { new } else { best })
-            .and_then(|best| {
-                if best.1 == AgentScore::REJECTED {
-                    None
-                } else {
-                    Some(best.0)
-                }
-            });
+        let mut best_agent = None;
+        let mut best_score = AgentScore::REJECTED;
+
+        for agent in self.agent_data_cache.iter() {
+            let score = self.score_agent(msg, &agent);
+
+            info!(?score, agent_id=?(agent.key()), "scored agent");
+
+            if score > best_score {
+                best_agent = Some(agent.actor_ref.clone());
+                best_score = score;
+            }
+        }
+
+        info!(?best_score, ?best_agent, "best agent");
 
         best_agent.ok_or_eyre("No valid agents found.")
     }
@@ -420,8 +425,6 @@ impl SchedulerActor {
         // if agent.metadata.vms.len() == 0 && hash(agent.config.hostname) % total_chance < threshold {
         //     agent_score = 1;
         // }
-
-        info!(?score, agent_id=?(agent.key()), "scored agent");
 
         score
     }
