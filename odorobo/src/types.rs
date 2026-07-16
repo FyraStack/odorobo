@@ -196,12 +196,6 @@ pub enum AffinityType {
 /// if there are several metadata tables, their results will be ANDed together
 /// EX: if a requirement is checked against several VMs, it must pass all VMs for the requirement to be fulfilled.
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
-pub enum AffinityDirection {
-    Normal,
-    Anti,
-}
-
-#[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
 pub struct AffinityRequirement {
     pub key: String,
     pub table: MetadataTable,
