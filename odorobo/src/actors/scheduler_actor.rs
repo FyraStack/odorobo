@@ -191,9 +191,14 @@ impl SchedulerActor {
             }
 
             if fails > 5 {
-                warn!(?actor_ref, "can no longer reach vm actor, cleaning up cache entries");
+                warn!(
+                    ?actor_ref,
+                    "can no longer reach vm actor, cleaning up cache entries"
+                );
 
-                let vmid = vm_actorid_ulid_map.remove(&actor_ref.id()).map(|(_, vmid)| vmid);
+                let vmid = vm_actorid_ulid_map
+                    .remove(&actor_ref.id())
+                    .map(|(_, vmid)| vmid);
 
                 // if the actor was never reachable, there's no vm_actorid_ulid_map entry.
                 // try to recover the vmid from the data_cache by scanning for a stale entry
@@ -288,7 +293,10 @@ impl SchedulerActor {
             }
 
             if fails > 5 {
-                warn!(?actor_ref, "can no longer reach agent actor, stopping updater");
+                warn!(
+                    ?actor_ref,
+                    "can no longer reach agent actor, stopping updater"
+                );
                 data_cache.remove(&actor_ref.id());
                 return;
             }
