@@ -7,8 +7,6 @@ pub mod networking;
 pub mod types;
 mod utils;
 
-use std::fs;
-
 use kameo::actor::Spawn;
 use stable_eyre::Result;
 
