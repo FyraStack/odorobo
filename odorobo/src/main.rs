@@ -21,13 +21,7 @@ use crate::utils::{actor_names::AGENT, connect_to_swarm, init};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli_config = config::Config::init();
-    // TODO: ask infra team where they want this on the box
-    let config: Config = if let Ok(file) = fs::File::open("config.json") {
-        serde_json::from_reader(file).expect("unable to parse config.json")
-    } else {
-        Config::default()
-    };
+    let config = Config::init();
 
     init(Some("odorobo"))?;
 
@@ -40,7 +34,7 @@ async fn main() -> Result<()> {
     let agent_actor = AgentActor::spawn(config.clone());
     agent_actor.register(AGENT).await?;
 
-    if cli_config.get_manager_enabled() {
+    if config.get_manager_enabled() {
         let scheduler_actor = SchedulerActor::spawn(());
         let http_actor = HTTPActor::spawn(scheduler_actor.clone());
 
