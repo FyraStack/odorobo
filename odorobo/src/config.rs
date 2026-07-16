@@ -2,30 +2,11 @@ use ahash::AHashMap;
 use clap::Parser;
 use ipnet::Ipv4Net;
 use serde::{Deserialize, Serialize};
-use std::net::Ipv4Addr;
+use std::{net::Ipv4Addr, sync::LazyLock};
 use sysinfo::System;
 use tracing::{info, warn};
 
-/// Gets the system hostname
-pub fn hostname() -> String {
-    System::host_name().unwrap_or("odorobo".into())
-}
-
-/// This was requested by katherine. Do not change without asking her.
-pub fn default_reserved_vcpus() -> u32 {
-    2
-}
-
-fn default_datacenter() -> String {
-    warn!("No datacenter specified, defaulting to Dev");
-
-    "Dev".into()
-}
-
-fn default_region() -> String {
-    warn!("No region specified, defaulting to Local");
-    "Local".into()
-}
+const CONFIG_PATH: &str = "config.json";
 
 fn default_bridge_name() -> String {
     "vmbr0".into()
@@ -118,41 +99,86 @@ impl Default for NetworkMode {
     }
 }
 
-/// Additional runtime options for the agent that aren't applicable to a JSON config file
-#[derive(Parser)]
-pub struct CliConfig {
-    /// Whether the manager should be enabled on this instance
-    #[clap(long, default_value = "false", env = "ODOROBO_MANAGER_ENABLED")]
-    pub manager_enabled: bool,
-}
-
-// The infra team wants a config file on the box where they can set info specific for the box its on.
-// TODO: Double check with infra team (katherine) if they want any other config on the box.
-#[derive(Serialize, Deserialize, Default, Debug, Clone)]
+/// Odorobo configurations.
+/// These fields are available as command-line arguments, environment variables, and json fields,
+/// with fallbacks set in the above order.
+#[fyra_proc_macros::cli(env_prefix = "ODOROBO_", serde_merge_fn)]
+#[derive(Parser, Serialize, Deserialize, Default, Debug, Clone)]
 pub struct Config {
+    /// Whether the manager should be enabled on this instance
+    #[clap(long)]
+    pub manager_enabled: Option<bool>,
     /// The hostname of the agent. Defaults to the system hostname
     /// if not specified in the config file.
-    #[serde(default = "hostname")]
-    pub hostname: String,
+    #[clap(long)]
+    pub hostname: Option<String>,
     /// The datacenter the agent is running in.
-    #[serde(default = "default_datacenter")]
-    pub datacenter: String,
+    #[clap(long)]
+    pub datacenter: Option<String>,
     /// The region the agent is running in.
-    #[serde(default = "default_region")]
-    pub region: String,
+    #[clap(long)]
+    pub region: Option<String>,
     /// The number of VCPUs reserved for the agent. Defaults to 2.
-    #[serde(default = "default_reserved_vcpus")]
-    pub reserved_vcpus: u32,
+    #[clap(long)]
+    pub reserved_vcpus: Option<u32>,
     /// this is just arbitrary data that will be shown but does no config
     /// Arbitrary labels that can be used
+    #[clap(skip)]
     #[serde(default)]
     pub labels: AHashMap<String, String>,
     /// Arbitrary annotations that can be used
+    #[clap(skip)]
     #[serde(default)]
     pub annotations: AHashMap<String, String>,
 
+    #[clap(skip)]
     #[serde(default)]
     pub network: NetworkConfig,
+
+    /// Ignore lockfiles and do not create a lockfile
+    #[clap(long)]
+    pub no_lockfile: Option<bool>,
+}
+
+impl Config {
+    pub fn init() -> Self {
+        let mut result = Self::parse();
+        if let Ok(fd) =
+            std::fs::File::open(CONFIG_PATH).inspect_err(|e| warn!(?e, "cannot open {CONFIG_PATH}"))
+        {
+            let Ok(json) =
+                serde_json::from_reader(fd).inspect_err(|e| warn!("cannot parse json: {e}"))
+            else {
+                return result;
+            };
+            result.serde_merge_fn(json);
+        }
+        result
+    }
+    pub fn get_manager_enabled(&self) -> bool {
+        self.manager_enabled.unwrap_or(false)
+    }
+    pub fn get_hostname(&self) -> &str {
+        static HOSTNAME: LazyLock<Option<String>> = LazyLock::new(System::host_name);
+        (self.hostname.as_deref()).unwrap_or_else(|| HOSTNAME.as_deref().unwrap_or("odorobo"))
+    }
+    pub fn get_datacenter(&self) -> &str {
+        static DEFAULT_DATACENTER: LazyLock<&'static str> = LazyLock::new(|| {
+            warn!("No datacenter specified, defaulting to Dev");
+            "Dev"
+        });
+        (self.datacenter.as_deref()).unwrap_or_else(|| *DEFAULT_DATACENTER)
+    }
+    pub fn get_region(&self) -> &str {
+        static DEFAULT_REGION: LazyLock<&'static str> = LazyLock::new(|| {
+            warn!("No region specified, defaulting to Local");
+            "Local"
+        });
+        (self.region.as_deref()).unwrap_or_else(|| *DEFAULT_REGION)
+    }
+    pub fn get_reserved_vcpus(&self) -> u32 {
+        self.reserved_vcpus.unwrap_or(2)
+    }
 }
 
 #[cfg(test)]

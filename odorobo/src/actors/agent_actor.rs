@@ -310,11 +310,11 @@ impl Message<GetAgentStatus> for AgentActor {
             .unwrap_or(0);
 
         AgentStatus {
-            hostname: self.config.hostname.clone(),
+            hostname: self.config.get_hostname().to_owned(),
             vcpus: self.vcpus,
             ram: self.memory,
             vms: self.vms.keys().copied().collect(),
-            used_vcpus: vcpus_used_by_vms + self.config.reserved_vcpus,
+            used_vcpus: vcpus_used_by_vms + self.config.get_reserved_vcpus(),
             used_ram: ByteSize::b(ram_used_by_vms),
         }
     }

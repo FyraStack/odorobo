@@ -2,13 +2,16 @@ use std::io::Write;
 
 const LOCKFILE: &str = "/var/lock/odorobo.lock";
 
-// `Option` needed since `std::mem::take` requires `impl Default`
 pub struct Lockfile(Option<std::fs::File>);
 
 impl Drop for Lockfile {
     fn drop(&mut self) {
-        tracing::debug!("dropping Lockfile");
-        std::mem::drop(std::mem::take(&mut self.0).expect("None in Lockfile"));
+        let Some(lockfile) = self.0.take() else {
+            tracing::debug!("no lockfile noted, skipping drop");
+            return;
+        };
+        tracing::debug!("removing lockfile");
+        drop(lockfile);
         _ = std::fs::remove_file(LOCKFILE)
             .inspect_err(|e| tracing::warn!(?LOCKFILE, ?e, "cannot remove lockfile"));
     }
@@ -17,7 +20,11 @@ impl Drop for Lockfile {
 /// Create an odorobo lockfile
 ///
 /// See #30, only 1 instance of odorobo should run.
-pub fn init_lockfile() -> Result<Lockfile, String> {
+pub fn init_lockfile(cfg: &crate::config::Config) -> Result<Lockfile, String> {
+    if cfg.no_lockfile.unwrap_or_default() {
+        tracing::info!("Skipping lockfile due to `no_lockfile`");
+        return Ok(Lockfile(None));
+    }
     tracing::trace!("creating lockfile at {LOCKFILE}");
     let mut f = std::fs::File::create_new(LOCKFILE)
         .map_err(|e| format!("Cannot create lockfile at {LOCKFILE}: {e:?}"))?;

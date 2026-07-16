@@ -7,44 +7,37 @@ pub mod networking;
 pub mod types;
 mod utils;
 
-use std::fs;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use clap::Parser;
 use kameo::actor::Spawn;
-use stable_eyre::Result;
+use stable_eyre::{Result, eyre::eyre};
 
 use crate::actors::agent_actor::AgentActor;
 use crate::actors::http_actor::HTTPActor;
 use crate::actors::scheduler_actor::SchedulerActor;
 use crate::config::Config;
-use crate::utils::actor_names::{HTTP_API_SERVER, SCHEDULER};
-use crate::utils::{actor_names::AGENT, connect_to_swarm, init};
+use crate::utils::actor_names::{AGENT, HTTP_API_SERVER, SCHEDULER};
+use crate::utils::{connect_to_swarm, init};
 
 fn main() -> Result<()> {
-    let cli_config = config::CliConfig::parse();
-    // TODO: ask infra team where they want this on the box
-    let config: Config = if let Ok(file) = fs::File::open("config.json") {
-        serde_json::from_reader(file).expect("unable to parse config.json")
-    } else {
-        Config::default()
-    };
+    let config = Config::init();
 
     init(Some("odorobo"))?;
     let term = utils::lockfile::register_termsigs()?;
-    let _lock = utils::lockfile::init_lockfile()
-        .map_err(|e| stable_eyre::eyre::eyre!("cannot init lockfile").wrap_err(e))?;
+    let _lock = utils::lockfile::init_lockfile(&config).map_err(|e| {
+        eyre!("init lockfile failed (note: the `no_lockfile` option can skip this)").wrap_err(e)
+    })?;
 
-    mainloop(term, cli_config, config)
+    mainloop(term, config)
 }
 
-fn mainloop(term: Arc<AtomicBool>, cli_config: config::CliConfig, config: Config) -> Result<()> {
+fn mainloop(term: Arc<AtomicBool>, config: Config) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("can't build tokio");
-    let handle = runtime.spawn(inner_main(cli_config, config));
+    let handle = runtime.spawn(inner_main(config));
 
     loop {
         if handle.is_finished() {
@@ -57,7 +50,7 @@ fn mainloop(term: Arc<AtomicBool>, cli_config: config::CliConfig, config: Config
     }
 }
 
-async fn inner_main(cli_config: config::CliConfig, config: Config) -> Result<()> {
+async fn inner_main(config: Config) -> Result<()> {
     tracing::info!(?config, "Starting odorobo");
 
     let local_peer_id = connect_to_swarm().unwrap();
@@ -67,7 +60,7 @@ async fn inner_main(cli_config: config::CliConfig, config: Config) -> Result<()>
     let agent_actor = AgentActor::spawn(config.clone());
     agent_actor.register(AGENT).await?;
 
-    if cli_config.manager_enabled {
+    if config.get_manager_enabled() {
         let scheduler_actor = SchedulerActor::spawn(());
         let http_actor = HTTPActor::spawn(scheduler_actor.clone());
 
