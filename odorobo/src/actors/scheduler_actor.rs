@@ -41,10 +41,11 @@ pub struct CachedAgentActor {
 #[derive(Debug, Clone)]
 pub struct CachedVMActor {
     pub actor_ref: Option<RemoteActorRef<VMActor>>,
+    /// The agent this VM was scheduled on. Used by the updater task to clean up
+    /// the agent's extended_vm_set if the VM actor dies before it's linked.
+    pub scheduled_agent_id: ActorId,
     pub data: GetVMInfoReply,
 }
-
-// todo: vms arent evicted from caches properly if the VM doesnt boot properly. need to determine why.
 
 // todo: i dont like the way this cache is setup. I think we may need to change it later, but it is hard to figure out what the optimal solution is without doing it at least once.
 //  especially when we haven't fully made decisions about some other things.
@@ -120,6 +121,7 @@ impl SchedulerActor {
         vm_actorid_ulid_map: Arc<DashMap<ActorId, Ulid>>,
         data_cache: Arc<DashMap<Ulid, CachedVMActor>>,
         keepalive_tasks: Arc<DashMap<ActorId, JoinHandle<()>>>,
+        agent_data_cache: Arc<DashMap<ActorId, CachedAgentActor>>,
     ) -> Result<(), Report> {
         trace!("running vm_actor_finder");
 
@@ -135,9 +137,15 @@ impl SchedulerActor {
 
                 let vm_actorid_ulid_map_clone = Arc::clone(&vm_actorid_ulid_map);
                 let data_cache_clone = Arc::clone(&data_cache);
+                let agent_data_cache_clone = Arc::clone(&agent_data_cache);
                 let updater_task = tokio::spawn(async move {
-                    Self::vm_updater_task(vm_actor, vm_actorid_ulid_map_clone, data_cache_clone)
-                        .await;
+                    Self::vm_updater_task(
+                        vm_actor,
+                        vm_actorid_ulid_map_clone,
+                        data_cache_clone,
+                        agent_data_cache_clone,
+                    )
+                    .await;
                 });
 
                 keepalive_tasks.insert(vm_actor_id, updater_task);
@@ -151,6 +159,7 @@ impl SchedulerActor {
         actor_ref: RemoteActorRef<VMActor>,
         vm_actorid_ulid_map: Arc<DashMap<ActorId, Ulid>>,
         data_cache: Arc<DashMap<Ulid, CachedVMActor>>,
+        agent_data_cache: Arc<DashMap<ActorId, CachedAgentActor>>,
     ) {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         let mut fails = 0;
@@ -164,6 +173,14 @@ impl SchedulerActor {
                     vmid,
                     CachedVMActor {
                         actor_ref: Some(actor_ref.clone()),
+                        // preserve the original scheduled_agent_id if an entry already exists
+                        // (e.g. from CreateVM::handle inserting it before the actor was reachable),
+                        // otherwise default to the vm actor's own id (won't match any agent entry,
+                        // so no accidental cleanup of wrong agent).
+                        scheduled_agent_id: data_cache
+                            .get(&vmid)
+                            .map(|e| e.scheduled_agent_id)
+                            .unwrap_or(actor_ref.id()),
                         data: data,
                     },
                 );
@@ -174,8 +191,35 @@ impl SchedulerActor {
             }
 
             if fails > 5 {
-                // todo: possibly better error handling
-                warn!(?actor_ref, "can no longer reach agent actor.")
+                warn!(?actor_ref, "can no longer reach vm actor, cleaning up cache entries");
+
+                let vmid = vm_actorid_ulid_map.remove(&actor_ref.id()).map(|(_, vmid)| vmid);
+
+                // if the actor was never reachable, there's no vm_actorid_ulid_map entry.
+                // try to recover the vmid from the data_cache by scanning for a stale entry
+                // that matches this actor_ref.
+                let vmid = vmid.or_else(|| {
+                    data_cache.iter().find_map(|entry| {
+                        if entry.actor_ref.as_ref().map(|r| r.id()) == Some(actor_ref.id()) {
+                            Some(*entry.key())
+                        } else {
+                            None
+                        }
+                    })
+                });
+
+                if let Some(vmid) = vmid {
+                    if let Some(cached_vm) = data_cache.get(&vmid) {
+                        agent_data_cache.alter(&cached_vm.scheduled_agent_id, |_, mut v| {
+                            v.extended_vm_set.remove(&vmid);
+                            v
+                        });
+                    }
+
+                    data_cache.remove(&vmid);
+                }
+
+                return;
             }
 
             interval.tick().await;
@@ -219,7 +263,6 @@ impl SchedulerActor {
         let mut fails = 0;
         loop {
             if let Ok(data) = actor_ref.ask(&GetAgentStatus).await {
-                // todo: replace with kameo stream
                 if data_cache.contains_key(&actor_ref.id()) {
                     data_cache.alter(&actor_ref.id(), |_, mut v| {
                         v.data = data;
@@ -245,8 +288,9 @@ impl SchedulerActor {
             }
 
             if fails > 5 {
-                // todo: possibly better error handling
-                warn!(?actor_ref, "can no longer reach agent actor.")
+                warn!(?actor_ref, "can no longer reach agent actor, stopping updater");
+                data_cache.remove(&actor_ref.id());
+                return;
             }
 
             interval.tick().await;
@@ -269,6 +313,7 @@ impl SchedulerActor {
                     Arc::clone(&vm_actorid_ulid_map_arc_clone),
                     Arc::clone(&vm_data_cache_arc_clone),
                     Arc::clone(&vm_keepalive_tasks_arc_clone),
+                    Arc::clone(&agent_data_cache_arc_clone),
                 );
 
                 let agent_join_handle = Self::agent_actor_finder(
@@ -355,7 +400,7 @@ impl SchedulerActor {
             return AgentScore::REJECTED;
         }
 
-        score.general += (agent_max_ram.as_u64() - agent.data.used_ram.as_u64()) as f32
+        score.general += (agent_max_ram.as_u64() - agent_used_ram.as_u64()) as f32
             / agent_max_ram.as_u64() as f32;
 
         // roughly based on: https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/
@@ -584,6 +629,7 @@ impl Message<CreateVM> for SchedulerActor {
             msg.vmid,
             CachedVMActor {
                 actor_ref: None,
+                scheduled_agent_id: target_agent.id(),
                 data: GetVMInfoReply {
                     vmid: msg.vmid,
                     config: Some(msg.config.clone()),
@@ -593,7 +639,7 @@ impl Message<CreateVM> for SchedulerActor {
 
         let reply = target_agent.ask(&msg).await;
 
-        // remove from caches if we fail to schedule
+        // remove from caches if the agent rejected the request
         if reply.is_err() {
             self.agent_data_cache.alter(&target_agent.id(), |_, mut v| {
                 v.extended_vm_set.remove(&msg.vmid);
