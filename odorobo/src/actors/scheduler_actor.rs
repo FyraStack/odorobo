@@ -281,8 +281,8 @@ impl SchedulerActor {
                         actor_ref.id(),
                         CachedAgentActor {
                             actor_ref: actor_ref.clone(),
-                            data: data,
-                            extended_vm_set: AHashSet::new(),
+                            data: data.clone(),
+                            extended_vm_set: AHashSet::from_iter(data.vms.iter().copied()),
                         },
                     );
                 }
@@ -365,8 +365,6 @@ impl SchedulerActor {
 
         for agent in self.agent_data_cache.iter() {
             let score = self.score_agent(msg, &agent);
-
-            info!(?score, agent_id=?(agent.key()), "scored agent");
 
             if score > best_score {
                 best_agent = Some(agent.actor_ref.clone());
@@ -596,10 +594,10 @@ impl Actor for SchedulerActor {
         };
 
         if let Some((_, vmid)) = self.vm_actorid_ulid_map.remove(&actor_id) {
-            // todo: this solution definitely isn't optimal. we likely should be storing which agent actor, this specific actor id is scheduled on and specifically removing it from that one.
-            //  especially because things get iffy with migration, but im ignoring that for the moment.
-            for mut agent in self.agent_data_cache.iter_mut() {
-                agent.extended_vm_set.remove(&vmid);
+            if let Some(cached_vm) = self.vm_data_cache.get(&vmid) {
+                if let Some(mut agent) = self.agent_data_cache.get_mut(&cached_vm.scheduled_agent_id) {
+                    agent.extended_vm_set.remove(&vmid);
+                }
             }
 
             // todo: we likely should keep a copy of the VirtualMachine manifest in the cache.
