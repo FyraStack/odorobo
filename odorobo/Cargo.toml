@@ -6,7 +6,8 @@ license = "AGPL-3.0-or-later"
 
 [dependencies]
 stable-eyre = { workspace = true }
-clap = {  workspace = true, features = ["derive", "env"] }
+clap = { workspace = true, features = ["derive", "env"] }
+fyra-proc-macros = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 reqwest = { workspace = true, features = ["json"] }
 serde_json = { workspace = true }
@@ -40,7 +41,7 @@ tower-http = { version = "0.7", features = ["trace"] }
 kameo = { version = "0.22", features = ["remote"] }
 ahash = { version = "0.8", features = ["serde"] }
 dirs = "6"
-ipnet = {version = "2.12", features = ["serde", "schemars08"]}
+ipnet = { version = "2.12", features = ["serde", "schemars08"] }
 url = { version = "2.5", features = ["serde"] }
 async-trait = "0.1"
 dashmap = "6.1"
@@ -58,7 +59,6 @@ aide = { version = "0.16.0-alpha.4", features = [
     "macros",
 ] }
 schemars = "1.2"
-
 
 
 cloud-hypervisor-client = { git = "https://github.com/FyraStack/cloud-hypervisor-client.git" }
