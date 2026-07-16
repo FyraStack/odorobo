@@ -181,7 +181,7 @@ impl SchedulerActor {
                             .get(&vmid)
                             .map(|e| e.scheduled_agent_id)
                             .unwrap_or(actor_ref.id()),
-                        data: data,
+                        data,
                     },
                 );
 
@@ -487,8 +487,8 @@ fn evaluate_table_value(value_option: &Option<&String>, requirement: &AffinityRe
     };
 
     match requirement.operator {
-        Operator::In => return requirement.values.iter().any(|e| *e == *value),
-        Operator::NotIn => return !requirement.values.iter().any(|e| *e == *value),
+        Operator::In => requirement.values.contains(value),
+        Operator::NotIn => !requirement.values.contains(value),
         Operator::Lt | Operator::Gt => {
             if requirement.values.len() != 1 {
                 return false;
@@ -503,12 +503,12 @@ fn evaluate_table_value(value_option: &Option<&String>, requirement: &AffinityRe
             };
 
             if requirement.operator == Operator::Lt {
-                return value_number < requirement_value_number;
+                value_number < requirement_value_number
             } else {
-                return value_number > requirement_value_number;
+                value_number > requirement_value_number
             }
         }
-    };
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -594,10 +594,11 @@ impl Actor for SchedulerActor {
         };
 
         if let Some((_, vmid)) = self.vm_actorid_ulid_map.remove(&actor_id) {
-            if let Some(cached_vm) = self.vm_data_cache.get(&vmid) {
-                if let Some(mut agent) = self.agent_data_cache.get_mut(&cached_vm.scheduled_agent_id) {
-                    agent.extended_vm_set.remove(&vmid);
-                }
+            if let Some(cached_vm) = self.vm_data_cache.get(&vmid)
+                && let Some(mut agent) =
+                    self.agent_data_cache.get_mut(&cached_vm.scheduled_agent_id)
+            {
+                agent.extended_vm_set.remove(&vmid);
             }
 
             // todo: we likely should keep a copy of the VirtualMachine manifest in the cache.
