@@ -5,8 +5,8 @@ DATADIR := PREFIX / "share"
 USRLIBDIR := PREFIX / "lib"
 
 # systemd unit load paths
-# defaults to /etc, but can be overridden by setting SYSTEMD_UNITDIR to a different path
-# usually /usr/lib/systemd/system
+# defaults to /usr/lib, to get /usr/lib/sytemd/system
+# can be overridden by setting SYSTEMD_UNITDIR to a different path
 
 SYSTEMD_UNITDIR := "/usr/lib"
 
