@@ -1376,7 +1376,7 @@ dependencies = [
 [[package]]
 name = "fyra-proc-macros"
 version = "0.1.0"
-source = "git+https://github.com/FyraLabs/fyra-proc-macros#c739d1ed4eedfa47d28b048ca8d5724b4dcdd57c"
+source = "git+https://github.com/FyraLabs/fyra-proc-macros#5f5f4a26ccbd227471dc55e971e1e62714d79b4f"
 dependencies = [
  "proc-macro-error",
  "proc-macro2",
