@@ -134,6 +134,10 @@ pub struct Config {
     #[clap(skip)]
     #[serde(default)]
     pub network: NetworkConfig,
+
+    /// Ignore lockfiles and do not create a lockfile
+    #[clap(long, action = clap::ArgAction::SetTrue)]
+    pub no_lockfile: Option<bool>,
 }
 
 impl Config {

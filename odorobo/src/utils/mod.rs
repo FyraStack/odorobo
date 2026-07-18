@@ -1,5 +1,6 @@
 pub mod actor_cache;
 pub mod actor_names;
+pub mod lockfile;
 
 use aide::OperationIo;
 use api_error::ApiError;
