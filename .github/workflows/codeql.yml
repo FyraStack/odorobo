@@ -1,0 +1,19 @@
+name: Clippy Code Scanning
+
+permissions:
+  contents: read
+  security-events: write
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "0 0 * * 0"
+
+jobs:
+  rust-clippy-analyze:
+    name: Clippy SARIF
+    uses: ./.github/workflows/clippy.yml
+    permissions:
+      contents: read
+      security-events: write
