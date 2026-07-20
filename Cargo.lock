@@ -2062,9 +2062,9 @@ dependencies = [
 
 [[package]]
 name = "kameo"
-version = "0.22.1"
+version = "0.22.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e6eb1621a4848496e79d03fb7fb8b7578089a99edc596a7f3d6299f5f75fb22b"
+checksum = "7cbab7323ed30490812f43ef6416a9e21bb150e9633e451ed124ca276b1ca82a"
 dependencies = [
  "const-fnv1a-hash",
  "const-str 1.1.0",
