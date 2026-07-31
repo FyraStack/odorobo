@@ -45,3 +45,45 @@ codegen-units = 1
 strip = "symbols" # TODO: this we should talk about doing this, because it makes debugging harder, so if we have a panic in production, the backtrace will likely not be as useful.
 
 incremental = false # this is just to get reproducible builds. incremental compiles aren't consistent and can sometimes be broken when combined with optimizations
+
+[workspace.lints.clippy]
+complexity = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+
+disallowed-macros = "deny"
+excessive-nesting = "warn"
+
+arithmetic_side_effects = "warn"
+assertions_on_result_states = "warn"
+clone_on_ref_ptr = "warn"
+create_dir = "warn"
+empty_enum_variants_with_brackets = "warn"
+empty_structs_with_brackets = "warn"
+field_scoped_visibility_modifiers = "deny"
+format_push_string = "warn"
+get_unwrap = "warn"
+if_then_some_else_none = "warn"
+impl_trait_in_params = "warn"
+infinite_loop = "deny"
+let_underscore_must_use = "deny"
+let_underscore_untyped = "warn"
+needless_raw_strings = "warn"
+rc_buffer = "warn"
+rc_mutex = "deny"
+redundant_type_annotations = "warn"
+renamed_function_params = "warn"
+rest_pat_in_fully_bound_structs = "warn"
+semicolon_outside_block = "warn"
+str_to_string = "warn"
+string_lit_chars_any = "warn"
+tests_outside_test_module = "warn"
+todo = "warn"
+try_err = "warn"
+undocumented_unsafe_blocks = "deny"
+unimplemented = "warn"
+unneeded_field_pattern = "warn"
+unwrap_in_result = "warn"
+missing_errors_doc = "allow"
+needless_for_each = "allow"
