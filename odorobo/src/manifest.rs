@@ -35,6 +35,8 @@ pub enum ManifestError {
     DuplicateDiskId(String),
     #[error("disk {0} cannot be both a boot disk and read-only")]
     ReadOnlyBootDisk(String),
+    #[error("manifest cannot define more than one boot disk")]
+    MultipleBootDisks,
     #[error("network {0} must define an id")]
     NetworkWithoutId(usize),
     #[error("cloud-init user-data and meta-data must be supplied together")]
@@ -114,6 +116,7 @@ impl DesiredState {
         // attachment belong to storage backends, so the manifest only checks
         // that the converter has one usable source from which to begin.
         let mut disk_ids = std::collections::HashSet::with_capacity(self.disks.len());
+        let mut has_boot_disk = false;
         for disk in &self.disks {
             if disk.id.trim().is_empty() {
                 return Err(ManifestError::EmptyDiskId);
@@ -128,6 +131,12 @@ impl DesiredState {
             }
             if disk.boot && disk.read_only {
                 return Err(ManifestError::ReadOnlyBootDisk(disk.id.clone()));
+            }
+            if disk.boot {
+                if has_boot_disk {
+                    return Err(ManifestError::MultipleBootDisks);
+                }
+                has_boot_disk = true;
             }
         }
         for (index, network) in self.networks.iter().enumerate() {
@@ -357,6 +366,24 @@ mod tests {
         assert!(matches!(
             manifest.validate(),
             Err(ManifestError::EmptyDiskId)
+        ));
+
+        manifest.desired.disks.clear();
+        manifest.desired.disks.push(Disk {
+            id: "root".to_owned(),
+            uri: Some("file:///disk.img".to_owned()),
+            boot: true,
+            ..Default::default()
+        });
+        manifest.desired.disks.push(Disk {
+            id: "other".to_owned(),
+            uri: Some("file:///other.img".to_owned()),
+            boot: true,
+            ..Default::default()
+        });
+        assert!(matches!(
+            manifest.validate(),
+            Err(ManifestError::MultipleBootDisks)
         ));
 
         manifest.desired.disks.clear();
