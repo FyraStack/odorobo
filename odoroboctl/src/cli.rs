@@ -100,7 +100,7 @@ pub async fn run_command(cli: Cli) -> Result<()> {
             // TODO: setup actual cli args for these parameters. or just take in arbitrary json and serialize it into a VirtualMachine.
             let vm = VirtualMachine {
                 data: VMData {
-                    id: Ulid::new(),
+                    id: Ulid::generate(),
                     name: "test_vm".to_string(),
                     vcpus: 4,
                     max_vcpus: None,
