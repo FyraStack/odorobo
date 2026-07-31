@@ -12,7 +12,7 @@ use ulid::Ulid;
     about = "Command-line interface for odorobo manager"
 )]
 pub struct Cli {
-    /// Address of the odorobo manager scheduler API server, e.g. "http://localhost:3000"
+    /// Address of the odorobo manager scheduler API server, e.g. "<http://localhost:3000>"
     #[arg(
         long,
         env = "ODOROBO_MANAGER_ADDR",
@@ -101,11 +101,11 @@ pub async fn run_command(cli: Cli) -> Result<()> {
             let vm = VirtualMachine {
                 data: VMData {
                     id: Ulid::generate(),
-                    name: "test_vm".to_string(),
+                    name: "test_vm".to_owned(),
                     vcpus: 4,
                     max_vcpus: None,
                     memory: ByteSize::gib(4),
-                    image: "/var/lib/odorobo/f43.raw".to_string(),
+                    image: "/var/lib/odorobo/f43.raw".to_owned(),
                     ..Default::default()
                 },
                 ..Default::default()
@@ -113,7 +113,7 @@ pub async fn run_command(cli: Cli) -> Result<()> {
 
             let request = CreateVMRequest { vm, boot: true };
 
-            let url = format!("{}/vms", base_url);
+            let url = format!("{base_url}/vms");
             let response = client.post(&url).json(&request).send().await?;
 
             println!("{:?}", response.url());
@@ -121,7 +121,7 @@ pub async fn run_command(cli: Cli) -> Result<()> {
             print_message_response(response, "VM create request sent successfully").await?;
         }
         Command::List => {
-            let url = format!("{}/vms", base_url);
+            let url = format!("{base_url}/vms");
             let response = client.get(&url).send().await?;
 
             if response.status().is_success() {
@@ -134,13 +134,13 @@ pub async fn run_command(cli: Cli) -> Result<()> {
             }
         }
         Command::Delete { vmid } => {
-            let url = format!("{}/vms/{}", base_url, vmid);
+            let url = format!("{base_url}/vms/{vmid}");
             let response = client.delete(&url).send().await?;
 
             print_message_response(response, "VM delete request sent successfully").await?;
         }
         Command::Shutdown { vmid } => {
-            let url = format!("{}/vms/{}/shutdown", base_url, vmid);
+            let url = format!("{base_url}/vms/{vmid}/shutdown");
             let response = client.put(&url).send().await?;
 
             print_message_response(response, "VM shutdown request sent successfully").await?;

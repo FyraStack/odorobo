@@ -68,14 +68,14 @@ impl<
     Data: Clone + Send + Sync + 'static + fmt::Debug,
 > ActorCache<ParentActor, ChildActor, Data>
 {
-    pub fn new(
-        parent_actor_ref: ActorRef<ParentActor>,
-        updater: impl ActorCacheUpdater<ChildActor, Data>,
-    ) -> Result<Self, Report> {
+    pub fn new<Updater>(parent_actor_ref: ActorRef<ParentActor>, updater: Updater) -> Self
+    where
+        Updater: ActorCacheUpdater<ChildActor, Data>,
+    {
         let data_cache = Arc::new(DashMap::new());
         let keepalive_tasks = Arc::new(DashMap::new());
 
-        let actor_cache = ActorCache {
+        let actor_cache = Self {
             parent_actor_ref: parent_actor_ref.clone(),
             data_cache,
             keepalive_tasks,
@@ -86,33 +86,32 @@ impl<
 
         actor_cache.start_actor_finder(parent_actor_ref, updater);
 
-        Ok(actor_cache)
+        actor_cache
     }
 
-    /// run this function inside of the on_link_died of the ParentActor
-    pub async fn on_link_died(&self, id: ActorId) {
+    /// run this function inside of the `on_link_died` of the `ParentActor`
+    pub fn on_link_died(&self, id: ActorId) {
         info!("removing agent actor from cache {id:?}");
 
         if let Some(actor_keepalive_task) = self.keepalive_tasks.remove(&id) {
             trace!("Aborting keepalive task for agent {id:?}");
             actor_keepalive_task.1.abort();
-        };
+        }
 
         self.data_cache.remove(&id);
     }
 
-    fn start_actor_finder(
-        &self,
-        parent_actor_ref: ActorRef<ParentActor>,
-        updater: impl ActorCacheUpdater<ChildActor, Data>,
-    ) {
+    fn start_actor_finder<Updater>(&self, parent_actor_ref: ActorRef<ParentActor>, updater: Updater)
+    where
+        Updater: ActorCacheUpdater<ChildActor, Data>,
+    {
         let keepalive_tasks_clone = Arc::clone(&self.keepalive_tasks);
         let data_cache_clone = Arc::clone(&self.data_cache);
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(1));
             loop {
-                let _ = Self::actor_finder(
+                _ = Self::actor_finder(
                     parent_actor_ref.clone(),
                     Arc::clone(&keepalive_tasks_clone),
                     Arc::clone(&data_cache_clone),
@@ -125,12 +124,15 @@ impl<
         });
     }
 
-    async fn actor_finder(
+    async fn actor_finder<Updater>(
         parent_actor_ref: ActorRef<ParentActor>,
         keepalive_tasks: Arc<DashMap<ActorId, JoinHandle<()>>>,
         data_cache: Arc<DashMap<ActorId, Data>>,
-        updater: impl ActorCacheUpdater<ChildActor, Data>,
-    ) -> Result<(), Report> {
+        updater: Updater,
+    ) -> Result<(), Report>
+    where
+        Updater: ActorCacheUpdater<ChildActor, Data>,
+    {
         let actor_refs = updater.get_actor_refs().await?;
 
         info!(?actor_refs, "running actor_finder");
@@ -155,11 +157,13 @@ impl<
     }
 
     #[instrument(skip_all)]
-    async fn updater_task(
+    async fn updater_task<Updater>(
         actor_ref: RemoteActorRef<ChildActor>,
         data_cache: Arc<DashMap<ActorId, Data>>,
-        updater: impl ActorCacheUpdater<ChildActor, Data>,
-    ) {
+        updater: Updater,
+    ) where
+        Updater: ActorCacheUpdater<ChildActor, Data>,
+    {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
 
         loop {

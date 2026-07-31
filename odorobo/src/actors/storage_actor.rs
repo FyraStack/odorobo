@@ -8,6 +8,7 @@ impl Actor for SerialTerminalWebsocketActor {
     type Args = ();
     type Error = Report;
 
+    #[allow(clippy::todo)]
     async fn on_start(_state: Self::Args, _actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
         todo!()
     }

@@ -12,17 +12,17 @@ use crate::types::VirtualMachine;
 //  additionally, when the VmConfig is created, this determines the MAC address of the server. meaning as soon as we have this info, we need to hit the router via the scheduler, because the router might be slow.
 /// Message to create a new VM
 ///
-/// VmConfig is a Cloud Hypervisor VM spec, containing the VM's full configuration (untransformed by odorobo)
+/// `VmConfig` is a Cloud Hypervisor VM spec, containing the VM's full configuration (untransformed by odorobo)
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CreateVM {
     /// the ULID of the VM to create
     pub vmid: Ulid,
-    /// VmConfig in message, untransformed.
+    /// `VmConfig` in message, untransformed.
     ///
-    /// Transformer API will transform this VmConfig into proper
+    /// Transformer API will transform this `VmConfig` into proper
     /// node-specific, paths, i.e attach LUNs, networking?
     ///
-    /// this data would go to state::instance::spawn()
+    /// this data would go to `state::instance::spawn()`
     pub config: VirtualMachine,
 }
 
@@ -56,7 +56,7 @@ pub struct PrepMigration {
     pub config: VmConfig,
 }
 
-/// Reply to a MigrateVMReceive message, containing the listening address of the VM
+/// Reply to a `MigrateVMReceive` message, containing the listening address of the VM
 #[derive(Serialize, Deserialize, Debug, Clone, Reply)]
 pub struct MigrateVMReceiveReply {
     pub listening_address: String,

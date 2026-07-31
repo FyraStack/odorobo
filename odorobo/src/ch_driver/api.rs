@@ -94,10 +94,10 @@ pub async fn call_request(socket_path: &Path, request: Request<Bytes>) -> Result
 fn build_api_path(path: &str, query: Option<&str>) -> Result<String> {
     let normalized_path = normalize_api_path(path)?;
 
-    match query.filter(|query| !query.is_empty()) {
-        Some(query) => Ok(format!("/api/v1{normalized_path}?{query}")),
-        None => Ok(format!("/api/v1{normalized_path}")),
-    }
+    query.filter(|query| !query.is_empty()).map_or_else(
+        || Ok(format!("/api/v1{normalized_path}")),
+        |query| Ok(format!("/api/v1{normalized_path}?{query}")),
+    )
 }
 
 fn normalize_api_path(path: &str) -> Result<String> {

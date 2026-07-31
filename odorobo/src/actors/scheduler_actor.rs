@@ -2,8 +2,11 @@ use std::ops::ControlFlow;
 
 use crate::actors::agent_actor::AgentActor;
 use crate::ch_driver::actor::VMActor;
-use crate::messages::agent::*;
-use crate::messages::vm::*;
+use crate::messages::agent::{AgentStatus, GetAgentStatus};
+use crate::messages::vm::{
+    AgentListVMs, AgentListVMsReply, CreateVM, CreateVMReply, DeleteVM, DeleteVMReply, GetVMInfo,
+    GetVMInfoReply, ShutdownVM, ShutdownVMReply,
+};
 use crate::messages::{Ping, Pong};
 use crate::utils::actor_cache::ActorCache;
 use crate::utils::actor_cache::ActorCacheUpdater;
@@ -20,8 +23,8 @@ use tracing::{info, warn};
 
 #[derive(RemoteActor)]
 pub struct SchedulerActor {
-    pub agent_actor_cache: ActorCache<SchedulerActor, AgentActor, CachedAgentActor>,
-    pub vm_actor_cache: ActorCache<SchedulerActor, VMActor, CachedVMActor>,
+    pub agent_actor_cache: ActorCache<Self, AgentActor, CachedAgentActor>,
+    pub vm_actor_cache: ActorCache<Self, VMActor, CachedVMActor>,
 }
 
 // todo: this might need to be a runtime thing but this makes it easy to write for now and could easily be switched out later.
@@ -33,10 +36,7 @@ impl SchedulerActor {
         dead_code,
         reason = "scheduler lookup helper reserved for explicit placement by actor id"
     )]
-    async fn lookup_by_actor_id(
-        &mut self,
-        actor_id: &ActorId,
-    ) -> Option<RemoteActorRef<AgentActor>> {
+    fn lookup_by_actor_id(&self, actor_id: &ActorId) -> Option<RemoteActorRef<AgentActor>> {
         self.agent_actor_cache
             .data_cache
             .get(actor_id)
@@ -47,7 +47,7 @@ impl SchedulerActor {
         dead_code,
         reason = "scheduler lookup helper reserved for explicit placement by hostname"
     )]
-    async fn lookup_by_hostname(&mut self, hostname: &str) -> Option<RemoteActorRef<AgentActor>> {
+    fn lookup_by_hostname(&self, hostname: &str) -> Option<RemoteActorRef<AgentActor>> {
         self.agent_actor_cache
             .data_cache
             .iter()
@@ -56,16 +56,13 @@ impl SchedulerActor {
     }
 
     /// current scheduling algo info:
-    /// this is vaguely based on https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/
+    /// this is vaguely based on <https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node>/
     /// when a vm is attempted to be scheduled, we loop through every agent and score it based on some rules
     /// there are hard rules that will simply throw out an agent entirely.
     /// otherwise, we take whatever the best agent we can find is.
     ///
     /// additionally, because caleb is way too performance brained, he used integer math for the entire scoring algorithm just so we didnt have to convert to floats.
-    async fn schedule_agent(
-        &mut self,
-        _msg: &CreateVM,
-    ) -> Result<RemoteActorRef<AgentActor>, Report> {
+    fn schedule_agent(&self, _msg: &CreateVM) -> Result<RemoteActorRef<AgentActor>, Report> {
         let mut best_agent = None;
         let mut best_agent_score = 0u32;
 
@@ -75,15 +72,24 @@ impl SchedulerActor {
             for agent in self.agent_actor_cache.data_cache.iter() {
                 let mut agent_score = 0u32;
 
-                let agent_max_vcpus = agent.metadata.vcpus * VCPU_OVERPROVISIONMENT_NUMERATOR
-                    / VCPU_OVERPROVISIONMENT_DENOMINATOR;
+                let agent_max_vcpus = agent
+                    .metadata
+                    .vcpus
+                    .checked_mul(VCPU_OVERPROVISIONMENT_NUMERATOR)
+                    .and_then(|value| value.checked_div(VCPU_OVERPROVISIONMENT_DENOMINATOR))
+                    .unwrap_or(u32::MAX);
 
                 if agent.metadata.used_vcpus >= agent_max_vcpus {
                     continue;
                 }
 
-                agent_score +=
-                    (agent_max_vcpus - agent.metadata.used_vcpus) * 1024 / agent_max_vcpus;
+                agent_score = agent_score.saturating_add(
+                    agent_max_vcpus
+                        .saturating_sub(agent.metadata.used_vcpus)
+                        .checked_mul(1024)
+                        .and_then(|value| value.checked_div(agent_max_vcpus))
+                        .unwrap_or(u32::MAX),
+                );
 
                 // todo: add ram overprovisionment.     not adding this to scheduler until it works on the hypervisor side.
                 let agent_max_ram = agent.metadata.ram;
@@ -92,8 +98,17 @@ impl SchedulerActor {
                     continue;
                 }
 
-                agent_score += ((agent_max_ram.as_u64() - agent.metadata.used_ram.as_u64()) * 1024
-                    / agent_max_ram.as_u64()) as u32;
+                agent_score = agent_score.saturating_add(
+                    u32::try_from(
+                        agent_max_ram
+                            .as_u64()
+                            .saturating_sub(agent.metadata.used_ram.as_u64())
+                            .checked_mul(1024)
+                            .and_then(|value| value.checked_div(agent_max_ram.as_u64()))
+                            .unwrap_or(u64::MAX),
+                    )
+                    .unwrap_or(u32::MAX),
+                );
 
                 // todo: https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/
 
@@ -206,8 +221,8 @@ impl Actor for SchedulerActor {
         info!(?peer_id, "Scheduler Actor started!");
 
         Ok(Self {
-            agent_actor_cache: ActorCache::new(actor_ref.clone(), AgentActorCacheUpdater)?,
-            vm_actor_cache: ActorCache::new(actor_ref, VMActorCacheUpdater)?,
+            agent_actor_cache: ActorCache::new(actor_ref.clone(), AgentActorCacheUpdater),
+            vm_actor_cache: ActorCache::new(actor_ref, VMActorCacheUpdater),
         })
     }
 
@@ -223,8 +238,8 @@ impl Actor for SchedulerActor {
             return Ok(ControlFlow::Break(ActorStopReason::Killed));
         };
 
-        self.agent_actor_cache.on_link_died(id).await;
-        self.vm_actor_cache.on_link_died(id).await;
+        self.agent_actor_cache.on_link_died(id);
+        self.vm_actor_cache.on_link_died(id);
 
         info!(vm_actor_cache=?self.agent_actor_cache.data_cache, agent_actor_cache=?self.vm_actor_cache.data_cache, "data caches post actor removal");
 
@@ -241,7 +256,7 @@ impl Message<CreateVM> for SchedulerActor {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         loop {
-            let target_agent = self.schedule_agent(&msg).await?;
+            let target_agent = self.schedule_agent(&msg)?;
 
             match target_agent.ask(&msg).await {
                 Ok(reply) => return Ok(reply),
@@ -293,7 +308,7 @@ impl Message<ShutdownVM> for SchedulerActor {
 
 /// this only gets data from the cache from agents
 /// we may need a different message that actually forcibly runs/updates everything.
-/// and/or messages that get data directly from the VMActors.
+/// and/or messages that get data directly from the `VMActors`.
 impl Message<AgentListVMs> for SchedulerActor {
     type Reply = Result<AgentListVMsReply, Report>;
 

@@ -19,8 +19,8 @@ impl TryFrom<&Url> for FileTarget {
     fn try_from(uri: &Url) -> Result<Self, Self::Error> {
         let path = uri
             .to_file_path()
-            .map_err(|_| eyre!("Failed to convert file URI to path: '{}'", uri.as_str()))?;
-        Ok(FileTarget { path })
+            .map_err(|()| eyre!("Failed to convert file URI to path: '{}'", uri.as_str()))?;
+        Ok(Self { path })
     }
 }
 
