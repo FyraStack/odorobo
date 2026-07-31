@@ -4,9 +4,9 @@
 //! The manifest is the provider-neutral desired state exchanged with Odorobo;
 //! provider-specific configuration is produced by the driver.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, path::Path};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::Error as DeError};
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -21,6 +21,8 @@ pub const MANIFEST_VERSION: u32 = 1;
 pub enum ManifestError {
     #[error("manifest version {0} is unsupported")]
     UnsupportedVersion(u32),
+    #[error("metadata must define a non-empty name")]
+    EmptyMetadataName,
     #[error("manifest must define at least one vCPU")]
     NoVcpus,
     #[error("max_vcpus ({max}) must be greater than or equal to vcpus ({vcpus})")]
@@ -47,7 +49,7 @@ pub enum ManifestError {
     InvalidVsockSocket,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct VmManifest {
     /// Version of this manifest's serialized contract, not the hypervisor API.
@@ -60,6 +62,33 @@ pub struct VmManifest {
     /// when calculating the next desired provider configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed: Option<ObservedState>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeserializableVmManifest {
+    api_version: u32,
+    id: Ulid,
+    desired: DesiredState,
+    #[serde(default)]
+    observed: Option<ObservedState>,
+}
+
+impl<'de> Deserialize<'de> for VmManifest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let manifest = DeserializableVmManifest::deserialize(deserializer)?;
+        let manifest = Self {
+            api_version: manifest.api_version,
+            id: manifest.id,
+            desired: manifest.desired,
+            observed: manifest.observed,
+        };
+        manifest.validate().map_err(D::Error::custom)?;
+        Ok(manifest)
+    }
 }
 
 impl VmManifest {
@@ -98,6 +127,9 @@ impl DesiredState {
     /// Validates relationships between fields that JSON deserialization alone
     /// cannot express, such as a boot disk needing a writable source.
     fn validate(&self) -> Result<(), ManifestError> {
+        if self.metadata.name.trim().is_empty() {
+            return Err(ManifestError::EmptyMetadataName);
+        }
         if self.compute.vcpus == 0 {
             return Err(ManifestError::NoVcpus);
         }
@@ -140,17 +172,16 @@ impl DesiredState {
             }
         }
         for (index, network) in self.networks.iter().enumerate() {
-            if network.id.is_empty() {
+            if network.id.trim().is_empty() {
                 return Err(ManifestError::NetworkWithoutId(index));
             }
         }
         // NoCloud treats user-data and meta-data as one instance-data set.
         // Accepting only half of it would produce a provider configuration that
         // looks valid but can fail during guest initialization.
-        if self
-            .cloud_init
-            .as_ref()
-            .is_some_and(|cloud| cloud.user_data.is_some() != cloud.meta_data.is_some())
+        if let Some(cloud) = &self.cloud_init
+            && (cloud.user_data.is_some() != cloud.meta_data.is_some()
+                || (cloud.user_data.is_none() && cloud.meta_data.is_none()))
         {
             return Err(ManifestError::IncompleteCloudInit);
         }
@@ -158,7 +189,7 @@ impl DesiredState {
             if vsock.guest_cid == 0 {
                 return Err(ManifestError::InvalidVsockCid);
             }
-            if vsock.socket.trim().is_empty() {
+            if vsock.socket.trim().is_empty() || !Path::new(&vsock.socket).is_absolute() {
                 return Err(ManifestError::InvalidVsockSocket);
             }
         }
@@ -389,11 +420,39 @@ mod tests {
         manifest.desired.disks.clear();
         manifest.desired.vsock = Some(Vsock {
             guest_cid: 42,
-            socket: "  ".to_owned(),
+            socket: "relative.sock".to_owned(),
         });
         assert!(matches!(
             manifest.validate(),
             Err(ManifestError::InvalidVsockSocket)
         ));
+
+        manifest.desired.vsock = None;
+        manifest.desired.metadata.name = "  ".to_owned();
+        assert!(matches!(
+            manifest.validate(),
+            Err(ManifestError::EmptyMetadataName)
+        ));
+
+        manifest.desired.metadata.name = "vm".to_owned();
+        manifest.desired.networks.push(Network {
+            id: "  ".to_owned(),
+            ..Default::default()
+        });
+        assert!(matches!(
+            manifest.validate(),
+            Err(ManifestError::NetworkWithoutId(0))
+        ));
+
+        manifest.desired.networks.clear();
+        manifest.desired.cloud_init = Some(CloudInit::default());
+        assert!(matches!(
+            manifest.validate(),
+            Err(ManifestError::IncompleteCloudInit)
+        ));
+
+        let invalid_json = include_str!("../../docs/fixtures/manifest/minimal.json")
+            .replace("\"vcpus\": 1", "\"vcpus\": 0");
+        serde_json::from_str::<VmManifest>(&invalid_json).unwrap_err();
     }
 }

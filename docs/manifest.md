@@ -44,18 +44,19 @@ paths are observed/driver-owned implementation details, not manifest fields.
 
 ## Validation and evolution
 
-A manifest must use a supported `api_version`, have non-zero vCPUs and memory,
-and satisfy these relationships:
+A manifest must use a supported `api_version`, have a non-empty metadata name,
+non-zero vCPUs and memory, and satisfy these relationships:
 
 - `max_vcpus` must be at least `vcpus`.
 - Every disk must have exactly one usable source (URI or volume reference), and
-  a boot disk cannot be read-only.
-- Every network must have a non-empty ID.
-- Cloud-init user-data and meta-data must be supplied together.
-- A vsock guest CID must be non-zero.
+  a boot disk cannot be read-only. At most one disk may be marked as boot.
+- Every network must have a non-empty, non-whitespace ID.
+- Cloud-init must provide non-empty configuration with user-data and meta-data
+  supplied together.
+- A vsock guest CID must be non-zero and its socket must be an absolute path.
 
-Unknown fields are rejected during deserialization rather than silently
-interpreted. New fields should be added in a future manifest version when they
+Invalid field combinations are rejected during deserialization, as are unknown
+fields, rather than silently interpreted. New fields should be added in a future manifest version when they
 change semantics; unreleased formats do not require Proxmox compatibility
 layers. Providers may reject a valid manifest field they cannot implement, with
 a clear unsupported-field error, rather than dropping it. This contract is
