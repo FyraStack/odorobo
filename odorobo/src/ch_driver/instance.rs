@@ -48,7 +48,7 @@ impl std::fmt::Debug for VMInstance {
             .field("id", &self.id)
             .field("ch_socket_path", &self.ch_socket_path)
             .field("vm_config", &self.vm_config)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -84,7 +84,7 @@ impl VMInstance {
         child_process: Option<tokio::process::Child>,
     ) -> Self {
         Self {
-            id: id.to_string(),
+            id: id.to_owned(),
             ch_socket_path,
             transformer: transformer.unwrap_or_default(),
             hook_manager: HookManager::default(),
@@ -96,7 +96,7 @@ impl VMInstance {
     /// Takes the child process out of this instance, transferring ownership to the caller.
     /// Useful for watching the process lifecycle externally (e.g. in an actor watcher task).
     /// After calling this, `destroy()` will skip the child-kill step.
-    pub fn take_child_process(&mut self) -> Option<tokio::process::Child> {
+    pub const fn take_child_process(&mut self) -> Option<tokio::process::Child> {
         self.child_process.take()
     }
 
@@ -162,7 +162,7 @@ impl VMInstance {
     /// Initiates a migration from this VM to the specified destination URI.
     ///
     /// Options:
-    /// - `dest`: the destination URI to migrate to, in the format expected by CH (e.g. "tcp:<IP_ADDRESS>:12345")
+    /// - `dest`: the destination URI to migrate to, in the format expected by CH (e.g. "tcp:<`IP_ADDRESS>:12345`")
     /// - `local`: if true, indicates that the migration is local (e.g. within the same host, for renaming a VM). This is passed to CH and may affect how the migration is performed.
     #[tracing::instrument]
     pub async fn send_migration(&mut self, dest: &str, local: bool) -> Result<()> {
@@ -170,7 +170,7 @@ impl VMInstance {
         trace!(destination = dest, "Sending migration command to VM");
 
         let send_migration_data = models::SendMigrationData {
-            destination_url: dest.to_string(),
+            destination_url: dest.to_owned(),
             local: Some(local),
             ..Default::default()
         };
@@ -207,13 +207,13 @@ impl VMInstance {
 
         trace!(port = rand_port, "Selected random port for migration");
 
-        let receiver_uri = format!("tcp:0.0.0.0:{}", rand_port);
+        let receiver_uri = format!("tcp:0.0.0.0:{rand_port}");
 
         let receive_migration_data = models::ReceiveMigrationData {
             receiver_url: receiver_uri.clone(),
         };
 
-        let vm_id = self.vm_id().to_string();
+        let vm_id = self.vm_id().to_owned();
         info!(
             vm_id,
             port = rand_port,
@@ -227,7 +227,7 @@ impl VMInstance {
                 .map_err(ChApiError::from)
                 .wrap_err(eyre!("Failed to prepare VM for migration {}", vm_id))
             {
-                Ok(_) => {
+                Ok(()) => {
                     info!(vm_id, "Migration receiver completed successfully");
                     // shut down vm
                     if let Err(e) = conn.shutdown_vmm().await {
@@ -275,8 +275,7 @@ impl VMInstance {
 
     pub fn configured_runtime_root() -> PathBuf {
         env::var_os(RUNTIME_ROOT_ENV_VAR)
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_RUNTIME_ROOT_DIR))
+            .map_or_else(|| PathBuf::from(DEFAULT_RUNTIME_ROOT_DIR), PathBuf::from)
     }
 
     pub fn conn(&self) -> SocketBasedApiClient {
@@ -357,7 +356,7 @@ impl VMInstance {
             .wrap_err(eyre!("Failed to ping VM {}", self.vm_id()))
     }
 
-    /// Spawn a new CH process and create a VMInstance for it.
+    /// Spawn a new CH process and create a `VMInstance` for it.
     ///
     /// Waits for the socket to become available (polls up to ~30 seconds).
     /// Calls a backend to handle the actual CH process spawning - typically a systemd unit
@@ -392,7 +391,7 @@ impl VMInstance {
             }
 
             if attempt < MAX_ATTEMPTS - 1 {
-                tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
             }
         }
 
@@ -426,7 +425,7 @@ impl VMInstance {
             );
         }
 
-        if let Ok(()) = self.conn().shutdown_vmm().await {
+        if matches!(self.conn().shutdown_vmm().await, Ok(())) {
             debug!(vm_id = self.vm_id(), "VMM shutdown successfully");
         } else {
             warn!(
@@ -437,7 +436,7 @@ impl VMInstance {
         let vm_config = self.vm_config.clone().unwrap_or_default();
         if let Some(mut child) = self.child_process.take() {
             trace!("VMM stopped... checking child process");
-            let _ = child.start_kill();
+            _ = child.start_kill();
             if let Err(err) = child.wait().await {
                 warn!(
                     vm_id = self.vm_id(),

@@ -21,10 +21,7 @@ impl Actor for HTTPActor {
     type Args = ActorRef<SchedulerActor>;
     type Error = Report;
 
-    async fn on_start(
-        scheduler: Self::Args,
-        actor_ref: ActorRef<Self>,
-    ) -> Result<Self, Self::Error> {
+    async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
         // run the HTTP API
         tokio::spawn(async move {
             tracing::info!(?EXTERNAL_HTTP_ADDRESS, "Starting HTTP server");
@@ -36,7 +33,7 @@ impl Actor for HTTPActor {
                 .unwrap();
         });
 
-        Ok(Self { scheduler })
+        Ok(Self { scheduler: args })
     }
 }
 

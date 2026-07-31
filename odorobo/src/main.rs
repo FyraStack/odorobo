@@ -29,19 +29,21 @@ fn main() -> Result<()> {
         eyre!("init lockfile failed (note: the `no_lockfile` option can skip this)").wrap_err(e)
     })?;
 
-    mainloop(term, config)
+    mainloop(&term, config)
 }
 
-fn mainloop(term: Arc<AtomicBool>, config: Config) -> Result<()> {
+fn mainloop(term: &Arc<AtomicBool>, config: Config) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .expect("can't build tokio");
+        .map_err(|err| eyre!("can't build tokio: {err}"))?;
     let handle = runtime.spawn(inner_main(config));
 
     loop {
         if handle.is_finished() {
-            break runtime.block_on(handle).expect("cannot join main thread");
+            break runtime
+                .block_on(handle)
+                .map_err(|err| eyre!("cannot join main thread: {err}"))?;
         }
         if term.load(Ordering::Relaxed) {
             handle.abort();

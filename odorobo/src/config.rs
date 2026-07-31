@@ -141,6 +141,7 @@ pub struct Config {
 }
 
 impl Config {
+    #[must_use]
     pub fn init() -> Self {
         let mut result = Self::parse();
         if let Ok(fd) =
@@ -155,13 +156,16 @@ impl Config {
         }
         result
     }
+    #[must_use]
     pub fn get_manager_enabled(&self) -> bool {
         self.manager_enabled.unwrap_or(false)
     }
+    #[must_use]
     pub fn get_hostname(&self) -> &str {
         static HOSTNAME: LazyLock<Option<String>> = LazyLock::new(System::host_name);
         (self.hostname.as_deref()).unwrap_or_else(|| HOSTNAME.as_deref().unwrap_or("odorobo"))
     }
+    #[must_use]
     pub fn get_datacenter(&self) -> &str {
         static DEFAULT_DATACENTER: LazyLock<&'static str> = LazyLock::new(|| {
             warn!("No datacenter specified, defaulting to Dev");
@@ -169,6 +173,7 @@ impl Config {
         });
         (self.datacenter.as_deref()).unwrap_or_else(|| *DEFAULT_DATACENTER)
     }
+    #[must_use]
     pub fn get_region(&self) -> &str {
         static DEFAULT_REGION: LazyLock<&'static str> = LazyLock::new(|| {
             warn!("No region specified, defaulting to Local");
@@ -176,6 +181,7 @@ impl Config {
         });
         (self.region.as_deref()).unwrap_or_else(|| *DEFAULT_REGION)
     }
+    #[must_use]
     pub fn get_reserved_vcpus(&self) -> u32 {
         self.reserved_vcpus.unwrap_or(2)
     }
@@ -191,10 +197,10 @@ mod tests {
                 dhcp_config: Some(DhcpConfig {
                     range: (Ipv4Addr::new(10, 10, 1, 100), Ipv4Addr::new(10, 10, 1, 200)),
                     subnet: Ipv4Net::new(Ipv4Addr::new(10, 10, 1, 0), 24).unwrap(),
-                    lease_time: "12h".to_string(),
+                    lease_time: "12h".to_owned(),
                 }),
                 network_mode: NetworkMode::HostonlyNat {
-                    bridge: "vmbr0".to_string(),
+                    bridge: "vmbr0".to_owned(),
                     gateway: Ipv4Addr::new(10, 10, 100, 1),
                     subnet: Ipv4Net::new(Ipv4Addr::new(10, 10, 100, 0), 24).unwrap(),
                     upstream_iface: default_upstream_iface(),
@@ -205,6 +211,6 @@ mod tests {
 
         let json = serde_json::to_string_pretty(&config).unwrap();
         // assert_eq!(json, )
-        println!("{}", json);
+        println!("{json}");
     }
 }

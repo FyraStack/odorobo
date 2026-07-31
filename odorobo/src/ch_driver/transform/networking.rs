@@ -68,7 +68,7 @@ fn rewrite_net_config(vmid: &str, net: &mut NetConfig) -> Result<()> {
         "rewriting network URI to deterministic TAP device"
     );
 
-    net.id = Some(id.to_string());
+    net.id = Some(id.to_owned());
     net.tap = Some(tap_name);
 
     Ok(())
@@ -100,7 +100,7 @@ fn deterministic_tap_name(vmid: &str, network_id: &str) -> String {
     // one side entirely. For VMIDs we keep the suffix rather than the prefix,
     // because ULID prefixes are timestamp-derived and less useful for uniqueness.
     let separator_len = 2; // two '-'
-    let fixed_len = TAP_PREFIX.len() + separator_len;
+    let fixed_len = TAP_PREFIX.len().saturating_add(separator_len);
     let available = MAX_IFNAME_LEN.saturating_sub(fixed_len);
 
     if available == 0 {
@@ -112,10 +112,11 @@ fn deterministic_tap_name(vmid: &str, network_id: &str) -> String {
     let network_budget = available.saturating_sub(vmid_budget).max(1);
 
     if vmid_part.len() > vmid_budget {
-        vmid_part = vmid_part[vmid_part.len() - vmid_budget..].to_string();
+        vmid_part = vmid_part[vmid_part.len().saturating_sub(vmid_budget)..].to_string();
     }
     if network_part.len() > network_budget {
-        network_part = network_part[network_part.len() - network_budget..].to_string();
+        network_part =
+            network_part[network_part.len().saturating_sub(network_budget)..].to_string();
     }
 
     let mut tap = format!("{TAP_PREFIX}-{vmid_part}-{network_part}");
@@ -147,7 +148,7 @@ mod tests {
     fn rewrites_net_uri_into_tap_and_plain_id() {
         let mut config = VmConfig {
             net: Some(vec![NetConfig {
-                id: Some("net://devnet".to_string()),
+                id: Some("net://devnet".to_owned()),
                 ..Default::default()
             }]),
             ..Default::default()
@@ -166,7 +167,7 @@ mod tests {
     fn ignores_non_network_uri_ids() {
         let mut config = VmConfig {
             net: Some(vec![NetConfig {
-                id: Some("net1".to_string()),
+                id: Some("net1".to_owned()),
                 ..Default::default()
             }]),
             ..Default::default()
@@ -183,7 +184,7 @@ mod tests {
     fn rejects_invalid_network_id() {
         let mut config = VmConfig {
             net: Some(vec![NetConfig {
-                id: Some("net://bad/id".to_string()),
+                id: Some("net://bad/id".to_owned()),
                 ..Default::default()
             }]),
             ..Default::default()
