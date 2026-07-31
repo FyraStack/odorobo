@@ -27,8 +27,12 @@ pub enum ManifestError {
     MaxVcpusLessThanBoot { vcpus: u32, max: u32 },
     #[error("memory must be greater than zero")]
     NoMemory,
-    #[error("disk {0} must define exactly one of URI or volume reference")]
+    #[error("disk must define a non-empty id")]
+    EmptyDiskId,
+    #[error("disk {0} must define exactly one usable source (URI or volume reference)")]
     InvalidDiskSource(String),
+    #[error("disk {0} has a duplicate id")]
+    DuplicateDiskId(String),
     #[error("disk {0} cannot be both a boot disk and read-only")]
     ReadOnlyBootDisk(String),
     #[error("network {0} must define an id")]
@@ -37,6 +41,8 @@ pub enum ManifestError {
     IncompleteCloudInit,
     #[error("vsock requires a non-zero guest CID")]
     InvalidVsockCid,
+    #[error("vsock requires a non-empty socket path")]
+    InvalidVsockSocket,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -106,9 +112,18 @@ impl DesiredState {
         }
         // A disk source remains abstract here. URI resolution and volume
         // attachment belong to storage backends, so the manifest only checks
-        // that the converter has one source from which to begin.
+        // that the converter has one usable source from which to begin.
+        let mut disk_ids = std::collections::HashSet::with_capacity(self.disks.len());
         for disk in &self.disks {
-            if disk.uri.is_some() == disk.volume_id.is_some() {
+            if disk.id.trim().is_empty() {
+                return Err(ManifestError::EmptyDiskId);
+            }
+            if !disk_ids.insert(&disk.id) {
+                return Err(ManifestError::DuplicateDiskId(disk.id.clone()));
+            }
+            if disk.uri.as_deref().is_some_and(|uri| uri.trim().is_empty())
+                || disk.uri.is_some() == disk.volume_id.is_some()
+            {
                 return Err(ManifestError::InvalidDiskSource(disk.id.clone()));
             }
             if disk.boot && disk.read_only {
@@ -130,12 +145,13 @@ impl DesiredState {
         {
             return Err(ManifestError::IncompleteCloudInit);
         }
-        if self
-            .vsock
-            .as_ref()
-            .is_some_and(|vsock| vsock.guest_cid == 0)
-        {
-            return Err(ManifestError::InvalidVsockCid);
+        if let Some(vsock) = &self.vsock {
+            if vsock.guest_cid == 0 {
+                return Err(ManifestError::InvalidVsockCid);
+            }
+            if vsock.socket.trim().is_empty() {
+                return Err(ManifestError::InvalidVsockSocket);
+            }
         }
         Ok(())
     }
@@ -308,6 +324,49 @@ mod tests {
         assert!(matches!(
             manifest.validate(),
             Err(ManifestError::InvalidDiskSource(_))
+        ));
+
+        manifest.desired.disks.clear();
+        manifest.desired.disks.push(Disk {
+            id: "root".to_owned(),
+            uri: Some("  ".to_owned()),
+            ..Default::default()
+        });
+        assert!(matches!(
+            manifest.validate(),
+            Err(ManifestError::InvalidDiskSource(_))
+        ));
+
+        manifest.desired.disks[0].uri = Some("file:///disk.img".to_owned());
+        manifest.desired.disks.push(Disk {
+            id: "root".to_owned(),
+            uri: Some("file:///other.img".to_owned()),
+            ..Default::default()
+        });
+        assert!(matches!(
+            manifest.validate(),
+            Err(ManifestError::DuplicateDiskId(_))
+        ));
+
+        manifest.desired.disks.clear();
+        manifest.desired.disks.push(Disk {
+            id: "  ".to_owned(),
+            uri: Some("file:///disk.img".to_owned()),
+            ..Default::default()
+        });
+        assert!(matches!(
+            manifest.validate(),
+            Err(ManifestError::EmptyDiskId)
+        ));
+
+        manifest.desired.disks.clear();
+        manifest.desired.vsock = Some(Vsock {
+            guest_cid: 42,
+            socket: "  ".to_owned(),
+        });
+        assert!(matches!(
+            manifest.validate(),
+            Err(ManifestError::InvalidVsockSocket)
         ));
     }
 }
