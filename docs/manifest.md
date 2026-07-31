@@ -5,6 +5,21 @@ not a Cloud Hypervisor `VmConfig`; the Cloud Hypervisor driver owns conversion,
 node-local paths, and runtime details. The current contract is version `1` and
 is represented by `odorobo::manifest::VmManifest`.
 
+## Existing field inventory
+
+The legacy `VirtualMachine` model in `odorobo/src/types.rs` currently combines
+intent and runtime data: `VMData` contains identity, name, vCPU limits, memory,
+an image, volumes, and network IDs, while `VirtualMachine` adds node, status,
+metadata, and affinity. The manifest separates those concerns so the control
+plane can provide stable intent without depending on the legacy shape.
+
+The current Cloud Hypervisor conversion in `odorobo/src/ch_driver/actor.rs`
+consumes vCPUs, maximum vCPUs, memory, and the image as a disk. Firmware and
+serial/platform defaults are currently driver-owned. Network, volume-to-disk,
+cloud-init, and vsock conversion remain provider integration work; their
+manifest fields are defined here so those later conversions have a stable
+contract and explicit ownership boundary.
+
 ## State ownership
 
 `desired` is supplied by the control plane and is the source of truth for what
@@ -39,11 +54,13 @@ and satisfy these relationships:
 - Cloud-init user-data and meta-data must be supplied together.
 - A vsock guest CID must be non-zero.
 
-Unknown fields are rejected by conversion/validation consumers rather than
-silently interpreted. New fields should be added in a future manifest version
-when they change semantics; unreleased formats do not require Proxmox
-compatibility layers. Providers may reject a valid manifest field they cannot
-implement, with a clear unsupported-field error, rather than dropping it.
+Unknown fields are rejected during deserialization rather than silently
+interpreted. New fields should be added in a future manifest version when they
+change semantics; unreleased formats do not require Proxmox compatibility
+layers. Providers may reject a valid manifest field they cannot implement, with
+a clear unsupported-field error, rather than dropping it. This contract is
+therefore intentionally forward-evolving, not a compatibility layer for
+Proxmox or unreleased Odorobo formats.
 
 ## Examples
 

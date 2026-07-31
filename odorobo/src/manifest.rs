@@ -27,8 +27,8 @@ pub enum ManifestError {
     MaxVcpusLessThanBoot { vcpus: u32, max: u32 },
     #[error("memory must be greater than zero")]
     NoMemory,
-    #[error("disk {0} must define a URI or a volume reference")]
-    DiskWithoutSource(String),
+    #[error("disk {0} must define exactly one of URI or volume reference")]
+    InvalidDiskSource(String),
     #[error("disk {0} cannot be both a boot disk and read-only")]
     ReadOnlyBootDisk(String),
     #[error("network {0} must define an id")]
@@ -40,6 +40,7 @@ pub enum ManifestError {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct VmManifest {
     /// Version of this manifest's serialized contract, not the hypervisor API.
     pub api_version: u32,
@@ -68,6 +69,7 @@ impl VmManifest {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct DesiredState {
     pub metadata: Metadata,
     pub compute: Compute,
@@ -106,8 +108,8 @@ impl DesiredState {
         // attachment belong to storage backends, so the manifest only checks
         // that the converter has one source from which to begin.
         for disk in &self.disks {
-            if disk.uri.is_none() && disk.volume_id.is_none() {
-                return Err(ManifestError::DiskWithoutSource(disk.id.clone()));
+            if disk.uri.is_some() == disk.volume_id.is_some() {
+                return Err(ManifestError::InvalidDiskSource(disk.id.clone()));
             }
             if disk.boot && disk.read_only {
                 return Err(ManifestError::ReadOnlyBootDisk(disk.id.clone()));
@@ -140,6 +142,7 @@ impl DesiredState {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Metadata {
     pub name: String,
     #[serde(default)]
@@ -149,6 +152,7 @@ pub struct Metadata {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Compute {
     pub vcpus: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -157,6 +161,7 @@ pub struct Compute {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Disk {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -170,6 +175,7 @@ pub struct Disk {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Network {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -177,6 +183,7 @@ pub struct Network {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Placement {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node: Option<String>,
@@ -185,6 +192,7 @@ pub struct Placement {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Boot {
     #[serde(default)]
     pub start: bool,
@@ -197,6 +205,7 @@ pub struct Boot {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct CloudInit {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_data: Option<String>,
@@ -205,12 +214,14 @@ pub struct CloudInit {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Vsock {
     pub guest_cid: u32,
     pub socket: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ObservedState {
     /// Odorobo's normalized view of the VM lifecycle.
     pub status: ObservedStatus,
@@ -244,12 +255,36 @@ mod tests {
 
     #[test]
     fn fixture_round_trips() {
-        let json = include_str!("../../docs/fixtures/manifest/minimal.json");
-        let manifest: VmManifest = serde_json::from_str(json).expect("valid fixture");
-        manifest.validate().expect("valid manifest");
-        let encoded = serde_json::to_string(&manifest).expect("serializable manifest");
-        let decoded: VmManifest = serde_json::from_str(&encoded).expect("round trip");
-        assert_eq!(manifest, decoded);
+        let fixtures = [
+            include_str!("../../docs/fixtures/manifest/minimal.json"),
+            include_str!("../../docs/fixtures/manifest/storage-backed.json"),
+            include_str!("../../docs/fixtures/manifest/networked.json"),
+            include_str!("../../docs/fixtures/manifest/cloud-init.json"),
+            include_str!("../../docs/fixtures/manifest/vsock.json"),
+        ];
+
+        for json in fixtures {
+            let manifest: VmManifest = serde_json::from_str(json).expect("valid fixture");
+            manifest.validate().expect("valid manifest");
+            let encoded = serde_json::to_string(&manifest).expect("serializable manifest");
+            let decoded: VmManifest = serde_json::from_str(&encoded).expect("round trip");
+            assert_eq!(manifest, decoded);
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_fields() {
+        let json = r#"{
+            "api_version": 1,
+            "id": "01J00000000000000000000000",
+            "desired": {
+                "metadata": { "name": "vm" },
+                "compute": { "vcpus": 1, "memory_bytes": 1 },
+                "boot": { "start": false },
+                "unexpected": true
+            }
+        }"#;
+        serde_json::from_str::<VmManifest>(json).unwrap_err();
     }
 
     #[test]
@@ -261,6 +296,18 @@ mod tests {
         assert!(matches!(
             manifest.validate(),
             Err(ManifestError::MaxVcpusLessThanBoot { .. })
+        ));
+
+        manifest.desired.compute.max_vcpus = None;
+        manifest.desired.disks.push(Disk {
+            id: "invalid".to_owned(),
+            uri: Some("file:///disk.img".to_owned()),
+            volume_id: Some(Ulid::generate()),
+            ..Default::default()
+        });
+        assert!(matches!(
+            manifest.validate(),
+            Err(ManifestError::InvalidDiskSource(_))
         ));
     }
 }
