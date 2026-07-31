@@ -18,7 +18,7 @@ tracing-subscriber = { version = "0.3", features = [
     "fmt",
     "json",
 ] }
-ulid = { version = "1.2", features = ["serde", "uuid"] }
+ulid = { version = "3.0", features = ["serde", "uuid"] }
 bytesize = { version = "2.3", features = ["serde"] }
 
 
