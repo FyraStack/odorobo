@@ -1,0 +1,13 @@
+{
+  "api_version": 1,
+  "id": "01J00000000000000000000005",
+  "desired": {
+    "metadata": { "name": "vsock", "labels": {}, "annotations": {} },
+    "compute": { "vcpus": 4, "memory_bytes": 4294967296 },
+    "disks": [],
+    "networks": [],
+    "placement": {},
+    "boot": { "start": true },
+    "vsock": { "guest_cid": 42, "socket": "/run/odorobo/vms/vsock/vsock.sock" }
+  }
+}

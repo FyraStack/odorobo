@@ -1,0 +1,12 @@
+{
+  "api_version": 1,
+  "id": "01J00000000000000000000000",
+  "desired": {
+    "metadata": { "name": "minimal", "labels": {}, "annotations": {} },
+    "compute": { "vcpus": 1, "memory_bytes": 536870912 },
+    "disks": [],
+    "networks": [],
+    "placement": {},
+    "boot": { "start": false }
+  }
+}
