@@ -194,7 +194,7 @@ pub enum AffinityType {
     Agent,
 }
 
-/// if there are several metadata tables, their results will be ANDed together
+/// If there are several metadata tables, their results will be `ANDed` together
 /// EX: if a requirement is checked against several VMs, it must pass all VMs for the requirement to be fulfilled.
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
 pub struct AffinityRequirement {
@@ -210,7 +210,7 @@ pub enum MetadataTable {
     Annotation,
 }
 
-#[derive(Serialize, Deserialize, Debug, JsonSchema, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, JsonSchema, Clone, PartialEq, Eq)]
 pub enum Operator {
     In,
     NotIn,

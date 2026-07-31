@@ -45,7 +45,7 @@ pub struct CachedAgentActor {
 pub struct CachedVMActor {
     pub actor_ref: Option<RemoteActorRef<VMActor>>,
     /// The agent this VM was scheduled on. Used by the updater task to clean up
-    /// the agent's extended_vm_set if the VM actor dies before it's linked.
+    /// the agent's `extended_vm_set` if the VM actor dies before it's linked.
     pub scheduled_agent_id: ActorId,
     pub data: GetVMInfoReply,
 }
@@ -99,19 +99,15 @@ static VCPU_OVERPROVISIONMENT_NUMERATOR: u32 = 2;
 static VCPU_OVERPROVISIONMENT_DENOMINATOR: u32 = 1;
 
 impl SchedulerActor {
-    async fn lookup_agent_by_actor_id(
-        &mut self,
-        actor_id: &ActorId,
-    ) -> Option<RemoteActorRef<AgentActor>> {
+    #[expect(dead_code, reason = "reserved for explicit placement by actor id")]
+    fn lookup_agent_by_actor_id(&self, actor_id: &ActorId) -> Option<RemoteActorRef<AgentActor>> {
         self.agent_data_cache
             .get(actor_id)
             .map(|data| data.actor_ref.clone())
     }
 
-    async fn lookup_agent_by_hostname(
-        &mut self,
-        hostname: &str,
-    ) -> Option<RemoteActorRef<AgentActor>> {
+    #[expect(dead_code, reason = "reserved for explicit placement by hostname")]
+    fn lookup_agent_by_hostname(&self, hostname: &str) -> Option<RemoteActorRef<AgentActor>> {
         self.agent_data_cache
             .iter()
             .find(|data| data.data.hostname == hostname)
@@ -120,7 +116,7 @@ impl SchedulerActor {
 
     // someone should likely give caleb a firm talking to about code duplication due to this section, but things are just different enough that trying to make them one function requires usage of a lot of generics which feels even worse. so i dont know what to do. cappy please fix. i hate this.
     async fn vm_actor_finder(
-        parent_actor_ref: RemoteActorRef<SchedulerActor>,
+        parent_actor_ref: RemoteActorRef<Self>,
         vm_actorid_ulid_map: Arc<DashMap<ActorId, Ulid>>,
         data_cache: Arc<DashMap<Ulid, CachedVMActor>>,
         keepalive_tasks: Arc<DashMap<ActorId, JoinHandle<()>>>,
@@ -165,7 +161,7 @@ impl SchedulerActor {
         agent_data_cache: Arc<DashMap<ActorId, CachedAgentActor>>,
     ) {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
-        let mut fails = 0;
+        let mut fails: u8 = 0;
         loop {
             if let Ok(data) = actor_ref.ask(&GetVMInfo { vmid: None }).await {
                 let vmid = data.vmid;
@@ -182,15 +178,14 @@ impl SchedulerActor {
                         // so no accidental cleanup of wrong agent).
                         scheduled_agent_id: data_cache
                             .get(&vmid)
-                            .map(|e| e.scheduled_agent_id)
-                            .unwrap_or(actor_ref.id()),
+                            .map_or_else(|| actor_ref.id(), |e| e.scheduled_agent_id),
                         data,
                     },
                 );
 
                 fails = 0;
             } else {
-                fails += 1;
+                fails = fails.saturating_add(1);
             }
 
             if fails > 5 {
@@ -208,11 +203,8 @@ impl SchedulerActor {
                 // that matches this actor_ref.
                 let vmid = vmid.or_else(|| {
                     data_cache.iter().find_map(|entry| {
-                        if entry.actor_ref.as_ref().map(|r| r.id()) == Some(actor_ref.id()) {
-                            Some(*entry.key())
-                        } else {
-                            None
-                        }
+                        (entry.actor_ref.as_ref().map(RemoteActorRef::id) == Some(actor_ref.id()))
+                            .then(|| *entry.key())
                     })
                 });
 
@@ -235,7 +227,7 @@ impl SchedulerActor {
     }
 
     async fn agent_actor_finder(
-        parent_actor_ref: RemoteActorRef<SchedulerActor>,
+        parent_actor_ref: RemoteActorRef<Self>,
         data_cache: Arc<DashMap<ActorId, CachedAgentActor>>,
         keepalive_tasks: Arc<DashMap<ActorId, JoinHandle<()>>>,
     ) -> Result<(), Report> {
@@ -268,7 +260,7 @@ impl SchedulerActor {
         data_cache: Arc<DashMap<ActorId, CachedAgentActor>>,
     ) {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
-        let mut fails = 0;
+        let mut fails: u8 = 0;
         loop {
             if let Ok(data) = actor_ref.ask(&GetAgentStatus).await {
                 if data_cache.contains_key(&actor_ref.id()) {
@@ -285,14 +277,14 @@ impl SchedulerActor {
                         CachedAgentActor {
                             actor_ref: actor_ref.clone(),
                             data: data.clone(),
-                            extended_vm_set: AHashSet::from_iter(data.vms.iter().copied()),
+                            extended_vm_set: data.vms.iter().copied().collect(),
                         },
                     );
                 }
 
                 fails = 0;
             } else {
-                fails += 1;
+                fails = fails.saturating_add(1);
             }
 
             if fails > 5 {
@@ -334,7 +326,13 @@ impl SchedulerActor {
                 );
 
                 // intentionally ignoring results because we want to keep finding actors even if an attempt fails
-                let _ = tokio::join!(vm_join_handle, agent_join_handle);
+                let (vm_result, agent_result) = tokio::join!(vm_join_handle, agent_join_handle);
+                if let Err(error) = vm_result {
+                    warn!(?error, "VM actor discovery failed");
+                }
+                if let Err(error) = agent_result {
+                    warn!(?error, "agent actor discovery failed");
+                }
 
                 //info!(?vm_data_cache_arc_clone);
                 //info!(?agent_data_cache_arc_clone);
@@ -356,13 +354,13 @@ impl SchedulerActor {
     ///         The general score uses things like resource utilization to not over load any specific agent.
     ///
     ///
-    /// Affinity rules are roughly based on https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/
+    /// Affinity rules are roughly based on <https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/>.
     ///
     /// todo:
     ///  - the cache likely needs to be updated automatically when a new vm is scheduled for info like used resources, because otherwise we have to deal with latency on that data we are using
     ///    and then if someone tries to schedule lets say 10 VMs in a batch, we could end up scheduling them all to the same agent because the metadata hasn't updated.
     ///    - there are a few solutions for this but they all kinda suck, mostly due to also making sure we deal with latency properly. I am ignoring the issue for now.
-    fn schedule_agent(&mut self, msg: &CreateVM) -> Result<RemoteActorRef<AgentActor>, Report> {
+    fn schedule_agent(&self, msg: &CreateVM) -> Result<RemoteActorRef<AgentActor>, Report> {
         let mut best_agent = None;
         let mut best_score = AgentScore::REJECTED;
 
@@ -390,29 +388,55 @@ impl SchedulerActor {
     ) -> AgentScore {
         let mut score = AgentScore::default();
 
-        let agent_max_vcpus = agent.data.vcpus * VCPU_OVERPROVISIONMENT_NUMERATOR
-            / VCPU_OVERPROVISIONMENT_DENOMINATOR;
+        let agent_max_vcpus = agent
+            .data
+            .vcpus
+            .saturating_mul(VCPU_OVERPROVISIONMENT_NUMERATOR)
+            .checked_div(VCPU_OVERPROVISIONMENT_DENOMINATOR)
+            .unwrap_or(u32::MAX);
         // todo: do we care about VMData.max_vcpus?
-        let agent_used_vcpus = agent.data.used_vcpus + msg.config.data.vcpus;
+        let agent_used_vcpus = agent.data.used_vcpus.saturating_add(msg.config.data.vcpus);
 
         if agent_used_vcpus >= agent_max_vcpus {
             return AgentScore::REJECTED;
         }
 
-        score.general += (agent_max_vcpus - agent_used_vcpus) as f32 / agent_max_vcpus as f32;
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "the scheduler score intentionally uses f32 ratios"
+        )]
+        #[expect(
+            clippy::arithmetic_side_effects,
+            reason = "the preceding capacity check guarantees non-negative subtraction"
+        )]
+        let vcpu_headroom = (agent_max_vcpus - agent_used_vcpus) as f32 / agent_max_vcpus as f32;
+        score.general += vcpu_headroom;
 
         // todo: add ram overprovisionment.     not adding this to scheduler until it works on the hypervisor side.
         let agent_max_ram = agent.data.ram;
-        let agent_used_ram = agent.data.used_ram + msg.config.data.memory;
+        let agent_used_ram = bytesize::ByteSize::b(
+            agent
+                .data
+                .used_ram
+                .as_u64()
+                .saturating_add(msg.config.data.memory.as_u64()),
+        );
 
         if agent_used_ram >= agent_max_ram {
             return AgentScore::REJECTED;
         }
 
-        score.general += (agent_max_ram.as_u64() - agent_used_ram.as_u64()) as f32
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "the scheduler score intentionally uses f32 ratios"
+        )]
+        let ram_headroom = agent_max_ram
+            .as_u64()
+            .saturating_sub(agent_used_ram.as_u64()) as f32
             / agent_max_ram.as_u64() as f32;
+        score.general += ram_headroom;
 
-        // roughly based on: https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/
+        // Roughly based on <https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/>.
         if let Some(affinity_rules) = &msg.config.affinity {
             for rule in affinity_rules {
                 let mut metadata_tables: Vec<ObjectMetadata> = Vec::with_capacity(1);
@@ -434,7 +458,7 @@ impl SchedulerActor {
                         }
                     }
                     AffinityType::Agent => metadata_tables.push(agent.data.metadata.clone()),
-                };
+                }
 
                 let mut follows_rule = false;
 
@@ -449,7 +473,7 @@ impl SchedulerActor {
 
                         let value_option = table.get(&requirement.key);
 
-                        if !evaluate_table_value(&value_option, requirement) {
+                        if !evaluate_table_value(value_option, requirement) {
                             requirement_outcome = false;
                             break;
                         }
@@ -467,7 +491,10 @@ impl SchedulerActor {
                     (AffinityStrictness::Required, false) => return AgentScore::REJECTED,
                     (AffinityStrictness::Required, true) => {} // specifically do nothing
                     (AffinityStrictness::Preferred { weight }, follows_rule) => {
-                        score.affinity += follows_rule as i64 * weight;
+                        let follows_rule = i64::from(follows_rule);
+                        score.affinity = score
+                            .affinity
+                            .saturating_add(follows_rule.saturating_mul(weight));
                     }
                 }
             }
@@ -484,8 +511,8 @@ impl SchedulerActor {
     }
 }
 
-fn evaluate_table_value(value_option: &Option<&String>, requirement: &AffinityRequirement) -> bool {
-    let Some(value) = *value_option else {
+fn evaluate_table_value(value_option: Option<&String>, requirement: &AffinityRequirement) -> bool {
+    let Some(value) = value_option else {
         return false;
     };
 
@@ -557,7 +584,7 @@ impl Actor for SchedulerActor {
 
         info!(?peer_id, "Scheduler Actor started!");
 
-        let mut scheduler_actor = SchedulerActor {
+        let mut scheduler_actor = Self {
             agent_data_cache: Arc::new(DashMap::new()),
             agent_keepalive_tasks: Arc::new(DashMap::new()),
             vm_actorid_ulid_map: Arc::new(DashMap::new()),
@@ -574,29 +601,29 @@ impl Actor for SchedulerActor {
     async fn on_link_died(
         &mut self,
         actor_ref: WeakActorRef<Self>,
-        actor_id: ActorId,
+        id: ActorId,
         reason: ActorStopReason,
     ) -> Result<ControlFlow<ActorStopReason>, Self::Error> {
-        warn!(?actor_id, ?reason, "Linked actor died");
+        warn!(?id, ?reason, "Linked actor died");
 
         // check that scheduler actor is still alive.
         let Some(_) = actor_ref.upgrade() else {
             return Ok(ControlFlow::Break(ActorStopReason::Killed));
         };
 
-        if let Some((_, keepalive_task)) = self.agent_keepalive_tasks.remove(&actor_id) {
-            trace!(?actor_id, "Aborting agent keepalive task");
+        if let Some((_, keepalive_task)) = self.agent_keepalive_tasks.remove(&id) {
+            trace!(?id, "Aborting agent keepalive task");
             keepalive_task.abort();
-        };
+        }
 
-        self.agent_data_cache.remove(&actor_id);
+        self.agent_data_cache.remove(&id);
 
-        if let Some((_, keepalive_task)) = self.vm_keepalive_tasks.remove(&actor_id) {
-            trace!(?actor_id, "Aborting vm keepalive task");
+        if let Some((_, keepalive_task)) = self.vm_keepalive_tasks.remove(&id) {
+            trace!(?id, "Aborting vm keepalive task");
             keepalive_task.abort();
-        };
+        }
 
-        if let Some((_, vmid)) = self.vm_actorid_ulid_map.remove(&actor_id) {
+        if let Some((_, vmid)) = self.vm_actorid_ulid_map.remove(&id) {
             if let Some(cached_vm) = self.vm_data_cache.get(&vmid)
                 && let Some(mut agent) =
                     self.agent_data_cache.get_mut(&cached_vm.scheduled_agent_id)
@@ -608,7 +635,7 @@ impl Actor for SchedulerActor {
             //  instead of removing the vm entirely, we should just modify the status to shutdown or crashed or something.
             //
             //  another potential issue is that the link dying doesn't guarantee that the vm is dead. if there is a networking partition, things get iffy.
-            trace!(?actor_id, ?vmid, "Removing vm from vm_data_cache");
+            trace!(?id, ?vmid, "Removing vm from vm_data_cache");
             self.vm_data_cache.remove(&vmid);
         }
 
