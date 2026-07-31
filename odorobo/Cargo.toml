@@ -33,7 +33,7 @@ libc = "0.2"
 random-port = "0.1"
 if-addrs = "0.15"
 libp2p = { version = "0.56", features = ["yamux", "serde", "mdns"] }
-sysinfo = "0.38.1"
+sysinfo = "0.39.6"
 rand = "0.10"
 axum = { version = "0.8", features = ["ws"] }
 axum-extra = "0.12"
@@ -62,7 +62,11 @@ schemars = "1.2"
 
 
 cloud-hypervisor-client = { git = "https://github.com/FyraStack/cloud-hypervisor-client.git" }
+signal-hook = "0.4.4"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rtnetlink = "0.21"
 nftables = { version = "0.6", features = ["tokio"] }
+
+[lints]
+workspace = true

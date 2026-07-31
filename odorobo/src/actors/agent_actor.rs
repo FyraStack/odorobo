@@ -5,7 +5,11 @@ use crate::{
         Ping, Pong,
         agent::{AgentStatus, GetAgentStatus},
         debug::PanicAgent,
-        vm::*,
+        vm::{
+            AgentListVMs, AgentListVMsReply, CreateVM, CreateVMReply, DeleteVM, DeleteVMReply,
+            GetVMInfo, GetVMInfoReply, MigrateVMReceive, MigrateVMReceiveReply, ShutdownVM,
+            ShutdownVMReply,
+        },
     },
     networking::actor::NetworkAgentActor,
     types::{ObjectMetadata, VirtualMachine},
@@ -39,7 +43,7 @@ pub struct AgentActor {
 
 impl AgentActor {
     async fn lookup_vm_actor(vmid: Ulid) -> Option<ActorRef<VMActor>> {
-        ActorRef::<VMActor>::lookup(format!("vm:{}", vmid))
+        ActorRef::<VMActor>::lookup(format!("vm:{vmid}"))
             .await
             .ok()
             .flatten()
@@ -50,22 +54,22 @@ impl Actor for AgentActor {
     type Args = Config;
     type Error = Report;
 
-    async fn on_start(config: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self> {
+    async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self> {
         let peer_id = *actor_ref.id().peer_id().unwrap();
 
         info!(?peer_id, "Agent Actor started!");
 
         // spawn networking actor
         let network_actor: ActorRef<NetworkAgentActor> =
-            NetworkAgentActor::spawn_link(&actor_ref, config.network.clone()).await;
+            NetworkAgentActor::spawn_link(&actor_ref, args.network.clone()).await;
         network_actor.register(NETWORK).await?;
 
         let sys = System::new_all();
 
-        Ok(AgentActor {
-            vcpus: sys.cpus().len() as u32,
+        Ok(Self {
+            vcpus: u32::try_from(sys.cpus().len()).unwrap_or(u32::MAX),
             memory: ByteSize::b(sys.total_memory()),
-            config,
+            config: args,
             vms: AHashMap::new(),
             metadata: ObjectMetadata::default(),
         })
@@ -111,8 +115,8 @@ impl Message<CreateVM> for AgentActor {
         let actor_ref =
             VMActor::spawn_link(ctx.actor_ref(), (vmid, Some(msg.config.clone()))).await;
 
-        let _ = actor_ref.register(vm_actor_id(vmid)).await;
-        let _ = actor_ref.register(VM).await;
+        _ = actor_ref.register(vm_actor_id(vmid)).await;
+        _ = actor_ref.register(VM).await;
         self.vms.insert(
             vmid,
             VMCacheData {
@@ -140,13 +144,13 @@ impl Message<MigrateVMReceive> for AgentActor {
         let vmid = msg.vmid;
         let actor_ref = VMActor::spawn_link(ctx.actor_ref(), (vmid, None)).await;
 
-        let _ = actor_ref.register(vm_actor_id(vmid)).await;
-        let _ = actor_ref.register(VM).await;
+        _ = actor_ref.register(vm_actor_id(vmid)).await;
+        _ = actor_ref.register(VM).await;
         self.vms.insert(
             vmid,
             VMCacheData {
                 actor_ref: actor_ref.clone(),
-                config: Default::default(),
+                config: VirtualMachine::default(),
             },
         );
 
@@ -194,18 +198,15 @@ impl Message<ShutdownVM> for AgentActor {
         msg: ShutdownVM,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        match Self::lookup_vm_actor(msg.vmid).await {
-            Some(actor_ref) => {
-                trace!(?msg, "Telling VM to shut down");
-                let res = actor_ref.tell(msg.clone()).await;
-                if let Err(err) = res {
-                    warn!(vm_id = %msg.vmid, ?err, "failed to shutdown VM actor");
-                }
+        if let Some(actor_ref) = Self::lookup_vm_actor(msg.vmid).await {
+            trace!(?msg, "Telling VM to shut down");
+            let res = actor_ref.tell(msg.clone()).await;
+            if let Err(err) = res {
+                warn!(vm_id = %msg.vmid, ?err, "failed to shutdown VM actor");
             }
-            None => {
-                warn!(vm_id = %msg.vmid, "VM actor not found for shutdown");
-                return Err("VM actor not found for shutdown".to_string());
-            }
+        } else {
+            warn!(vm_id = %msg.vmid, "VM actor not found for shutdown");
+            return Err("VM actor not found for shutdown".to_owned());
         }
 
         Ok(ShutdownVMReply)
@@ -299,14 +300,14 @@ impl Message<GetAgentStatus> for AgentActor {
             .vms
             .values()
             .map(|vm| vm.config.data.vcpus)
-            .reduce(|acc, cpus| acc + cpus)
+            .reduce(u32::saturating_add)
             .unwrap_or(0);
 
         let ram_used_by_vms = self
             .vms
             .values()
             .map(|vm| vm.config.data.memory.as_u64())
-            .reduce(|acc, memory| acc + memory)
+            .reduce(u64::saturating_add)
             .unwrap_or(0);
 
         AgentStatus {
@@ -314,7 +315,7 @@ impl Message<GetAgentStatus> for AgentActor {
             vcpus: self.vcpus,
             ram: self.memory,
             vms: self.vms.keys().copied().collect(),
-            used_vcpus: vcpus_used_by_vms + self.config.get_reserved_vcpus(),
+            used_vcpus: vcpus_used_by_vms.saturating_add(self.config.get_reserved_vcpus()),
             used_ram: ByteSize::b(ram_used_by_vms),
             metadata: self.metadata.clone(),
         }

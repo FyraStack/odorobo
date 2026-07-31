@@ -55,19 +55,19 @@ impl Actor for VMActor {
                 debug!(%vmid, "watching child process to handle actor cleanup");
                 match child_process.wait().await {
                     Ok(status) => {
-                        if !status.success() {
+                        if status.success() {
+                            warn!(%vmid, "child process exited outside of actor teardown");
+                            _ = actor_ref.stop_gracefully().await;
+                        } else {
                             error!(%vmid, ?status, "child process exited unexpectedly, killing actor");
                             actor_ref.kill();
-                        } else {
-                            warn!(%vmid, "child process exited outside of actor teardown");
-                            let _ = actor_ref.stop_gracefully().await;
                         }
                     }
                     Err(err) => {
                         error!(%vmid, ?err, "failed to wait on child process, killing actor");
                         actor_ref.kill();
                     }
-                };
+                }
             });
         } else {
             warn!(%vmid, "VMInstance has no child process to watch");
@@ -112,18 +112,18 @@ impl Actor for VMActor {
 // todo: improve a lot of these config options. most of them should be set by the manifest
 impl From<VirtualMachine> for VmConfig {
     fn from(vm: VirtualMachine) -> Self {
-        VmConfig {
+        Self {
             cpus: Some(CpusConfig {
-                boot_vcpus: vm.data.vcpus as i32,
-                max_vcpus: vm.data.max_vcpus.unwrap_or(vm.data.vcpus) as i32,
+                boot_vcpus: vm.data.vcpus.cast_signed(),
+                max_vcpus: vm.data.max_vcpus.unwrap_or(vm.data.vcpus).cast_signed(),
                 ..Default::default()
             }),
             memory: Some(MemoryConfig {
-                size: vm.data.memory.as_u64() as i64,
+                size: vm.data.memory.as_u64().cast_signed(),
                 ..Default::default()
             }),
             payload: PayloadConfig {
-                firmware: Some("/var/lib/odorobo/CLOUDHV.fd".to_string()),
+                firmware: Some("/var/lib/odorobo/CLOUDHV.fd".to_owned()),
                 ..Default::default()
             },
             disks: Some(vec![DiskConfig {
@@ -140,7 +140,7 @@ impl From<VirtualMachine> for VmConfig {
             //     }
             // ]),
             platform: Some(PlatformConfig {
-                serial_number: Some("ds=nocloud".to_string()),
+                serial_number: Some("ds=nocloud".to_owned()),
                 ..Default::default()
             }),
             ..Default::default()

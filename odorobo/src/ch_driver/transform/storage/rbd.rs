@@ -56,7 +56,7 @@ fn rbd_lines_list(input: &str) -> Result<Vec<(String, String)>> {
         // 0   pool               foo        testimg    -   /dev/rbd0
         if parts.len() == 6 {
             let rbd_path = format!("{}/{}", parts[1], parts[3]);
-            let device_path = parts[5].to_string();
+            let device_path = parts[5].to_owned();
             mappings.push((rbd_path, device_path));
         }
         if parts.len() == 5 {
@@ -64,7 +64,7 @@ fn rbd_lines_list(input: &str) -> Result<Vec<(String, String)>> {
             // id  pool               image    snap  device
             // 0   pool               testimg    -   /dev/rbd0
             let rbd_path = format!("{}/{}", parts[1], parts[2]);
-            let device_path = parts[4].to_string();
+            let device_path = parts[4].to_owned();
             mappings.push((rbd_path, device_path));
         }
     }
@@ -144,13 +144,13 @@ impl TryFrom<&Url> for RbdImage {
         let pool = uri
             .host_str()
             .ok_or_else(|| eyre!("RBD URI must have a host (pool name)"))?
-            .to_string();
+            .to_owned();
         let path = uri.path();
         if path.is_empty() || path == "/" {
             return Err(eyre!("RBD URI must have a path (image name)"));
         }
-        let image = path.trim_start_matches('/').to_string();
-        Ok(RbdImage { pool, image })
+        let image = path.trim_start_matches('/').to_owned();
+        Ok(Self { pool, image })
     }
 }
 
@@ -174,26 +174,31 @@ impl StorageDriver for RbdStorage {
     }
 }
 
-#[test]
-fn test_rbd_image_from_uri() {
-    let uri = Url::parse("rbd://my-pool/my-image").unwrap();
-    let image = RbdImage::try_from(&uri).unwrap();
-    assert_eq!(image.pool, "my-pool");
-    assert_eq!(image.image, "my-image");
-    assert_eq!(image.rbd_path(), "my-pool/my-image");
-    assert_eq!(
-        image.device_path(),
-        std::path::PathBuf::from("/dev/rbd/my-pool/my-image")
-    );
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-#[test]
-fn test_rbd_lines_list() {
-    let input = "\
+    #[test]
+    fn test_rbd_image_from_uri() {
+        let uri = Url::parse("rbd://my-pool/my-image").unwrap();
+        let image = RbdImage::try_from(&uri).unwrap();
+        assert_eq!(image.pool, "my-pool");
+        assert_eq!(image.image, "my-image");
+        assert_eq!(image.rbd_path(), "my-pool/my-image");
+        assert_eq!(
+            image.device_path(),
+            std::path::PathBuf::from("/dev/rbd/my-pool/my-image")
+        );
+    }
+
+    #[test]
+    fn test_rbd_lines_list() {
+        let input = "\
 id  pool               namespace  image    snap  device
 0   kessoku-blockpool             testimg  -     /dev/rbd0";
-    let mappings = rbd_lines_list(input).unwrap();
-    assert_eq!(mappings.len(), 1);
-    assert_eq!(mappings[0].0, "kessoku-blockpool/testimg");
-    assert_eq!(mappings[0].1, "/dev/rbd0");
+        let mappings = rbd_lines_list(input).unwrap();
+        assert_eq!(mappings.len(), 1);
+        assert_eq!(mappings[0].0, "kessoku-blockpool/testimg");
+        assert_eq!(mappings[0].1, "/dev/rbd0");
+    }
 }

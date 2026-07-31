@@ -11,6 +11,7 @@ mod bytesize_as_u64 {
     use bytesize::ByteSize;
     use serde::{Deserialize, Deserializer, Serializer};
 
+    #[allow(clippy::trivially_copy_pass_by_ref)]
     pub fn serialize<S: Serializer>(size: &ByteSize, s: S) -> Result<S::Ok, S::Error> {
         s.serialize_u64(size.as_u64())
     }
@@ -24,6 +25,7 @@ mod opt_bytesize_as_u64 {
     use bytesize::ByteSize;
     use serde::{Deserialize, Deserializer, Serializer};
 
+    #[allow(clippy::ref_option)]
     pub fn serialize<S: Serializer>(size: &Option<ByteSize>, s: S) -> Result<S::Ok, S::Error> {
         match size {
             Some(b) => s.serialize_some(&b.as_u64()),
@@ -59,7 +61,7 @@ pub struct StorageUri(#[schemars(with = "String")] pub url::Url);
 
 impl Default for StorageUri {
     fn default() -> Self {
-        StorageUri(url::Url::parse("file:///tmp").unwrap())
+        Self(url::Url::parse("file:///tmp").unwrap())
     }
 }
 
@@ -165,8 +167,7 @@ pub struct VirtualMachine {
     /// Metadata
     pub metadata: Option<ObjectMetadata>,
 
-    /// List of Affinity rules for scheduling.
-    /// Affinity rules are ANDed or summed based on strictness
+    /// List of Affinity rules for scheduling. These are `ANDed` / summed together depending on the strictness.
     pub affinity: Option<Vec<AffinityRule>>,
 }
 
@@ -174,10 +175,10 @@ pub struct VirtualMachine {
 pub struct AffinityRule {
     pub strictness: AffinityStrictness,
     pub affinity_type: AffinityType,
-    /// if true, the outcome of the requirements is inverted
+    /// If true, the outcome of the requirements is inverted.
     #[serde(default)]
     pub inverse: bool,
-    /// ORed together
+    /// `ORed` together
     pub requirements: Vec<AffinityRequirement>,
 }
 

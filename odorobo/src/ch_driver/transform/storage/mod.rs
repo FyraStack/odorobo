@@ -62,7 +62,7 @@ impl StorageDriverTransformer {
         self.backends
             .iter()
             .find(|b| b.scheme() == uri.scheme())
-            .map(|b| b.as_ref())
+            .map(std::convert::AsRef::as_ref)
     }
 
     /// Releases storage resources for all URI-backed disks in a VM config.
@@ -101,7 +101,7 @@ impl Default for StorageDriverTransformer {
 impl ConfigTransform for StorageDriverTransformer {
     fn teardown(&self, _vmid: &str, config: &mut VmConfig) -> Result<()> {
         tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(self.release_config(config))
+            tokio::runtime::Handle::current().block_on(self.release_config(config));
         });
         Ok(())
     }

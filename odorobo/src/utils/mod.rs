@@ -1,4 +1,5 @@
 pub mod actor_names;
+pub mod lockfile;
 
 use aide::OperationIo;
 use api_error::ApiError;
@@ -25,7 +26,7 @@ impl<M> From<kameo::error::SendError<M, Report>> for OdoroboError {
     fn from(value: kameo::error::SendError<M, Report>) -> Self {
         let kameo_error = value.to_string();
         error!(?value);
-        OdoroboError::Report(
+        Self::Report(
             value.err().unwrap_or_else(|| {
                 Report::msg(format!("could not unwrap kameo error: {kameo_error}"))
             }),
@@ -62,7 +63,7 @@ mod tests {
 }
 
 pub fn env_filter(debug_target: Option<&str>) -> EnvFilter {
-    let env = std::env::var("ODOROBO_LOG").unwrap_or_else(|_| "".into());
+    let env = std::env::var("ODOROBO_LOG").unwrap_or_else(|_| String::new());
 
     let base = EnvFilter::builder()
         .with_default_directive(LevelFilter::INFO.into())
@@ -164,7 +165,7 @@ pub fn connect_to_swarm() -> Result<PeerId> {
                 ))) => {
                     for (peer_id, _) in list {
                         warn!("mDNS peer expired: {peer_id}");
-                        let _ = swarm.disconnect_peer_id(peer_id);
+                        _ = swarm.disconnect_peer_id(peer_id);
                     }
                 }
                 // Handle Kameo events (optional - for monitoring)

@@ -11,7 +11,7 @@ use kameo::actor::ActorRef;
 
 use crate::{actors::http_actor::HTTPActor, utils::OdoroboError};
 
-/// Build the full app: finalizes the OpenAPI spec and attaches it as an extension.
+/// Build the full app: finalizes the `OpenAPI` spec and attaches it as an extension.
 pub fn build(state: ActorRef<HTTPActor>) -> Router {
     aide::generate::on_error(|error| {
         tracing::warn!("aide schema gen error: {error}");
@@ -46,7 +46,7 @@ where
         .with_state(state)
 }
 
-/// Serve the OpenAPI spec as JSON
+/// Serve the `OpenAPI` spec as JSON
 async fn serve_api(
     Extension(api): Extension<OpenApi>,
 ) -> Result<impl IntoApiResponse, OdoroboError> {

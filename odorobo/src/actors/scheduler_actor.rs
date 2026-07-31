@@ -5,8 +5,11 @@ use std::time::Duration;
 
 use crate::actors::agent_actor::AgentActor;
 use crate::ch_driver::actor::VMActor;
-use crate::messages::agent::*;
-use crate::messages::vm::*;
+use crate::messages::agent::{AgentStatus, GetAgentStatus};
+use crate::messages::vm::{
+    AgentListVMs, AgentListVMsReply, CreateVM, CreateVMReply, DeleteVM, DeleteVMReply, GetVMInfo,
+    GetVMInfoReply, ShutdownVM, ShutdownVMReply,
+};
 use crate::messages::{Ping, Pong};
 use crate::types::AffinityRequirement;
 use crate::types::AffinityStrictness;
@@ -702,7 +705,7 @@ impl Message<ShutdownVM> for SchedulerActor {
 
 /// this only gets data from the cache from agents
 /// we may need a different message that actually forcibly runs/updates everything.
-/// and/or messages that get data directly from the VMActors.
+/// and/or messages that get data directly from the `VMActors`.
 impl Message<AgentListVMs> for SchedulerActor {
     type Reply = Result<AgentListVMsReply, Report>;
 
