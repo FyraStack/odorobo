@@ -10,6 +10,7 @@ jobs:
       security-events: write
       contents: read
       packages: read
+    # Track the shared RVA23 builder and cache fixes from the actions repository.
     uses: FyraLabs/actions/.github/workflows/rust.yml@main
     with:
       test-pre: sudo apt-get update && sudo apt-get install -y protobuf-compiler
