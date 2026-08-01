@@ -15,6 +15,7 @@ jobs:
       test-pre: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       # Exercise the shared, digest-pinned RVA23 builder.
       test-riscv-rva23: true
+      test-riscv-builder-image: ghcr.io/fyralabs/rva23-builder@sha256:206d17485eb31e7b7aaad2fc8563471e71e0815574e15dd1328b97fc56696827
 
       test-riscv-artifact-name: odorobo-riscv-rva23
       test-riscv-artifact-paths: |
