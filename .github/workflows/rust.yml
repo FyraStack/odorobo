@@ -11,4 +11,5 @@ jobs:
       contents: read
     uses: FyraLabs/actions/.github/workflows/rust.yml@main
     with:
+      test-pre: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       test-riscv-rva23: true

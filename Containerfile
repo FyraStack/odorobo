@@ -3,6 +3,7 @@ RUN apk add \
 	bash \
 	gcc \
 	musl-dev \
+	protobuf-compiler \
 	rustup \
 	zig
 RUN rustup-init \
