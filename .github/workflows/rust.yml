@@ -13,6 +13,7 @@ jobs:
     uses: FyraLabs/actions/.github/workflows/rust.yml@main
     with:
       test-pre: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      # Exercise the shared, digest-pinned RVA23 builder.
       test-riscv-rva23: true
 
       test-riscv-artifact-name: odorobo-riscv-rva23
