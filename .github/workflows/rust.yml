@@ -11,4 +11,10 @@ jobs:
       contents: read
     uses: FyraLabs/actions/.github/workflows/rust.yml@main
     with:
+      test-pre: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       test-riscv-rva23: true
+
+      test-riscv-artifact-name: odorobo-riscv-rva23
+      test-riscv-artifact-paths: |
+        target/riscv64a23-unknown-linux-gnu/release/odorobo
+        target/riscv64a23-unknown-linux-gnu/release/odoroboctl
