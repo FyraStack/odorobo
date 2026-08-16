@@ -2,7 +2,8 @@ use std::{collections::VecDeque, sync::Arc};
 
 use crate::messages::vm::{
     DeleteVM, GetConsoleHistory, GetConsoleHistoryReply, GetVMInfo, GetVMInfoReply,
-    MigrateVMReceive, MigrateVMReceiveReply, PrepMigration, ShutdownVM,
+    MigrateVMReceive, MigrateVMReceiveReply, PrepMigration, SendConsoleInput,
+    SendConsoleInputReply, ShutdownVM,
 };
 use crate::{ch_driver::VMInstance, types::VirtualMachine};
 use cloud_hypervisor_client::models::{
@@ -322,6 +323,32 @@ impl Message<GetConsoleHistory> for VMActor {
     ) -> Self::Reply {
         GetConsoleHistoryReply {
             history: self.console.history().await,
+        }
+    }
+}
+
+#[remote_message]
+impl Message<SendConsoleInput> for VMActor {
+    type Reply = SendConsoleInputReply;
+
+    async fn handle(
+        &mut self,
+        msg: SendConsoleInput,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let written = msg.input.len();
+        match self.console.write_input(&msg.input).await {
+            Ok(()) => SendConsoleInputReply {
+                written,
+                error: None,
+            },
+            Err(err) => {
+                error!(vmid = %self.vmid, ?err, "failed to write to serial console");
+                SendConsoleInputReply {
+                    written: 0,
+                    error: Some(err.to_string()),
+                }
+            }
         }
     }
 }

@@ -112,3 +112,16 @@ pub struct GetConsoleHistory {
 pub struct GetConsoleHistoryReply {
     pub history: Vec<u8>,
 }
+
+/// Send raw input bytes to a VM's serial console.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SendConsoleInput {
+    pub vmid: Ulid,
+    pub input: Vec<u8>,
+}
+
+#[derive(Serialize, Deserialize, Reply, Debug, Clone)]
+pub struct SendConsoleInputReply {
+    pub written: usize,
+    pub error: Option<String>,
+}
