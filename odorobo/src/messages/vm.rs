@@ -91,7 +91,7 @@ pub struct AgentListVMsReply {
 }
 
 /// Get VM info
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct GetVMInfo {
     pub vmid: Option<Ulid>,
 }
@@ -100,4 +100,15 @@ pub struct GetVMInfo {
 pub struct GetVMInfoReply {
     pub vmid: Ulid,
     pub config: Option<VmConfig>,
+}
+
+/// Retrieve the retained serial-console output for a VM.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct GetConsoleHistory {
+    pub vmid: Ulid,
+}
+
+#[derive(Serialize, Deserialize, Reply, Debug, Clone)]
+pub struct GetConsoleHistoryReply {
+    pub history: Vec<u8>,
 }

@@ -4,8 +4,9 @@ use crate::actors::agent_actor::AgentActor;
 use crate::ch_driver::actor::VMActor;
 use crate::messages::agent::{AgentStatus, GetAgentStatus};
 use crate::messages::vm::{
-    AgentListVMs, AgentListVMsReply, CreateVM, CreateVMReply, DeleteVM, DeleteVMReply, GetVMInfo,
-    GetVMInfoReply, ShutdownVM, ShutdownVMReply,
+    AgentListVMs, AgentListVMsReply, CreateVM, CreateVMReply, DeleteVM, DeleteVMReply,
+    GetConsoleHistory, GetConsoleHistoryReply, GetVMInfo, GetVMInfoReply, ShutdownVM,
+    ShutdownVMReply,
 };
 use crate::messages::{Ping, Pong};
 use crate::utils::actor_cache::ActorCache;
@@ -264,6 +265,24 @@ impl Message<CreateVM> for SchedulerActor {
                     warn!("CreateVM forwarding failed, trying again: {err}");
                 }
             }
+        }
+    }
+}
+
+impl Message<GetConsoleHistory> for SchedulerActor {
+    type Reply = Result<GetConsoleHistoryReply, Report>;
+
+    async fn handle(
+        &mut self,
+        msg: GetConsoleHistory,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let vm = RemoteActorRef::<VMActor>::lookup(vm_actor_id(msg.vmid)).await?;
+        tracing::trace!(?vm, vmid = %msg.vmid, "GetConsoleHistory");
+        if let Some(vm) = vm {
+            Ok(vm.ask(&msg).await?)
+        } else {
+            Err(eyre!("VM not found"))
         }
     }
 }

@@ -289,13 +289,22 @@ impl VMInstance {
     /// Returns the PTY path for this VM's serial console by querying the CH API.
     #[tracing::instrument]
     pub async fn console_path(&self) -> Result<PathBuf> {
-        trace!("Getting console PTY path from CH API");
+        trace!("Getting console path from CH API");
         let info = self.info().await?;
-        let path =
-            info.config.serial.and_then(|s| s.file).ok_or_else(|| {
-                eyre!("No serial console PTY path available for {}", self.vm_id())
-            })?;
+        let serial = info
+            .config
+            .serial
+            .ok_or_else(|| eyre!("No serial console configured for {}", self.vm_id()))?;
+        let path = serial
+            .file
+            .or(serial.socket)
+            .ok_or_else(|| eyre!("No serial console path available for {}", self.vm_id()))?;
         Ok(PathBuf::from(path))
+    }
+
+    /// Returns the configured UNIX socket path for this VM's serial console.
+    pub fn console_socket_path(&self) -> PathBuf {
+        self.runtime_dir().join("console.sock")
     }
 
     /// Opens the PTY console device for this VM and returns a connected stream.

@@ -1,6 +1,8 @@
+use std::{collections::VecDeque, sync::Arc};
+
 use crate::messages::vm::{
-    DeleteVM, GetVMInfo, GetVMInfoReply, MigrateVMReceive, MigrateVMReceiveReply, PrepMigration,
-    ShutdownVM,
+    DeleteVM, GetConsoleHistory, GetConsoleHistoryReply, GetVMInfo, GetVMInfoReply,
+    MigrateVMReceive, MigrateVMReceiveReply, PrepMigration, ShutdownVM,
 };
 use crate::{ch_driver::VMInstance, types::VirtualMachine};
 use cloud_hypervisor_client::models::{
@@ -9,7 +11,12 @@ use cloud_hypervisor_client::models::{
 use kameo::prelude::*;
 use serde::{Deserialize, Serialize};
 use stable_eyre::{Report, Result};
-use tokio::task::JoinHandle;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{UnixStream, unix::OwnedWriteHalf},
+    sync::{Mutex, broadcast},
+    task::JoinHandle,
+};
 use tracing::{debug, error, info, trace, warn};
 
 /// A migration state that holds the listening address and VM config for a migration,
@@ -21,6 +28,156 @@ pub struct MigrationState {
     pub migration_task: Option<JoinHandle<()>>,
 }
 
+const CONSOLE_SPOOL_SIZE: usize = 1024 * 1024;
+
+/// Bounded serial-console history shared with the task draining the CH socket.
+#[derive(Clone)]
+pub struct Console {
+    inner: Arc<Mutex<ConsoleBuffer>>,
+    output: broadcast::Sender<Vec<u8>>,
+    writer: Arc<Mutex<Option<OwnedWriteHalf>>>,
+}
+
+impl Default for Console {
+    fn default() -> Self {
+        let (output, _) = broadcast::channel(256);
+        Self {
+            inner: Arc::new(Mutex::new(ConsoleBuffer::default())),
+            output,
+            writer: Arc::new(Mutex::new(None)),
+        }
+    }
+}
+
+#[derive(Default)]
+struct ConsoleBuffer {
+    ring: VecDeque<Vec<u8>>,
+    len: usize,
+}
+
+impl Console {
+    /// Attach to a Cloud Hypervisor serial socket and start spooling its output.
+    pub async fn attach(socket_path: std::path::PathBuf) -> Result<Self> {
+        let stream = UnixStream::connect(&socket_path).await.map_err(|err| {
+            Report::msg(format!(
+                "failed to attach console spool to {}: {err}",
+                socket_path.display()
+            ))
+        })?;
+        let (mut reader, writer) = stream.into_split();
+        let (output, _) = broadcast::channel(256);
+        let console = Self {
+            inner: Arc::new(Mutex::new(ConsoleBuffer::default())),
+            output,
+            writer: Arc::new(Mutex::new(Some(writer))),
+        };
+        let spool = console.clone();
+        tokio::spawn(async move {
+            let mut buffer = [0_u8; 16 * 1024];
+            loop {
+                match reader.read(&mut buffer).await {
+                    Ok(0) => {
+                        debug!("serial console closed");
+                        break;
+                    }
+                    Ok(read) => spool.push(buffer[..read].to_vec()).await,
+                    Err(err) => {
+                        warn!(?err, "serial console spool stopped reading");
+                        break;
+                    }
+                }
+            }
+        });
+        Ok(console)
+    }
+
+    async fn push(&self, chunk: Vec<u8>) {
+        trace!(
+            bytes = chunk.len(),
+            output = %String::from_utf8_lossy(&chunk),
+            "serial console output received"
+        );
+        let _subscribers = self.output.send(chunk.clone());
+        let chunk = if chunk.len() > CONSOLE_SPOOL_SIZE {
+            chunk[chunk.len().saturating_sub(CONSOLE_SPOOL_SIZE)..].to_vec()
+        } else {
+            chunk
+        };
+        {
+            let mut buffer = self.inner.lock().await;
+            buffer.len = buffer.len.saturating_add(chunk.len());
+            buffer.ring.push_back(chunk);
+            while buffer.len > CONSOLE_SPOOL_SIZE {
+                let excess = buffer.len.saturating_sub(CONSOLE_SPOOL_SIZE);
+                if let Some(oldest) = buffer.ring.pop_front() {
+                    if oldest.len() > excess {
+                        buffer.len = buffer.len.saturating_sub(excess);
+                        buffer.ring.push_front(oldest[excess..].to_vec());
+                    } else {
+                        buffer.len = buffer.len.saturating_sub(oldest.len());
+                    }
+                } else {
+                    buffer.len = 0;
+                    break;
+                }
+            }
+            drop(buffer);
+        }
+    }
+
+    /// Subscribe to live serial output. Chunks are broadcast without replay.
+    pub fn subscribe(&self) -> broadcast::Receiver<Vec<u8>> {
+        self.output.subscribe()
+    }
+
+    /// Write input bytes to the guest serial console.
+    pub async fn write_input(&self, input: &[u8]) -> Result<()> {
+        {
+            let mut writer_guard = self.writer.lock().await;
+            let writer = writer_guard
+                .as_mut()
+                .ok_or_else(|| Report::msg("console is not attached"))?;
+            let result = writer
+                .write_all(input)
+                .await
+                .map_err(|err| Report::msg(format!("failed to write to serial console: {err}")));
+            drop(writer_guard);
+            result
+        }
+    }
+
+    /// Return the currently retained serial output, oldest bytes first.
+    pub async fn history(&self) -> Vec<u8> {
+        let mut history = Vec::new();
+        {
+            let buffer = self.inner.lock().await;
+            history.reserve(buffer.len);
+            for chunk in &buffer.ring {
+                history.extend_from_slice(chunk);
+            }
+            drop(buffer);
+        };
+        history
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CONSOLE_SPOOL_SIZE, Console};
+
+    #[tokio::test]
+    async fn console_history_is_bounded_to_one_megabyte() {
+        let console = Console::default();
+        console.push(vec![b'a'; CONSOLE_SPOOL_SIZE]).await;
+        console.push(b"tail".to_vec()).await;
+
+        let history = console.history().await;
+        assert_eq!(history.len(), CONSOLE_SPOOL_SIZE);
+        assert_eq!(&history[..4], b"aaaa");
+        assert_eq!(&history[CONSOLE_SPOOL_SIZE - 4..], b"tail");
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MigrationFinished;
 
@@ -30,6 +187,7 @@ pub struct VMActor {
     /// path to the Cloud Hypervisor socket, in /run/odorobo/vms/<VMID>/ch.sock
     pub vm_instance: VMInstance,
     pub migration_state: Option<MigrationState>,
+    pub console: Console,
 }
 
 impl Actor for VMActor {
@@ -41,6 +199,9 @@ impl Actor for VMActor {
     async fn on_start((vmid, vm_config): Self::Args, actor_ref: ActorRef<Self>) -> Result<Self> {
         let mut vminstance =
             VMInstance::spawn(&vmid.to_string(), vm_config.map(VmConfig::from), None).await?;
+
+        // attach console on startup for spooling
+        let console = Console::attach(vminstance.console_socket_path()).await?;
 
         // Take the child process out so we can watch for unexpected death.
         // destroy() handles a missing child_process gracefully.
@@ -72,6 +233,7 @@ impl Actor for VMActor {
             vmid,
             vm_instance: vminstance,
             migration_state: None,
+            console,
         })
     }
 
@@ -146,6 +308,21 @@ impl From<VirtualMachine> for VmConfig {
 impl From<VMActor> for VMInstance {
     fn from(actor: VMActor) -> Self {
         actor.vm_instance
+    }
+}
+
+#[remote_message]
+impl Message<GetConsoleHistory> for VMActor {
+    type Reply = GetConsoleHistoryReply;
+
+    async fn handle(
+        &mut self,
+        _msg: GetConsoleHistory,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        GetConsoleHistoryReply {
+            history: self.console.history().await,
+        }
     }
 }
 
