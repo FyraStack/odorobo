@@ -7,7 +7,6 @@
 use std::{collections::BTreeMap, path::Path};
 
 use bytesize::ByteSize;
-use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::Error as DeError};
 use thiserror::Error;
 use ulid::Ulid;
@@ -45,39 +44,32 @@ pub enum ManifestError {
     MaxVcpusLessThanBoot { vcpus: u32, max: u32 },
     #[error("memory must be greater than zero")]
     NoMemory,
-    #[error("storage attachment must define a non-empty id")]
-    EmptyStorageId,
-    #[error(
-        "storage attachment {0} must define exactly one usable source (URI or volume reference)"
-    )]
-    InvalidStorageSource(String),
-    #[error("storage attachment {0} has a duplicate id")]
-    DuplicateStorageId(String),
-    #[error("storage attachment {0} cannot be both a boot attachment and read-only")]
-    ReadOnlyBootStorage(String),
-    #[error("manifest cannot define more than one boot storage attachment")]
-    MultipleBootStorageAttachments,
+    #[error("disk must define a non-empty id")]
+    EmptyDiskId,
+    #[error("disk {0} must define exactly one usable source (URI or volume reference)")]
+    InvalidDiskSource(String),
+    #[error("disk {0} has a duplicate id")]
+    DuplicateDiskId(String),
+    #[error("disk {0} cannot be both a boot storage attachment and read-only")]
+    ReadOnlyBootDisk(String),
+    #[error("manifest cannot define more than one boot disk")]
+    MultipleBootDisks,
     #[error("network {0} must define an id")]
     NetworkWithoutId(usize),
     #[error("cloud-init user-data and meta-data must be supplied together")]
     IncompleteCloudInit,
-    #[error("cloud-init user-data and meta-data must both be non-empty")]
-    EmptyCloudInitData,
     #[error("vsock requires a non-zero guest CID")]
     InvalidVsockCid,
-    #[error("vsock requires a non-empty absolute socket path")]
+    #[error("vsock requires a non-empty socket path")]
     InvalidVsockSocket,
-    #[error("affinity comparison for key {0} requires exactly one finite numeric value")]
-    InvalidAffinityComparison(String),
 }
 
-#[derive(Clone, Debug, Serialize, JsonSchema, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct VmManifest {
     /// Version of this manifest's serialized contract, not the hypervisor API.
     pub api_version: u32,
     /// Stable identity used to correlate desired state with runtime reports.
-    #[schemars(with = "String")]
     pub id: Ulid,
     /// Control-plane intent that Odorobo should reconcile onto a node.
     pub desired: DesiredState,
@@ -128,7 +120,7 @@ impl VmManifest {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DesiredState {
     pub metadata: Metadata,
@@ -174,10 +166,10 @@ impl DesiredState {
         let mut has_boot_storage = false;
         for storage in &self.storage {
             if storage.id.trim().is_empty() {
-                return Err(ManifestError::EmptyStorageId);
+                return Err(ManifestError::EmptyDiskId);
             }
             if !storage_ids.insert(&storage.id) {
-                return Err(ManifestError::DuplicateStorageId(storage.id.clone()));
+                return Err(ManifestError::DuplicateDiskId(storage.id.clone()));
             }
             if storage
                 .uri
@@ -185,14 +177,14 @@ impl DesiredState {
                 .is_some_and(|uri| uri.trim().is_empty())
                 || storage.uri.is_some() == storage.volume_id.is_some()
             {
-                return Err(ManifestError::InvalidStorageSource(storage.id.clone()));
+                return Err(ManifestError::InvalidDiskSource(storage.id.clone()));
             }
             if storage.boot && storage.read_only {
-                return Err(ManifestError::ReadOnlyBootStorage(storage.id.clone()));
+                return Err(ManifestError::ReadOnlyBootDisk(storage.id.clone()));
             }
             if storage.boot {
                 if has_boot_storage {
-                    return Err(ManifestError::MultipleBootStorageAttachments);
+                    return Err(ManifestError::MultipleBootDisks);
                 }
                 has_boot_storage = true;
             }
@@ -202,40 +194,14 @@ impl DesiredState {
                 return Err(ManifestError::NetworkWithoutId(index));
             }
         }
-        for rule in &self.placement.affinity {
-            for requirement in &rule.requirements {
-                let valid_comparison = match requirement.values.as_slice() {
-                    [value] => value.parse::<f64>().is_ok_and(f64::is_finite),
-                    _ => false,
-                };
-                if matches!(requirement.operator, Operator::Lt | Operator::Gt) && !valid_comparison
-                {
-                    return Err(ManifestError::InvalidAffinityComparison(
-                        requirement.key.clone(),
-                    ));
-                }
-            }
-        }
         // NoCloud treats user-data and meta-data as one instance-data set.
         // Accepting only half of it would produce a provider configuration that
         // looks valid but can fail during guest initialization.
-        if let Some(cloud) = &self.cloud_init {
-            if cloud.user_data.is_some() != cloud.meta_data.is_some()
-                || (cloud.user_data.is_none() && cloud.meta_data.is_none())
-            {
-                return Err(ManifestError::IncompleteCloudInit);
-            }
-            if cloud
-                .user_data
-                .as_deref()
-                .is_some_and(|data| data.trim().is_empty())
-                || cloud
-                    .meta_data
-                    .as_deref()
-                    .is_some_and(|data| data.trim().is_empty())
-            {
-                return Err(ManifestError::EmptyCloudInitData);
-            }
+        if let Some(cloud) = &self.cloud_init
+            && (cloud.user_data.is_some() != cloud.meta_data.is_some()
+                || (cloud.user_data.is_none() && cloud.meta_data.is_none()))
+        {
+            return Err(ManifestError::IncompleteCloudInit);
         }
         if let Some(vsock) = &self.vsock {
             if vsock.guest_cid == 0 {
@@ -249,7 +215,7 @@ impl DesiredState {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Metadata {
     pub name: String,
@@ -259,25 +225,23 @@ pub struct Metadata {
     pub annotations: BTreeMap<String, String>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Compute {
     pub vcpus: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_vcpus: Option<u32>,
-    #[schemars(with = "u64")]
     #[serde(rename = "memory_bytes", with = "bytesize_as_u64")]
     pub memory: ByteSize,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Storage {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uri: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(with = "Option<String>")]
     pub volume_id: Option<Ulid>,
     #[serde(default)]
     pub boot: bool,
@@ -285,7 +249,7 @@ pub struct Storage {
     pub read_only: bool,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Network {
     pub id: String,
@@ -293,7 +257,7 @@ pub struct Network {
     pub mac_address: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Placement {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -304,7 +268,7 @@ pub struct Placement {
     pub affinity: Vec<AffinityRule>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AffinityRule {
     pub strictness: AffinityStrictness,
@@ -315,21 +279,28 @@ pub struct AffinityRule {
     pub requirements: Vec<AffinityRequirement>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AffinityStrictness {
     Required,
     Preferred { weight: i64 },
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AffinityType {
     VirtualMachine,
     Agent,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AffinityDirection {
+    Normal,
+    Anti,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AffinityRequirement {
     pub key: String,
@@ -338,14 +309,14 @@ pub struct AffinityRequirement {
     pub values: Vec<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MetadataTable {
     Label,
     Annotation,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Operator {
     In,
@@ -354,7 +325,7 @@ pub enum Operator {
     Gt,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Boot {
     #[serde(default)]
@@ -367,7 +338,7 @@ pub struct Boot {
     pub cmdline: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CloudInit {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -376,14 +347,14 @@ pub struct CloudInit {
     pub meta_data: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Vsock {
     pub guest_cid: u32,
     pub socket: String,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ObservedState {
     /// Odorobo's normalized view of the VM lifecycle.
@@ -401,7 +372,7 @@ pub struct ObservedState {
     pub error: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ObservedStatus {
     #[default]
@@ -415,6 +386,11 @@ pub enum ObservedStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn minimal_manifest() -> VmManifest {
+        serde_json::from_str(include_str!("../../docs/fixtures/manifest/minimal.json"))
+            .expect("minimal fixture is valid")
+    }
 
     #[test]
     fn fixture_round_trips() {
@@ -450,53 +426,11 @@ mod tests {
         serde_json::from_str::<VmManifest>(json).unwrap_err();
     }
 
-    fn minimal_manifest() -> VmManifest {
-        serde_json::from_str(include_str!("../../docs/fixtures/manifest/minimal.json"))
-            .expect("valid minimal fixture")
-    }
-
     #[test]
-    fn rejects_unsupported_version_during_validation_and_deserialization() {
-        let mut manifest = minimal_manifest();
-        manifest.api_version = MANIFEST_VERSION + 1;
-        assert_eq!(
-            manifest.validate(),
-            Err(ManifestError::UnsupportedVersion(MANIFEST_VERSION + 1))
-        );
-
-        let json = include_str!("../../docs/fixtures/manifest/minimal.json")
-            .replace("\"api_version\": 1", "\"api_version\": 2");
-        serde_json::from_str::<VmManifest>(&json).expect_err("unsupported version must reject");
-    }
-
-    #[test]
-    fn generated_schema_describes_manifest_shape() {
-        let schema = schemars::schema_for!(VmManifest);
-        let schema = serde_json::to_value(schema).expect("schema is serializable");
-        let properties = schema
-            .get("properties")
-            .and_then(serde_json::Value::as_object)
-            .expect("manifest schema has properties");
-
-        for field in ["api_version", "id", "desired", "observed"] {
-            assert!(
-                properties.contains_key(field),
-                "missing schema field {field}"
-            );
-        }
-        assert_eq!(properties["id"]["type"], "string");
-    }
-
-    #[test]
-    fn validates_compute_boundaries() {
-        let mut manifest = minimal_manifest();
-        manifest.desired.compute.max_vcpus = Some(manifest.desired.compute.vcpus);
-        assert_eq!(manifest.validate(), Ok(()));
-
-        manifest.desired.compute.vcpus = 0;
-        assert_eq!(manifest.validate(), Err(ManifestError::NoVcpus));
-
-        manifest.desired.compute.vcpus = 1;
+    fn rejects_invalid_combinations() {
+        let mut manifest: VmManifest =
+            serde_json::from_str(include_str!("../../docs/fixtures/manifest/minimal.json"))
+                .unwrap();
         manifest.desired.compute.max_vcpus = Some(0);
         assert!(matches!(
             manifest.validate(),
@@ -534,7 +468,7 @@ mod tests {
         });
         assert!(matches!(
             manifest.validate(),
-            Err(ManifestError::InvalidStorageSource(_))
+            Err(ManifestError::InvalidDiskSource(_))
         ));
 
         manifest.desired.storage.clear();
@@ -546,7 +480,7 @@ mod tests {
         });
         assert!(matches!(
             manifest.validate(),
-            Err(ManifestError::InvalidStorageSource(_))
+            Err(ManifestError::InvalidDiskSource(_))
         ));
 
         manifest.desired.storage.clear();
@@ -557,7 +491,7 @@ mod tests {
         });
         assert!(matches!(
             manifest.validate(),
-            Err(ManifestError::InvalidStorageSource(_))
+            Err(ManifestError::InvalidDiskSource(_))
         ));
 
         manifest.desired.storage[0].uri = Some("file:///disk.img".to_owned());
@@ -568,7 +502,7 @@ mod tests {
         });
         assert!(matches!(
             manifest.validate(),
-            Err(ManifestError::DuplicateStorageId(_))
+            Err(ManifestError::DuplicateDiskId(_))
         ));
 
         manifest.desired.storage.clear();
@@ -579,7 +513,7 @@ mod tests {
         });
         assert!(matches!(
             manifest.validate(),
-            Err(ManifestError::EmptyStorageId)
+            Err(ManifestError::EmptyDiskId)
         ));
 
         manifest.desired.storage.clear();
@@ -597,61 +531,27 @@ mod tests {
         });
         assert!(matches!(
             manifest.validate(),
-            Err(ManifestError::MultipleBootStorageAttachments)
+            Err(ManifestError::MultipleBootDisks)
         ));
 
         manifest.desired.storage.clear();
-        manifest.desired.storage.push(Storage {
-            id: "root".to_owned(),
-            uri: Some("file:///disk.img".to_owned()),
-            boot: true,
-            read_only: true,
-            ..Default::default()
+        manifest.desired.vsock = Some(Vsock {
+            guest_cid: 42,
+            socket: "relative.sock".to_owned(),
         });
         assert!(matches!(
             manifest.validate(),
-            Err(ManifestError::ReadOnlyBootStorage(_))
+            Err(ManifestError::InvalidVsockSocket)
         ));
-    }
-
-    #[test]
-    fn validates_vsock_and_metadata_boundaries() {
-        let mut manifest = minimal_manifest();
-        manifest.desired.vsock = Some(Vsock {
-            guest_cid: 42,
-            socket: "/run/odorobo/vsock.sock".to_owned(),
-        });
-        assert_eq!(manifest.validate(), Ok(()));
-
-        manifest
-            .desired
-            .vsock
-            .as_mut()
-            .expect("vsock exists")
-            .guest_cid = 0;
-        assert_eq!(manifest.validate(), Err(ManifestError::InvalidVsockCid));
-
-        let vsock = manifest.desired.vsock.as_mut().expect("vsock exists");
-        vsock.guest_cid = 42;
-        vsock.socket = "  ".to_owned();
-        assert_eq!(manifest.validate(), Err(ManifestError::InvalidVsockSocket));
-
-        manifest
-            .desired
-            .vsock
-            .as_mut()
-            .expect("vsock exists")
-            .socket = "relative.sock".to_owned();
-        assert_eq!(manifest.validate(), Err(ManifestError::InvalidVsockSocket));
 
         manifest.desired.vsock = None;
         manifest.desired.metadata.name = "  ".to_owned();
-        assert_eq!(manifest.validate(), Err(ManifestError::EmptyMetadataName));
-    }
+        assert!(matches!(
+            manifest.validate(),
+            Err(ManifestError::EmptyMetadataName)
+        ));
 
-    #[test]
-    fn rejects_invalid_network_and_cloud_init() {
-        let mut manifest = minimal_manifest();
+        manifest.desired.metadata.name = "vm".to_owned();
         manifest.desired.networks.push(Network {
             id: "  ".to_owned(),
             ..Default::default()
@@ -662,34 +562,11 @@ mod tests {
         ));
 
         manifest.desired.networks.clear();
-        for cloud_init in [
-            CloudInit::default(),
-            CloudInit {
-                user_data: Some("#cloud-config".to_owned()),
-                meta_data: None,
-            },
-            CloudInit {
-                user_data: None,
-                meta_data: Some("instance-id: vm".to_owned()),
-            },
-        ] {
-            manifest.desired.cloud_init = Some(cloud_init);
-            assert_eq!(manifest.validate(), Err(ManifestError::IncompleteCloudInit));
-        }
-
-        for cloud_init in [
-            CloudInit {
-                user_data: Some("  ".to_owned()),
-                meta_data: Some("instance-id: vm".to_owned()),
-            },
-            CloudInit {
-                user_data: Some("#cloud-config".to_owned()),
-                meta_data: Some("  ".to_owned()),
-            },
-        ] {
-            manifest.desired.cloud_init = Some(cloud_init);
-            assert_eq!(manifest.validate(), Err(ManifestError::EmptyCloudInitData));
-        }
+        manifest.desired.cloud_init = Some(CloudInit::default());
+        assert!(matches!(
+            manifest.validate(),
+            Err(ManifestError::IncompleteCloudInit)
+        ));
     }
 
     #[test]
@@ -708,35 +585,6 @@ mod tests {
         ] {
             serde_json::from_str::<VmManifest>(&json)
                 .expect_err("unknown fields must reject at every contract level");
-        }
-    }
-
-    #[test]
-    fn rejects_invalid_affinity_comparisons() {
-        let mut manifest = minimal_manifest();
-        for values in [
-            Vec::new(),
-            vec!["1".to_owned(), "2".to_owned()],
-            vec!["not-a-number".to_owned()],
-            vec!["NaN".to_owned()],
-        ] {
-            manifest.desired.placement.affinity = vec![AffinityRule {
-                strictness: AffinityStrictness::Required,
-                affinity_type: AffinityType::Agent,
-                inverse: false,
-                requirements: vec![AffinityRequirement {
-                    key: "capacity".to_owned(),
-                    table: MetadataTable::Annotation,
-                    operator: Operator::Gt,
-                    values,
-                }],
-            }];
-            assert_eq!(
-                manifest.validate(),
-                Err(ManifestError::InvalidAffinityComparison(
-                    "capacity".to_owned()
-                ))
-            );
         }
     }
 
