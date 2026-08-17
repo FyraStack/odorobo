@@ -257,15 +257,19 @@ impl SchedulerActor {
                             })
                             .map(|index| (index, entries.remove(index)))
                     });
-                    if let Some(cached_vm) = removed_cached_vm
-                        && data_cache
-                            .get(&vmid)
-                            .is_none_or(|entries| entries.is_empty())
-                    {
-                        agent_data_cache.alter(&cached_vm.1.scheduled_agent_id, |_, mut v| {
-                            v.extended_vm_set.remove(&vmid);
-                            v
+                    if let Some(cached_vm) = removed_cached_vm {
+                        let scheduled_agent_id = cached_vm.1.scheduled_agent_id;
+                        let agent_still_has_vm = data_cache.get(&vmid).is_some_and(|entries| {
+                            entries
+                                .iter()
+                                .any(|entry| entry.scheduled_agent_id == scheduled_agent_id)
                         });
+                        if !agent_still_has_vm {
+                            agent_data_cache.alter(&scheduled_agent_id, |_, mut v| {
+                                v.extended_vm_set.remove(&vmid);
+                                v
+                            });
+                        }
                     }
                     if data_cache
                         .get(&vmid)
@@ -457,7 +461,14 @@ impl SchedulerActor {
         // todo: do we care about VMData.max_vcpus?
         let agent_used_vcpus = agent.data.used_vcpus.saturating_add(msg.config.data.vcpus);
 
-        if agent_used_vcpus >= agent_max_vcpus {
+        if !has_capacity(
+            agent_max_vcpus,
+            agent.data.used_vcpus,
+            msg.config.data.vcpus,
+            agent.data.ram.as_u64(),
+            agent.data.used_ram.as_u64(),
+            msg.config.data.memory.as_u64(),
+        ) {
             return AgentScore::REJECTED;
         }
 
@@ -472,7 +483,7 @@ impl SchedulerActor {
         let vcpu_headroom = (agent_max_vcpus - agent_used_vcpus) as f32 / agent_max_vcpus as f32;
         score.general += vcpu_headroom;
 
-        // todo: add ram overprovisionment.     not adding this to scheduler until it works on the hypervisor side.
+        // todo: add ram overprovisionment. not adding this to scheduler until it works on the hypervisor side.
         let agent_max_ram = agent.data.ram;
         let agent_used_ram = bytesize::ByteSize::b(
             agent
@@ -481,10 +492,6 @@ impl SchedulerActor {
                 .as_u64()
                 .saturating_add(msg.config.data.memory.as_u64()),
         );
-
-        if agent_used_ram >= agent_max_ram {
-            return AgentScore::REJECTED;
-        }
 
         #[expect(
             clippy::cast_precision_loss,
@@ -521,43 +528,12 @@ impl SchedulerActor {
                     AffinityType::Agent => metadata_tables.push(agent.data.metadata.clone()),
                 }
 
-                let mut follows_rule = false;
+                let follows_rule = evaluate_affinity_rule(&metadata_tables, rule);
 
-                for requirement in &rule.requirements {
-                    let mut requirement_outcome = true;
-
-                    for object_metadata in &metadata_tables {
-                        let table = match requirement.table {
-                            MetadataTable::Label => &object_metadata.labels,
-                            MetadataTable::Annotation => &object_metadata.annotations,
-                        };
-
-                        let value_option = table.get(&requirement.key);
-
-                        if !evaluate_table_value(value_option, requirement) {
-                            requirement_outcome = false;
-                            break;
-                        }
-                    }
-
-                    if requirement_outcome {
-                        follows_rule = true;
-                        break;
-                    }
-                }
-
-                follows_rule ^= rule.inverse;
-
-                match (rule.strictness, follows_rule) {
-                    (AffinityStrictness::Required, false) => return AgentScore::REJECTED,
-                    (AffinityStrictness::Required, true) => {} // specifically do nothing
-                    (AffinityStrictness::Preferred { weight }, follows_rule) => {
-                        let follows_rule = i64::from(follows_rule);
-                        score.affinity = score
-                            .affinity
-                            .saturating_add(follows_rule.saturating_mul(weight));
-                    }
-                }
+                let Some(affinity_delta) = affinity_delta(rule.strictness, follows_rule) else {
+                    return AgentScore::REJECTED;
+                };
+                score.affinity = score.affinity.saturating_add(affinity_delta);
             }
         }
 
@@ -572,9 +548,61 @@ impl SchedulerActor {
     }
 }
 
+const fn has_capacity(
+    max_vcpus: u32,
+    used_vcpus: u32,
+    requested_vcpus: u32,
+    max_ram: u64,
+    used_ram: u64,
+    requested_ram: u64,
+) -> bool {
+    used_vcpus.saturating_add(requested_vcpus) < max_vcpus
+        && used_ram.saturating_add(requested_ram) < max_ram
+}
+
+fn affinity_delta(strictness: AffinityStrictness, follows_rule: bool) -> Option<i64> {
+    match strictness {
+        AffinityStrictness::Required if !follows_rule => None,
+        AffinityStrictness::Required => Some(0),
+        AffinityStrictness::Preferred { weight } => {
+            Some(i64::from(follows_rule).saturating_mul(weight))
+        }
+    }
+}
+
+fn evaluate_affinity_rule(
+    metadata_tables: &[ObjectMetadata],
+    rule: &crate::types::AffinityRule,
+) -> bool {
+    let mut follows_rule = false;
+
+    for requirement in &rule.requirements {
+        let mut requirement_outcome = !metadata_tables.is_empty();
+
+        for object_metadata in metadata_tables {
+            let table = match requirement.table {
+                MetadataTable::Label => &object_metadata.labels,
+                MetadataTable::Annotation => &object_metadata.annotations,
+            };
+
+            if !evaluate_table_value(table.get(&requirement.key), requirement) {
+                requirement_outcome = false;
+                break;
+            }
+        }
+
+        if requirement_outcome {
+            follows_rule = true;
+            break;
+        }
+    }
+
+    follows_rule ^ rule.inverse
+}
+
 fn evaluate_table_value(value_option: Option<&String>, requirement: &AffinityRequirement) -> bool {
     let Some(value) = value_option else {
-        return false;
+        return matches!(requirement.operator, Operator::NotIn);
     };
 
     match requirement.operator {
@@ -604,8 +632,11 @@ fn evaluate_table_value(value_option: Option<&String>, requirement: &AffinityReq
 
 #[cfg(test)]
 mod tests {
-    use super::evaluate_table_value;
-    use crate::types::{AffinityRequirement, MetadataTable, Operator};
+    use super::{affinity_delta, evaluate_affinity_rule, evaluate_table_value, has_capacity};
+    use crate::types::{
+        AffinityRequirement, AffinityRule, AffinityStrictness, AffinityType, MetadataTable,
+        ObjectMetadata, Operator,
+    };
     use std::collections::BTreeMap;
 
     fn requirement(operator: Operator, values: &[&str]) -> AffinityRequirement {
@@ -632,6 +663,10 @@ mod tests {
             None,
             &requirement(Operator::In, &["frontend"])
         ));
+        assert!(evaluate_table_value(
+            None,
+            &requirement(Operator::NotIn, &["frontend"])
+        ));
     }
 
     #[test]
@@ -657,6 +692,46 @@ mod tests {
             metadata.get("tier"),
             &requirement(Operator::Gt, &["not-a-number"])
         ));
+    }
+
+    #[test]
+    fn evaluates_inverse_and_empty_requirements() {
+        let metadata = ObjectMetadata {
+            labels: BTreeMap::from([("tier".to_owned(), "frontend".to_owned())]),
+            annotations: BTreeMap::new(),
+        };
+        let rule = AffinityRule {
+            strictness: AffinityStrictness::Required,
+            affinity_type: AffinityType::Agent,
+            inverse: true,
+            requirements: vec![requirement(Operator::In, &["frontend"])],
+        };
+        assert!(!evaluate_affinity_rule(&[metadata], &rule));
+
+        let empty_rule = AffinityRule {
+            strictness: AffinityStrictness::Required,
+            affinity_type: AffinityType::Agent,
+            inverse: false,
+            requirements: Vec::new(),
+        };
+        assert!(!evaluate_affinity_rule(&[], &empty_rule));
+    }
+
+    #[test]
+    fn evaluates_required_preferred_and_capacity_rules() {
+        assert_eq!(affinity_delta(AffinityStrictness::Required, true), Some(0));
+        assert_eq!(affinity_delta(AffinityStrictness::Required, false), None);
+        assert_eq!(
+            affinity_delta(AffinityStrictness::Preferred { weight: 7 }, true),
+            Some(7)
+        );
+        assert_eq!(
+            affinity_delta(AffinityStrictness::Preferred { weight: 7 }, false),
+            Some(0)
+        );
+        assert!(has_capacity(8, 2, 2, 16, 4, 4));
+        assert!(!has_capacity(8, 6, 2, 16, 4, 4));
+        assert!(!has_capacity(8, 2, 2, 16, 12, 4));
     }
 }
 
@@ -754,15 +829,22 @@ impl Actor for SchedulerActor {
                         .is_some_and(|actor| actor.id() == id)
                 })
                 .map(|index| entries.remove(index));
+            if let Some(cached_vm) = removed_cached_vm {
+                let scheduled_agent_id = cached_vm.scheduled_agent_id;
+                let agent_still_has_vm = entries
+                    .iter()
+                    .any(|entry| entry.scheduled_agent_id == scheduled_agent_id);
+                if !agent_still_has_vm {
+                    self.agent_data_cache
+                        .alter(&scheduled_agent_id, |_, mut v| {
+                            v.extended_vm_set.remove(&vmid);
+                            v
+                        });
+                }
+            }
             if entries.is_empty() {
                 drop(entries);
                 self.vm_data_cache.remove(&vmid);
-                if let Some(cached_vm) = removed_cached_vm
-                    && let Some(mut agent) =
-                        self.agent_data_cache.get_mut(&cached_vm.scheduled_agent_id)
-                {
-                    agent.extended_vm_set.remove(&vmid);
-                }
             }
         }
 
@@ -803,22 +885,38 @@ impl Message<CreateVM> for SchedulerActor {
 
         let reply = target_agent.ask(&msg).await;
 
-        if reply.is_err() {
-            // A lost reply is not a rejected create. Keep the cache if the VM actor exists.
-            let actor_exists = RemoteActorRef::<VMActor>::lookup(vm_actor_id(msg.vmid))
-                .await?
-                .is_some();
-            if !actor_exists {
-                self.agent_data_cache.alter(&target_agent.id(), |_, mut v| {
-                    v.extended_vm_set.remove(&msg.vmid);
-                    v
-                });
-                if let Some(mut entries) = self.vm_data_cache.get_mut(&msg.vmid) {
-                    entries.retain(|entry| entry.actor_ref.is_some());
-                    if entries.is_empty() {
-                        drop(entries);
-                        self.vm_data_cache.remove(&msg.vmid);
-                    }
+        if let Ok(reply) = &reply
+            && let Some(actor_id_bytes) = &reply.actor_id
+            && let Ok(actor_id) = ActorId::from_bytes(actor_id_bytes)
+        {
+            self.vm_actorid_ulid_map.insert(actor_id, msg.vmid);
+            let actor_ref = RemoteActorRef::<VMActor>::lookup(vm_actor_id(msg.vmid))
+                .await
+                .ok()
+                .flatten();
+            if let Some(mut entries) = self.vm_data_cache.get_mut(&msg.vmid)
+                && let Some(entry) = entries.iter_mut().find(|entry| entry.actor_ref.is_none())
+            {
+                entry.actor_ref = actor_ref;
+            }
+        }
+
+        if reply.is_err()
+            && RemoteActorRef::<VMActor>::lookup(vm_actor_id(msg.vmid))
+                .await
+                .ok()
+                .flatten()
+                .is_none()
+        {
+            self.agent_data_cache.alter(&target_agent.id(), |_, mut v| {
+                v.extended_vm_set.remove(&msg.vmid);
+                v
+            });
+            if let Some(mut entries) = self.vm_data_cache.get_mut(&msg.vmid) {
+                entries.retain(|entry| entry.actor_ref.is_some());
+                if entries.is_empty() {
+                    drop(entries);
+                    self.vm_data_cache.remove(&msg.vmid);
                 }
             }
         }

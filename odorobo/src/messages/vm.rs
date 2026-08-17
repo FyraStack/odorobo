@@ -29,6 +29,8 @@ pub struct CreateVM {
 #[derive(Serialize, Deserialize, Reply, Debug, JsonSchema)]
 pub struct CreateVMReply {
     pub config: Option<VirtualMachine>,
+    /// Serialized ID of the VM actor created by the agent.
+    pub actor_id: Option<Vec<u8>>,
 }
 
 /// Message to delete a VM's config from the agent, shutting it down

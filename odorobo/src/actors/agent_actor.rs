@@ -128,6 +128,7 @@ impl Message<CreateVM> for AgentActor {
         info!(?vmid, "VM Spawned successfully");
         CreateVMReply {
             config: Some(msg.config),
+            actor_id: Some(actor_ref.id().to_bytes()),
         }
     }
 }
