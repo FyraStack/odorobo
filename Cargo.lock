@@ -87,7 +87,7 @@ dependencies = [
  "bytes",
  "cfg-if",
  "http 1.5.0",
- "indexmap",
+ "indexmap 2.14.0",
  "schemars 1.2.2",
  "serde",
  "serde_json",
@@ -182,7 +182,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9d2b12ecf81b86e8671399b44cd1c7e04bebb805be7403837d309530252155f7"
 dependencies = [
  "api-error-derive",
- "axum-core",
+ "axum-core 0.5.6",
  "http 1.5.0",
  "serde_core",
  "serde_json",
@@ -377,7 +377,7 @@ dependencies = [
  "axum-core 0.4.5",
  "bytes",
  "futures-util",
- "http 1.4.2",
+ "http 1.5.0",
  "http-body",
  "http-body-util",
  "itoa",
@@ -439,7 +439,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "futures-util",
- "http 1.4.2",
+ "http 1.5.0",
  "http-body",
  "http-body-util",
  "mime",
@@ -1245,7 +1245,7 @@ version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc0452bcc559431b16f472b7ab86e2f9ccd5f3c2da3795afbd6b773665e047fe"
 dependencies = [
- "http 1.4.2",
+ "http 1.5.0",
  "prost 0.13.5",
  "tokio",
  "tokio-stream",
@@ -1568,7 +1568,7 @@ dependencies = [
  "futures-core",
  "futures-sink",
  "http 1.5.0",
- "indexmap",
+ "indexmap 2.14.0",
  "slab",
  "tokio",
  "tokio-util",
@@ -4726,7 +4726,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "h2",
- "http 1.4.2",
+ "http 1.5.0",
  "http-body",
  "http-body-util",
  "hyper",
