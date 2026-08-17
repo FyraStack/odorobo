@@ -88,7 +88,7 @@ pub struct SchedulerActor {
     //  alternatively we could have the other manager nodes try to keep track of that data, but i think we are going to run into issues with keeping the state consistent between all nodes.
     //  we may need to make some architecture designs about db consistency vs uptime vs speed in that situation, and im not doing that on my own.
     pub vm_actorid_ulid_map: Arc<DashMap<ActorId, Ulid>>,
-    pub vm_data_cache: Arc<DashMap<Ulid, CachedVMActor>>,
+    pub vm_data_cache: Arc<DashMap<Ulid, Vec<CachedVMActor>>>,
     pub vm_keepalive_tasks: Arc<DashMap<ActorId, JoinHandle<()>>>,
 
     pub cache_actor_finder: Option<JoinHandle<()>>,
@@ -118,7 +118,7 @@ impl SchedulerActor {
     async fn vm_actor_finder(
         parent_actor_ref: RemoteActorRef<Self>,
         vm_actorid_ulid_map: Arc<DashMap<ActorId, Ulid>>,
-        data_cache: Arc<DashMap<Ulid, CachedVMActor>>,
+        data_cache: Arc<DashMap<Ulid, Vec<CachedVMActor>>>,
         keepalive_tasks: Arc<DashMap<ActorId, JoinHandle<()>>>,
         agent_data_cache: Arc<DashMap<ActorId, CachedAgentActor>>,
     ) -> Result<(), Report> {
@@ -127,12 +127,15 @@ impl SchedulerActor {
         let mut vm_actor_stream = RemoteActorRef::<VMActor>::lookup_all(VM);
 
         while let Some(vm_actor) = vm_actor_stream.try_next().await? {
-            if !keepalive_tasks.contains_key(&vm_actor.id()) {
+            let vm_actor_id = vm_actor.id();
+            let updater_is_running = keepalive_tasks
+                .get(&vm_actor_id)
+                .is_some_and(|task| !task.is_finished());
+            if !updater_is_running {
+                keepalive_tasks.remove(&vm_actor_id);
                 trace!(?vm_actor, "starting vm_updater_task");
 
                 parent_actor_ref.link_remote(&vm_actor).await?;
-
-                let vm_actor_id = vm_actor.id();
 
                 let vm_actorid_ulid_map_clone = Arc::clone(&vm_actorid_ulid_map);
                 let data_cache_clone = Arc::clone(&data_cache);
@@ -154,10 +157,14 @@ impl SchedulerActor {
         Ok(())
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the updater keeps polling and performs coordinated cache cleanup"
+    )]
     async fn vm_updater_task(
         actor_ref: RemoteActorRef<VMActor>,
         vm_actorid_ulid_map: Arc<DashMap<ActorId, Ulid>>,
-        data_cache: Arc<DashMap<Ulid, CachedVMActor>>,
+        data_cache: Arc<DashMap<Ulid, Vec<CachedVMActor>>>,
         agent_data_cache: Arc<DashMap<ActorId, CachedAgentActor>>,
     ) {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
@@ -168,20 +175,42 @@ impl SchedulerActor {
 
                 vm_actorid_ulid_map.insert(actor_ref.id(), vmid); // should we be doing this on every loop? idk. but we at least need to do it on the first iteration given we don't know the mapping before that
 
-                data_cache.insert(
-                    vmid,
-                    CachedVMActor {
-                        actor_ref: Some(actor_ref.clone()),
-                        // preserve the original scheduled_agent_id if an entry already exists
-                        // (e.g. from CreateVM::handle inserting it before the actor was reachable),
-                        // otherwise default to the vm actor's own id (won't match any agent entry,
-                        // so no accidental cleanup of wrong agent).
-                        scheduled_agent_id: data_cache
-                            .get(&vmid)
-                            .map_or_else(|| actor_ref.id(), |e| e.scheduled_agent_id),
-                        data,
-                    },
-                );
+                let scheduled_agent_id = data_cache
+                    .get(&vmid)
+                    .and_then(|entries| {
+                        entries.iter().find_map(|entry| {
+                            entry
+                                .actor_ref
+                                .as_ref()
+                                .is_none_or(|actor| actor.id() == actor_ref.id())
+                                .then_some(entry.scheduled_agent_id)
+                        })
+                    })
+                    .unwrap_or_else(|| actor_ref.id());
+                let cached_vm = CachedVMActor {
+                    actor_ref: Some(actor_ref.clone()),
+                    scheduled_agent_id,
+                    data,
+                };
+                data_cache
+                    .entry(vmid)
+                    .and_modify(|entries| {
+                        if let Some(entry) = entries.iter_mut().find(|entry| {
+                            entry
+                                .actor_ref
+                                .as_ref()
+                                .is_some_and(|actor| actor.id() == actor_ref.id())
+                        }) {
+                            *entry = cached_vm.clone();
+                        } else if let Some(entry) =
+                            entries.iter_mut().find(|entry| entry.actor_ref.is_none())
+                        {
+                            *entry = cached_vm.clone();
+                        } else {
+                            entries.push(cached_vm.clone());
+                        }
+                    })
+                    .or_insert_with(|| vec![cached_vm]);
 
                 fails = 0;
             } else {
@@ -203,20 +232,47 @@ impl SchedulerActor {
                 // that matches this actor_ref.
                 let vmid = vmid.or_else(|| {
                     data_cache.iter().find_map(|entry| {
-                        (entry.actor_ref.as_ref().map(RemoteActorRef::id) == Some(actor_ref.id()))
+                        entry
+                            .value()
+                            .iter()
+                            .any(|cached| {
+                                cached
+                                    .actor_ref
+                                    .as_ref()
+                                    .is_some_and(|actor| actor.id() == actor_ref.id())
+                            })
                             .then(|| *entry.key())
                     })
                 });
 
                 if let Some(vmid) = vmid {
-                    if let Some(cached_vm) = data_cache.get(&vmid) {
-                        agent_data_cache.alter(&cached_vm.scheduled_agent_id, |_, mut v| {
+                    let removed_cached_vm = data_cache.get_mut(&vmid).and_then(|mut entries| {
+                        entries
+                            .iter()
+                            .position(|entry| {
+                                entry
+                                    .actor_ref
+                                    .as_ref()
+                                    .is_some_and(|actor| actor.id() == actor_ref.id())
+                            })
+                            .map(|index| (index, entries.remove(index)))
+                    });
+                    if let Some(cached_vm) = removed_cached_vm
+                        && data_cache
+                            .get(&vmid)
+                            .is_none_or(|entries| entries.is_empty())
+                    {
+                        agent_data_cache.alter(&cached_vm.1.scheduled_agent_id, |_, mut v| {
                             v.extended_vm_set.remove(&vmid);
                             v
                         });
                     }
-
-                    data_cache.remove(&vmid);
+                    if data_cache
+                        .get(&vmid)
+                        .is_some_and(|entries| entries.is_empty())
+                    {
+                        data_cache.remove(&vmid);
+                    }
                 }
 
                 return;
@@ -236,12 +292,15 @@ impl SchedulerActor {
         let mut agent_actor_stream = RemoteActorRef::<AgentActor>::lookup_all(AGENT);
 
         while let Some(agent_actor) = agent_actor_stream.try_next().await? {
-            if !keepalive_tasks.contains_key(&agent_actor.id()) {
+            let agent_actor_id = agent_actor.id();
+            let updater_is_running = keepalive_tasks
+                .get(&agent_actor_id)
+                .is_some_and(|task| !task.is_finished());
+            if !updater_is_running {
+                keepalive_tasks.remove(&agent_actor_id);
                 trace!(?agent_actor, "starting agent_updater_task");
 
                 parent_actor_ref.link_remote(&agent_actor).await?;
-
-                let agent_actor_id = agent_actor.id();
 
                 let data_cache_clone = Arc::clone(&data_cache);
                 let updater_task = tokio::spawn(async move {
@@ -267,6 +326,7 @@ impl SchedulerActor {
                     data_cache.alter(&actor_ref.id(), |_, mut v| {
                         v.data = data;
 
+                        v.extended_vm_set.retain(|vmid| v.data.vms.contains(vmid));
                         v.extended_vm_set.extend(v.data.vms.iter());
 
                         v
@@ -444,16 +504,17 @@ impl SchedulerActor {
                 match rule.affinity_type {
                     AffinityType::VirtualMachine => {
                         for vmid in &agent.extended_vm_set {
-                            let Some(vm_data_cache_ref) = &self.vm_data_cache.get(vmid) else {
+                            let Some(vm_data_cache_refs) = self.vm_data_cache.get(vmid) else {
                                 continue;
                             };
 
-                            let Some(vm_manifest) = &vm_data_cache_ref.data.config else {
-                                continue;
-                            };
-
-                            if let Some(metadata) = &vm_manifest.metadata {
-                                metadata_tables.push(metadata.clone());
+                            for vm_data_cache_ref in vm_data_cache_refs.iter() {
+                                let Some(vm_manifest) = &vm_data_cache_ref.data.config else {
+                                    continue;
+                                };
+                                if let Some(metadata) = &vm_manifest.metadata {
+                                    metadata_tables.push(metadata.clone());
+                                }
                             }
                         }
                     }
@@ -541,6 +602,64 @@ fn evaluate_table_value(value_option: Option<&String>, requirement: &AffinityReq
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::evaluate_table_value;
+    use crate::types::{AffinityRequirement, MetadataTable, Operator};
+    use std::collections::BTreeMap;
+
+    fn requirement(operator: Operator, values: &[&str]) -> AffinityRequirement {
+        AffinityRequirement {
+            key: "tier".to_owned(),
+            table: MetadataTable::Label,
+            operator,
+            values: values.iter().map(|value| (*value).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn evaluates_membership_and_missing_keys() {
+        let metadata = BTreeMap::from([("tier".to_owned(), "frontend".to_owned())]);
+        assert!(evaluate_table_value(
+            metadata.get("tier"),
+            &requirement(Operator::In, &["frontend", "api"])
+        ));
+        assert!(!evaluate_table_value(
+            metadata.get("tier"),
+            &requirement(Operator::In, &["backend"])
+        ));
+        assert!(!evaluate_table_value(
+            None,
+            &requirement(Operator::In, &["frontend"])
+        ));
+    }
+
+    #[test]
+    fn evaluates_not_in_and_numeric_comparisons() {
+        let metadata = BTreeMap::from([("tier".to_owned(), "4".to_owned())]);
+        assert!(evaluate_table_value(
+            metadata.get("tier"),
+            &requirement(Operator::NotIn, &["5"])
+        ));
+        assert!(evaluate_table_value(
+            metadata.get("tier"),
+            &requirement(Operator::Lt, &["5"])
+        ));
+        assert!(evaluate_table_value(
+            metadata.get("tier"),
+            &requirement(Operator::Gt, &["3"])
+        ));
+        assert!(!evaluate_table_value(
+            metadata.get("tier"),
+            &requirement(Operator::Lt, &["4", "5"])
+        ));
+        assert!(!evaluate_table_value(
+            metadata.get("tier"),
+            &requirement(Operator::Gt, &["not-a-number"])
+        ));
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct AgentScore {
     general: f32,
@@ -623,20 +742,28 @@ impl Actor for SchedulerActor {
             keepalive_task.abort();
         }
 
-        if let Some((_, vmid)) = self.vm_actorid_ulid_map.remove(&id) {
-            if let Some(cached_vm) = self.vm_data_cache.get(&vmid)
-                && let Some(mut agent) =
-                    self.agent_data_cache.get_mut(&cached_vm.scheduled_agent_id)
-            {
-                agent.extended_vm_set.remove(&vmid);
+        if let Some((_, vmid)) = self.vm_actorid_ulid_map.remove(&id)
+            && let Some(mut entries) = self.vm_data_cache.get_mut(&vmid)
+        {
+            let removed_cached_vm = entries
+                .iter()
+                .position(|entry| {
+                    entry
+                        .actor_ref
+                        .as_ref()
+                        .is_some_and(|actor| actor.id() == id)
+                })
+                .map(|index| entries.remove(index));
+            if entries.is_empty() {
+                drop(entries);
+                self.vm_data_cache.remove(&vmid);
+                if let Some(cached_vm) = removed_cached_vm
+                    && let Some(mut agent) =
+                        self.agent_data_cache.get_mut(&cached_vm.scheduled_agent_id)
+                {
+                    agent.extended_vm_set.remove(&vmid);
+                }
             }
-
-            // todo: we likely should keep a copy of the VirtualMachine manifest in the cache.
-            //  instead of removing the vm entirely, we should just modify the status to shutdown or crashed or something.
-            //
-            //  another potential issue is that the link dying doesn't guarantee that the vm is dead. if there is a networking partition, things get iffy.
-            trace!(?id, ?vmid, "Removing vm from vm_data_cache");
-            self.vm_data_cache.remove(&vmid);
         }
 
         // todo: attempt vm restarts if necessary.
@@ -662,28 +789,38 @@ impl Message<CreateVM> for SchedulerActor {
             return Err(eyre!("target agent is not in data cache"));
         }
 
-        self.vm_data_cache.insert(
-            msg.vmid,
-            CachedVMActor {
+        self.vm_data_cache
+            .entry(msg.vmid)
+            .or_default()
+            .push(CachedVMActor {
                 actor_ref: None,
                 scheduled_agent_id: target_agent.id(),
                 data: GetVMInfoReply {
                     vmid: msg.vmid,
                     config: Some(msg.config.clone()),
                 },
-            },
-        );
+            });
 
         let reply = target_agent.ask(&msg).await;
 
-        // remove from caches if the agent rejected the request
         if reply.is_err() {
-            self.agent_data_cache.alter(&target_agent.id(), |_, mut v| {
-                v.extended_vm_set.remove(&msg.vmid);
-
-                v
-            });
-            self.vm_data_cache.remove(&msg.vmid);
+            // A lost reply is not a rejected create. Keep the cache if the VM actor exists.
+            let actor_exists = RemoteActorRef::<VMActor>::lookup(vm_actor_id(msg.vmid))
+                .await?
+                .is_some();
+            if !actor_exists {
+                self.agent_data_cache.alter(&target_agent.id(), |_, mut v| {
+                    v.extended_vm_set.remove(&msg.vmid);
+                    v
+                });
+                if let Some(mut entries) = self.vm_data_cache.get_mut(&msg.vmid) {
+                    entries.retain(|entry| entry.actor_ref.is_some());
+                    if entries.is_empty() {
+                        drop(entries);
+                        self.vm_data_cache.remove(&msg.vmid);
+                    }
+                }
+            }
         }
 
         Ok(reply?)

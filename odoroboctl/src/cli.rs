@@ -31,9 +31,12 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Create a VM via the scheduler endpoint,
-    /// optionally also booting it immediately after creation (if `--boot` is specified).
-    Create,
+    /// Create a VM via the scheduler endpoint.
+    Create {
+        /// Path or URI of the VM disk image.
+        #[arg(long, env = "ODOROBO_VM_IMAGE")]
+        image: String,
+    },
 
     /// List VMs currently known by the manager/agent.
     List,
@@ -101,7 +104,7 @@ pub async fn run_command(cli: Cli) -> Result<()> {
     let base_url = cli.manager_addr;
 
     match cli.command {
-        Command::Create => {
+        Command::Create { image } => {
             // TODO: setup actual cli args for these parameters. or just take in arbitrary json and serialize it into a VirtualMachine.
             let vm = VirtualMachine {
                 data: VMData {
@@ -110,7 +113,7 @@ pub async fn run_command(cli: Cli) -> Result<()> {
                     vcpus: 4,
                     max_vcpus: None,
                     memory: ByteSize::gib(4),
-                    image: "/var/lib/odorobo/f43-1.raw".to_owned(),
+                    image,
                     ..Default::default()
                 },
                 metadata: Some(ObjectMetadata {
