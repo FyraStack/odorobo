@@ -4,7 +4,7 @@
   "desired": {
     "metadata": { "name": "storage-backed", "labels": {}, "annotations": {} },
     "compute": { "vcpus": 2, "max_vcpus": 4, "memory_bytes": 4294967296 },
-    "disks": [
+    "storage": [
       { "id": "root", "uri": "rbd://vms/root", "boot": true },
       { "id": "data", "volume_id": "01J00000000000000000000002" }
     ],

@@ -4,7 +4,7 @@
   "desired": {
     "metadata": { "name": "cloud-init", "labels": {}, "annotations": {} },
     "compute": { "vcpus": 2, "memory_bytes": 2147483648 },
-    "disks": [],
+    "storage": [],
     "networks": [],
     "placement": {},
     "boot": { "start": true },

@@ -4,7 +4,7 @@
   "desired": {
     "metadata": { "name": "minimal", "labels": {}, "annotations": {} },
     "compute": { "vcpus": 1, "memory_bytes": 536870912 },
-    "disks": [],
+    "storage": [],
     "networks": [],
     "placement": {},
     "boot": { "start": false }

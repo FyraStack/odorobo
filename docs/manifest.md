@@ -27,11 +27,12 @@ Odorobo should provision. It contains:
 
 - `metadata`: stable name, labels, and annotations.
 - `compute`: boot vCPUs, optional scaling ceiling, and memory in bytes.
-- `disks`: ordered disk intent. A disk references either a storage URI or a
-  provisioned volume ID; `boot` identifies the boot disk.
+- `storage`: ordered storage attachments. An attachment references either a storage URI or a
+  provisioned volume ID; `boot` identifies the boot attachment.
 - `networks`: stable network IDs and optional guest MAC addresses.
-- `placement`: scheduling hints, not a host binding unless `node` is set by the
-  scheduler.
+- `placement`: scheduling hints, including an optional node, required node labels,
+  and affinity rules. Affinity rules support required or weighted-preferred
+  VM/agent normal or anti-affinity, with OR-ed label/annotation requirements.
 - `boot`: whether to start after provisioning and optional firmware/kernel/
   command-line intent.
 - `cloud_init`: paired NoCloud user-data and meta-data.
@@ -48,8 +49,10 @@ A manifest must use a supported `api_version`, have a non-empty metadata name,
 non-zero vCPUs and memory, and satisfy these relationships:
 
 - `max_vcpus` must be at least `vcpus`.
-- Every disk must have exactly one usable source (URI or volume reference), and
-  a boot disk cannot be read-only. At most one disk may be marked as boot.
+- Every storage attachment must have exactly one usable source (URI or volume reference), and
+  a boot storage attachment cannot be read-only. At most one storage attachment may be marked as boot.
+- Affinity requirements within a rule are OR-ed; rules are combined according to
+  their strictness and direction.
 - Every network must have a non-empty, non-whitespace ID.
 - Cloud-init must provide non-empty configuration with user-data and meta-data
   supplied together.
@@ -82,7 +85,9 @@ For example:
   "desired": {
     "metadata": { "name": "vm", "labels": {}, "annotations": {} },
     "compute": { "vcpus": 2, "memory_bytes": 2147483648 },
-    "disks": [], "networks": [], "placement": {},
+    "storage": [],
+    "networks": [],
+    "placement": {},
     "boot": { "start": true },
     "vsock": { "guest_cid": 42, "socket": "/run/odorobo/vms/vm/vsock.sock" }
   }

@@ -35,7 +35,7 @@ pub enum ManifestError {
     InvalidDiskSource(String),
     #[error("disk {0} has a duplicate id")]
     DuplicateDiskId(String),
-    #[error("disk {0} cannot be both a boot disk and read-only")]
+    #[error("disk {0} cannot be both a boot storage attachment and read-only")]
     ReadOnlyBootDisk(String),
     #[error("manifest cannot define more than one boot disk")]
     MultipleBootDisks,
@@ -111,7 +111,7 @@ pub struct DesiredState {
     pub metadata: Metadata,
     pub compute: Compute,
     #[serde(default)]
-    pub disks: Vec<Disk>,
+    pub storage: Vec<Storage>,
     #[serde(default)]
     pub networks: Vec<Network>,
     #[serde(default)]
@@ -125,7 +125,7 @@ pub struct DesiredState {
 
 impl DesiredState {
     /// Validates relationships between fields that JSON deserialization alone
-    /// cannot express, such as a boot disk needing a writable source.
+    /// cannot express, such as a boot storage attachment needing a writable source.
     fn validate(&self) -> Result<(), ManifestError> {
         if self.metadata.name.trim().is_empty() {
             return Err(ManifestError::EmptyMetadataName);
@@ -147,28 +147,31 @@ impl DesiredState {
         // A disk source remains abstract here. URI resolution and volume
         // attachment belong to storage backends, so the manifest only checks
         // that the converter has one usable source from which to begin.
-        let mut disk_ids = std::collections::HashSet::with_capacity(self.disks.len());
-        let mut has_boot_disk = false;
-        for disk in &self.disks {
-            if disk.id.trim().is_empty() {
+        let mut storage_ids = std::collections::HashSet::with_capacity(self.storage.len());
+        let mut has_boot_storage = false;
+        for storage in &self.storage {
+            if storage.id.trim().is_empty() {
                 return Err(ManifestError::EmptyDiskId);
             }
-            if !disk_ids.insert(&disk.id) {
-                return Err(ManifestError::DuplicateDiskId(disk.id.clone()));
+            if !storage_ids.insert(&storage.id) {
+                return Err(ManifestError::DuplicateDiskId(storage.id.clone()));
             }
-            if disk.uri.as_deref().is_some_and(|uri| uri.trim().is_empty())
-                || disk.uri.is_some() == disk.volume_id.is_some()
+            if storage
+                .uri
+                .as_deref()
+                .is_some_and(|uri| uri.trim().is_empty())
+                || storage.uri.is_some() == storage.volume_id.is_some()
             {
-                return Err(ManifestError::InvalidDiskSource(disk.id.clone()));
+                return Err(ManifestError::InvalidDiskSource(storage.id.clone()));
             }
-            if disk.boot && disk.read_only {
-                return Err(ManifestError::ReadOnlyBootDisk(disk.id.clone()));
+            if storage.boot && storage.read_only {
+                return Err(ManifestError::ReadOnlyBootDisk(storage.id.clone()));
             }
-            if disk.boot {
-                if has_boot_disk {
+            if storage.boot {
+                if has_boot_storage {
                     return Err(ManifestError::MultipleBootDisks);
                 }
-                has_boot_disk = true;
+                has_boot_storage = true;
             }
         }
         for (index, network) in self.networks.iter().enumerate() {
@@ -218,7 +221,7 @@ pub struct Compute {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct Disk {
+pub struct Storage {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uri: Option<String>,
@@ -245,6 +248,63 @@ pub struct Placement {
     pub node: Option<String>,
     #[serde(default)]
     pub required_labels: BTreeMap<String, String>,
+    #[serde(default)]
+    pub affinity: Vec<AffinityRule>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AffinityRule {
+    pub strictness: AffinityStrictness,
+    pub affinity_type: AffinityType,
+    pub direction: AffinityDirection,
+    pub requirements: Vec<AffinityRequirement>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AffinityStrictness {
+    Required,
+    Preferred { weight: i64 },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AffinityType {
+    VirtualMachine,
+    Agent,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AffinityDirection {
+    Normal,
+    Anti,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AffinityRequirement {
+    pub key: String,
+    pub table: MetadataTable,
+    pub operator: Operator,
+    pub values: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MetadataTable {
+    Label,
+    Annotation,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Operator {
+    In,
+    NotIn,
+    Lt,
+    Gt,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -355,7 +415,7 @@ mod tests {
         ));
 
         manifest.desired.compute.max_vcpus = None;
-        manifest.desired.disks.push(Disk {
+        manifest.desired.storage.push(Storage {
             id: "invalid".to_owned(),
             uri: Some("file:///disk.img".to_owned()),
             volume_id: Some(Ulid::generate()),
@@ -366,8 +426,8 @@ mod tests {
             Err(ManifestError::InvalidDiskSource(_))
         ));
 
-        manifest.desired.disks.clear();
-        manifest.desired.disks.push(Disk {
+        manifest.desired.storage.clear();
+        manifest.desired.storage.push(Storage {
             id: "root".to_owned(),
             uri: Some("  ".to_owned()),
             ..Default::default()
@@ -377,8 +437,8 @@ mod tests {
             Err(ManifestError::InvalidDiskSource(_))
         ));
 
-        manifest.desired.disks[0].uri = Some("file:///disk.img".to_owned());
-        manifest.desired.disks.push(Disk {
+        manifest.desired.storage[0].uri = Some("file:///disk.img".to_owned());
+        manifest.desired.storage.push(Storage {
             id: "root".to_owned(),
             uri: Some("file:///other.img".to_owned()),
             ..Default::default()
@@ -388,8 +448,8 @@ mod tests {
             Err(ManifestError::DuplicateDiskId(_))
         ));
 
-        manifest.desired.disks.clear();
-        manifest.desired.disks.push(Disk {
+        manifest.desired.storage.clear();
+        manifest.desired.storage.push(Storage {
             id: "  ".to_owned(),
             uri: Some("file:///disk.img".to_owned()),
             ..Default::default()
@@ -399,14 +459,14 @@ mod tests {
             Err(ManifestError::EmptyDiskId)
         ));
 
-        manifest.desired.disks.clear();
-        manifest.desired.disks.push(Disk {
+        manifest.desired.storage.clear();
+        manifest.desired.storage.push(Storage {
             id: "root".to_owned(),
             uri: Some("file:///disk.img".to_owned()),
             boot: true,
             ..Default::default()
         });
-        manifest.desired.disks.push(Disk {
+        manifest.desired.storage.push(Storage {
             id: "other".to_owned(),
             uri: Some("file:///other.img".to_owned()),
             boot: true,
@@ -417,7 +477,7 @@ mod tests {
             Err(ManifestError::MultipleBootDisks)
         ));
 
-        manifest.desired.disks.clear();
+        manifest.desired.storage.clear();
         manifest.desired.vsock = Some(Vsock {
             guest_cid: 42,
             socket: "relative.sock".to_owned(),

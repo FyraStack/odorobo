@@ -4,7 +4,7 @@
   "desired": {
     "metadata": { "name": "vsock", "labels": {}, "annotations": {} },
     "compute": { "vcpus": 4, "memory_bytes": 4294967296 },
-    "disks": [],
+    "storage": [],
     "networks": [],
     "placement": {},
     "boot": { "start": true },
