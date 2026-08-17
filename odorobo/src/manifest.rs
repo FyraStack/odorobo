@@ -29,20 +29,24 @@ pub enum ManifestError {
     MaxVcpusLessThanBoot { vcpus: u32, max: u32 },
     #[error("memory must be greater than zero")]
     NoMemory,
-    #[error("disk must define a non-empty id")]
-    EmptyDiskId,
-    #[error("disk {0} must define exactly one usable source (URI or volume reference)")]
-    InvalidDiskSource(String),
-    #[error("disk {0} has a duplicate id")]
-    DuplicateDiskId(String),
-    #[error("disk {0} cannot be both a boot storage attachment and read-only")]
-    ReadOnlyBootDisk(String),
-    #[error("manifest cannot define more than one boot disk")]
-    MultipleBootDisks,
+    #[error("storage attachment must define a non-empty id")]
+    EmptyStorageId,
+    #[error(
+        "storage attachment {0} must define exactly one usable source (URI or volume reference)"
+    )]
+    InvalidStorageSource(String),
+    #[error("storage attachment {0} has a duplicate id")]
+    DuplicateStorageId(String),
+    #[error("storage attachment {0} cannot be both a boot attachment and read-only")]
+    ReadOnlyBootStorage(String),
+    #[error("manifest cannot define more than one boot storage attachment")]
+    MultipleBootStorageAttachments,
     #[error("network {0} must define an id")]
     NetworkWithoutId(usize),
     #[error("cloud-init user-data and meta-data must be supplied together")]
     IncompleteCloudInit,
+    #[error("cloud-init user-data and meta-data must both be non-empty")]
+    EmptyCloudInitData,
     #[error("vsock requires a non-zero guest CID")]
     InvalidVsockCid,
     #[error("vsock requires a non-empty socket path")]
@@ -151,10 +155,10 @@ impl DesiredState {
         let mut has_boot_storage = false;
         for storage in &self.storage {
             if storage.id.trim().is_empty() {
-                return Err(ManifestError::EmptyDiskId);
+                return Err(ManifestError::EmptyStorageId);
             }
             if !storage_ids.insert(&storage.id) {
-                return Err(ManifestError::DuplicateDiskId(storage.id.clone()));
+                return Err(ManifestError::DuplicateStorageId(storage.id.clone()));
             }
             if storage
                 .uri
@@ -162,14 +166,14 @@ impl DesiredState {
                 .is_some_and(|uri| uri.trim().is_empty())
                 || storage.uri.is_some() == storage.volume_id.is_some()
             {
-                return Err(ManifestError::InvalidDiskSource(storage.id.clone()));
+                return Err(ManifestError::InvalidStorageSource(storage.id.clone()));
             }
             if storage.boot && storage.read_only {
-                return Err(ManifestError::ReadOnlyBootDisk(storage.id.clone()));
+                return Err(ManifestError::ReadOnlyBootStorage(storage.id.clone()));
             }
             if storage.boot {
                 if has_boot_storage {
-                    return Err(ManifestError::MultipleBootDisks);
+                    return Err(ManifestError::MultipleBootStorageAttachments);
                 }
                 has_boot_storage = true;
             }
@@ -182,11 +186,23 @@ impl DesiredState {
         // NoCloud treats user-data and meta-data as one instance-data set.
         // Accepting only half of it would produce a provider configuration that
         // looks valid but can fail during guest initialization.
-        if let Some(cloud) = &self.cloud_init
-            && (cloud.user_data.is_some() != cloud.meta_data.is_some()
-                || (cloud.user_data.is_none() && cloud.meta_data.is_none()))
-        {
-            return Err(ManifestError::IncompleteCloudInit);
+        if let Some(cloud) = &self.cloud_init {
+            if cloud.user_data.is_some() != cloud.meta_data.is_some()
+                || (cloud.user_data.is_none() && cloud.meta_data.is_none())
+            {
+                return Err(ManifestError::IncompleteCloudInit);
+            }
+            if cloud
+                .user_data
+                .as_deref()
+                .is_some_and(|data| data.trim().is_empty())
+                || cloud
+                    .meta_data
+                    .as_deref()
+                    .is_some_and(|data| data.trim().is_empty())
+            {
+                return Err(ManifestError::EmptyCloudInitData);
+            }
         }
         if let Some(vsock) = &self.vsock {
             if vsock.guest_cid == 0 {
@@ -403,18 +419,28 @@ mod tests {
         serde_json::from_str::<VmManifest>(json).unwrap_err();
     }
 
+    fn minimal_manifest() -> VmManifest {
+        serde_json::from_str(include_str!("../../docs/fixtures/manifest/minimal.json"))
+            .expect("valid minimal fixture")
+    }
+
     #[test]
-    fn rejects_invalid_combinations() {
-        let mut manifest: VmManifest =
-            serde_json::from_str(include_str!("../../docs/fixtures/manifest/minimal.json"))
-                .unwrap();
+    fn rejects_invalid_compute() {
+        let mut manifest = minimal_manifest();
         manifest.desired.compute.max_vcpus = Some(0);
         assert!(matches!(
             manifest.validate(),
             Err(ManifestError::MaxVcpusLessThanBoot { .. })
         ));
 
-        manifest.desired.compute.max_vcpus = None;
+        let invalid_json = include_str!("../../docs/fixtures/manifest/minimal.json")
+            .replace("\"vcpus\": 1", "\"vcpus\": 0");
+        serde_json::from_str::<VmManifest>(&invalid_json).unwrap_err();
+    }
+
+    #[test]
+    fn rejects_invalid_storage() {
+        let mut manifest = minimal_manifest();
         manifest.desired.storage.push(Storage {
             id: "invalid".to_owned(),
             uri: Some("file:///disk.img".to_owned()),
@@ -423,7 +449,7 @@ mod tests {
         });
         assert!(matches!(
             manifest.validate(),
-            Err(ManifestError::InvalidDiskSource(_))
+            Err(ManifestError::InvalidStorageSource(_))
         ));
 
         manifest.desired.storage.clear();
@@ -434,7 +460,7 @@ mod tests {
         });
         assert!(matches!(
             manifest.validate(),
-            Err(ManifestError::InvalidDiskSource(_))
+            Err(ManifestError::InvalidStorageSource(_))
         ));
 
         manifest.desired.storage[0].uri = Some("file:///disk.img".to_owned());
@@ -445,7 +471,7 @@ mod tests {
         });
         assert!(matches!(
             manifest.validate(),
-            Err(ManifestError::DuplicateDiskId(_))
+            Err(ManifestError::DuplicateStorageId(_))
         ));
 
         manifest.desired.storage.clear();
@@ -456,7 +482,7 @@ mod tests {
         });
         assert!(matches!(
             manifest.validate(),
-            Err(ManifestError::EmptyDiskId)
+            Err(ManifestError::EmptyStorageId)
         ));
 
         manifest.desired.storage.clear();
@@ -474,10 +500,13 @@ mod tests {
         });
         assert!(matches!(
             manifest.validate(),
-            Err(ManifestError::MultipleBootDisks)
+            Err(ManifestError::MultipleBootStorageAttachments)
         ));
+    }
 
-        manifest.desired.storage.clear();
+    #[test]
+    fn rejects_invalid_vsock_and_metadata() {
+        let mut manifest = minimal_manifest();
         manifest.desired.vsock = Some(Vsock {
             guest_cid: 42,
             socket: "relative.sock".to_owned(),
@@ -493,8 +522,11 @@ mod tests {
             manifest.validate(),
             Err(ManifestError::EmptyMetadataName)
         ));
+    }
 
-        manifest.desired.metadata.name = "vm".to_owned();
+    #[test]
+    fn rejects_invalid_network_and_cloud_init() {
+        let mut manifest = minimal_manifest();
         manifest.desired.networks.push(Network {
             id: "  ".to_owned(),
             ..Default::default()
@@ -511,8 +543,33 @@ mod tests {
             Err(ManifestError::IncompleteCloudInit)
         ));
 
-        let invalid_json = include_str!("../../docs/fixtures/manifest/minimal.json")
-            .replace("\"vcpus\": 1", "\"vcpus\": 0");
-        serde_json::from_str::<VmManifest>(&invalid_json).unwrap_err();
+        manifest.desired.cloud_init = Some(CloudInit {
+            user_data: Some("  ".to_owned()),
+            meta_data: Some("instance-id: vm".to_owned()),
+        });
+        assert!(matches!(
+            manifest.validate(),
+            Err(ManifestError::EmptyCloudInitData)
+        ));
+    }
+
+    #[test]
+    fn serializes_affinity() {
+        let mut manifest = minimal_manifest();
+        manifest.desired.placement.affinity.push(AffinityRule {
+            strictness: AffinityStrictness::Preferred { weight: 10 },
+            affinity_type: AffinityType::VirtualMachine,
+            direction: AffinityDirection::Anti,
+            requirements: vec![AffinityRequirement {
+                key: "tier".to_owned(),
+                table: MetadataTable::Label,
+                operator: Operator::In,
+                values: vec!["batch".to_owned()],
+            }],
+        });
+        let encoded = serde_json::to_string(&manifest).expect("affinity is serializable");
+        assert!(encoded.contains("preferred"));
+        assert!(encoded.contains("virtual_machine"));
+        assert!(encoded.contains("anti"));
     }
 }
