@@ -18,8 +18,9 @@ use crate::{
 use ahash::AHashMap;
 use bytesize::ByteSize;
 use kameo::prelude::*;
+use odorobo::cluster_state::{ClusterStateStore, StateStore, VM_MANIFESTS_PREFIX, key};
 use stable_eyre::{Report, Result};
-use std::ops::ControlFlow;
+use std::{ops::ControlFlow, sync::Arc};
 use sysinfo::System;
 use tracing::{error, info, trace, warn};
 use ulid::Ulid;
@@ -39,6 +40,7 @@ pub struct AgentActor {
     pub vms: AHashMap<Ulid, VMCacheData>,
     // pub network_actor: ActorRef<NetworkAgentActor>,
     pub metadata: ObjectMetadata,
+    pub state_store: Arc<StateStore>,
 }
 
 impl AgentActor {
@@ -51,27 +53,61 @@ impl AgentActor {
 }
 
 impl Actor for AgentActor {
-    type Args = Config;
+    type Args = (Config, Arc<StateStore>);
     type Error = Report;
 
-    async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self> {
+    async fn on_start(
+        (config, state_store): Self::Args,
+        actor_ref: ActorRef<Self>,
+    ) -> Result<Self> {
         let peer_id = *actor_ref.id().peer_id().unwrap();
 
         info!(?peer_id, "Agent Actor started!");
 
         // spawn networking actor
         let network_actor: ActorRef<NetworkAgentActor> =
-            NetworkAgentActor::spawn_link(&actor_ref, args.network.clone()).await;
+            NetworkAgentActor::spawn_link(&actor_ref, config.network.clone()).await;
         network_actor.register(NETWORK).await?;
 
         let sys = System::new_all();
+        let mut vms = AHashMap::new();
+        match state_store
+            .list::<VirtualMachine>(VM_MANIFESTS_PREFIX)
+            .await
+        {
+            Ok(records) => {
+                for (_, vm_config) in records {
+                    let vmid = vm_config.data.id;
+                    let actor =
+                        VMActor::spawn_link(&actor_ref, (vmid, Some(vm_config.clone()))).await;
+                    _ = actor.register(vm_actor_id(vmid)).await;
+                    _ = actor.register(VM).await;
+                    vms.insert(
+                        vmid,
+                        VMCacheData {
+                            actor_ref: actor,
+                            config: vm_config,
+                        },
+                    );
+                }
+                info!(
+                    count = vms.len(),
+                    "Recovered VM manifests from cluster state"
+                );
+            }
+            Err(error) => warn!(
+                ?error,
+                "Unable to recover VM manifests; retaining empty local cache"
+            ),
+        }
 
         Ok(Self {
             vcpus: u32::try_from(sys.cpus().len()).unwrap_or(u32::MAX),
             memory: ByteSize::b(sys.total_memory()),
-            config: args,
-            vms: AHashMap::new(),
+            config,
+            vms,
             metadata: ObjectMetadata::default(),
+            state_store,
         })
     }
 
@@ -111,6 +147,13 @@ impl Message<CreateVM> for AgentActor {
 
     async fn handle(&mut self, msg: CreateVM, ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
         let vmid = msg.vmid;
+        if let Err(error) = self
+            .state_store
+            .put(&key(VM_MANIFESTS_PREFIX, &vmid), &msg.config)
+            .await
+        {
+            warn!(?error, vm_id = %vmid, "Unable to persist VM manifest; continuing without durable state");
+        }
         // spawn AND link at the same time
         let actor_ref =
             VMActor::spawn_link(ctx.actor_ref(), (vmid, Some(msg.config.clone()))).await;
@@ -185,6 +228,13 @@ impl Message<DeleteVM> for AgentActor {
             }
         }
 
+        if let Err(error) = self
+            .state_store
+            .delete(&key(VM_MANIFESTS_PREFIX, &msg.vmid))
+            .await
+        {
+            warn!(?error, vm_id = %msg.vmid, "Unable to delete VM manifest; retaining durable record for recovery");
+        }
         DeleteVMReply
     }
 }

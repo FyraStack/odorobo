@@ -1,4 +1,4 @@
-use std::ops::ControlFlow;
+use std::{ops::ControlFlow, sync::Arc};
 
 use crate::actors::agent_actor::AgentActor;
 use crate::ch_driver::actor::VMActor;
@@ -16,6 +16,7 @@ use crate::utils::actor_names::vm_actor_id;
 use async_trait::async_trait;
 use kameo::prelude::*;
 use libp2p::futures::TryStreamExt;
+use odorobo::cluster_state::{ClusterStateStore, PLACEMENT_PREFIX, StateStore, key};
 use stable_eyre::eyre::OptionExt;
 use stable_eyre::{Report, Result, eyre::eyre};
 use tracing::info_span;
@@ -25,6 +26,7 @@ use tracing::{info, warn};
 pub struct SchedulerActor {
     pub agent_actor_cache: ActorCache<Self, AgentActor, CachedAgentActor>,
     pub vm_actor_cache: ActorCache<Self, VMActor, CachedVMActor>,
+    pub state_store: Arc<StateStore>,
 }
 
 // todo: this might need to be a runtime thing but this makes it easy to write for now and could easily be switched out later.
@@ -147,7 +149,9 @@ impl ActorCacheUpdater<AgentActor, CachedAgentActor> for AgentActorCacheUpdater 
         let mut agent_actors_lookup = RemoteActorRef::<AgentActor>::lookup_all(AGENT);
         let mut actor_ref_vec = Vec::new();
 
-        while let Some(agent_actor) = agent_actors_lookup.try_next().await? {
+        loop {
+            let next_agent = agent_actors_lookup.try_next().await?;
+            let Some(agent_actor) = next_agent else { break };
             actor_ref_vec.push(agent_actor);
         }
 
@@ -181,13 +185,21 @@ pub struct CachedVMActor {
     pub metadata: GetVMInfoReply,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PlacementRecord {
+    vmid: ulid::Ulid,
+    node: String,
+}
+
 #[async_trait]
 impl ActorCacheUpdater<VMActor, CachedVMActor> for VMActorCacheUpdater {
     async fn get_actor_refs(&self) -> Result<Vec<RemoteActorRef<VMActor>>> {
         let mut agent_actors_lookup = RemoteActorRef::<VMActor>::lookup_all(VM);
         let mut actor_ref_vec = Vec::new();
 
-        while let Some(agent_actor) = agent_actors_lookup.try_next().await? {
+        loop {
+            let next_agent = agent_actors_lookup.try_next().await?;
+            let Some(agent_actor) = next_agent else { break };
             actor_ref_vec.push(agent_actor);
         }
 
@@ -212,10 +224,11 @@ impl ActorCacheUpdater<VMActor, CachedVMActor> for VMActorCacheUpdater {
 }
 
 impl Actor for SchedulerActor {
-    type Args = ();
+    type Args = Arc<StateStore>;
     type Error = Report;
 
-    async fn on_start(_state: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
+    async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
+        let state_store = args;
         let peer_id = *actor_ref.id().peer_id().unwrap();
 
         info!(?peer_id, "Scheduler Actor started!");
@@ -223,6 +236,7 @@ impl Actor for SchedulerActor {
         Ok(Self {
             agent_actor_cache: ActorCache::new(actor_ref.clone(), AgentActorCacheUpdater),
             vm_actor_cache: ActorCache::new(actor_ref, VMActorCacheUpdater),
+            state_store,
         })
     }
 
@@ -259,7 +273,25 @@ impl Message<CreateVM> for SchedulerActor {
             let target_agent = self.schedule_agent(&msg)?;
 
             match target_agent.ask(&msg).await {
-                Ok(reply) => return Ok(reply),
+                Ok(reply) => {
+                    let node = target_agent
+                        .ask(&GetAgentStatus)
+                        .await
+                        .map_or_else(|_| "unknown".to_owned(), |status| status.hostname);
+                    let placement = PlacementRecord {
+                        vmid: msg.vmid,
+                        node,
+                    };
+                    if let Err(error) = self
+                        .state_store
+                        .put(&key(PLACEMENT_PREFIX, &msg.vmid), &placement)
+                        .await
+                    {
+                        warn!(?error, vm_id = %msg.vmid, "Unable to persist VM placement; retaining local state");
+                    }
+                    drop(target_agent);
+                    return Ok(reply);
+                }
                 Err(err) => {
                     warn!("CreateVM forwarding failed, trying again: {err}");
                 }
@@ -280,6 +312,13 @@ impl Message<DeleteVM> for SchedulerActor {
         tracing::trace!(?vm, "DeleteVM");
         if let Some(vm) = vm {
             vm.tell(&msg).send()?;
+            if let Err(error) = self
+                .state_store
+                .delete(&key(PLACEMENT_PREFIX, &msg.vmid))
+                .await
+            {
+                warn!(?error, vm_id = %msg.vmid, "Unable to delete VM placement; retaining durable record");
+            }
             Ok(DeleteVMReply)
         } else {
             Err(eyre!("VM not found"))

@@ -4,7 +4,7 @@
 //! JSON records with a `version` field so readers can reject unknown versions
 //! rather than silently misinterpreting state.
 
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, fmt::Display, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use etcd_client::{Certificate, Client, ConnectOptions, TlsOptions};
@@ -48,14 +48,19 @@ pub trait ClusterStateStore: Send + Sync {
     async fn put<T: Serialize + Send + Sync>(&self, key: &str, value: &T)
     -> Result<(), StateError>;
     async fn get<T: DeserializeOwned + Send>(&self, key: &str) -> Result<Option<T>, StateError>;
+    async fn list<T: DeserializeOwned + Send>(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<(String, T)>, StateError>;
     async fn delete(&self, key: &str) -> Result<(), StateError>;
     async fn health(&self) -> StoreHealth;
 }
 
-pub fn key<T: AsRef<str>>(prefix: &str, id: T) -> String {
-    format!("{prefix}/{}", id.as_ref())
+pub fn key<T: Display + ?Sized>(prefix: &str, id: &T) -> String {
+    format!("{prefix}/{id}")
 }
 
+#[derive(Clone)]
 pub struct EtcdStateStore {
     client: Arc<RwLock<Client>>,
 }
@@ -107,6 +112,68 @@ impl EtcdStateStore {
     }
 }
 
+#[derive(Clone)]
+pub enum StateStore {
+    Etcd(EtcdStateStore),
+    Memory(MemoryStateStore),
+}
+
+impl StateStore {
+    pub async fn connect(
+        endpoints: &[String],
+        username: Option<&str>,
+        password: Option<&str>,
+        tls: Option<TlsConfig>,
+        timeout: Duration,
+        retries: u32,
+    ) -> Result<Self, StateError> {
+        Ok(Self::Etcd(
+            EtcdStateStore::connect(endpoints, username, password, tls, timeout, retries).await?,
+        ))
+    }
+}
+
+#[async_trait]
+impl ClusterStateStore for StateStore {
+    async fn put<T: Serialize + Send + Sync>(
+        &self,
+        key: &str,
+        value: &T,
+    ) -> Result<(), StateError> {
+        match self {
+            Self::Etcd(store) => store.put(key, value).await,
+            Self::Memory(store) => store.put(key, value).await,
+        }
+    }
+    async fn get<T: DeserializeOwned + Send>(&self, key: &str) -> Result<Option<T>, StateError> {
+        match self {
+            Self::Etcd(store) => store.get(key).await,
+            Self::Memory(store) => store.get(key).await,
+        }
+    }
+    async fn list<T: DeserializeOwned + Send>(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<(String, T)>, StateError> {
+        match self {
+            Self::Etcd(store) => store.list(prefix).await,
+            Self::Memory(store) => store.list(prefix).await,
+        }
+    }
+    async fn delete(&self, key: &str) -> Result<(), StateError> {
+        match self {
+            Self::Etcd(store) => store.delete(key).await,
+            Self::Memory(store) => store.delete(key).await,
+        }
+    }
+    async fn health(&self) -> StoreHealth {
+        match self {
+            Self::Etcd(store) => store.health().await,
+            Self::Memory(store) => store.health().await,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TlsConfig {
     pub ca_file: String,
@@ -150,6 +217,30 @@ impl ClusterStateStore for EtcdStateStore {
         Ok(Some(record.value))
     }
 
+    async fn list<T: DeserializeOwned + Send>(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<(String, T)>, StateError> {
+        let response = self
+            .client
+            .write()
+            .await
+            .get(prefix, Some(etcd_client::GetOptions::new().with_prefix()))
+            .await
+            .map_err(|error| StateError::Backend(error.to_string()))?;
+        response
+            .kvs()
+            .iter()
+            .map(|value| {
+                let record: VersionedRecord<T> = serde_json::from_slice(value.value())?;
+                if record.version != RECORD_VERSION {
+                    return Err(StateError::UnsupportedVersion(record.version));
+                }
+                Ok((value.key_str().unwrap_or_default().to_owned(), record.value))
+            })
+            .collect()
+    }
+
     async fn delete(&self, key: &str) -> Result<(), StateError> {
         self.client
             .write()
@@ -174,9 +265,9 @@ impl ClusterStateStore for EtcdStateStore {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct MemoryStateStore {
-    values: RwLock<BTreeMap<String, Vec<u8>>>,
+    values: Arc<RwLock<BTreeMap<String, Vec<u8>>>>,
 }
 
 #[async_trait]
@@ -204,6 +295,24 @@ impl ClusterStateStore for MemoryStateStore {
         }
         Ok(Some(record.value))
     }
+    async fn list<T: DeserializeOwned + Send>(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<(String, T)>, StateError> {
+        self.values
+            .read()
+            .await
+            .iter()
+            .filter(|(key, _)| key.starts_with(prefix))
+            .map(|(key, value)| {
+                let record: VersionedRecord<T> = serde_json::from_slice(value)?;
+                if record.version != RECORD_VERSION {
+                    return Err(StateError::UnsupportedVersion(record.version));
+                }
+                Ok((key.clone(), record.value))
+            })
+            .collect()
+    }
     async fn delete(&self, key: &str) -> Result<(), StateError> {
         self.values.write().await.remove(key);
         Ok(())
@@ -223,7 +332,7 @@ mod tests {
     #[tokio::test]
     async fn round_trips_versioned_records_without_destructive_reads() {
         let store = MemoryStateStore::default();
-        let key = key(VM_MANIFESTS_PREFIX, "vm-1");
+        let key = key(VM_MANIFESTS_PREFIX, &"vm-1");
         store
             .put(&key, &serde_json::json!({"name": "demo"}))
             .await
@@ -239,6 +348,14 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        assert_eq!(
+            store
+                .list::<serde_json::Value>(VM_MANIFESTS_PREFIX)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
         assert!(
             store
                 .get::<serde_json::Value>(&key)
@@ -246,5 +363,23 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+        store.delete(&key).await.unwrap();
+        assert!(
+            store
+                .get::<serde_json::Value>(&key)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        store.values.write().await.insert(
+            key.clone(),
+            serde_json::to_vec(&serde_json::json!({"version": 2, "value": {"name": "future"}}))
+                .unwrap(),
+        );
+        assert!(matches!(
+            store.get::<serde_json::Value>(&key).await,
+            Err(super::StateError::UnsupportedVersion(2))
+        ));
     }
 }
