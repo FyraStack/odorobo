@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
 use std::ops::ControlFlow;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::actors::agent_actor::AgentActor;
 use crate::ch_driver::actor::VMActor;
@@ -48,6 +48,7 @@ pub struct CachedVMActor {
     /// the agent's `extended_vm_set` if the VM actor dies before it's linked.
     pub scheduled_agent_id: ActorId,
     pub data: GetVMInfoReply,
+    pub cached_at: Instant,
 }
 
 // todo: i dont like the way this cache is setup. I think we may need to change it later, but it is hard to figure out what the optimal solution is without doing it at least once.
@@ -97,6 +98,7 @@ pub struct SchedulerActor {
 // todo: this might need to be a runtime thing but this makes it easy to write for now and could easily be switched out later.
 static VCPU_OVERPROVISIONMENT_NUMERATOR: u32 = 2;
 static VCPU_OVERPROVISIONMENT_DENOMINATOR: u32 = 1;
+const UNRESOLVED_VM_CACHE_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl SchedulerActor {
     fn update_cached_vm_entry(
@@ -115,6 +117,47 @@ impl SchedulerActor {
             *entry = cached_vm;
         } else {
             entries.push(cached_vm);
+        }
+    }
+
+    fn cleanup_unresolved_vm_cache(
+        data_cache: &DashMap<Ulid, Vec<CachedVMActor>>,
+        agent_data_cache: &DashMap<ActorId, CachedAgentActor>,
+    ) {
+        let now = Instant::now();
+        let vmids: Vec<_> = data_cache.iter().map(|entry| *entry.key()).collect();
+
+        for vmid in vmids {
+            let mut removed_agent_ids = Vec::new();
+            let cache_is_empty = data_cache.get_mut(&vmid).map_or(false, |mut entries| {
+                entries.retain(|entry| {
+                    let expired = entry.actor_ref.is_none()
+                        && now.duration_since(entry.cached_at) >= UNRESOLVED_VM_CACHE_TIMEOUT;
+                    if expired {
+                        removed_agent_ids.push(entry.scheduled_agent_id);
+                    }
+                    !expired
+                });
+                entries.is_empty()
+            });
+
+            if cache_is_empty {
+                data_cache.remove(&vmid);
+            }
+
+            for agent_id in removed_agent_ids {
+                let agent_still_has_vm = data_cache.get(&vmid).is_some_and(|entries| {
+                    entries
+                        .iter()
+                        .any(|entry| entry.scheduled_agent_id == agent_id)
+                });
+                if !agent_still_has_vm {
+                    agent_data_cache.alter(&agent_id, |_, mut agent| {
+                        agent.extended_vm_set.remove(&vmid);
+                        agent
+                    });
+                }
+            }
         }
     }
 
@@ -206,6 +249,7 @@ impl SchedulerActor {
                     actor_ref: Some(actor_ref.clone()),
                     scheduled_agent_id,
                     data,
+                    cached_at: Instant::now(),
                 };
                 data_cache
                     .entry(vmid)
@@ -400,6 +444,11 @@ impl SchedulerActor {
                 if let Err(error) = agent_result {
                     warn!(?error, "agent actor discovery failed");
                 }
+
+                Self::cleanup_unresolved_vm_cache(
+                    &vm_data_cache_arc_clone,
+                    &agent_data_cache_arc_clone,
+                );
 
                 //info!(?vm_data_cache_arc_clone);
                 //info!(?agent_data_cache_arc_clone);
@@ -635,12 +684,19 @@ fn evaluate_table_value(value_option: Option<&String>, requirement: &AffinityReq
 
 #[cfg(test)]
 mod tests {
-    use super::{affinity_delta, evaluate_affinity_rule, evaluate_table_value, has_capacity};
+    use super::{
+        CachedVMActor, SchedulerActor, affinity_delta, evaluate_affinity_rule,
+        evaluate_table_value, has_capacity,
+    };
+    use crate::messages::vm::GetVMInfoReply;
     use crate::types::{
         AffinityRequirement, AffinityRule, AffinityStrictness, AffinityType, MetadataTable,
         ObjectMetadata, Operator,
     };
+    use dashmap::DashMap;
     use std::collections::BTreeMap;
+    use std::time::{Duration, Instant};
+    use ulid::Ulid;
 
     fn requirement(operator: Operator, values: &[&str]) -> AffinityRequirement {
         AffinityRequirement {
@@ -649,6 +705,29 @@ mod tests {
             operator,
             values: values.iter().map(|value| (*value).to_owned()).collect(),
         }
+    }
+
+    #[test]
+    fn removes_expired_unresolved_vm_placeholders() {
+        let vmid = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("valid ulid");
+        let agent_id = super::ActorId::new(1);
+        let data_cache = DashMap::new();
+        data_cache.insert(
+            vmid,
+            vec![CachedVMActor {
+                actor_ref: None,
+                scheduled_agent_id: agent_id,
+                data: GetVMInfoReply { vmid, config: None },
+                cached_at: Instant::now()
+                    .checked_sub(Duration::from_secs(31))
+                    .expect("test timestamp should be representable"),
+            }],
+        );
+        let agent_data_cache = DashMap::new();
+
+        SchedulerActor::cleanup_unresolved_vm_cache(&data_cache, &agent_data_cache);
+
+        assert!(!data_cache.contains_key(&vmid));
     }
 
     #[test]
@@ -884,6 +963,7 @@ impl Message<CreateVM> for SchedulerActor {
                     vmid: msg.vmid,
                     config: Some(msg.config.clone()),
                 },
+                cached_at: Instant::now(),
             });
 
         let reply = target_agent.ask(&msg).await;
