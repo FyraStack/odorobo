@@ -19,19 +19,32 @@ fn default_subnet() -> Ipv4Net {
 fn default_gateway() -> Ipv4Addr {
     "10.0.0.1".parse().unwrap()
 }
+
+fn default_etcd_endpoint() -> String {
+    "http://127.0.0.1:2379".to_owned()
+}
 /// Infers the default upstream interface from the system's default route
 fn default_upstream_iface() -> String {
     // ip route
-    let out = std::process::Command::new("ip")
+    let Some(iface) = std::process::Command::new("ip")
         .arg("route")
         .output()
-        .unwrap();
-    let output = String::from_utf8(out.stdout).unwrap();
+        .ok()
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|routes| {
+            routes
+                .lines()
+                .find(|line| line.starts_with("default"))
+                .and_then(|route| route.split_whitespace().nth(4))
+                .map(str::to_owned)
+        })
+    else {
+        warn!("cannot infer default upstream interface; using eth0");
+        return "eth0".to_owned();
+    };
 
-    let default_route = output.lines().find(|l| l.starts_with("default")).unwrap();
-    let iface = default_route.split_whitespace().nth(4).unwrap();
-    info!("inferring default upstream interface: {}", iface);
-    iface.into()
+    info!("inferring default upstream interface: {iface}");
+    iface
 }
 
 /// DHCP server config
@@ -138,6 +151,50 @@ pub struct Config {
     /// Ignore lockfiles and do not create a lockfile
     #[clap(long, action = clap::ArgAction::SetTrue)]
     pub no_lockfile: Option<bool>,
+
+    /// etcd endpoints used for durable cluster state.
+    #[clap(long, value_delimiter = ',')]
+    #[serde(default = "default_etcd_endpoints")]
+    #[allow(clippy::unnecessary_wraps)]
+    pub etcd_endpoints: Option<Vec<String>>,
+    /// Optional etcd username.
+    #[clap(long)]
+    pub etcd_username: Option<String>,
+    /// Optional etcd password. Prefer the `ODOROBO_ETCD_PASSWORD` environment variable.
+    #[clap(long, env = "ODOROBO_ETCD_PASSWORD", hide_env_values = true)]
+    pub etcd_password: Option<String>,
+    /// Enable TLS for etcd connections.
+    #[clap(long)]
+    #[serde(default)]
+    pub etcd_tls: Option<bool>,
+    /// CA certificate PEM file for etcd TLS.
+    #[clap(long)]
+    pub etcd_ca_file: Option<String>,
+    /// Per-request etcd timeout in milliseconds.
+    #[clap(long)]
+    #[serde(default = "default_etcd_timeout_ms")]
+    #[allow(clippy::unnecessary_wraps)]
+    pub etcd_timeout_ms: Option<u64>,
+    /// Number of connection attempts when creating the etcd client.
+    #[clap(long)]
+    #[serde(default = "default_etcd_retries")]
+    #[allow(clippy::unnecessary_wraps)]
+    pub etcd_retries: Option<u32>,
+}
+
+#[allow(clippy::unnecessary_wraps)]
+fn default_etcd_endpoints() -> Option<Vec<String>> {
+    Some(vec![default_etcd_endpoint()])
+}
+
+#[allow(clippy::unnecessary_wraps)]
+const fn default_etcd_timeout_ms() -> Option<u64> {
+    Some(5_000)
+}
+
+#[allow(clippy::unnecessary_wraps)]
+const fn default_etcd_retries() -> Option<u32> {
+    Some(3)
 }
 
 impl Config {
@@ -203,7 +260,7 @@ mod tests {
                     bridge: "vmbr0".to_owned(),
                     gateway: Ipv4Addr::new(10, 10, 100, 1),
                     subnet: Ipv4Net::new(Ipv4Addr::new(10, 10, 100, 0), 24).unwrap(),
-                    upstream_iface: default_upstream_iface(),
+                    upstream_iface: "eth0".to_owned(),
                 },
             },
             ..Default::default()

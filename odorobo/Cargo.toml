@@ -16,6 +16,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 ulid = { workspace = true }
 bytesize = { workspace = true }
+etcd-client = { workspace = true }
 
 http-body-util = "0.1"
 hyper = { version = "1.9", features = ["full"] }
