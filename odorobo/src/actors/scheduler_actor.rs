@@ -454,7 +454,7 @@ impl SchedulerActor {
                                 continue;
                             };
 
-                            for vm_data_cache_ref in vm_data_cache_refs.iter() {
+                            for vm_data_cache_ref in vm_data_cache_refs {
                                 let Some(vm_manifest) = &vm_data_cache_ref.data.config else {
                                     continue;
                                 };
@@ -800,7 +800,7 @@ impl Actor for SchedulerActor {
             cache_actor_finder: None,
         };
 
-        scheduler_actor.start_actor_finder(actor_ref.clone());
+        scheduler_actor.start_actor_finder(actor_ref);
 
         Ok(scheduler_actor)
     }
