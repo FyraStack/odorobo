@@ -1,11 +1,6 @@
-use std::collections::BTreeMap;
-
 use bytesize::ByteSize;
 use clap::{Parser, Subcommand};
-use odorobo::types::{
-    AffinityRequirement, AffinityRule, AffinityStrictness, AffinityType, CreateVMRequest,
-    MetadataTable, ObjectMetadata, Operator, VMData, VirtualMachine,
-};
+use odorobo::types::{CreateVMRequest, VMData, VirtualMachine};
 use reqwest::{Client, Response};
 use serde::Deserialize;
 use stable_eyre::Result;
@@ -116,24 +111,7 @@ pub async fn run_command(cli: Cli) -> Result<()> {
                     image,
                     ..Default::default()
                 },
-                metadata: Some(ObjectMetadata {
-                    labels: BTreeMap::new(),
-                    annotations: BTreeMap::from([(
-                        String::from("distribution"),
-                        String::from("different"),
-                    )]),
-                }),
-                affinity: Some(vec![AffinityRule {
-                    strictness: AffinityStrictness::Required,
-                    affinity_type: AffinityType::VirtualMachine,
-                    inverse: false,
-                    requirements: vec![AffinityRequirement {
-                        key: String::from("distribution"),
-                        table: MetadataTable::Annotation,
-                        operator: Operator::NotIn,
-                        values: vec![String::from("different")],
-                    }],
-                }]),
+
                 ..Default::default()
             };
 
