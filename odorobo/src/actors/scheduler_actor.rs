@@ -561,15 +561,15 @@ fn evaluate_table_value(value_option: Option<&String>, requirement: &AffinityReq
         Operator::In => requirement.values.contains(value),
         Operator::NotIn => !requirement.values.contains(value),
         Operator::Lt | Operator::Gt => {
-            if requirement.values.len() != 1 {
+            let [requirement_value] = &requirement.values[..] else {
                 return false;
-            }
+            };
 
             let Ok(value_number): Result<f64, _> = value.parse() else {
                 return false;
             };
 
-            let Ok(requirement_value_number): Result<f64, _> = requirement.values[0].parse() else {
+            let Ok(requirement_value_number): Result<f64, _> = requirement_value.parse() else {
                 return false;
             };
 
