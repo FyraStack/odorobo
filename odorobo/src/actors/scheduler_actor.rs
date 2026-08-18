@@ -17,6 +17,7 @@ use crate::types::AffinityType;
 use crate::types::MetadataTable;
 use crate::types::ObjectMetadata;
 use crate::types::Operator;
+use crate::types::VirtualMachine;
 use crate::utils::actor_names::AGENT;
 use crate::utils::actor_names::VM;
 use crate::utils::actor_names::vm_actor_id;
@@ -35,27 +36,32 @@ use ulid::Ulid;
 #[derive(Debug, Clone)]
 pub struct CachedAgentActor {
     pub actor_ref: RemoteActorRef<AgentActor>,
+    /// Latest observation reported by the agent. This is not scheduler placement state.
     pub data: AgentStatus,
-    /// this is a set of all VMs that may be on an agent. it is used for rules such as affinity to make sure we don't schedule things in ways that arent allowed
-    /// We don't know for a fact these VMs are scheduled due to latency and boot up delay, but they may be scheduled.
-    pub extended_vm_set: AHashSet<Ulid>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VmLifecycle {
+    Pending,
+    Running,
+}
+
+#[derive(Debug, Clone)]
+pub struct VmPlacement {
+    pub agent_id: ActorId,
+    pub config: VirtualMachine,
+    pub lifecycle: VmLifecycle,
+    pub created_at: Instant,
+    pub last_confirmed_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone)]
 pub struct CachedVMActor {
     pub actor_ref: Option<RemoteActorRef<VMActor>>,
-    /// The agent this VM was scheduled on. Used by the updater task to clean up
-    /// the agent's `extended_vm_set` if the VM actor dies before it's linked.
-    pub scheduled_agent_id: Option<ActorId>,
     pub data: GetVMInfoReply,
     pub cached_at: Instant,
-    /// False until a VM updater has successfully polled this actor.
-    pub updater_confirmed: bool,
 }
 
-// todo: i dont like the way this cache is setup. I think we may need to change it later, but it is hard to figure out what the optimal solution is without doing it at least once.
-//  especially when we haven't fully made decisions about some other things.
-//
 // todo: we should improve the cache to not have agents and vms send the full data on every update.
 //  I looked at kameo streams to make this better, but they aren't really intended for this kind of long term update use case.
 //  They use rust futures::stream which seems to be more intended for you have an iterator for example that will create data, but not like full on sending messages.
@@ -68,29 +74,9 @@ pub struct SchedulerActor {
     pub agent_data_cache: Arc<DashMap<ActorId, CachedAgentActor>>,
     pub agent_keepalive_tasks: Arc<DashMap<ActorId, JoinHandle<()>>>,
 
-    // todo: we might need a better way to store this.
-    //  we 100% need a way to store vms even if we don't know their actorid (ex: actor hasn't been started or is shutdown)
-    //  we also might want to be able to store them without a ulid, possibly
-    //  so we might need a vec of vms and then to just store maps/indexes of actorid and ulid to vector index
-    //  and then like a freelist or something.
-    //  i dont really love that option either though cause it feels overkill.
-    //  maybe we sure just be using a proper database entirely?
-    //  idk. will figure it out later.
-    //
-    //  new related problem: i just realized vmid, actorid pairs dont have to be unique.
-    //  if a vm is migrating from one actor to another, there might be two actors with the same vmid.
-    //
-    //  additional context (05/05/2026): we almost may need a way to store them without a ulid, due to how CH migration works.
-    //  the question becomes if we want to abstract CH migration away entirely from the scheduler.
-    //  we could also possibly ignore it for the non-HA scheduler.
-    //  I (caleb) want to ask cappy (and possibly Lea) about these problems.
-    //
-    //  the best solution for at least some of this is almost certainly having an external reliable DB (such as etcd) to store some of these things permanently.
-    //  we will need that specifically for what VMs are supposed to be running, because if a large percentage of the cluster goes down, including the manager, we need a way to recover.
-    //  and i dont think leaving that on dashboard which could have high latency is a good idea.
-    //  alternatively we could have the other manager nodes try to keep track of that data, but i think we are going to run into issues with keeping the state consistent between all nodes.
-    //  we may need to make some architecture designs about db consistency vs uptime vs speed in that situation, and im not doing that on my own.
     pub vm_actorid_ulid_map: Arc<DashMap<ActorId, Ulid>>,
+    pub vm_placements: Arc<DashMap<Ulid, VmPlacement>>,
+    /// this is a vec because a vmid/ulid can be scheduled on multiple boxes simultaneously during migration
     pub vm_data_cache: Arc<DashMap<Ulid, Vec<CachedVMActor>>>,
     pub vm_keepalive_tasks: Arc<DashMap<ActorId, JoinHandle<()>>>,
 
@@ -123,44 +109,48 @@ impl SchedulerActor {
     }
 
     fn cleanup_unresolved_vm_cache(
+        placements: &DashMap<Ulid, VmPlacement>,
         data_cache: &DashMap<Ulid, Vec<CachedVMActor>>,
-        agent_data_cache: &DashMap<ActorId, CachedAgentActor>,
     ) {
         let now = Instant::now();
-        let vmids: Vec<_> = data_cache.iter().map(|entry| *entry.key()).collect();
+        let expired: Vec<_> = placements
+            .iter()
+            .filter(|entry| {
+                entry.lifecycle == VmLifecycle::Pending
+                    && now.duration_since(entry.created_at) >= UNRESOLVED_VM_CACHE_TIMEOUT
+            })
+            .map(|entry| *entry.key())
+            .collect();
 
-        for vmid in vmids {
-            let mut removed_agent_ids = Vec::new();
-            let cache_is_empty = data_cache.get_mut(&vmid).is_some_and(|mut entries| {
-                entries.retain(|entry| {
-                    let expired = !entry.updater_confirmed
-                        && now.duration_since(entry.cached_at) >= UNRESOLVED_VM_CACHE_TIMEOUT;
-                    if expired && let Some(agent_id) = entry.scheduled_agent_id {
-                        removed_agent_ids.push(agent_id);
-                    }
-                    !expired
-                });
-                entries.is_empty()
-            });
-
-            if cache_is_empty {
-                data_cache.remove(&vmid);
-            }
-
-            for agent_id in removed_agent_ids {
-                let agent_still_has_vm = data_cache.get(&vmid).is_some_and(|entries| {
-                    entries
-                        .iter()
-                        .any(|entry| entry.scheduled_agent_id == Some(agent_id))
-                });
-                if !agent_still_has_vm {
-                    agent_data_cache.alter(&agent_id, |_, mut agent| {
-                        agent.extended_vm_set.remove(&vmid);
-                        agent
-                    });
-                }
-            }
+        for vmid in expired {
+            Self::remove_vm_state(vmid, placements, data_cache);
         }
+    }
+
+    /// takes a list of observed vmids and gives you a set of every vmid that could be on an agent.
+    fn placement_vm_ids(
+        placements: &DashMap<Ulid, VmPlacement>,
+        agent_id: ActorId,
+        observed: &[Ulid],
+    ) -> AHashSet<Ulid> {
+        observed
+            .iter()
+            .copied()
+            .chain(
+                placements
+                    .iter()
+                    .filter_map(|entry| (entry.agent_id == agent_id).then_some(*entry.key())),
+            )
+            .collect()
+    }
+
+    fn remove_vm_state(
+        vmid: Ulid,
+        placements: &DashMap<Ulid, VmPlacement>,
+        data_cache: &DashMap<Ulid, Vec<CachedVMActor>>,
+    ) {
+        placements.remove(&vmid);
+        data_cache.remove(&vmid);
     }
 
     #[expect(dead_code, reason = "reserved for explicit placement by actor id")]
@@ -184,7 +174,7 @@ impl SchedulerActor {
         vm_actorid_ulid_map: Arc<DashMap<ActorId, Ulid>>,
         data_cache: Arc<DashMap<Ulid, Vec<CachedVMActor>>>,
         keepalive_tasks: Arc<DashMap<ActorId, JoinHandle<()>>>,
-        agent_data_cache: Arc<DashMap<ActorId, CachedAgentActor>>,
+        placements: Arc<DashMap<Ulid, VmPlacement>>,
     ) -> Result<(), Report> {
         trace!("running vm_actor_finder");
 
@@ -203,13 +193,13 @@ impl SchedulerActor {
 
                 let vm_actorid_ulid_map_clone = Arc::clone(&vm_actorid_ulid_map);
                 let data_cache_clone = Arc::clone(&data_cache);
-                let agent_data_cache_clone = Arc::clone(&agent_data_cache);
+                let placements_clone = Arc::clone(&placements);
                 let updater_task = tokio::spawn(async move {
                     Self::vm_updater_task(
                         vm_actor,
                         vm_actorid_ulid_map_clone,
                         data_cache_clone,
-                        agent_data_cache_clone,
+                        placements_clone,
                     )
                     .await;
                 });
@@ -225,7 +215,7 @@ impl SchedulerActor {
         actor_ref: RemoteActorRef<VMActor>,
         vm_actorid_ulid_map: Arc<DashMap<ActorId, Ulid>>,
         data_cache: Arc<DashMap<Ulid, Vec<CachedVMActor>>>,
-        agent_data_cache: Arc<DashMap<ActorId, CachedAgentActor>>,
+        placements: Arc<DashMap<Ulid, VmPlacement>>,
     ) {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         let mut fails: u8 = 0;
@@ -235,22 +225,14 @@ impl SchedulerActor {
 
                 vm_actorid_ulid_map.insert(actor_ref.id(), vmid); // should we be doing this on every loop? idk. but we at least need to do it on the first iteration given we don't know the mapping before that
 
-                let scheduled_agent_id = data_cache.get(&vmid).and_then(|entries| {
-                    entries.iter().find_map(|entry| {
-                        entry
-                            .actor_ref
-                            .as_ref()
-                            .is_none_or(|actor| actor.id() == actor_ref.id())
-                            .then_some(entry.scheduled_agent_id)
-                            .flatten()
-                    })
-                });
+                if let Some(mut placement) = placements.get_mut(&vmid) {
+                    placement.lifecycle = VmLifecycle::Running;
+                    placement.last_confirmed_at = Some(Instant::now());
+                }
                 let cached_vm = CachedVMActor {
                     actor_ref: Some(actor_ref.clone()),
-                    scheduled_agent_id,
                     data,
                     cached_at: Instant::now(),
-                    updater_confirmed: true,
                 };
                 data_cache
                     .entry(vmid)
@@ -293,38 +275,7 @@ impl SchedulerActor {
                 });
 
                 if let Some(vmid) = vmid {
-                    let removed_cached_vm = data_cache.get_mut(&vmid).and_then(|mut entries| {
-                        entries
-                            .iter()
-                            .position(|entry| {
-                                entry
-                                    .actor_ref
-                                    .as_ref()
-                                    .is_some_and(|actor| actor.id() == actor_ref.id())
-                            })
-                            .map(|index| (index, entries.remove(index)))
-                    });
-                    if let Some(cached_vm) = removed_cached_vm
-                        && let Some(scheduled_agent_id) = cached_vm.1.scheduled_agent_id
-                    {
-                        let agent_still_has_vm = data_cache.get(&vmid).is_some_and(|entries| {
-                            entries
-                                .iter()
-                                .any(|entry| entry.scheduled_agent_id == Some(scheduled_agent_id))
-                        });
-                        if !agent_still_has_vm {
-                            agent_data_cache.alter(&scheduled_agent_id, |_, mut v| {
-                                v.extended_vm_set.remove(&vmid);
-                                v
-                            });
-                        }
-                    }
-                    if data_cache
-                        .get(&vmid)
-                        .is_some_and(|entries| entries.is_empty())
-                    {
-                        data_cache.remove(&vmid);
-                    }
+                    Self::remove_vm_state(vmid, &placements, &data_cache);
                 }
 
                 return;
@@ -337,7 +288,6 @@ impl SchedulerActor {
     async fn agent_actor_finder(
         parent_actor_ref: RemoteActorRef<Self>,
         data_cache: Arc<DashMap<ActorId, CachedAgentActor>>,
-        vm_data_cache: Arc<DashMap<Ulid, Vec<CachedVMActor>>>,
         keepalive_tasks: Arc<DashMap<ActorId, JoinHandle<()>>>,
     ) -> Result<(), Report> {
         trace!("running agent_actor_finder");
@@ -356,10 +306,8 @@ impl SchedulerActor {
                 parent_actor_ref.link_remote(&agent_actor).await?;
 
                 let data_cache_clone = Arc::clone(&data_cache);
-                let vm_data_cache_clone = Arc::clone(&vm_data_cache);
                 let updater_task = tokio::spawn(async move {
-                    Self::agent_updater_task(agent_actor, data_cache_clone, vm_data_cache_clone)
-                        .await;
+                    Self::agent_updater_task(agent_actor, data_cache_clone).await;
                 });
 
                 keepalive_tasks.insert(agent_actor_id, updater_task);
@@ -372,28 +320,22 @@ impl SchedulerActor {
     async fn agent_updater_task(
         actor_ref: RemoteActorRef<AgentActor>,
         data_cache: Arc<DashMap<ActorId, CachedAgentActor>>,
-        vm_data_cache: Arc<DashMap<Ulid, Vec<CachedVMActor>>>,
     ) {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         let mut fails: u8 = 0;
         loop {
             if let Ok(data) = actor_ref.ask(&GetAgentStatus).await {
-                let reserved_vms = reserved_vms_for_agent(&vm_data_cache, actor_ref.id());
                 if data_cache.contains_key(&actor_ref.id()) {
                     data_cache.alter(&actor_ref.id(), |_, mut v| {
                         v.data = data;
-                        v.extended_vm_set =
-                            v.data.vms.iter().copied().chain(reserved_vms).collect();
                         v
                     });
                 } else {
-                    let extended_vm_set = data.vms.iter().copied().chain(reserved_vms).collect();
                     data_cache.insert(
                         actor_ref.id(),
                         CachedAgentActor {
                             actor_ref: actor_ref.clone(),
                             data,
-                            extended_vm_set,
                         },
                     );
                 }
@@ -422,6 +364,7 @@ impl SchedulerActor {
 
         let vm_actorid_ulid_map_arc_clone = Arc::clone(&self.vm_actorid_ulid_map);
         let vm_data_cache_arc_clone = Arc::clone(&self.vm_data_cache);
+        let vm_placements_arc_clone = Arc::clone(&self.vm_placements);
         let vm_keepalive_tasks_arc_clone = Arc::clone(&self.vm_keepalive_tasks);
 
         self.cache_actor_finder = Some(tokio::spawn(async move {
@@ -432,13 +375,12 @@ impl SchedulerActor {
                     Arc::clone(&vm_actorid_ulid_map_arc_clone),
                     Arc::clone(&vm_data_cache_arc_clone),
                     Arc::clone(&vm_keepalive_tasks_arc_clone),
-                    Arc::clone(&agent_data_cache_arc_clone),
+                    Arc::clone(&vm_placements_arc_clone),
                 );
 
                 let agent_join_handle = Self::agent_actor_finder(
                     actor_ref.clone(),
                     Arc::clone(&agent_data_cache_arc_clone),
-                    Arc::clone(&vm_data_cache_arc_clone),
                     Arc::clone(&agent_keepalive_tasks_arc_clone),
                 );
 
@@ -452,8 +394,8 @@ impl SchedulerActor {
                 }
 
                 Self::cleanup_unresolved_vm_cache(
+                    &vm_placements_arc_clone,
                     &vm_data_cache_arc_clone,
-                    &agent_data_cache_arc_clone,
                 );
 
                 //info!(?vm_data_cache_arc_clone);
@@ -518,7 +460,7 @@ impl SchedulerActor {
             .unwrap_or(u32::MAX);
         // todo: do we care about VMData.max_vcpus?
         let (pending_vcpus, pending_ram) =
-            pending_resources_for_agent(&self.vm_data_cache, agent.actor_ref.id(), &agent.data.vms);
+            pending_resources_for_agent(&self.vm_placements, agent.actor_ref.id());
         let used_vcpus = agent.data.used_vcpus.saturating_add(pending_vcpus);
         let used_ram = agent.data.used_ram.as_u64().saturating_add(pending_ram);
         let agent_used_vcpus = used_vcpus.saturating_add(msg.config.data.vcpus);
@@ -567,8 +509,13 @@ impl SchedulerActor {
 
                 match rule.affinity_type {
                     AffinityType::VirtualMachine => {
-                        for vmid in &agent.extended_vm_set {
-                            let Some(vm_data_cache_refs) = self.vm_data_cache.get(vmid) else {
+                        let vmids = Self::placement_vm_ids(
+                            &self.vm_placements,
+                            agent.actor_ref.id(),
+                            &agent.data.vms,
+                        );
+                        for vmid in vmids {
+                            let Some(vm_data_cache_refs) = self.vm_data_cache.get(&vmid) else {
                                 continue;
                             };
 
@@ -617,37 +564,14 @@ const fn has_capacity(
         && used_ram.saturating_add(requested_ram) <= max_ram
 }
 
-fn reserved_vms_for_agent(
-    vm_data_cache: &DashMap<Ulid, Vec<CachedVMActor>>,
-    agent_id: ActorId,
-) -> Vec<Ulid> {
-    vm_data_cache
-        .iter()
-        .filter(|entry| {
-            entry
-                .iter()
-                .any(|vm| vm.scheduled_agent_id == Some(agent_id))
-        })
-        .map(|entry| *entry.key())
-        .collect()
-}
-
 fn pending_resources_for_agent(
-    vm_data_cache: &DashMap<Ulid, Vec<CachedVMActor>>,
+    placements: &DashMap<Ulid, VmPlacement>,
     agent_id: ActorId,
-    confirmed_vms: &[Ulid],
 ) -> (u32, u64) {
-    vm_data_cache
+    placements
         .iter()
-        .filter(|entry| !confirmed_vms.contains(entry.key()))
-        .flat_map(|entry| {
-            entry
-                .iter()
-                .filter(|vm| vm.scheduled_agent_id == Some(agent_id))
-                .filter_map(|vm| vm.data.config.as_ref())
-                .map(|config| (config.data.vcpus, config.data.memory.as_u64()))
-                .collect::<Vec<_>>()
-        })
+        .filter(|entry| entry.agent_id == agent_id && entry.lifecycle == VmLifecycle::Pending)
+        .map(|entry| (entry.config.data.vcpus, entry.config.data.memory.as_u64()))
         .fold((0u32, 0u64), |(vcpus, ram), (vm_vcpus, vm_ram)| {
             (vcpus.saturating_add(vm_vcpus), ram.saturating_add(vm_ram))
         })
@@ -726,10 +650,10 @@ fn evaluate_table_value(value_option: Option<&String>, requirement: &AffinityReq
 #[cfg(test)]
 mod tests {
     use super::{
-        CachedVMActor, SchedulerActor, affinity_delta, evaluate_affinity_rule,
-        evaluate_table_value, has_capacity, pending_resources_for_agent, reserved_vms_for_agent,
+        CachedVMActor, SchedulerActor, VmLifecycle, VmPlacement, affinity_delta,
+        evaluate_affinity_rule, evaluate_table_value, has_capacity, pending_resources_for_agent,
     };
-    use crate::messages::vm::GetVMInfoReply;
+
     use crate::types::{
         AffinityRequirement, AffinityRule, AffinityStrictness, AffinityType, MetadataTable,
         ObjectMetadata, Operator, VirtualMachine,
@@ -753,23 +677,24 @@ mod tests {
     fn removes_expired_unresolved_vm_placeholders() {
         let vmid = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("valid ulid");
         let agent_id = super::ActorId::new(1);
-        let data_cache = DashMap::new();
-        data_cache.insert(
+        let placements: DashMap<Ulid, VmPlacement> = DashMap::new();
+        placements.insert(
             vmid,
-            vec![CachedVMActor {
-                actor_ref: None,
-                scheduled_agent_id: Some(agent_id),
-                data: GetVMInfoReply { vmid, config: None },
-                cached_at: Instant::now()
+            VmPlacement {
+                agent_id,
+                config: VirtualMachine::default(),
+                lifecycle: VmLifecycle::Pending,
+                created_at: Instant::now()
                     .checked_sub(Duration::from_secs(31))
                     .expect("test timestamp should be representable"),
-                updater_confirmed: false,
-            }],
+                last_confirmed_at: None,
+            },
         );
-        let agent_data_cache = DashMap::new();
+        let data_cache: DashMap<Ulid, Vec<CachedVMActor>> = DashMap::new();
 
-        SchedulerActor::cleanup_unresolved_vm_cache(&data_cache, &agent_data_cache);
+        SchedulerActor::cleanup_unresolved_vm_cache(&placements, &data_cache);
 
+        assert!(!placements.contains_key(&vmid));
         assert!(!data_cache.contains_key(&vmid));
     }
 
@@ -780,29 +705,21 @@ mod tests {
         let mut config = VirtualMachine::default();
         config.data.vcpus = 4;
         config.data.memory = ByteSize::gib(8);
-        let data_cache = DashMap::new();
-        data_cache.insert(
+        let placements = DashMap::new();
+        placements.insert(
             vmid,
-            vec![CachedVMActor {
-                actor_ref: None,
-                scheduled_agent_id: Some(agent_id),
-                data: GetVMInfoReply {
-                    vmid,
-                    config: Some(config),
-                },
-                cached_at: Instant::now(),
-                updater_confirmed: false,
-            }],
+            VmPlacement {
+                agent_id,
+                config,
+                lifecycle: VmLifecycle::Pending,
+                created_at: Instant::now(),
+                last_confirmed_at: None,
+            },
         );
 
-        assert_eq!(reserved_vms_for_agent(&data_cache, agent_id), vec![vmid]);
         assert_eq!(
-            pending_resources_for_agent(&data_cache, agent_id, &[]),
+            pending_resources_for_agent(&placements, agent_id),
             (4, ByteSize::gib(8).as_u64())
-        );
-        assert_eq!(
-            pending_resources_for_agent(&data_cache, agent_id, &[vmid]),
-            (0, 0)
         );
     }
 
@@ -942,6 +859,7 @@ impl Actor for SchedulerActor {
             agent_data_cache: Arc::new(DashMap::new()),
             agent_keepalive_tasks: Arc::new(DashMap::new()),
             vm_actorid_ulid_map: Arc::new(DashMap::new()),
+            vm_placements: Arc::new(DashMap::new()),
             vm_data_cache: Arc::new(DashMap::new()),
             vm_keepalive_tasks: Arc::new(DashMap::new()),
             cache_actor_finder: None,
@@ -977,36 +895,8 @@ impl Actor for SchedulerActor {
             keepalive_task.abort();
         }
 
-        if let Some((_, vmid)) = self.vm_actorid_ulid_map.remove(&id)
-            && let Some(mut entries) = self.vm_data_cache.get_mut(&vmid)
-        {
-            let removed_cached_vm = entries
-                .iter()
-                .position(|entry| {
-                    entry
-                        .actor_ref
-                        .as_ref()
-                        .is_some_and(|actor| actor.id() == id)
-                })
-                .map(|index| entries.remove(index));
-            if let Some(cached_vm) = removed_cached_vm
-                && let Some(scheduled_agent_id) = cached_vm.scheduled_agent_id
-            {
-                let agent_still_has_vm = entries
-                    .iter()
-                    .any(|entry| entry.scheduled_agent_id == Some(scheduled_agent_id));
-                if !agent_still_has_vm {
-                    self.agent_data_cache
-                        .alter(&scheduled_agent_id, |_, mut v| {
-                            v.extended_vm_set.remove(&vmid);
-                            v
-                        });
-                }
-            }
-            if entries.is_empty() {
-                drop(entries);
-                self.vm_data_cache.remove(&vmid);
-            }
+        if let Some((_, vmid)) = self.vm_actorid_ulid_map.remove(&id) {
+            Self::remove_vm_state(vmid, &self.vm_placements, &self.vm_data_cache);
         }
 
         // todo: attempt vm restarts if necessary.
@@ -1025,25 +915,26 @@ impl Message<CreateVM> for SchedulerActor {
     ) -> Self::Reply {
         let target_agent = self.schedule_agent(&msg)?;
 
-        // we add to cache first, because we want to make sure future requests assume this vm exists. if the message fails, we clean it up afterward.
-        if let Some(mut cached_data) = self.agent_data_cache.get_mut(&target_agent.id()) {
-            cached_data.extended_vm_set.insert(msg.vmid);
-        } else {
-            return Err(eyre!("target agent is not in data cache"));
-        }
-
+        self.vm_placements.insert(
+            msg.vmid,
+            VmPlacement {
+                agent_id: target_agent.id(),
+                config: msg.config.clone(),
+                lifecycle: VmLifecycle::Pending,
+                created_at: Instant::now(),
+                last_confirmed_at: None,
+            },
+        );
         self.vm_data_cache
             .entry(msg.vmid)
             .or_default()
             .push(CachedVMActor {
                 actor_ref: None,
-                scheduled_agent_id: Some(target_agent.id()),
                 data: GetVMInfoReply {
                     vmid: msg.vmid,
                     config: Some(msg.config.clone()),
                 },
                 cached_at: Instant::now(),
-                updater_confirmed: false,
             });
 
         let reply = target_agent.ask(&msg).await;
@@ -1062,17 +953,7 @@ impl Message<CreateVM> for SchedulerActor {
                 .flatten()
                 .is_none()
         {
-            self.agent_data_cache.alter(&target_agent.id(), |_, mut v| {
-                v.extended_vm_set.remove(&msg.vmid);
-                v
-            });
-            if let Some(mut entries) = self.vm_data_cache.get_mut(&msg.vmid) {
-                entries.retain(|entry| entry.updater_confirmed);
-                if entries.is_empty() {
-                    drop(entries);
-                    self.vm_data_cache.remove(&msg.vmid);
-                }
-            }
+            Self::remove_vm_state(msg.vmid, &self.vm_placements, &self.vm_data_cache);
         }
 
         Ok(reply?)
