@@ -178,6 +178,7 @@ pub struct AffinityRule {
     /// If true, the outcome of the requirements is inverted.
     #[serde(default)]
     pub inverse: bool,
+
     /// `ORed` together
     pub requirements: Vec<AffinityRequirement>,
 }
