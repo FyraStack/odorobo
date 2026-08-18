@@ -99,6 +99,25 @@ static VCPU_OVERPROVISIONMENT_NUMERATOR: u32 = 2;
 static VCPU_OVERPROVISIONMENT_DENOMINATOR: u32 = 1;
 
 impl SchedulerActor {
+    fn update_cached_vm_entry(
+        entries: &mut Vec<CachedVMActor>,
+        actor_id: ActorId,
+        cached_vm: CachedVMActor,
+    ) {
+        if let Some(entry) = entries.iter_mut().find(|entry| {
+            entry
+                .actor_ref
+                .as_ref()
+                .is_some_and(|actor| actor.id() == actor_id)
+        }) {
+            *entry = cached_vm;
+        } else if let Some(entry) = entries.iter_mut().find(|entry| entry.actor_ref.is_none()) {
+            *entry = cached_vm;
+        } else {
+            entries.push(cached_vm);
+        }
+    }
+
     #[expect(dead_code, reason = "reserved for explicit placement by actor id")]
     fn lookup_agent_by_actor_id(&self, actor_id: &ActorId) -> Option<RemoteActorRef<AgentActor>> {
         self.agent_data_cache
@@ -157,10 +176,6 @@ impl SchedulerActor {
         Ok(())
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the updater keeps polling and performs coordinated cache cleanup"
-    )]
     async fn vm_updater_task(
         actor_ref: RemoteActorRef<VMActor>,
         vm_actorid_ulid_map: Arc<DashMap<ActorId, Ulid>>,
@@ -195,20 +210,7 @@ impl SchedulerActor {
                 data_cache
                     .entry(vmid)
                     .and_modify(|entries| {
-                        if let Some(entry) = entries.iter_mut().find(|entry| {
-                            entry
-                                .actor_ref
-                                .as_ref()
-                                .is_some_and(|actor| actor.id() == actor_ref.id())
-                        }) {
-                            *entry = cached_vm.clone();
-                        } else if let Some(entry) =
-                            entries.iter_mut().find(|entry| entry.actor_ref.is_none())
-                        {
-                            *entry = cached_vm.clone();
-                        } else {
-                            entries.push(cached_vm.clone());
-                        }
+                        Self::update_cached_vm_entry(entries, actor_ref.id(), cached_vm.clone());
                     })
                     .or_insert_with(|| vec![cached_vm]);
 
@@ -330,8 +332,9 @@ impl SchedulerActor {
                     data_cache.alter(&actor_ref.id(), |_, mut v| {
                         v.data = data;
 
-                        v.extended_vm_set.retain(|vmid| v.data.vms.contains(vmid));
-                        v.extended_vm_set.extend(v.data.vms.iter());
+                        // Keep optimistic reservations until their VM lifecycle reports that they
+                        // no longer exist. Status updates can race with CreateVM and arrive first.
+                        v.extended_vm_set.extend(v.data.vms.iter().copied());
 
                         v
                     });
