@@ -124,6 +124,12 @@ static VCPU_OVERPROVISIONMENT_DENOMINATOR: u32 = 1;
 const UNRESOLVED_VM_CACHE_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl SchedulerActor {
+    fn shrink_non_migrating_entries<T>(entries: &mut Vec<T>) {
+        if entries.len() <= 1 && entries.capacity() > entries.len() {
+            entries.shrink_to_fit();
+        }
+    }
+
     fn update_cached_vm_entry(
         entries: &mut Vec<CachedVMActor>,
         actor_id: ActorId,
@@ -141,6 +147,7 @@ impl SchedulerActor {
         } else {
             entries.push(cached_vm);
         }
+        Self::shrink_non_migrating_entries(entries);
     }
 
     fn cleanup_unresolved_vm_cache(
@@ -155,6 +162,7 @@ impl SchedulerActor {
                     entry.lifecycle != VmLifecycle::Pending
                         || now.duration_since(entry.created_at) < UNRESOLVED_VM_CACHE_TIMEOUT
                 });
+                Self::shrink_non_migrating_entries(entries);
                 entries.is_empty().then_some(*vmid)
             })
             .collect();
@@ -201,6 +209,7 @@ impl SchedulerActor {
                         .as_ref()
                         .is_none_or(|actor| actor.id() != actor_id)
                 });
+                Self::shrink_non_migrating_entries(entries);
                 entries.is_empty().then_some(*vmid)
             })
             .collect();
@@ -251,6 +260,7 @@ impl SchedulerActor {
                         entry.last_confirmed_at = Some(now);
                     }
                 }
+                Self::shrink_non_migrating_entries(entries);
                 entries.is_empty().then_some(*vmid)
             })
             .collect();
