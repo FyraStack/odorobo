@@ -92,7 +92,7 @@ pub struct AgentListVMsReply {
     pub vms: Vec<Ulid>,
 }
 
-/// Get VM info
+/// Get VM info, including the full manifest.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct GetVMInfo {
     pub vmid: Option<Ulid>,
@@ -102,4 +102,13 @@ pub struct GetVMInfo {
 pub struct GetVMInfoReply {
     pub vmid: Ulid,
     pub config: Option<VirtualMachine>,
+}
+
+/// Lightweight VM liveness check used by the scheduler heartbeat.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct GetVMHeartbeat;
+
+#[derive(Serialize, Deserialize, Reply, Debug, Clone, Copy)]
+pub struct GetVMHeartbeatReply {
+    pub vmid: Ulid,
 }

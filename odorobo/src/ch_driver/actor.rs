@@ -1,6 +1,6 @@
 use crate::messages::vm::{
-    DeleteVM, GetVMInfo, GetVMInfoReply, MigrateVMReceive, MigrateVMReceiveReply, PrepMigration,
-    ShutdownVM,
+    DeleteVM, GetVMHeartbeat, GetVMHeartbeatReply, GetVMInfo, GetVMInfoReply, MigrateVMReceive,
+    MigrateVMReceiveReply, PrepMigration, ShutdownVM,
 };
 use crate::{ch_driver::VMInstance, types::VirtualMachine};
 use cloud_hypervisor_client::models::{
@@ -167,6 +167,19 @@ impl Message<GetVMInfo> for VMActor {
             vmid: self.vmid,
             config: self.manifest.clone(), // we likely dont want to send the entire manifest on every update, but some of this data is required and this is easier for now.
         }
+    }
+}
+
+#[remote_message]
+impl Message<GetVMHeartbeat> for VMActor {
+    type Reply = GetVMHeartbeatReply;
+
+    async fn handle(
+        &mut self,
+        _msg: GetVMHeartbeat,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        GetVMHeartbeatReply { vmid: self.vmid }
     }
 }
 

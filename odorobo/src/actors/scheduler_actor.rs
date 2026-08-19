@@ -8,8 +8,8 @@ use crate::actors::agent_actor::AgentActor;
 use crate::ch_driver::actor::VMActor;
 use crate::messages::agent::{AgentStatus, GetAgentStatus};
 use crate::messages::vm::{
-    AgentListVMs, AgentListVMsReply, CreateVM, CreateVMReply, DeleteVM, DeleteVMReply, GetVMInfo,
-    GetVMInfoReply, ShutdownVM, ShutdownVMReply,
+    AgentListVMs, AgentListVMsReply, CreateVM, CreateVMReply, DeleteVM, DeleteVMReply,
+    GetVMHeartbeat, GetVMInfo, GetVMInfoReply, ShutdownVM, ShutdownVMReply,
 };
 use crate::messages::{Ping, Pong};
 use crate::types::AffinityRequirement;
@@ -91,7 +91,6 @@ pub struct VmPlacement {
 #[derive(Debug, Clone)]
 pub struct CachedVMActor {
     pub actor_ref: Option<RemoteActorRef<VMActor>>,
-    pub cached_at: Instant,
 }
 
 // todo: we should improve the cache to not have agents and vms send the full data on every update.
@@ -125,7 +124,7 @@ const UNRESOLVED_VM_CACHE_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl SchedulerActor {
     fn shrink_non_migrating_entries<T>(entries: &mut Vec<T>) {
-        if entries.len() <= 1 && entries.capacity() > entries.len() {
+        if entries.len() <= 1 && entries.capacity() >= 4 {
             entries.shrink_to_fit();
         }
     }
@@ -329,21 +328,29 @@ impl SchedulerActor {
     async fn vm_updater_task(scheduler: ActorRef<Self>, actor_ref: RemoteActorRef<VMActor>) {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         let mut fails: u8 = 0;
-        loop {
-            if let Ok(data) = actor_ref.ask(&GetVMInfo { vmid: None }).await {
-                let send_result = scheduler
-                    .tell(VmUpdated {
-                        actor_ref: actor_ref.clone(),
-                        data,
-                    })
-                    .send()
-                    .await
-                    .map_err(|error| eyre!("failed to send VM update: {error}"));
-                if let Err(error) = send_result {
-                    warn!(?error, "VM updater could not notify scheduler");
-                    return;
-                }
+        let mut initialized = false;
 
+        loop {
+            if !initialized {
+                if let Ok(data) = actor_ref.ask(&GetVMInfo { vmid: None }).await {
+                    let send_result = scheduler
+                        .tell(VmUpdated {
+                            actor_ref: actor_ref.clone(),
+                            data,
+                        })
+                        .send()
+                        .await
+                        .map_err(|error| eyre!("failed to send VM update: {error}"));
+                    if let Err(error) = send_result {
+                        warn!(?error, "VM updater could not notify scheduler");
+                        return;
+                    }
+                    initialized = true;
+                    fails = 0;
+                } else {
+                    fails = fails.saturating_add(1);
+                }
+            } else if actor_ref.ask(&GetVMHeartbeat).await.is_ok() {
                 fails = 0;
             } else {
                 fails = fails.saturating_add(1);
@@ -436,7 +443,7 @@ impl SchedulerActor {
 
     fn start_actor_finder(&mut self, actor_ref: ActorRef<Self>) {
         self.cache_actor_finder = Some(tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
             loop {
                 let vm_result = Self::vm_actor_finder(actor_ref.clone()).await;
                 let agent_result = Self::agent_actor_finder(actor_ref.clone()).await;
@@ -471,11 +478,12 @@ impl SchedulerActor {
     ///    and then if someone tries to schedule lets say 10 VMs in a batch, we could end up scheduling them all to the same agent because the metadata hasn't updated.
     ///    - there are a few solutions for this but they all kinda suck, mostly due to also making sure we deal with latency properly. I am ignoring the issue for now.
     fn schedule_agent(&self, msg: &CreateVM) -> Result<RemoteActorRef<AgentActor>, Report> {
+        let pending_resources = pending_resources_by_agent(&self.vm_manifests, &self.vm_placements);
         let mut best_agent = None;
         let mut best_score = AgentScore::REJECTED;
 
         for agent in self.agent_data_cache.values() {
-            let score = self.score_agent(msg, agent);
+            let score = self.score_agent(msg, agent, &pending_resources);
 
             if score > best_score {
                 best_agent = Some(agent.actor_ref.clone());
@@ -491,7 +499,12 @@ impl SchedulerActor {
     // this function intentionally only checks against the cache. this has some positives and negatives:
     // positive: it will never trigger any network requests so its very fast, and having to do network requests for scoring whenever we want to schedule a vm is likely a bad idea
     // negative: it technically has a delayed view of the cluster, meaning that some things that happened in the future, may not exist yet. so we need to be careful about how this is done so affinity rules are not accidentally broken. mostly this means, if we do anything that could affect the outcome of an affinity rule (ex: network request to an agent), we need to update the cache, before we do the action.
-    fn score_agent(&self, msg: &CreateVM, agent: &CachedAgentActor) -> AgentScore {
+    fn score_agent(
+        &self,
+        msg: &CreateVM,
+        agent: &CachedAgentActor,
+        pending_resources: &AHashMap<ActorId, (u32, u64)>,
+    ) -> AgentScore {
         let mut score = AgentScore::default();
 
         let agent_max_vcpus = agent
@@ -501,11 +514,10 @@ impl SchedulerActor {
             .checked_div(VCPU_OVERPROVISIONMENT_DENOMINATOR)
             .unwrap_or(u32::MAX);
         // todo: do we care about VMData.max_vcpus?
-        let (pending_vcpus, pending_ram) = pending_resources_for_agent(
-            &self.vm_manifests,
-            &self.vm_placements,
-            agent.actor_ref.id(),
-        );
+        let (pending_vcpus, pending_ram) = pending_resources
+            .get(&agent.actor_ref.id())
+            .copied()
+            .unwrap_or_default();
         let used_vcpus = agent.data.used_vcpus.saturating_add(pending_vcpus);
         let used_ram = agent.data.used_ram.as_u64().saturating_add(pending_ram);
         let agent_used_vcpus = used_vcpus.saturating_add(msg.config.data.vcpus);
@@ -604,23 +616,36 @@ const fn has_capacity(
         && used_ram.saturating_add(requested_ram) <= max_ram
 }
 
+fn pending_resources_by_agent(
+    manifests: &AHashMap<Ulid, VirtualMachine>,
+    placements: &AHashMap<Ulid, Vec<VmPlacement>>,
+) -> AHashMap<ActorId, (u32, u64)> {
+    let mut resources = AHashMap::new();
+    for (vmid, entries) in placements {
+        let Some(manifest) = manifests.get(vmid) else {
+            continue;
+        };
+        for entry in entries {
+            if entry.lifecycle == VmLifecycle::Pending {
+                let totals = resources.entry(entry.agent_id).or_insert((0u32, 0u64));
+                totals.0 = totals.0.saturating_add(manifest.data.vcpus);
+                totals.1 = totals.1.saturating_add(manifest.data.memory.as_u64());
+            }
+        }
+    }
+    resources
+}
+
+#[cfg(test)]
 fn pending_resources_for_agent(
     manifests: &AHashMap<Ulid, VirtualMachine>,
     placements: &AHashMap<Ulid, Vec<VmPlacement>>,
     agent_id: ActorId,
 ) -> (u32, u64) {
-    placements
-        .iter()
-        .flat_map(|(vmid, entries)| entries.iter().map(move |entry| (vmid, entry)))
-        .filter(|(_, entry)| entry.agent_id == agent_id && entry.lifecycle == VmLifecycle::Pending)
-        .filter_map(|(vmid, _)| {
-            manifests
-                .get(vmid)
-                .map(|manifest| (manifest.data.vcpus, manifest.data.memory.as_u64()))
-        })
-        .fold((0u32, 0u64), |(vcpus, ram), (vm_vcpus, vm_ram)| {
-            (vcpus.saturating_add(vm_vcpus), ram.saturating_add(vm_ram))
-        })
+    pending_resources_by_agent(manifests, placements)
+        .get(&agent_id)
+        .copied()
+        .unwrap_or_default()
 }
 
 fn affinity_delta(strictness: AffinityStrictness, follows_rule: bool) -> Option<i64> {
@@ -1094,7 +1119,6 @@ impl Message<VmUpdated> for SchedulerActor {
         }
         let cached_vm = CachedVMActor {
             actor_ref: Some(msg.actor_ref),
-            cached_at: Instant::now(),
         };
         let entries = self.vm_data_cache.entry(vmid).or_default();
         Self::update_cached_vm_entry(entries, actor_id, cached_vm);
@@ -1195,10 +1219,7 @@ impl Message<CreateVM> for SchedulerActor {
         self.vm_data_cache
             .entry(msg.vmid)
             .or_default()
-            .push(CachedVMActor {
-                actor_ref: None,
-                cached_at: Instant::now(),
-            });
+            .push(CachedVMActor { actor_ref: None });
 
         let reply = target_agent.ask(&msg).await;
 
