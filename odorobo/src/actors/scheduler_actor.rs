@@ -221,6 +221,26 @@ impl SchedulerActor {
         }
     }
 
+    fn remove_agent_placements(
+        agent_id: ActorId,
+        manifests: &mut AHashMap<Ulid, VirtualMachine>,
+        placements: &mut AHashMap<Ulid, Vec<VmPlacement>>,
+        data_cache: &mut AHashMap<Ulid, Vec<CachedVMActor>>,
+    ) {
+        let empty_vmids: Vec<_> = placements
+            .iter_mut()
+            .filter_map(|(vmid, entries)| {
+                entries.retain(|entry| entry.agent_id != agent_id);
+                Self::shrink_non_migrating_entries(entries);
+                entries.is_empty().then_some(*vmid)
+            })
+            .collect();
+
+        for vmid in empty_vmids {
+            Self::remove_vm_state(vmid, manifests, placements, data_cache);
+        }
+    }
+
     fn reconcile_agent_placements(
         agent_id: ActorId,
         status: &AgentStatus,
@@ -976,14 +996,33 @@ impl Actor for SchedulerActor {
         }
 
         self.agent_data_cache.remove(&id);
+        Self::remove_agent_placements(
+            id,
+            &mut self.vm_manifests,
+            &mut self.vm_placements,
+            &mut self.vm_data_cache,
+        );
 
         if let Some(keepalive_task) = self.vm_keepalive_tasks.remove(&id) {
             trace!(?id, "Aborting vm keepalive task");
             keepalive_task.abort();
         }
 
-        self.vm_actorid_ulid_map.remove(&id);
+        let vmid = self.vm_actorid_ulid_map.remove(&id);
         Self::remove_vm_actor(id, &mut self.vm_data_cache);
+        if let Some(vmid) = vmid
+            && self
+                .vm_data_cache
+                .get(&vmid)
+                .is_none_or(|entries| entries.iter().all(|entry| entry.actor_ref.is_none()))
+        {
+            Self::remove_vm_state(
+                vmid,
+                &mut self.vm_manifests,
+                &mut self.vm_placements,
+                &mut self.vm_data_cache,
+            );
+        }
 
         // todo: attempt vm restarts if necessary.
 
@@ -1067,8 +1106,22 @@ impl Message<VmUpdaterStopped> for SchedulerActor {
 
     async fn handle(&mut self, msg: VmUpdaterStopped, _ctx: &mut Context<Self, Self::Reply>) {
         self.vm_keepalive_tasks.remove(&msg.actor_id);
-        self.vm_actorid_ulid_map.remove(&msg.actor_id);
+        let vmid = self.vm_actorid_ulid_map.remove(&msg.actor_id);
         Self::remove_vm_actor(msg.actor_id, &mut self.vm_data_cache);
+
+        if let Some(vmid) = vmid
+            && self
+                .vm_data_cache
+                .get(&vmid)
+                .is_none_or(|entries| entries.iter().all(|entry| entry.actor_ref.is_none()))
+        {
+            Self::remove_vm_state(
+                vmid,
+                &mut self.vm_manifests,
+                &mut self.vm_placements,
+                &mut self.vm_data_cache,
+            );
+        }
     }
 }
 
@@ -1098,6 +1151,12 @@ impl Message<AgentUpdaterStopped> for SchedulerActor {
     async fn handle(&mut self, msg: AgentUpdaterStopped, _ctx: &mut Context<Self, Self::Reply>) {
         self.agent_keepalive_tasks.remove(&msg.actor_id);
         self.agent_data_cache.remove(&msg.actor_id);
+        Self::remove_agent_placements(
+            msg.actor_id,
+            &mut self.vm_manifests,
+            &mut self.vm_placements,
+            &mut self.vm_data_cache,
+        );
     }
 }
 
