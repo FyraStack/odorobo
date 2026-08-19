@@ -29,6 +29,8 @@ pub struct CreateVM {
 #[derive(Serialize, Deserialize, Reply, Debug, JsonSchema)]
 pub struct CreateVMReply {
     pub config: Option<VirtualMachine>,
+    /// Serialized ID of the VM actor created by the agent.
+    pub actor_id: Option<Vec<u8>>,
 }
 
 /// Message to delete a VM's config from the agent, shutting it down
@@ -90,7 +92,7 @@ pub struct AgentListVMsReply {
     pub vms: Vec<Ulid>,
 }
 
-/// Get VM info
+/// Get VM info, including the full manifest.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct GetVMInfo {
     pub vmid: Option<Ulid>,
@@ -99,5 +101,14 @@ pub struct GetVMInfo {
 #[derive(Serialize, Deserialize, Reply, Debug, Clone)]
 pub struct GetVMInfoReply {
     pub vmid: Ulid,
-    pub config: Option<VmConfig>,
+    pub config: Option<VirtualMachine>,
+}
+
+/// Lightweight VM liveness check used by the scheduler heartbeat.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct GetVMHeartbeat;
+
+#[derive(Serialize, Deserialize, Reply, Debug, Clone, Copy)]
+pub struct GetVMHeartbeatReply {
+    pub vmid: Ulid,
 }

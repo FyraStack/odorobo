@@ -1,213 +1,1138 @@
+use std::cmp::Ordering;
+
 use std::ops::ControlFlow;
+
+use std::time::{Duration, Instant};
 
 use crate::actors::agent_actor::AgentActor;
 use crate::ch_driver::actor::VMActor;
 use crate::messages::agent::{AgentStatus, GetAgentStatus};
 use crate::messages::vm::{
-    AgentListVMs, AgentListVMsReply, CreateVM, CreateVMReply, DeleteVM, DeleteVMReply, GetVMInfo,
-    GetVMInfoReply, ShutdownVM, ShutdownVMReply,
+    AgentListVMs, AgentListVMsReply, CreateVM, CreateVMReply, DeleteVM, DeleteVMReply,
+    GetVMHeartbeat, GetVMInfo, GetVMInfoReply, ShutdownVM, ShutdownVMReply,
 };
 use crate::messages::{Ping, Pong};
-use crate::utils::actor_cache::ActorCache;
-use crate::utils::actor_cache::ActorCacheUpdater;
+use crate::types::AffinityRequirement;
+use crate::types::AffinityStrictness;
+use crate::types::AffinityType;
+use crate::types::MetadataTable;
+use crate::types::ObjectMetadata;
+use crate::types::Operator;
+use crate::types::VirtualMachine;
 use crate::utils::actor_names::AGENT;
 use crate::utils::actor_names::VM;
 use crate::utils::actor_names::vm_actor_id;
-use async_trait::async_trait;
+use ahash::{AHashMap, AHashSet};
 use kameo::prelude::*;
 use libp2p::futures::TryStreamExt;
 use stable_eyre::eyre::OptionExt;
 use stable_eyre::{Report, Result, eyre::eyre};
-use tracing::info_span;
+use tokio::task::JoinHandle;
+use tracing::trace;
 use tracing::{info, warn};
+use ulid::Ulid;
 
+#[derive(Debug)]
+struct VmActorDiscovered {
+    actor_ref: RemoteActorRef<VMActor>,
+}
+
+#[derive(Debug)]
+struct AgentActorDiscovered {
+    actor_ref: RemoteActorRef<AgentActor>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CachedActorKind {
+    Agent,
+    Vm,
+}
+
+#[derive(Debug)]
+struct VmUpdated {
+    actor_ref: RemoteActorRef<VMActor>,
+    data: GetVMInfoReply,
+}
+
+#[derive(Debug)]
+struct VmUpdaterStopped {
+    actor_id: ActorId,
+}
+
+#[derive(Debug)]
+struct AgentUpdated {
+    actor_id: ActorId,
+    actor_ref: RemoteActorRef<AgentActor>,
+    data: AgentStatus,
+}
+
+#[derive(Debug)]
+struct AgentUpdaterStopped {
+    actor_id: ActorId,
+}
+
+#[derive(Debug)]
+struct ReconcileVmPlacements;
+
+#[derive(Debug, Clone)]
+pub struct CachedAgentActor {
+    pub actor_ref: RemoteActorRef<AgentActor>,
+    pub data: AgentStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VmLifecycle {
+    Pending,
+    Running,
+}
+
+#[derive(Debug, Clone)]
+pub struct VmPlacement {
+    pub agent_id: ActorId,
+    pub lifecycle: VmLifecycle,
+    pub created_at: Instant,
+    pub last_confirmed_at: Option<Instant>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CachedVMActor {
+    pub actor_ref: Option<RemoteActorRef<VMActor>>,
+}
+
+// todo: we should improve the cache to not have agents and vms send the full data on every update.
+//  I looked at kameo streams to make this better, but they aren't really intended for this kind of long term update use case.
+//  They use rust futures::stream which seems to be more intended for you have an iterator for example that will create data, but not like full on sending messages.
+//  This could likely be done pretty easily by having two get data messages.
+//   Option 1: One that creates a session and sends the full data and then only sends diffs after that.
+//   Option 2: we can have one that sends full data, and then another that only sends data that changes.
+//  Option 2 is easier to write and uses less compute, but uses more network bandwidth.
 #[derive(RemoteActor)]
 pub struct SchedulerActor {
-    pub agent_actor_cache: ActorCache<Self, AgentActor, CachedAgentActor>,
-    pub vm_actor_cache: ActorCache<Self, VMActor, CachedVMActor>,
+    pub agent_data_cache: AHashMap<ActorId, CachedAgentActor>,
+    pub agent_keepalive_tasks: AHashMap<ActorId, JoinHandle<()>>,
+
+    pub vm_actorid_ulid_map: AHashMap<ActorId, Ulid>,
+    /// Canonical manifest storage; placements and actor entries refer to the VM ID.
+    pub vm_manifests: AHashMap<Ulid, VirtualMachine>,
+    /// A VM may be placed on multiple agents while it is migrating.
+    pub vm_placements: AHashMap<Ulid, Vec<VmPlacement>>,
+    /// this is a vec because a vmid/ulid can be scheduled on multiple boxes simultaneously during migration
+    pub vm_data_cache: AHashMap<Ulid, Vec<CachedVMActor>>,
+    pub vm_keepalive_tasks: AHashMap<ActorId, JoinHandle<()>>,
+    actor_kinds: AHashMap<ActorId, CachedActorKind>,
+
+    pub cache_actor_finder: Option<JoinHandle<()>>,
 }
 
 // todo: this might need to be a runtime thing but this makes it easy to write for now and could easily be switched out later.
 static VCPU_OVERPROVISIONMENT_NUMERATOR: u32 = 2;
 static VCPU_OVERPROVISIONMENT_DENOMINATOR: u32 = 1;
+const UNRESOLVED_VM_CACHE_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl SchedulerActor {
-    #[expect(
-        dead_code,
-        reason = "scheduler lookup helper reserved for explicit placement by actor id"
-    )]
-    fn lookup_by_actor_id(&self, actor_id: &ActorId) -> Option<RemoteActorRef<AgentActor>> {
-        self.agent_actor_cache
-            .data_cache
+    fn shrink_non_migrating_entries<T>(entries: &mut Vec<T>) {
+        if entries.len() <= 1 && entries.capacity() >= 4 {
+            entries.shrink_to_fit();
+        }
+    }
+
+    fn update_cached_vm_entry(
+        entries: &mut Vec<CachedVMActor>,
+        actor_id: ActorId,
+        cached_vm: CachedVMActor,
+    ) {
+        if let Some(entry) = entries.iter_mut().find(|entry| {
+            entry
+                .actor_ref
+                .as_ref()
+                .is_some_and(|actor| actor.id() == actor_id)
+        }) {
+            *entry = cached_vm;
+        } else if let Some(entry) = entries.iter_mut().find(|entry| entry.actor_ref.is_none()) {
+            *entry = cached_vm;
+        } else {
+            entries.push(cached_vm);
+        }
+        Self::shrink_non_migrating_entries(entries);
+    }
+
+    fn cleanup_unresolved_vm_cache(
+        manifests: &mut AHashMap<Ulid, VirtualMachine>,
+        placements: &mut AHashMap<Ulid, Vec<VmPlacement>>,
+        data_cache: &mut AHashMap<Ulid, Vec<CachedVMActor>>,
+    ) {
+        let now = Instant::now();
+        let empty_vmids: Vec<_> = placements
+            .iter_mut()
+            .filter_map(|(vmid, entries)| {
+                entries.retain(|entry| {
+                    entry.lifecycle != VmLifecycle::Pending
+                        || now.duration_since(entry.created_at) < UNRESOLVED_VM_CACHE_TIMEOUT
+                });
+                Self::shrink_non_migrating_entries(entries);
+                entries.is_empty().then_some(*vmid)
+            })
+            .collect();
+
+        for vmid in empty_vmids {
+            Self::remove_vm_state(vmid, manifests, placements, data_cache);
+        }
+    }
+
+    /// takes a list of observed vmids and gives you a set of every vmid that could be on an agent.
+    fn placement_vm_ids(
+        placements: &AHashMap<Ulid, Vec<VmPlacement>>,
+        agent_id: ActorId,
+        observed: &[Ulid],
+    ) -> AHashSet<Ulid> {
+        observed
+            .iter()
+            .copied()
+            .chain(placements.iter().filter_map(|(vmid, entries)| {
+                entries
+                    .iter()
+                    .any(|entry| entry.agent_id == agent_id)
+                    .then_some(*vmid)
+            }))
+            .collect()
+    }
+
+    fn remove_vm_state(
+        vmid: Ulid,
+        manifests: &mut AHashMap<Ulid, VirtualMachine>,
+        placements: &mut AHashMap<Ulid, Vec<VmPlacement>>,
+        data_cache: &mut AHashMap<Ulid, Vec<CachedVMActor>>,
+    ) {
+        manifests.remove(&vmid);
+        placements.remove(&vmid);
+        data_cache.remove(&vmid);
+    }
+
+    fn remove_vm_actor(actor_id: ActorId, data_cache: &mut AHashMap<Ulid, Vec<CachedVMActor>>) {
+        let empty_vmids: Vec<_> = data_cache
+            .iter_mut()
+            .filter_map(|(vmid, entries)| {
+                entries.retain(|entry| {
+                    entry
+                        .actor_ref
+                        .as_ref()
+                        .is_none_or(|actor| actor.id() != actor_id)
+                });
+                Self::shrink_non_migrating_entries(entries);
+                entries.is_empty().then_some(*vmid)
+            })
+            .collect();
+        for vmid in empty_vmids {
+            data_cache.remove(&vmid);
+        }
+    }
+
+    fn remove_agent_placements(
+        agent_id: ActorId,
+        manifests: &mut AHashMap<Ulid, VirtualMachine>,
+        placements: &mut AHashMap<Ulid, Vec<VmPlacement>>,
+        data_cache: &mut AHashMap<Ulid, Vec<CachedVMActor>>,
+    ) {
+        let empty_vmids: Vec<_> = placements
+            .iter_mut()
+            .filter_map(|(vmid, entries)| {
+                entries.retain(|entry| entry.agent_id != agent_id);
+                Self::shrink_non_migrating_entries(entries);
+                entries.is_empty().then_some(*vmid)
+            })
+            .collect();
+
+        for vmid in empty_vmids {
+            Self::remove_vm_state(vmid, manifests, placements, data_cache);
+        }
+    }
+
+    fn rollback_failed_create(
+        vmid: Ulid,
+        actor_exists: bool,
+        manifests: &mut AHashMap<Ulid, VirtualMachine>,
+        placements: &mut AHashMap<Ulid, Vec<VmPlacement>>,
+        data_cache: &mut AHashMap<Ulid, Vec<CachedVMActor>>,
+    ) {
+        if !actor_exists {
+            Self::remove_vm_state(vmid, manifests, placements, data_cache);
+        }
+    }
+
+    fn cleanup_agent_actor(&mut self, actor_id: ActorId) {
+        if let Some(keepalive_task) = self.agent_keepalive_tasks.remove(&actor_id) {
+            trace!(?actor_id, "Aborting agent keepalive task");
+            keepalive_task.abort();
+        }
+        self.agent_data_cache.remove(&actor_id);
+        Self::remove_agent_placements(
+            actor_id,
+            &mut self.vm_manifests,
+            &mut self.vm_placements,
+            &mut self.vm_data_cache,
+        );
+    }
+
+    fn cleanup_vm_actor(&mut self, actor_id: ActorId) {
+        if let Some(keepalive_task) = self.vm_keepalive_tasks.remove(&actor_id) {
+            trace!(?actor_id, "Aborting VM keepalive task");
+            keepalive_task.abort();
+        }
+        let vmid = self.vm_actorid_ulid_map.remove(&actor_id);
+        Self::remove_vm_actor(actor_id, &mut self.vm_data_cache);
+        if let Some(vmid) = vmid
+            && self
+                .vm_data_cache
+                .get(&vmid)
+                .is_none_or(|entries| entries.iter().all(|entry| entry.actor_ref.is_none()))
+        {
+            Self::remove_vm_state(
+                vmid,
+                &mut self.vm_manifests,
+                &mut self.vm_placements,
+                &mut self.vm_data_cache,
+            );
+        }
+    }
+
+    fn reconcile_agent_placements(
+        agent_id: ActorId,
+        status: &AgentStatus,
+        manifests: &AHashMap<Ulid, VirtualMachine>,
+        placements: &mut AHashMap<Ulid, Vec<VmPlacement>>,
+    ) {
+        let now = Instant::now();
+        let observed: AHashSet<_> = status.vms.iter().copied().collect();
+        let missing_agent_placements: Vec<_> = observed
+            .iter()
+            .filter(|vmid| manifests.contains_key(vmid))
+            .filter(|vmid| {
+                placements
+                    .get(vmid)
+                    .is_none_or(|entries| !entries.iter().any(|entry| entry.agent_id == agent_id))
+            })
+            .copied()
+            .collect();
+        for vmid in missing_agent_placements {
+            placements.entry(vmid).or_default().push(VmPlacement {
+                agent_id,
+                lifecycle: VmLifecycle::Running,
+                created_at: now,
+                last_confirmed_at: Some(now),
+            });
+        }
+
+        let empty_vmids: Vec<_> = placements
+            .iter_mut()
+            .filter_map(|(vmid, entries)| {
+                entries.retain(|entry| {
+                    entry.agent_id != agent_id
+                        || entry.lifecycle == VmLifecycle::Pending
+                        || observed.contains(vmid)
+                });
+                for entry in entries
+                    .iter_mut()
+                    .filter(|entry| entry.agent_id == agent_id)
+                {
+                    if observed.contains(vmid) {
+                        entry.lifecycle = VmLifecycle::Running;
+                        entry.last_confirmed_at = Some(now);
+                    }
+                }
+                Self::shrink_non_migrating_entries(entries);
+                entries.is_empty().then_some(*vmid)
+            })
+            .collect();
+        for vmid in empty_vmids {
+            placements.remove(&vmid);
+        }
+    }
+
+    #[expect(dead_code, reason = "reserved for explicit placement by actor id")]
+    fn lookup_agent_by_actor_id(&self, actor_id: &ActorId) -> Option<RemoteActorRef<AgentActor>> {
+        self.agent_data_cache
             .get(actor_id)
             .map(|data| data.actor_ref.clone())
     }
 
-    #[expect(
-        dead_code,
-        reason = "scheduler lookup helper reserved for explicit placement by hostname"
-    )]
-    fn lookup_by_hostname(&self, hostname: &str) -> Option<RemoteActorRef<AgentActor>> {
-        self.agent_actor_cache
-            .data_cache
-            .iter()
-            .find(|data| data.metadata.hostname == hostname)
+    #[expect(dead_code, reason = "reserved for explicit placement by hostname")]
+    fn lookup_agent_by_hostname(&self, hostname: &str) -> Option<RemoteActorRef<AgentActor>> {
+        self.agent_data_cache
+            .values()
+            .find(|data| data.data.hostname == hostname)
             .map(|data| data.actor_ref.clone())
     }
 
-    /// current scheduling algo info:
-    /// this is vaguely based on <https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node>/
-    /// when a vm is attempted to be scheduled, we loop through every agent and score it based on some rules
-    /// there are hard rules that will simply throw out an agent entirely.
-    /// otherwise, we take whatever the best agent we can find is.
-    ///
-    /// additionally, because caleb is way too performance brained, he used integer math for the entire scoring algorithm just so we didnt have to convert to floats.
-    fn schedule_agent(&self, _msg: &CreateVM) -> Result<RemoteActorRef<AgentActor>, Report> {
-        let mut best_agent = None;
-        let mut best_agent_score = 0u32;
+    async fn vm_actor_finder(parent_actor_ref: ActorRef<Self>) -> Result<(), Report> {
+        trace!("running vm_actor_finder");
 
-        // todo: this arguably could be done as map-reduce. is that better?
-        let span = info_span!("schedule_agent");
-        span.in_scope(|| {
-            for agent in self.agent_actor_cache.data_cache.iter() {
-                let mut agent_score = 0u32;
+        let mut vm_actor_stream = RemoteActorRef::<VMActor>::lookup_all(VM);
 
-                let agent_max_vcpus = agent
-                    .metadata
-                    .vcpus
-                    .checked_mul(VCPU_OVERPROVISIONMENT_NUMERATOR)
-                    .and_then(|value| value.checked_div(VCPU_OVERPROVISIONMENT_DENOMINATOR))
-                    .unwrap_or(u32::MAX);
+        while let Some(vm_actor) = vm_actor_stream.try_next().await? {
+            parent_actor_ref
+                .tell(VmActorDiscovered {
+                    actor_ref: vm_actor,
+                })
+                .send()
+                .await?;
+        }
 
-                if agent.metadata.used_vcpus >= agent_max_vcpus {
-                    continue;
+        Ok(())
+    }
+
+    async fn vm_updater_task(scheduler: ActorRef<Self>, actor_ref: RemoteActorRef<VMActor>) {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        let mut fails: u8 = 0;
+        let mut initialized = false;
+
+        loop {
+            if !initialized {
+                if let Ok(data) = actor_ref.ask(&GetVMInfo { vmid: None }).await {
+                    let send_result = scheduler
+                        .tell(VmUpdated {
+                            actor_ref: actor_ref.clone(),
+                            data,
+                        })
+                        .send()
+                        .await
+                        .map_err(|error| eyre!("failed to send VM update: {error}"));
+                    if let Err(error) = send_result {
+                        warn!(?error, "VM updater could not notify scheduler");
+                        return;
+                    }
+                    initialized = true;
+                    fails = 0;
+                } else {
+                    fails = fails.saturating_add(1);
                 }
-
-                agent_score = agent_score.saturating_add(
-                    agent_max_vcpus
-                        .saturating_sub(agent.metadata.used_vcpus)
-                        .checked_mul(1024)
-                        .and_then(|value| value.checked_div(agent_max_vcpus))
-                        .unwrap_or(u32::MAX),
-                );
-
-                // todo: add ram overprovisionment.     not adding this to scheduler until it works on the hypervisor side.
-                let agent_max_ram = agent.metadata.ram;
-
-                if agent.metadata.used_ram >= agent_max_ram {
-                    continue;
-                }
-
-                agent_score = agent_score.saturating_add(
-                    u32::try_from(
-                        agent_max_ram
-                            .as_u64()
-                            .saturating_sub(agent.metadata.used_ram.as_u64())
-                            .checked_mul(1024)
-                            .and_then(|value| value.checked_div(agent_max_ram.as_u64()))
-                            .unwrap_or(u64::MAX),
-                    )
-                    .unwrap_or(u32::MAX),
-                );
-
-                // todo: https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/
-
-                // todo (future): possibly keep a percent of agents completely empty, to be able to be converted to dedis automatically.
-                // they would have their agent score set to 1, so they can be scheduled to if there is no other avaliable agents.
-                // rough pseudo code to implement this:
-                // if agent.metadata.vms.len() == 0 && hash(agent.config.hostname) % total_chance < threshold {
-                //     agent_score = 1;
-                // }
-
-                info!(agent=?agent.value(), score=agent_score);
-
-                if agent_score > best_agent_score {
-                    best_agent = Some(agent.actor_ref.clone());
-                    best_agent_score = agent_score;
-                }
+            } else if actor_ref.ask(&GetVMHeartbeat).await.is_ok() {
+                fails = 0;
+            } else {
+                fails = fails.saturating_add(1);
             }
-        });
+
+            if fails > 5 {
+                warn!(
+                    ?actor_ref,
+                    "can no longer reach vm actor, cleaning up cache entries"
+                );
+
+                let send_result = scheduler
+                    .tell(VmUpdaterStopped {
+                        actor_id: actor_ref.id(),
+                    })
+                    .send()
+                    .await
+                    .map_err(|error| eyre!("failed to send VM stop: {error}"));
+                if let Err(error) = send_result {
+                    warn!(?error, "VM updater could not notify scheduler");
+                }
+                return;
+            }
+
+            interval.tick().await;
+        }
+    }
+
+    async fn agent_actor_finder(parent_actor_ref: ActorRef<Self>) -> Result<(), Report> {
+        trace!("running agent_actor_finder");
+
+        let mut agent_actor_stream = RemoteActorRef::<AgentActor>::lookup_all(AGENT);
+
+        while let Some(agent_actor) = agent_actor_stream.try_next().await? {
+            parent_actor_ref
+                .tell(AgentActorDiscovered {
+                    actor_ref: agent_actor,
+                })
+                .send()
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn agent_updater_task(scheduler: ActorRef<Self>, actor_ref: RemoteActorRef<AgentActor>) {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        let mut fails: u8 = 0;
+        loop {
+            if let Ok(data) = actor_ref.ask(&GetAgentStatus).await {
+                let send_result = scheduler
+                    .tell(AgentUpdated {
+                        actor_id: actor_ref.id(),
+                        actor_ref: actor_ref.clone(),
+                        data,
+                    })
+                    .send()
+                    .await
+                    .map_err(|error| eyre!("failed to send agent update: {error}"));
+                if let Err(error) = send_result {
+                    warn!(?error, "agent updater could not notify scheduler");
+                    return;
+                }
+                fails = 0;
+            } else {
+                fails = fails.saturating_add(1);
+            }
+
+            if fails > 5 {
+                warn!(
+                    ?actor_ref,
+                    "can no longer reach agent actor, stopping updater"
+                );
+                let send_result = scheduler
+                    .tell(AgentUpdaterStopped {
+                        actor_id: actor_ref.id(),
+                    })
+                    .send()
+                    .await
+                    .map_err(|error| eyre!("failed to send agent stop: {error}"));
+                if let Err(error) = send_result {
+                    warn!(?error, "agent updater could not notify scheduler");
+                }
+                return;
+            }
+
+            interval.tick().await;
+        }
+    }
+
+    fn start_actor_finder(&mut self, actor_ref: ActorRef<Self>) {
+        self.cache_actor_finder = Some(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                let vm_result = Self::vm_actor_finder(actor_ref.clone()).await;
+                let agent_result = Self::agent_actor_finder(actor_ref.clone()).await;
+                if let Err(error) = vm_result {
+                    warn!(?error, "VM actor discovery failed");
+                }
+                if let Err(error) = agent_result {
+                    warn!(?error, "agent actor discovery failed");
+                }
+                actor_ref.tell(ReconcileVmPlacements).send().await.ok();
+                interval.tick().await;
+            }
+        }));
+    }
+
+    /// Determine the best agent to schedule a specific VM creation request to.
+    ///
+    /// Rough explanation of the algorithm:
+    ///     Loop through every known agent.
+    ///         Go through a set of rules to determine if the VM can be scheduled on this agent at all, and an affinity score and a general score.
+    ///
+    ///     Based on these scores, pick the best agent.
+    ///         First the affinity score is used, because these are things the customer specifically wanted.
+    ///         If the affinity score is tied, we use the general score as a tie breaker.
+    ///         The general score uses things like resource utilization to not over load any specific agent.
+    ///
+    ///
+    /// Affinity rules are roughly based on <https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/>.
+    ///
+    /// todo:
+    ///  - the cache likely needs to be updated automatically when a new vm is scheduled for info like used resources, because otherwise we have to deal with latency on that data we are using
+    ///    and then if someone tries to schedule lets say 10 VMs in a batch, we could end up scheduling them all to the same agent because the metadata hasn't updated.
+    ///    - there are a few solutions for this but they all kinda suck, mostly due to also making sure we deal with latency properly. I am ignoring the issue for now.
+    fn schedule_agent(&self, msg: &CreateVM) -> Result<RemoteActorRef<AgentActor>, Report> {
+        let pending_resources = pending_resources_by_agent(&self.vm_manifests, &self.vm_placements);
+        let mut best_agent = None;
+        let mut best_score = AgentScore::REJECTED;
+
+        for agent in self.agent_data_cache.values() {
+            let score = self.score_agent(msg, agent, &pending_resources);
+
+            if score > best_score {
+                best_agent = Some(agent.actor_ref.clone());
+                best_score = score;
+            }
+        }
+
+        info!(?best_score, ?best_agent, "best agent");
 
         best_agent.ok_or_eyre("No valid agents found.")
     }
-}
 
-#[derive(Copy, Clone)]
-struct AgentActorCacheUpdater;
+    // this function intentionally only checks against the cache. this has some positives and negatives:
+    // positive: it will never trigger any network requests so its very fast, and having to do network requests for scoring whenever we want to schedule a vm is likely a bad idea
+    // negative: it technically has a delayed view of the cluster, meaning that some things that happened in the future, may not exist yet. so we need to be careful about how this is done so affinity rules are not accidentally broken. mostly this means, if we do anything that could affect the outcome of an affinity rule (ex: network request to an agent), we need to update the cache, before we do the action.
+    fn score_agent(
+        &self,
+        msg: &CreateVM,
+        agent: &CachedAgentActor,
+        pending_resources: &AHashMap<ActorId, (u32, u64)>,
+    ) -> AgentScore {
+        let mut score = AgentScore::default();
 
-#[derive(Debug, Clone)]
-pub struct CachedAgentActor {
-    pub actor_ref: RemoteActorRef<AgentActor>,
-    pub metadata: AgentStatus,
-}
+        let agent_max_vcpus = agent
+            .data
+            .vcpus
+            .saturating_mul(VCPU_OVERPROVISIONMENT_NUMERATOR)
+            .checked_div(VCPU_OVERPROVISIONMENT_DENOMINATOR)
+            .unwrap_or(u32::MAX);
+        // todo: do we care about VMData.max_vcpus?
+        let (pending_vcpus, pending_ram) = pending_resources
+            .get(&agent.actor_ref.id())
+            .copied()
+            .unwrap_or_default();
+        let used_vcpus = agent.data.used_vcpus.saturating_add(pending_vcpus);
+        let used_ram = agent.data.used_ram.as_u64().saturating_add(pending_ram);
+        let agent_used_vcpus = used_vcpus.saturating_add(msg.config.data.vcpus);
 
-#[async_trait]
-impl ActorCacheUpdater<AgentActor, CachedAgentActor> for AgentActorCacheUpdater {
-    async fn get_actor_refs(&self) -> Result<Vec<RemoteActorRef<AgentActor>>> {
-        let mut agent_actors_lookup = RemoteActorRef::<AgentActor>::lookup_all(AGENT);
-        let mut actor_ref_vec = Vec::new();
-
-        while let Some(agent_actor) = agent_actors_lookup.try_next().await? {
-            actor_ref_vec.push(agent_actor);
+        if !has_capacity(
+            agent_max_vcpus,
+            used_vcpus,
+            msg.config.data.vcpus,
+            agent.data.ram.as_u64(),
+            used_ram,
+            msg.config.data.memory.as_u64(),
+        ) {
+            return AgentScore::REJECTED;
         }
 
-        Ok(actor_ref_vec)
-    }
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "the scheduler score intentionally uses f32 ratios"
+        )]
+        #[expect(
+            clippy::arithmetic_side_effects,
+            reason = "the preceding capacity check guarantees non-negative subtraction"
+        )]
+        let vcpu_headroom = (agent_max_vcpus - agent_used_vcpus) as f32 / agent_max_vcpus as f32;
+        score.general += vcpu_headroom;
 
-    async fn on_update(
-        &self,
-        actor_ref: &RemoteActorRef<AgentActor>,
-        previous_value: Option<CachedAgentActor>,
-    ) -> Result<CachedAgentActor, Report> {
-        let output_actor_ref = match previous_value {
-            Some(value) => value.actor_ref,
-            _ => actor_ref.clone(),
-        };
+        // todo: add ram overprovisionment. not adding this to scheduler until it works on the hypervisor side.
+        let agent_max_ram = agent.data.ram;
+        let agent_used_ram =
+            bytesize::ByteSize::b(used_ram.saturating_add(msg.config.data.memory.as_u64()));
 
-        Ok(CachedAgentActor {
-            actor_ref: output_actor_ref,
-            metadata: actor_ref.ask(&GetAgentStatus).await?,
-        })
-    }
-}
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "the scheduler score intentionally uses f32 ratios"
+        )]
+        let ram_headroom = agent_max_ram
+            .as_u64()
+            .saturating_sub(agent_used_ram.as_u64()) as f32
+            / agent_max_ram.as_u64() as f32;
+        score.general += ram_headroom;
 
-// todo: this code is really bad, and we should not have effectively two copies of ths same thing.
-#[derive(Copy, Clone)]
-struct VMActorCacheUpdater;
+        // Roughly based on <https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/>.
+        if let Some(affinity_rules) = &msg.config.affinity {
+            for rule in affinity_rules {
+                let mut metadata_tables: Vec<&ObjectMetadata> = Vec::with_capacity(1);
 
-#[derive(Debug, Clone)]
-pub struct CachedVMActor {
-    pub actor_ref: RemoteActorRef<VMActor>,
-    pub metadata: GetVMInfoReply,
-}
+                match rule.affinity_type {
+                    AffinityType::VirtualMachine => {
+                        let vmids = Self::placement_vm_ids(
+                            &self.vm_placements,
+                            agent.actor_ref.id(),
+                            &agent.data.vms,
+                        );
+                        for vmid in vmids {
+                            if let Some(metadata) = self
+                                .vm_manifests
+                                .get(&vmid)
+                                .and_then(|manifest| manifest.metadata.as_ref())
+                            {
+                                metadata_tables.push(metadata);
+                            }
+                        }
+                    }
+                    AffinityType::Agent => metadata_tables.push(&agent.data.metadata),
+                }
 
-#[async_trait]
-impl ActorCacheUpdater<VMActor, CachedVMActor> for VMActorCacheUpdater {
-    async fn get_actor_refs(&self) -> Result<Vec<RemoteActorRef<VMActor>>> {
-        let mut agent_actors_lookup = RemoteActorRef::<VMActor>::lookup_all(VM);
-        let mut actor_ref_vec = Vec::new();
+                let follows_rule = evaluate_affinity_rule(&metadata_tables, rule);
 
-        while let Some(agent_actor) = agent_actors_lookup.try_next().await? {
-            actor_ref_vec.push(agent_actor);
+                let Some(affinity_delta) = affinity_delta(rule.strictness, follows_rule) else {
+                    return AgentScore::REJECTED;
+                };
+                score.affinity = score.affinity.saturating_add(affinity_delta);
+            }
         }
 
-        Ok(actor_ref_vec)
+        // todo (future): possibly keep a percent of agents completely empty, to be able to be converted to dedis automatically.
+        // they would have their agent score set to like f32::MIN, so they can be scheduled to if there is no other available agents.
+        // rough pseudo code to implement this:
+        // if agent.metadata.vms.len() == 0 && hash(agent.config.hostname) % total_chance < threshold {
+        //     agent_score = 1;
+        // }
+
+        score
+    }
+}
+
+const fn has_capacity(
+    max_vcpus: u32,
+    used_vcpus: u32,
+    requested_vcpus: u32,
+    max_ram: u64,
+    used_ram: u64,
+    requested_ram: u64,
+) -> bool {
+    used_vcpus.saturating_add(requested_vcpus) <= max_vcpus
+        && used_ram.saturating_add(requested_ram) <= max_ram
+}
+
+fn pending_resources_by_agent(
+    manifests: &AHashMap<Ulid, VirtualMachine>,
+    placements: &AHashMap<Ulid, Vec<VmPlacement>>,
+) -> AHashMap<ActorId, (u32, u64)> {
+    let mut resources = AHashMap::new();
+    for (vmid, entries) in placements {
+        let Some(manifest) = manifests.get(vmid) else {
+            continue;
+        };
+        for entry in entries {
+            if entry.lifecycle == VmLifecycle::Pending {
+                let totals = resources.entry(entry.agent_id).or_insert((0u32, 0u64));
+                totals.0 = totals.0.saturating_add(manifest.data.vcpus);
+                totals.1 = totals.1.saturating_add(manifest.data.memory.as_u64());
+            }
+        }
+    }
+    resources
+}
+
+#[cfg(test)]
+fn pending_resources_for_agent(
+    manifests: &AHashMap<Ulid, VirtualMachine>,
+    placements: &AHashMap<Ulid, Vec<VmPlacement>>,
+    agent_id: ActorId,
+) -> (u32, u64) {
+    pending_resources_by_agent(manifests, placements)
+        .get(&agent_id)
+        .copied()
+        .unwrap_or_default()
+}
+
+fn affinity_delta(strictness: AffinityStrictness, follows_rule: bool) -> Option<i64> {
+    match strictness {
+        AffinityStrictness::Required if !follows_rule => None,
+        AffinityStrictness::Required => Some(0),
+        AffinityStrictness::Preferred { weight } => {
+            Some(i64::from(follows_rule).saturating_mul(weight))
+        }
+    }
+}
+
+fn evaluate_affinity_rule(
+    metadata_tables: &[&ObjectMetadata],
+    rule: &crate::types::AffinityRule,
+) -> bool {
+    let mut follows_rule = false;
+
+    for requirement in &rule.requirements {
+        let mut requirement_outcome = !metadata_tables.is_empty();
+
+        for object_metadata in metadata_tables {
+            let table = match requirement.table {
+                MetadataTable::Label => &object_metadata.labels,
+                MetadataTable::Annotation => &object_metadata.annotations,
+            };
+
+            if !evaluate_table_value(table.get(&requirement.key), requirement) {
+                requirement_outcome = false;
+                break;
+            }
+        }
+
+        if requirement_outcome {
+            follows_rule = true;
+            break;
+        }
     }
 
-    async fn on_update(
-        &self,
-        actor_ref: &RemoteActorRef<VMActor>,
-        previous_value: Option<CachedVMActor>,
-    ) -> Result<CachedVMActor, Report> {
-        let output_actor_ref = match previous_value {
-            Some(value) => value.actor_ref,
-            _ => actor_ref.clone(),
+    follows_rule ^ rule.inverse
+}
+
+fn evaluate_table_value(value_option: Option<&String>, requirement: &AffinityRequirement) -> bool {
+    let Some(value) = value_option else {
+        return matches!(requirement.operator, Operator::NotIn);
+    };
+
+    match requirement.operator {
+        Operator::In => requirement.values.contains(value),
+        Operator::NotIn => !requirement.values.contains(value),
+        Operator::Lt | Operator::Gt => {
+            let [requirement_value] = &requirement.values[..] else {
+                return false;
+            };
+
+            let Ok(value_number): Result<f64, _> = value.parse() else {
+                return false;
+            };
+
+            let Ok(requirement_value_number): Result<f64, _> = requirement_value.parse() else {
+                return false;
+            };
+
+            if requirement.operator == Operator::Lt {
+                value_number < requirement_value_number
+            } else {
+                value_number > requirement_value_number
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CachedActorKind, CachedVMActor, SchedulerActor, VmLifecycle, VmPlacement, affinity_delta,
+        evaluate_affinity_rule, evaluate_table_value, has_capacity, pending_resources_for_agent,
+    };
+
+    use crate::messages::agent::AgentStatus;
+    use crate::types::{
+        AffinityRequirement, AffinityRule, AffinityStrictness, AffinityType, MetadataTable,
+        ObjectMetadata, Operator, VirtualMachine,
+    };
+    use ahash::AHashMap;
+    use bytesize::ByteSize;
+    use std::collections::BTreeMap;
+    use std::time::{Duration, Instant};
+    use ulid::Ulid;
+
+    fn requirement(operator: Operator, values: &[&str]) -> AffinityRequirement {
+        AffinityRequirement {
+            key: "tier".to_owned(),
+            table: MetadataTable::Label,
+            operator,
+            values: values.iter().map(|value| (*value).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn removes_expired_unresolved_vm_placeholders() {
+        let vmid = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("valid ulid");
+        let agent_id = super::ActorId::new(1);
+        let mut placements: AHashMap<Ulid, Vec<VmPlacement>> = AHashMap::new();
+        placements.insert(
+            vmid,
+            vec![VmPlacement {
+                agent_id,
+                lifecycle: VmLifecycle::Pending,
+                created_at: Instant::now()
+                    .checked_sub(Duration::from_secs(31))
+                    .expect("test timestamp should be representable"),
+                last_confirmed_at: None,
+            }],
+        );
+        let mut manifests = AHashMap::from([(vmid, VirtualMachine::default())]);
+        let mut data_cache: AHashMap<Ulid, Vec<CachedVMActor>> = AHashMap::new();
+
+        SchedulerActor::cleanup_unresolved_vm_cache(
+            &mut manifests,
+            &mut placements,
+            &mut data_cache,
+        );
+
+        assert!(!manifests.contains_key(&vmid));
+        assert!(!placements.contains_key(&vmid));
+        assert!(!data_cache.contains_key(&vmid));
+    }
+
+    #[test]
+    fn reserves_pending_vm_resources_until_agent_status_confirms_them() {
+        let vmid = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("valid ulid");
+        let agent_id = super::ActorId::new(1);
+        let mut config = VirtualMachine::default();
+        config.data.vcpus = 4;
+        config.data.memory = ByteSize::gib(8);
+        let mut placements: AHashMap<Ulid, Vec<VmPlacement>> = AHashMap::new();
+        placements.insert(
+            vmid,
+            vec![VmPlacement {
+                agent_id,
+                lifecycle: VmLifecycle::Pending,
+                created_at: Instant::now(),
+                last_confirmed_at: None,
+            }],
+        );
+
+        let manifests = AHashMap::from([(vmid, config)]);
+        assert_eq!(
+            pending_resources_for_agent(&manifests, &placements, agent_id),
+            (4, ByteSize::gib(8).as_u64())
+        );
+    }
+
+    #[test]
+    fn reconciling_source_agent_preserves_destination_migration_placement() {
+        let vmid = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("valid ulid");
+        let source_agent = super::ActorId::new(1);
+        let destination_agent = super::ActorId::new(2);
+        let running_placement = |agent_id| VmPlacement {
+            agent_id,
+            lifecycle: VmLifecycle::Running,
+            created_at: Instant::now(),
+            last_confirmed_at: Some(Instant::now()),
+        };
+        let manifests = AHashMap::from([(vmid, VirtualMachine::default())]);
+        let mut placements = AHashMap::from([(vmid, vec![running_placement(source_agent)])]);
+        let destination_status = AgentStatus {
+            hostname: "destination".to_owned(),
+            vcpus: 1,
+            ram: ByteSize::b(1),
+            used_vcpus: 0,
+            used_ram: ByteSize::b(0),
+            vms: vec![vmid],
+            metadata: ObjectMetadata::default(),
+        };
+        SchedulerActor::reconcile_agent_placements(
+            destination_agent,
+            &destination_status,
+            &manifests,
+            &mut placements,
+        );
+        assert_eq!(manifests.len(), 1);
+
+        let source_status = AgentStatus {
+            hostname: "source".to_owned(),
+            vcpus: 1,
+            ram: ByteSize::b(1),
+            used_vcpus: 0,
+            used_ram: ByteSize::b(0),
+            vms: Vec::new(),
+            metadata: ObjectMetadata::default(),
         };
 
-        Ok(CachedVMActor {
-            actor_ref: output_actor_ref,
-            metadata: actor_ref.ask(&GetVMInfo { vmid: None }).await?,
-        })
+        SchedulerActor::reconcile_agent_placements(
+            source_agent,
+            &source_status,
+            &manifests,
+            &mut placements,
+        );
+
+        let remaining = placements
+            .get(&vmid)
+            .expect("destination placement remains");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].agent_id, destination_agent);
+    }
+
+    #[test]
+    fn failed_create_rolls_back_state_without_an_actor() {
+        let vmid = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("valid ulid");
+        let mut manifests = AHashMap::from([(vmid, VirtualMachine::default())]);
+        let mut placements = AHashMap::from([(
+            vmid,
+            vec![VmPlacement {
+                agent_id: super::ActorId::new(1),
+                lifecycle: VmLifecycle::Pending,
+                created_at: Instant::now(),
+                last_confirmed_at: None,
+            }],
+        )]);
+        let mut data_cache = AHashMap::from([(vmid, vec![CachedVMActor { actor_ref: None }])]);
+
+        SchedulerActor::rollback_failed_create(
+            vmid,
+            false,
+            &mut manifests,
+            &mut placements,
+            &mut data_cache,
+        );
+
+        assert!(!manifests.contains_key(&vmid));
+        assert!(!placements.contains_key(&vmid));
+        assert!(!data_cache.contains_key(&vmid));
+    }
+
+    #[test]
+    fn failed_create_keeps_state_if_actor_exists() {
+        let vmid = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("valid ulid");
+        let mut manifests = AHashMap::from([(vmid, VirtualMachine::default())]);
+        let mut placements = AHashMap::new();
+        let mut data_cache = AHashMap::new();
+
+        SchedulerActor::rollback_failed_create(
+            vmid,
+            true,
+            &mut manifests,
+            &mut placements,
+            &mut data_cache,
+        );
+
+        assert!(manifests.contains_key(&vmid));
+    }
+
+    #[test]
+    fn agent_cleanup_does_not_remove_unrelated_vm_state() {
+        let agent_id = super::ActorId::new(1);
+        let vm_actor_id = super::ActorId::new(2);
+        let placement_agent_id = super::ActorId::new(3);
+        let vmid = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("valid ulid");
+        let mut scheduler = SchedulerActor {
+            agent_data_cache: AHashMap::new(),
+            agent_keepalive_tasks: AHashMap::new(),
+            vm_actorid_ulid_map: AHashMap::from([(vm_actor_id, vmid)]),
+            vm_manifests: AHashMap::from([(vmid, VirtualMachine::default())]),
+            vm_placements: AHashMap::from([(
+                vmid,
+                vec![VmPlacement {
+                    agent_id: placement_agent_id,
+                    lifecycle: VmLifecycle::Running,
+                    created_at: Instant::now(),
+                    last_confirmed_at: Some(Instant::now()),
+                }],
+            )]),
+            vm_data_cache: AHashMap::from([(vmid, vec![CachedVMActor { actor_ref: None }])]),
+            vm_keepalive_tasks: AHashMap::new(),
+            actor_kinds: AHashMap::from([(agent_id, CachedActorKind::Agent)]),
+            cache_actor_finder: None,
+        };
+
+        scheduler.cleanup_agent_actor(agent_id);
+
+        assert!(scheduler.vm_placements.contains_key(&vmid));
+        assert!(scheduler.vm_manifests.contains_key(&vmid));
+        assert!(scheduler.vm_actorid_ulid_map.contains_key(&vm_actor_id));
+        assert!(scheduler.vm_data_cache.contains_key(&vmid));
+    }
+
+    #[test]
+    fn vm_cleanup_does_not_remove_unrelated_agent_state() {
+        let agent_id = super::ActorId::new(1);
+        let vm_actor_id = super::ActorId::new(2);
+        let vmid = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("valid ulid");
+        let mut scheduler = SchedulerActor {
+            agent_data_cache: AHashMap::new(),
+            agent_keepalive_tasks: AHashMap::new(),
+            vm_actorid_ulid_map: AHashMap::from([(vm_actor_id, vmid)]),
+            vm_manifests: AHashMap::from([(vmid, VirtualMachine::default())]),
+            vm_placements: AHashMap::new(),
+            vm_data_cache: AHashMap::from([(vmid, vec![CachedVMActor { actor_ref: None }])]),
+            vm_keepalive_tasks: AHashMap::new(),
+            actor_kinds: AHashMap::from([(agent_id, CachedActorKind::Agent)]),
+            cache_actor_finder: None,
+        };
+
+        scheduler.cleanup_vm_actor(vm_actor_id);
+
+        assert!(scheduler.actor_kinds.contains_key(&agent_id));
+        assert!(!scheduler.vm_manifests.contains_key(&vmid));
+        assert!(!scheduler.vm_data_cache.contains_key(&vmid));
+    }
+
+    #[test]
+    fn evaluates_membership_and_missing_keys() {
+        let metadata = BTreeMap::from([("tier".to_owned(), "frontend".to_owned())]);
+        assert!(evaluate_table_value(
+            metadata.get("tier"),
+            &requirement(Operator::In, &["frontend", "api"])
+        ));
+        assert!(!evaluate_table_value(
+            metadata.get("tier"),
+            &requirement(Operator::In, &["backend"])
+        ));
+        assert!(!evaluate_table_value(
+            None,
+            &requirement(Operator::In, &["frontend"])
+        ));
+        assert!(evaluate_table_value(
+            None,
+            &requirement(Operator::NotIn, &["frontend"])
+        ));
+    }
+
+    #[test]
+    fn evaluates_not_in_and_numeric_comparisons() {
+        let metadata = BTreeMap::from([("tier".to_owned(), "4".to_owned())]);
+        assert!(evaluate_table_value(
+            metadata.get("tier"),
+            &requirement(Operator::NotIn, &["5"])
+        ));
+        assert!(evaluate_table_value(
+            metadata.get("tier"),
+            &requirement(Operator::Lt, &["5"])
+        ));
+        assert!(evaluate_table_value(
+            metadata.get("tier"),
+            &requirement(Operator::Gt, &["3"])
+        ));
+        assert!(!evaluate_table_value(
+            metadata.get("tier"),
+            &requirement(Operator::Lt, &["4", "5"])
+        ));
+        assert!(!evaluate_table_value(
+            metadata.get("tier"),
+            &requirement(Operator::Gt, &["not-a-number"])
+        ));
+    }
+
+    #[test]
+    fn evaluates_inverse_and_empty_requirements() {
+        let metadata = ObjectMetadata {
+            labels: BTreeMap::from([("tier".to_owned(), "frontend".to_owned())]),
+            annotations: BTreeMap::new(),
+        };
+        let rule = AffinityRule {
+            strictness: AffinityStrictness::Required,
+            affinity_type: AffinityType::Agent,
+            inverse: true,
+            requirements: vec![requirement(Operator::In, &["frontend"])],
+        };
+        assert!(!evaluate_affinity_rule(&[&metadata], &rule));
+
+        let empty_rule = AffinityRule {
+            strictness: AffinityStrictness::Required,
+            affinity_type: AffinityType::Agent,
+            inverse: false,
+            requirements: Vec::new(),
+        };
+        assert!(!evaluate_affinity_rule(&[], &empty_rule));
+    }
+
+    #[test]
+    fn evaluates_required_preferred_and_capacity_rules() {
+        assert_eq!(affinity_delta(AffinityStrictness::Required, true), Some(0));
+        assert_eq!(affinity_delta(AffinityStrictness::Required, false), None);
+        assert_eq!(
+            affinity_delta(AffinityStrictness::Preferred { weight: 7 }, true),
+            Some(7)
+        );
+        assert_eq!(
+            affinity_delta(AffinityStrictness::Preferred { weight: 7 }, false),
+            Some(0)
+        );
+        assert!(has_capacity(8, 2, 2, 16, 4, 4));
+        assert!(has_capacity(8, 6, 2, 16, 4, 4));
+        assert!(has_capacity(8, 2, 2, 16, 12, 4));
+        assert!(!has_capacity(8, 7, 2, 16, 4, 4));
+        assert!(!has_capacity(8, 2, 2, 16, 13, 4));
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct AgentScore {
+    general: f32,
+    affinity: i64,
+}
+
+impl AgentScore {
+    pub const REJECTED: Self = Self {
+        general: f32::NEG_INFINITY,
+        affinity: i64::MIN,
+    };
+}
+
+impl Default for AgentScore {
+    fn default() -> Self {
+        Self {
+            general: 0.0,
+            affinity: 0,
+        }
+    }
+}
+
+impl PartialOrd for AgentScore {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        let affinity_cmp = self.affinity.cmp(&other.affinity);
+
+        if affinity_cmp != Ordering::Equal {
+            return Some(affinity_cmp);
+        }
+
+        self.general.partial_cmp(&other.general)
     }
 }
 
@@ -220,10 +1145,21 @@ impl Actor for SchedulerActor {
 
         info!(?peer_id, "Scheduler Actor started!");
 
-        Ok(Self {
-            agent_actor_cache: ActorCache::new(actor_ref.clone(), AgentActorCacheUpdater),
-            vm_actor_cache: ActorCache::new(actor_ref, VMActorCacheUpdater),
-        })
+        let mut scheduler_actor = Self {
+            agent_data_cache: AHashMap::new(),
+            agent_keepalive_tasks: AHashMap::new(),
+            vm_actorid_ulid_map: AHashMap::new(),
+            vm_manifests: AHashMap::new(),
+            vm_placements: AHashMap::new(),
+            vm_data_cache: AHashMap::new(),
+            vm_keepalive_tasks: AHashMap::new(),
+            actor_kinds: AHashMap::new(),
+            cache_actor_finder: None,
+        };
+
+        scheduler_actor.start_actor_finder(actor_ref);
+
+        Ok(scheduler_actor)
     }
 
     async fn on_link_died(
@@ -232,18 +1168,167 @@ impl Actor for SchedulerActor {
         id: ActorId,
         reason: ActorStopReason,
     ) -> Result<ControlFlow<ActorStopReason>, Self::Error> {
-        warn!("Linked actor {id:?} died with reason {reason:?}");
+        warn!(?id, ?reason, "Linked actor died");
 
+        // check that scheduler actor is still alive.
         let Some(_) = actor_ref.upgrade() else {
             return Ok(ControlFlow::Break(ActorStopReason::Killed));
         };
 
-        self.agent_actor_cache.on_link_died(id);
-        self.vm_actor_cache.on_link_died(id);
+        match self.actor_kinds.remove(&id) {
+            Some(CachedActorKind::Agent) => self.cleanup_agent_actor(id),
+            Some(CachedActorKind::Vm) => self.cleanup_vm_actor(id),
+            None => {}
+        }
 
-        info!(vm_actor_cache=?self.agent_actor_cache.data_cache, agent_actor_cache=?self.vm_actor_cache.data_cache, "data caches post actor removal");
+        // todo: attempt vm restarts if necessary.
 
         Ok(ControlFlow::Continue(()))
+    }
+}
+
+impl Message<VmActorDiscovered> for SchedulerActor {
+    type Reply = ();
+
+    async fn handle(&mut self, msg: VmActorDiscovered, ctx: &mut Context<Self, Self::Reply>) {
+        let actor_id = msg.actor_ref.id();
+        let updater_is_running = self
+            .vm_keepalive_tasks
+            .get(&actor_id)
+            .is_some_and(|task| !task.is_finished());
+        if updater_is_running {
+            return;
+        }
+        self.vm_keepalive_tasks.remove(&actor_id);
+        if let Err(error) = ctx.actor_ref().link_remote(&msg.actor_ref).await {
+            warn!(?error, ?actor_id, "failed to link VM actor");
+            return;
+        }
+        self.actor_kinds.insert(actor_id, CachedActorKind::Vm);
+        let scheduler = ctx.actor_ref().clone();
+        let actor_ref = msg.actor_ref;
+        let task = tokio::spawn(async move {
+            Self::vm_updater_task(scheduler, actor_ref).await;
+        });
+        self.vm_keepalive_tasks.insert(actor_id, task);
+    }
+}
+
+impl Message<AgentActorDiscovered> for SchedulerActor {
+    type Reply = ();
+
+    async fn handle(&mut self, msg: AgentActorDiscovered, ctx: &mut Context<Self, Self::Reply>) {
+        let actor_id = msg.actor_ref.id();
+        let updater_is_running = self
+            .agent_keepalive_tasks
+            .get(&actor_id)
+            .is_some_and(|task| !task.is_finished());
+        if updater_is_running {
+            return;
+        }
+        self.agent_keepalive_tasks.remove(&actor_id);
+        if let Err(error) = ctx.actor_ref().link_remote(&msg.actor_ref).await {
+            warn!(?error, ?actor_id, "failed to link agent actor");
+            return;
+        }
+        self.actor_kinds.insert(actor_id, CachedActorKind::Agent);
+        let scheduler = ctx.actor_ref().clone();
+        let actor_ref = msg.actor_ref;
+        let task = tokio::spawn(async move {
+            Self::agent_updater_task(scheduler, actor_ref).await;
+        });
+        self.agent_keepalive_tasks.insert(actor_id, task);
+    }
+}
+
+impl Message<VmUpdated> for SchedulerActor {
+    type Reply = ();
+
+    async fn handle(&mut self, msg: VmUpdated, _ctx: &mut Context<Self, Self::Reply>) {
+        let vmid = msg.data.vmid;
+        let actor_id = msg.actor_ref.id();
+        self.vm_actorid_ulid_map.insert(actor_id, vmid);
+        if let Some(manifest) = msg.data.config {
+            self.vm_manifests.insert(vmid, manifest);
+        }
+        let cached_vm = CachedVMActor {
+            actor_ref: Some(msg.actor_ref),
+        };
+        let entries = self.vm_data_cache.entry(vmid).or_default();
+        Self::update_cached_vm_entry(entries, actor_id, cached_vm);
+    }
+}
+
+impl Message<VmUpdaterStopped> for SchedulerActor {
+    type Reply = ();
+
+    async fn handle(&mut self, msg: VmUpdaterStopped, _ctx: &mut Context<Self, Self::Reply>) {
+        self.vm_keepalive_tasks.remove(&msg.actor_id);
+        self.actor_kinds.remove(&msg.actor_id);
+        let vmid = self.vm_actorid_ulid_map.remove(&msg.actor_id);
+        Self::remove_vm_actor(msg.actor_id, &mut self.vm_data_cache);
+
+        if let Some(vmid) = vmid
+            && self
+                .vm_data_cache
+                .get(&vmid)
+                .is_none_or(|entries| entries.iter().all(|entry| entry.actor_ref.is_none()))
+        {
+            Self::remove_vm_state(
+                vmid,
+                &mut self.vm_manifests,
+                &mut self.vm_placements,
+                &mut self.vm_data_cache,
+            );
+        }
+    }
+}
+
+impl Message<AgentUpdated> for SchedulerActor {
+    type Reply = ();
+
+    async fn handle(&mut self, msg: AgentUpdated, _ctx: &mut Context<Self, Self::Reply>) {
+        Self::reconcile_agent_placements(
+            msg.actor_id,
+            &msg.data,
+            &self.vm_manifests,
+            &mut self.vm_placements,
+        );
+        self.agent_data_cache.insert(
+            msg.actor_id,
+            CachedAgentActor {
+                actor_ref: msg.actor_ref,
+                data: msg.data,
+            },
+        );
+    }
+}
+
+impl Message<AgentUpdaterStopped> for SchedulerActor {
+    type Reply = ();
+
+    async fn handle(&mut self, msg: AgentUpdaterStopped, _ctx: &mut Context<Self, Self::Reply>) {
+        self.agent_keepalive_tasks.remove(&msg.actor_id);
+        self.actor_kinds.remove(&msg.actor_id);
+        self.agent_data_cache.remove(&msg.actor_id);
+        Self::remove_agent_placements(
+            msg.actor_id,
+            &mut self.vm_manifests,
+            &mut self.vm_placements,
+            &mut self.vm_data_cache,
+        );
+    }
+}
+
+impl Message<ReconcileVmPlacements> for SchedulerActor {
+    type Reply = ();
+
+    async fn handle(&mut self, _msg: ReconcileVmPlacements, _ctx: &mut Context<Self, Self::Reply>) {
+        Self::cleanup_unresolved_vm_cache(
+            &mut self.vm_manifests,
+            &mut self.vm_placements,
+            &mut self.vm_data_cache,
+        );
     }
 }
 
@@ -255,16 +1340,48 @@ impl Message<CreateVM> for SchedulerActor {
         msg: CreateVM,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        loop {
-            let target_agent = self.schedule_agent(&msg)?;
+        let target_agent = self.schedule_agent(&msg)?;
 
-            match target_agent.ask(&msg).await {
-                Ok(reply) => return Ok(reply),
-                Err(err) => {
-                    warn!("CreateVM forwarding failed, trying again: {err}");
-                }
-            }
+        self.vm_manifests.insert(msg.vmid, msg.config.clone());
+        self.vm_placements
+            .entry(msg.vmid)
+            .or_default()
+            .push(VmPlacement {
+                agent_id: target_agent.id(),
+                lifecycle: VmLifecycle::Pending,
+                created_at: Instant::now(),
+                last_confirmed_at: None,
+            });
+        self.vm_data_cache
+            .entry(msg.vmid)
+            .or_default()
+            .push(CachedVMActor { actor_ref: None });
+
+        let reply = target_agent.ask(&msg).await;
+
+        if let Ok(reply) = &reply
+            && let Some(actor_id_bytes) = &reply.actor_id
+            && let Ok(actor_id) = ActorId::from_bytes(actor_id_bytes)
+        {
+            self.vm_actorid_ulid_map.insert(actor_id, msg.vmid);
         }
+
+        if reply.is_err() {
+            let actor_exists = RemoteActorRef::<VMActor>::lookup(vm_actor_id(msg.vmid))
+                .await
+                .ok()
+                .flatten()
+                .is_some();
+            Self::rollback_failed_create(
+                msg.vmid,
+                actor_exists,
+                &mut self.vm_manifests,
+                &mut self.vm_placements,
+                &mut self.vm_data_cache,
+            );
+        }
+
+        Ok(reply?)
     }
 }
 
@@ -279,6 +1396,7 @@ impl Message<DeleteVM> for SchedulerActor {
         let vm = RemoteActorRef::<VMActor>::lookup(vm_actor_id(msg.vmid)).await?;
         tracing::trace!(?vm, "DeleteVM");
         if let Some(vm) = vm {
+            // don't update cache, because we rely on link dying and updater task to remove from cache once the VM is fully down.
             vm.tell(&msg).send()?;
             Ok(DeleteVMReply)
         } else {
@@ -298,6 +1416,7 @@ impl Message<ShutdownVM> for SchedulerActor {
         let vm = RemoteActorRef::<VMActor>::lookup(vm_actor_id(msg.vmid)).await?;
         tracing::trace!(?vm, "ShutdownVM");
         if let Some(vm) = vm {
+            // don't update cache, because we rely on link dying and updater task to remove from cache once the VM is fully down.
             vm.tell(&msg).send()?;
             Ok(ShutdownVMReply)
         } else {
@@ -319,8 +1438,8 @@ impl Message<AgentListVMs> for SchedulerActor {
     ) -> Self::Reply {
         let mut vms = Vec::new();
 
-        for agent in self.agent_actor_cache.data_cache.iter() {
-            vms.extend_from_slice(agent.metadata.vms.as_slice());
+        for agent in self.agent_data_cache.values() {
+            vms.extend_from_slice(agent.data.vms.as_slice());
         }
 
         Ok(AgentListVMsReply { vms })
