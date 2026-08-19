@@ -42,6 +42,12 @@ struct AgentActorDiscovered {
     actor_ref: RemoteActorRef<AgentActor>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CachedActorKind {
+    Agent,
+    Vm,
+}
+
 #[derive(Debug)]
 struct VmUpdated {
     actor_ref: RemoteActorRef<VMActor>,
@@ -113,6 +119,7 @@ pub struct SchedulerActor {
     /// this is a vec because a vmid/ulid can be scheduled on multiple boxes simultaneously during migration
     pub vm_data_cache: AHashMap<Ulid, Vec<CachedVMActor>>,
     pub vm_keepalive_tasks: AHashMap<ActorId, JoinHandle<()>>,
+    actor_kinds: AHashMap<ActorId, CachedActorKind>,
 
     pub cache_actor_finder: Option<JoinHandle<()>>,
 }
@@ -237,6 +244,54 @@ impl SchedulerActor {
 
         for vmid in empty_vmids {
             Self::remove_vm_state(vmid, manifests, placements, data_cache);
+        }
+    }
+
+    fn rollback_failed_create(
+        vmid: Ulid,
+        actor_exists: bool,
+        manifests: &mut AHashMap<Ulid, VirtualMachine>,
+        placements: &mut AHashMap<Ulid, Vec<VmPlacement>>,
+        data_cache: &mut AHashMap<Ulid, Vec<CachedVMActor>>,
+    ) {
+        if !actor_exists {
+            Self::remove_vm_state(vmid, manifests, placements, data_cache);
+        }
+    }
+
+    fn cleanup_agent_actor(&mut self, actor_id: ActorId) {
+        if let Some(keepalive_task) = self.agent_keepalive_tasks.remove(&actor_id) {
+            trace!(?actor_id, "Aborting agent keepalive task");
+            keepalive_task.abort();
+        }
+        self.agent_data_cache.remove(&actor_id);
+        Self::remove_agent_placements(
+            actor_id,
+            &mut self.vm_manifests,
+            &mut self.vm_placements,
+            &mut self.vm_data_cache,
+        );
+    }
+
+    fn cleanup_vm_actor(&mut self, actor_id: ActorId) {
+        if let Some(keepalive_task) = self.vm_keepalive_tasks.remove(&actor_id) {
+            trace!(?actor_id, "Aborting VM keepalive task");
+            keepalive_task.abort();
+        }
+        let vmid = self.vm_actorid_ulid_map.remove(&actor_id);
+        Self::remove_vm_actor(actor_id, &mut self.vm_data_cache);
+        if let Some(vmid) = vmid
+            && self
+                .vm_data_cache
+                .get(&vmid)
+                .is_none_or(|entries| entries.iter().all(|entry| entry.actor_ref.is_none()))
+        {
+            Self::remove_vm_state(
+                vmid,
+                &mut self.vm_manifests,
+                &mut self.vm_placements,
+                &mut self.vm_data_cache,
+            );
         }
     }
 
@@ -721,7 +776,7 @@ fn evaluate_table_value(value_option: Option<&String>, requirement: &AffinityReq
 #[cfg(test)]
 mod tests {
     use super::{
-        CachedVMActor, SchedulerActor, VmLifecycle, VmPlacement, affinity_delta,
+        CachedActorKind, CachedVMActor, SchedulerActor, VmLifecycle, VmPlacement, affinity_delta,
         evaluate_affinity_rule, evaluate_table_value, has_capacity, pending_resources_for_agent,
     };
 
@@ -852,6 +907,110 @@ mod tests {
             .expect("destination placement remains");
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].agent_id, destination_agent);
+    }
+
+    #[test]
+    fn failed_create_rolls_back_state_without_an_actor() {
+        let vmid = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("valid ulid");
+        let mut manifests = AHashMap::from([(vmid, VirtualMachine::default())]);
+        let mut placements = AHashMap::from([(
+            vmid,
+            vec![VmPlacement {
+                agent_id: super::ActorId::new(1),
+                lifecycle: VmLifecycle::Pending,
+                created_at: Instant::now(),
+                last_confirmed_at: None,
+            }],
+        )]);
+        let mut data_cache = AHashMap::from([(vmid, vec![CachedVMActor { actor_ref: None }])]);
+
+        SchedulerActor::rollback_failed_create(
+            vmid,
+            false,
+            &mut manifests,
+            &mut placements,
+            &mut data_cache,
+        );
+
+        assert!(!manifests.contains_key(&vmid));
+        assert!(!placements.contains_key(&vmid));
+        assert!(!data_cache.contains_key(&vmid));
+    }
+
+    #[test]
+    fn failed_create_keeps_state_if_actor_exists() {
+        let vmid = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("valid ulid");
+        let mut manifests = AHashMap::from([(vmid, VirtualMachine::default())]);
+        let mut placements = AHashMap::new();
+        let mut data_cache = AHashMap::new();
+
+        SchedulerActor::rollback_failed_create(
+            vmid,
+            true,
+            &mut manifests,
+            &mut placements,
+            &mut data_cache,
+        );
+
+        assert!(manifests.contains_key(&vmid));
+    }
+
+    #[test]
+    fn agent_cleanup_does_not_remove_unrelated_vm_state() {
+        let agent_id = super::ActorId::new(1);
+        let vm_actor_id = super::ActorId::new(2);
+        let placement_agent_id = super::ActorId::new(3);
+        let vmid = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("valid ulid");
+        let mut scheduler = SchedulerActor {
+            agent_data_cache: AHashMap::new(),
+            agent_keepalive_tasks: AHashMap::new(),
+            vm_actorid_ulid_map: AHashMap::from([(vm_actor_id, vmid)]),
+            vm_manifests: AHashMap::from([(vmid, VirtualMachine::default())]),
+            vm_placements: AHashMap::from([(
+                vmid,
+                vec![VmPlacement {
+                    agent_id: placement_agent_id,
+                    lifecycle: VmLifecycle::Running,
+                    created_at: Instant::now(),
+                    last_confirmed_at: Some(Instant::now()),
+                }],
+            )]),
+            vm_data_cache: AHashMap::from([(vmid, vec![CachedVMActor { actor_ref: None }])]),
+            vm_keepalive_tasks: AHashMap::new(),
+            actor_kinds: AHashMap::from([(agent_id, CachedActorKind::Agent)]),
+            cache_actor_finder: None,
+        };
+
+        scheduler.cleanup_agent_actor(agent_id);
+
+        assert!(scheduler.vm_placements.contains_key(&vmid));
+        assert!(scheduler.vm_manifests.contains_key(&vmid));
+        assert!(scheduler.vm_actorid_ulid_map.contains_key(&vm_actor_id));
+        assert!(scheduler.vm_data_cache.contains_key(&vmid));
+    }
+
+    #[test]
+    fn vm_cleanup_does_not_remove_unrelated_agent_state() {
+        let agent_id = super::ActorId::new(1);
+        let vm_actor_id = super::ActorId::new(2);
+        let vmid = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("valid ulid");
+        let mut scheduler = SchedulerActor {
+            agent_data_cache: AHashMap::new(),
+            agent_keepalive_tasks: AHashMap::new(),
+            vm_actorid_ulid_map: AHashMap::from([(vm_actor_id, vmid)]),
+            vm_manifests: AHashMap::from([(vmid, VirtualMachine::default())]),
+            vm_placements: AHashMap::new(),
+            vm_data_cache: AHashMap::from([(vmid, vec![CachedVMActor { actor_ref: None }])]),
+            vm_keepalive_tasks: AHashMap::new(),
+            actor_kinds: AHashMap::from([(agent_id, CachedActorKind::Agent)]),
+            cache_actor_finder: None,
+        };
+
+        scheduler.cleanup_vm_actor(vm_actor_id);
+
+        assert!(scheduler.actor_kinds.contains_key(&agent_id));
+        assert!(!scheduler.vm_manifests.contains_key(&vmid));
+        assert!(!scheduler.vm_data_cache.contains_key(&vmid));
     }
 
     #[test]
@@ -994,6 +1153,7 @@ impl Actor for SchedulerActor {
             vm_placements: AHashMap::new(),
             vm_data_cache: AHashMap::new(),
             vm_keepalive_tasks: AHashMap::new(),
+            actor_kinds: AHashMap::new(),
             cache_actor_finder: None,
         };
 
@@ -1015,38 +1175,10 @@ impl Actor for SchedulerActor {
             return Ok(ControlFlow::Break(ActorStopReason::Killed));
         };
 
-        if let Some(keepalive_task) = self.agent_keepalive_tasks.remove(&id) {
-            trace!(?id, "Aborting agent keepalive task");
-            keepalive_task.abort();
-        }
-
-        self.agent_data_cache.remove(&id);
-        Self::remove_agent_placements(
-            id,
-            &mut self.vm_manifests,
-            &mut self.vm_placements,
-            &mut self.vm_data_cache,
-        );
-
-        if let Some(keepalive_task) = self.vm_keepalive_tasks.remove(&id) {
-            trace!(?id, "Aborting vm keepalive task");
-            keepalive_task.abort();
-        }
-
-        let vmid = self.vm_actorid_ulid_map.remove(&id);
-        Self::remove_vm_actor(id, &mut self.vm_data_cache);
-        if let Some(vmid) = vmid
-            && self
-                .vm_data_cache
-                .get(&vmid)
-                .is_none_or(|entries| entries.iter().all(|entry| entry.actor_ref.is_none()))
-        {
-            Self::remove_vm_state(
-                vmid,
-                &mut self.vm_manifests,
-                &mut self.vm_placements,
-                &mut self.vm_data_cache,
-            );
+        match self.actor_kinds.remove(&id) {
+            Some(CachedActorKind::Agent) => self.cleanup_agent_actor(id),
+            Some(CachedActorKind::Vm) => self.cleanup_vm_actor(id),
+            None => {}
         }
 
         // todo: attempt vm restarts if necessary.
@@ -1072,6 +1204,7 @@ impl Message<VmActorDiscovered> for SchedulerActor {
             warn!(?error, ?actor_id, "failed to link VM actor");
             return;
         }
+        self.actor_kinds.insert(actor_id, CachedActorKind::Vm);
         let scheduler = ctx.actor_ref().clone();
         let actor_ref = msg.actor_ref;
         let task = tokio::spawn(async move {
@@ -1098,6 +1231,7 @@ impl Message<AgentActorDiscovered> for SchedulerActor {
             warn!(?error, ?actor_id, "failed to link agent actor");
             return;
         }
+        self.actor_kinds.insert(actor_id, CachedActorKind::Agent);
         let scheduler = ctx.actor_ref().clone();
         let actor_ref = msg.actor_ref;
         let task = tokio::spawn(async move {
@@ -1130,6 +1264,7 @@ impl Message<VmUpdaterStopped> for SchedulerActor {
 
     async fn handle(&mut self, msg: VmUpdaterStopped, _ctx: &mut Context<Self, Self::Reply>) {
         self.vm_keepalive_tasks.remove(&msg.actor_id);
+        self.actor_kinds.remove(&msg.actor_id);
         let vmid = self.vm_actorid_ulid_map.remove(&msg.actor_id);
         Self::remove_vm_actor(msg.actor_id, &mut self.vm_data_cache);
 
@@ -1174,6 +1309,7 @@ impl Message<AgentUpdaterStopped> for SchedulerActor {
 
     async fn handle(&mut self, msg: AgentUpdaterStopped, _ctx: &mut Context<Self, Self::Reply>) {
         self.agent_keepalive_tasks.remove(&msg.actor_id);
+        self.actor_kinds.remove(&msg.actor_id);
         self.agent_data_cache.remove(&msg.actor_id);
         Self::remove_agent_placements(
             msg.actor_id,
@@ -1230,15 +1366,15 @@ impl Message<CreateVM> for SchedulerActor {
             self.vm_actorid_ulid_map.insert(actor_id, msg.vmid);
         }
 
-        if reply.is_err()
-            && RemoteActorRef::<VMActor>::lookup(vm_actor_id(msg.vmid))
+        if reply.is_err() {
+            let actor_exists = RemoteActorRef::<VMActor>::lookup(vm_actor_id(msg.vmid))
                 .await
                 .ok()
                 .flatten()
-                .is_none()
-        {
-            Self::remove_vm_state(
+                .is_some();
+            Self::rollback_failed_create(
                 msg.vmid,
+                actor_exists,
                 &mut self.vm_manifests,
                 &mut self.vm_placements,
                 &mut self.vm_data_cache,
