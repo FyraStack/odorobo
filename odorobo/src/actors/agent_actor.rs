@@ -128,6 +128,7 @@ impl Message<CreateVM> for AgentActor {
         info!(?vmid, "VM Spawned successfully");
         CreateVMReply {
             config: Some(msg.config),
+            actor_id: Some(actor_ref.id().to_bytes()),
         }
     }
 }
@@ -317,6 +318,7 @@ impl Message<GetAgentStatus> for AgentActor {
             vms: self.vms.keys().copied().collect(),
             used_vcpus: vcpus_used_by_vms.saturating_add(self.config.get_reserved_vcpus()),
             used_ram: ByteSize::b(ram_used_by_vms),
+            metadata: self.metadata.clone(),
         }
     }
 }
