@@ -363,19 +363,19 @@ impl Actor for NetworkAgentActor {
         let (connection, handle, _) = rtnetlink::new_connection()?;
         let netlink_thread = tokio::spawn(connection);
 
-        let common = match args.network_mode.clone() {
+        let common = match &args.network_mode {
             NetworkMode::HostonlyNat {
                 bridge,
                 subnet,
                 upstream_iface,
                 ..
             } => NetworkConfigCommon {
-                bridge,
+                bridge: bridge.clone(),
                 subnet: subnet.to_string(),
-                upstream_iface: Some(upstream_iface),
+                upstream_iface: Some(upstream_iface.clone()),
             },
             NetworkMode::Bridged { bridge, subnet, .. } => NetworkConfigCommon {
-                bridge,
+                bridge: bridge.clone(),
                 subnet: subnet.to_string(),
                 upstream_iface: None,
             },

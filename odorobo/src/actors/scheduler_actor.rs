@@ -16,7 +16,6 @@ use crate::messages::vm::{
     SendConsoleInput, SendConsoleInputReply, ShutdownVM, ShutdownVMReply,
 };
 use crate::messages::{Ping, Pong};
-use crate::types::ObjectMetadata;
 use crate::utils::actor_names::AGENT;
 use crate::utils::actor_names::VM;
 use crate::utils::actor_names::vm_actor_id;
@@ -97,12 +96,17 @@ pub struct CachedVMActor {
     pub actor_ref: Option<RemoteActorRef<VMActor>>,
 }
 
+type MetadataTables<'a> = [(
+    &'a std::collections::BTreeMap<String, String>,
+    &'a std::collections::BTreeMap<String, String>,
+)];
+
 // todo: we should improve the cache to not have agents and vms send the full data on every update.
 //  I looked at kameo streams to make this better, but they aren't really intended for this kind of long term update use case.
 //  They use rust futures::stream which seems to be more intended for you have an iterator for example that will create data, but not like full on sending messages.
 //  This could likely be done pretty easily by having two get data messages.
 //   Option 1: One that creates a session and sends the full data and then only sends diffs after that.
-//   Option 2: we can have one that sends full data, and then another that only sends data that changes.
+//   Option 2: One that sends full data, and then another that only sends data that changes.
 //  Option 2 is easier to write and uses less compute, but uses more network bandwidth.
 #[derive(RemoteActor)]
 pub struct SchedulerActor {
@@ -177,22 +181,29 @@ impl SchedulerActor {
         }
     }
 
-    /// takes a list of observed vmids and gives you a set of every vmid that could be on an agent.
+    /// Returns every VM that could be on an agent, without allocating a hash set.
+    ///
+    /// The observed list is normally the dominant source and is already unique;
+    /// migration placements are checked linearly to preserve deduplication while
+    /// avoiding a temporary hash table on every affinity evaluation.
     fn placement_vm_ids(
         placements: &AHashMap<Ulid, Vec<VmPlacement>>,
         agent_id: ActorId,
         observed: &[Ulid],
-    ) -> AHashSet<Ulid> {
-        observed
-            .iter()
-            .copied()
-            .chain(placements.iter().filter_map(|(vmid, entries)| {
-                entries
-                    .iter()
-                    .any(|entry| entry.agent_id == agent_id)
-                    .then_some(*vmid)
-            }))
-            .collect()
+    ) -> Vec<Ulid> {
+        let mut vmids = Vec::with_capacity(observed.len());
+        vmids.extend_from_slice(observed);
+        for vmid in placements.iter().filter_map(|(vmid, entries)| {
+            entries
+                .iter()
+                .any(|entry| entry.agent_id == agent_id)
+                .then_some(vmid)
+        }) {
+            if !vmids.contains(vmid) {
+                vmids.push(*vmid);
+            }
+        }
+        vmids
     }
 
     fn remove_vm_state(
@@ -248,11 +259,18 @@ impl SchedulerActor {
     fn rollback_failed_create(
         vmid: Ulid,
         actor_exists: bool,
+        actor_id: Option<ActorId>,
+        actor_map: &mut AHashMap<ActorId, Ulid>,
         manifests: &mut AHashMap<Ulid, VmManifest>,
         placements: &mut AHashMap<Ulid, Vec<VmPlacement>>,
         data_cache: &mut AHashMap<Ulid, Vec<CachedVMActor>>,
     ) {
         if !actor_exists {
+            if let Some(actor_id) = actor_id
+                && actor_map.get(&actor_id) == Some(&vmid)
+            {
+                actor_map.remove(&actor_id);
+            }
             Self::remove_vm_state(vmid, manifests, placements, data_cache);
         }
     }
@@ -617,26 +635,31 @@ impl SchedulerActor {
         if !msg.config.desired.placement.affinity.is_empty() {
             let affinity_rules = &msg.config.desired.placement.affinity;
             for rule in affinity_rules {
-                let mut metadata_tables: Vec<&ObjectMetadata> = Vec::with_capacity(1);
-
-                let vm_metadata: Vec<ObjectMetadata> = match rule.affinity_type {
-                    AffinityType::VirtualMachine => Self::placement_vm_ids(
-                        &self.vm_placements,
-                        agent.actor_ref.id(),
-                        &agent.data.vms,
-                    )
-                    .into_iter()
-                    .filter_map(|vmid| self.vm_manifests.get(&vmid))
-                    .map(|manifest| ObjectMetadata {
-                        labels: manifest.desired.metadata.labels.clone(),
-                        annotations: manifest.desired.metadata.annotations.clone(),
-                    })
-                    .collect(),
-                    AffinityType::Agent => Vec::new(),
-                };
-                metadata_tables.extend(vm_metadata.iter());
-                if matches!(rule.affinity_type, AffinityType::Agent) {
-                    metadata_tables.push(&agent.data.metadata);
+                let mut metadata_tables = Vec::with_capacity(1);
+                match rule.affinity_type {
+                    AffinityType::VirtualMachine => {
+                        metadata_tables.extend(
+                            Self::placement_vm_ids(
+                                &self.vm_placements,
+                                agent.actor_ref.id(),
+                                &agent.data.vms,
+                            )
+                            .into_iter()
+                            .filter_map(|vmid| self.vm_manifests.get(&vmid))
+                            .map(|manifest| {
+                                (
+                                    &manifest.desired.metadata.labels,
+                                    &manifest.desired.metadata.annotations,
+                                )
+                            }),
+                        );
+                    }
+                    AffinityType::Agent => {
+                        metadata_tables.push((
+                            &agent.data.metadata.labels,
+                            &agent.data.metadata.annotations,
+                        ));
+                    }
                 }
 
                 let follows_rule = evaluate_affinity_rule(&metadata_tables, rule);
@@ -716,7 +739,7 @@ fn affinity_delta(strictness: &AffinityStrictness, follows_rule: bool) -> Option
 }
 
 fn evaluate_affinity_rule(
-    metadata_tables: &[&ObjectMetadata],
+    metadata_tables: &MetadataTables<'_>,
     rule: &crate::manifest::AffinityRule,
 ) -> bool {
     let mut follows_rule = false;
@@ -726,8 +749,8 @@ fn evaluate_affinity_rule(
 
         for object_metadata in metadata_tables {
             let table = match requirement.table {
-                MetadataTable::Label => &object_metadata.labels,
-                MetadataTable::Annotation => &object_metadata.annotations,
+                MetadataTable::Label => object_metadata.0,
+                MetadataTable::Annotation => object_metadata.1,
             };
 
             if !evaluate_table_value(table.get(&requirement.key), requirement) {
@@ -935,6 +958,7 @@ mod tests {
     fn failed_create_rolls_back_state_without_an_actor() {
         let vmid = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("valid ulid");
         let mut manifests = AHashMap::from([(vmid, test_manifest(1, 1))]);
+        let mut actor_map = AHashMap::new();
         let mut placements = AHashMap::from([(
             vmid,
             vec![VmPlacement {
@@ -949,6 +973,8 @@ mod tests {
         SchedulerActor::rollback_failed_create(
             vmid,
             false,
+            None,
+            &mut actor_map,
             &mut manifests,
             &mut placements,
             &mut data_cache,
@@ -963,12 +989,15 @@ mod tests {
     fn failed_create_keeps_state_if_actor_exists() {
         let vmid = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("valid ulid");
         let mut manifests = AHashMap::from([(vmid, test_manifest(1, 1))]);
+        let mut actor_map = AHashMap::new();
         let mut placements = AHashMap::new();
         let mut data_cache = AHashMap::new();
 
         SchedulerActor::rollback_failed_create(
             vmid,
             true,
+            None,
+            &mut actor_map,
             &mut manifests,
             &mut placements,
             &mut data_cache,
@@ -1093,7 +1122,10 @@ mod tests {
             inverse: true,
             requirements: vec![requirement(Operator::In, &["frontend"])],
         };
-        assert!(!evaluate_affinity_rule(&[&metadata], &rule));
+        assert!(!evaluate_affinity_rule(
+            &[(&metadata.labels, &metadata.annotations)],
+            &rule,
+        ));
 
         let non_matching_rule = AffinityRule {
             strictness: AffinityStrictness::Required,
@@ -1407,6 +1439,13 @@ impl Message<CreateVM> for SchedulerActor {
             Self::rollback_failed_create(
                 msg.vmid,
                 actor_exists,
+                reply.as_ref().ok().and_then(|reply| {
+                    reply
+                        .actor_id
+                        .as_deref()
+                        .and_then(|bytes| ActorId::from_bytes(bytes).ok())
+                }),
+                &mut self.vm_actorid_ulid_map,
                 &mut self.vm_manifests,
                 &mut self.vm_placements,
                 &mut self.vm_data_cache,
@@ -1505,7 +1544,12 @@ impl Message<AgentListVMs> for SchedulerActor {
         _msg: AgentListVMs,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        let mut vms = Vec::new();
+        let total_vms = self
+            .agent_data_cache
+            .values()
+            .map(|agent| agent.data.vms.len())
+            .sum();
+        let mut vms = Vec::with_capacity(total_vms);
 
         for agent in self.agent_data_cache.values() {
             vms.extend_from_slice(agent.data.vms.as_slice());

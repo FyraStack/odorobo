@@ -1,7 +1,6 @@
 use crate::{
     ch_driver::actor::VMActor,
     config::Config,
-    manifest::VmManifest,
     messages::{
         Ping, Pong,
         agent::{AgentStatus, GetAgentStatus},
@@ -29,13 +28,16 @@ use kameo::error::PanicError;
 
 pub struct VMCacheData {
     actor_ref: ActorRef<VMActor>,
-    config: VmManifest,
+    vcpus: u32,
+    memory_bytes: u64,
 }
 
 #[derive(RemoteActor)]
 pub struct AgentActor {
     pub vcpus: u32,
     pub memory: ByteSize,
+    used_vcpus: u32,
+    used_memory_bytes: u64,
     pub config: Config,
     pub vms: AHashMap<Ulid, VMCacheData>,
     // pub network_actor: ActorRef<NetworkAgentActor>,
@@ -43,6 +45,24 @@ pub struct AgentActor {
 }
 
 impl AgentActor {
+    fn insert_vm(&mut self, vmid: Ulid, cache: VMCacheData) {
+        let vcpus = cache.vcpus;
+        let memory_bytes = cache.memory_bytes;
+        if let Some(previous) = self.vms.insert(vmid, cache) {
+            self.used_vcpus = self.used_vcpus.saturating_sub(previous.vcpus);
+            self.used_memory_bytes = self.used_memory_bytes.saturating_sub(previous.memory_bytes);
+        }
+        self.used_vcpus = self.used_vcpus.saturating_add(vcpus);
+        self.used_memory_bytes = self.used_memory_bytes.saturating_add(memory_bytes);
+    }
+
+    fn remove_vm(&mut self, vmid: Ulid) -> Option<VMCacheData> {
+        let removed = self.vms.remove(&vmid)?;
+        self.used_vcpus = self.used_vcpus.saturating_sub(removed.vcpus);
+        self.used_memory_bytes = self.used_memory_bytes.saturating_sub(removed.memory_bytes);
+        Some(removed)
+    }
+
     async fn lookup_vm_actor(vmid: Ulid) -> Option<ActorRef<VMActor>> {
         ActorRef::<VMActor>::lookup(format!("vm:{vmid}"))
             .await
@@ -73,6 +93,8 @@ impl Actor for AgentActor {
             memory: ByteSize::b(sys.total_memory()),
             config: args,
             vms: AHashMap::new(),
+            used_vcpus: 0,
+            used_memory_bytes: 0,
             metadata: ObjectMetadata::default(),
         })
     }
@@ -101,7 +123,15 @@ impl Actor for AgentActor {
     ) -> Result<ControlFlow<ActorStopReason>> {
         warn!("Linked actor {id:?} died with reason {reason:?}");
 
-        self.vms.retain(|_, vm| vm.actor_ref.id() != id);
+        let removed: Vec<_> = self
+            .vms
+            .iter()
+            .filter(|(_, vm)| vm.actor_ref.id() == id)
+            .map(|(vmid, _)| *vmid)
+            .collect();
+        for vmid in removed {
+            self.remove_vm(vmid);
+        }
 
         Ok(ControlFlow::Continue(()))
     }
@@ -119,11 +149,12 @@ impl Message<CreateVM> for AgentActor {
 
         _ = actor_ref.register(vm_actor_id(vmid)).await;
         _ = actor_ref.register(VM).await;
-        self.vms.insert(
+        self.insert_vm(
             vmid,
             VMCacheData {
                 actor_ref: actor_ref.clone(),
-                config: msg.config.clone(),
+                vcpus: msg.config.desired.compute.vcpus,
+                memory_bytes: msg.config.desired.compute.memory_bytes,
             },
         );
 
@@ -149,11 +180,12 @@ impl Message<MigrateVMReceive> for AgentActor {
 
         _ = actor_ref.register(vm_actor_id(vmid)).await;
         _ = actor_ref.register(VM).await;
-        self.vms.insert(
+        self.insert_vm(
             vmid,
             VMCacheData {
                 actor_ref: actor_ref.clone(),
-                config: msg.config.clone(),
+                vcpus: msg.config.desired.compute.vcpus,
+                memory_bytes: msg.config.desired.compute.memory_bytes,
             },
         );
 
@@ -174,7 +206,7 @@ impl Message<DeleteVM> for AgentActor {
         msg: DeleteVM,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        match self.vms.remove(&msg.vmid) {
+        match self.remove_vm(msg.vmid) {
             Some(cache_data) => {
                 let res = cache_data.actor_ref.tell(msg.clone()).await;
                 if let Err(err) = res {
@@ -302,27 +334,15 @@ impl Message<GetAgentStatus> for AgentActor {
         _msg: GetAgentStatus,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        let vcpus_used_by_vms = self
-            .vms
-            .values()
-            .map(|vm| vm.config.desired.compute.vcpus)
-            .reduce(u32::saturating_add)
-            .unwrap_or(0);
-
-        let ram_used_by_vms = self
-            .vms
-            .values()
-            .map(|vm| vm.config.desired.compute.memory_bytes)
-            .reduce(u64::saturating_add)
-            .unwrap_or(0);
-
         AgentStatus {
             hostname: self.config.get_hostname().to_owned(),
             vcpus: self.vcpus,
             ram: self.memory,
             vms: self.vms.keys().copied().collect(),
-            used_vcpus: vcpus_used_by_vms.saturating_add(self.config.get_reserved_vcpus()),
-            used_ram: ByteSize::b(ram_used_by_vms),
+            used_vcpus: self
+                .used_vcpus
+                .saturating_add(self.config.get_reserved_vcpus()),
+            used_ram: ByteSize::b(self.used_memory_bytes),
             metadata: self.metadata.clone(),
         }
     }

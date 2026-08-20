@@ -35,7 +35,7 @@ impl ISCSITarget {
 
         Command::new("iscsiadm")
             .args(["-m", "node", "-T", &self.iqn, "-p", &self.host, "--login"])
-            .output()
+            .status()
             .await
             .map_err(|e| eyre!("Failed to execute iscsiadm command: {e}"))?;
         Ok(self.to_device_path())
@@ -46,7 +46,7 @@ impl ISCSITarget {
         info!(?self, "Detaching iSCSI target");
         Command::new("iscsiadm")
             .args(["-m", "node", "-T", &self.iqn, "-p", &self.host, "--logout"])
-            .output()
+            .status()
             .await
             .map_err(|e| eyre!("Failed to execute iscsiadm command: {e}"))?;
         Ok(())
@@ -64,12 +64,9 @@ impl From<&Url> for ISCSITarget {
         let host_ip = uri.host_str().unwrap_or_default().to_owned();
         let port = uri.port().unwrap_or(3260);
         let host = format!("{host_ip}:{port}");
-        let path_segments: Vec<&str> = uri
-            .path_segments()
-            .map(std::iter::Iterator::collect)
-            .unwrap_or_default();
-        let iqn = path_segments.first().unwrap_or(&"").to_string();
-        let lun_str = path_segments.get(1).unwrap_or(&"");
+        let mut path_segments = uri.path_segments().into_iter().flatten();
+        let iqn = path_segments.next().unwrap_or_default().to_owned();
+        let lun_str = path_segments.next().unwrap_or_default();
         let lun = lun_str
             .strip_prefix("lun")
             .unwrap_or(lun_str)

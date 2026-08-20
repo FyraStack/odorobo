@@ -51,21 +51,28 @@ async fn rbd_map_list() -> Result<Vec<(String, String)>> {
 fn rbd_lines_list(input: &str) -> Result<Vec<(String, String)>> {
     let mut mappings = Vec::new();
     for line in input.lines().skip(1) {
-        let parts: Vec<&str> = line.split_whitespace().collect();
+        let mut parts = line.split_whitespace();
+        let _id = parts.next();
+        let Some(pool) = parts.next() else {
+            continue;
+        };
+        let Some(field) = parts.next() else {
+            continue;
+        };
+        let Some(next) = parts.next() else {
+            continue;
+        };
+        let Some(fifth) = parts.next() else {
+            continue;
+        };
+
         // id  pool               namespace  image    snap  device
         // 0   pool               foo        testimg    -   /dev/rbd0
-        if parts.len() == 6 {
-            let rbd_path = format!("{}/{}", parts[1], parts[3]);
-            let device_path = parts[5].to_owned();
-            mappings.push((rbd_path, device_path));
-        }
-        if parts.len() == 5 {
-            // if namespace is empty, it might be omitted from the output, so we need to handle that case as well
-            // id  pool               image    snap  device
-            // 0   pool               testimg    -   /dev/rbd0
-            let rbd_path = format!("{}/{}", parts[1], parts[2]);
-            let device_path = parts[4].to_owned();
-            mappings.push((rbd_path, device_path));
+        if let Some(device) = parts.next() {
+            mappings.push((format!("{pool}/{next}"), device.to_owned()));
+        } else if fifth.starts_with("/dev/") {
+            // If namespace is empty, it may be omitted from the output.
+            mappings.push((format!("{pool}/{field}"), fifth.to_owned()));
         }
     }
 
@@ -101,17 +108,16 @@ impl RbdImage {
         }
 
         info!(?rbd_path, "Mapping RBD image to device");
-        let output = Command::new("rbd")
+        let status = Command::new("rbd")
             .args(rbd_extra_args())
             .arg("device")
             .arg("map")
             .arg(&rbd_path)
-            .output()
+            .status()
             .await
             .map_err(|e| eyre!("Failed to execute rbd command: {e}"))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(eyre!("rbd map failed: {stderr}"));
+        if !status.success() {
+            return Err(eyre!("rbd map failed with status {status}"));
         }
         Ok(())
     }
@@ -121,17 +127,16 @@ impl RbdImage {
     pub async fn unmap(&self) -> Result<()> {
         let rbd_path = self.rbd_path();
         info!(?rbd_path, "Unmapping RBD image");
-        let output = Command::new("rbd")
+        let status = Command::new("rbd")
             .args(rbd_extra_args())
             .arg("device")
             .arg("unmap")
             .arg(&rbd_path)
-            .output()
+            .status()
             .await
             .map_err(|e| eyre!("Failed to execute rbd command: {e}"))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(eyre!("rbd unmap failed: {stderr}"));
+        if !status.success() {
+            return Err(eyre!("rbd unmap failed with status {status}"));
         }
         Ok(())
     }
