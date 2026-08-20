@@ -27,10 +27,14 @@ pub fn to_vm_config(manifest: &VmManifest) -> Result<VmConfig> {
         .collect::<Result<Vec<_>>>()?;
 
     if desired.cloud_init.is_some() {
-        return Err(eyre!("Cloud Hypervisor cloud-init conversion is not implemented yet"));
+        return Err(eyre!(
+            "Cloud Hypervisor cloud-init conversion is not implemented yet"
+        ));
     }
     if desired.vsock.is_some() {
-        return Err(eyre!("Cloud Hypervisor vsock conversion is not implemented yet"));
+        return Err(eyre!(
+            "Cloud Hypervisor vsock conversion is not implemented yet"
+        ));
     }
     if !desired.networks.is_empty() {
         return Err(eyre!(
@@ -42,13 +46,8 @@ pub fn to_vm_config(manifest: &VmManifest) -> Result<VmConfig> {
         cpus: Some(CpusConfig {
             boot_vcpus: i32::try_from(desired.compute.vcpus)
                 .map_err(|_| eyre!("vCPU count exceeds Cloud Hypervisor limits"))?,
-            max_vcpus: i32::try_from(
-                desired
-                    .compute
-                    .max_vcpus
-                    .unwrap_or(desired.compute.vcpus),
-            )
-            .map_err(|_| eyre!("maximum vCPU count exceeds Cloud Hypervisor limits"))?,
+            max_vcpus: i32::try_from(desired.compute.max_vcpus.unwrap_or(desired.compute.vcpus))
+                .map_err(|_| eyre!("maximum vCPU count exceeds Cloud Hypervisor limits"))?,
             ..Default::default()
         }),
         memory: Some(MemoryConfig {
@@ -113,7 +112,7 @@ mod tests {
     fn minimal() -> VmManifest {
         VmManifest {
             api_version: crate::manifest::MANIFEST_VERSION,
-            id: Ulid::new(),
+            id: Ulid::generate(),
             desired: DesiredState {
                 metadata: Metadata {
                     name: "test".to_owned(),
@@ -136,7 +135,10 @@ mod tests {
         let config = to_vm_config(&minimal()).expect("minimal manifest converts");
         assert_eq!(config.cpus.expect("cpus").boot_vcpus, 2);
         assert_eq!(config.memory.expect("memory").size, 1024);
-        assert_eq!(config.platform.expect("platform").serial_number.as_deref(), Some("ds=nocloud"));
+        assert_eq!(
+            config.platform.expect("platform").serial_number.as_deref(),
+            Some("ds=nocloud")
+        );
     }
 
     #[test]

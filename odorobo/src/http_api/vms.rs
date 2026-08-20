@@ -50,15 +50,17 @@ async fn vm_info(
 async fn create_vm(
     State(state): State<ActorRef<HTTPActor>>,
     Json(request): Json<CreateVMRequest>,
-) -> Result<impl IntoApiResponse, OdoroboError> {
+) -> Result<Json<serde_json::Value>, OdoroboError> {
     let message = CreateVM {
-        vmid: request.vm.data.id,
+        vmid: request.vm.id,
         config: request.vm,
     };
 
     let reply = state.ask(message).await?;
 
-    Ok(Json(reply))
+    let response = serde_json::to_value(reply)
+        .map_err(|error| OdoroboError::Report(stable_eyre::Report::from(error)))?;
+    Ok(Json(response))
 }
 
 async fn delete_vm(

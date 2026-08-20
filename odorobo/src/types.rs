@@ -7,6 +7,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
+use crate::manifest::VmManifest;
+
 mod bytesize_as_u64 {
     use bytesize::ByteSize;
     use serde::{Deserialize, Deserializer, Serializer};
@@ -65,10 +67,10 @@ impl Default for StorageUri {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, JsonSchema, Default, Clone)]
+#[derive(Serialize, Deserialize, Debug, JsonSchema, OperationIo, Clone)]
 pub struct CreateVMRequest {
-    /// Data of the VM to create
-    pub vm: VirtualMachine,
+    /// Provider-neutral VM intent to create.
+    pub vm: VmManifest,
     /// Whether to boot the VM immediately after creation
     pub boot: bool,
 }

@@ -2,6 +2,7 @@ pub mod actors;
 mod ch_driver;
 pub mod config;
 pub mod http_api;
+mod manifest;
 pub mod messages;
 pub mod networking;
 pub mod types;
