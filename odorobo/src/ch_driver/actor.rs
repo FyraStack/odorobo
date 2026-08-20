@@ -201,8 +201,12 @@ impl Actor for VMActor {
 
     #[tracing::instrument(skip_all)]
     async fn on_start((vmid, vm_config): Self::Args, actor_ref: ActorRef<Self>) -> Result<Self> {
+        let boot = vm_config
+            .as_ref()
+            .is_some_and(|manifest| manifest.desired.boot.start);
         let vm_config_for_ch = vm_config.as_ref().map(to_vm_config).transpose()?;
-        let mut vminstance = VMInstance::spawn(&vmid.to_string(), vm_config_for_ch, None).await?;
+        let mut vminstance =
+            VMInstance::spawn(&vmid.to_string(), vm_config_for_ch, boot, None).await?;
 
         let console = Console::default();
         // A migration receiver has no config yet; its serial socket is created

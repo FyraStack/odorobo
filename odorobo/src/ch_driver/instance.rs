@@ -376,6 +376,7 @@ impl VMInstance {
     pub async fn spawn(
         id: &str,
         vm_config: Option<VmConfig>,
+        boot: bool,
         transformer: Option<TransformChain>,
     ) -> Result<Self> {
         let ch_socket_path = Self::runtime_dir_for(id).join(SOCKET_FILE_NAME);
@@ -397,7 +398,7 @@ impl VMInstance {
                 info!(vm_id = id, "CH socket available");
                 if let Some(vm_config) = vm_config {
                     info!(?vm_config, "Creating VM config and booting");
-                    instance.create_config(vm_config, true).await?;
+                    instance.create_config(vm_config, boot).await?;
                 }
                 return Ok(instance);
             }

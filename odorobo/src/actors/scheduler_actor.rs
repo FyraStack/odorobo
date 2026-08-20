@@ -641,8 +641,7 @@ impl SchedulerActor {
 
                 let follows_rule = evaluate_affinity_rule(&metadata_tables, rule);
 
-                let Some(affinity_delta) = affinity_delta(rule.strictness.clone(), follows_rule)
-                else {
+                let Some(affinity_delta) = affinity_delta(&rule.strictness, follows_rule) else {
                     return AgentScore::REJECTED;
                 };
                 score.affinity = score.affinity.saturating_add(affinity_delta);
@@ -706,12 +705,12 @@ fn pending_resources_for_agent(
         .unwrap_or_default()
 }
 
-fn affinity_delta(strictness: AffinityStrictness, follows_rule: bool) -> Option<i64> {
+fn affinity_delta(strictness: &AffinityStrictness, follows_rule: bool) -> Option<i64> {
     match strictness {
         AffinityStrictness::Required if !follows_rule => None,
         AffinityStrictness::Required => Some(0),
         AffinityStrictness::Preferred { weight } => {
-            Some(i64::from(follows_rule).saturating_mul(weight))
+            Some(i64::from(follows_rule).saturating_mul(*weight))
         }
     }
 }
@@ -1110,14 +1109,14 @@ mod tests {
 
     #[test]
     fn evaluates_required_preferred_and_capacity_rules() {
-        assert_eq!(affinity_delta(AffinityStrictness::Required, true), Some(0));
-        assert_eq!(affinity_delta(AffinityStrictness::Required, false), None);
+        assert_eq!(affinity_delta(&AffinityStrictness::Required, true), Some(0));
+        assert_eq!(affinity_delta(&AffinityStrictness::Required, false), None);
         assert_eq!(
-            affinity_delta(AffinityStrictness::Preferred { weight: 7 }, true),
+            affinity_delta(&AffinityStrictness::Preferred { weight: 7 }, true),
             Some(7)
         );
         assert_eq!(
-            affinity_delta(AffinityStrictness::Preferred { weight: 7 }, false),
+            affinity_delta(&AffinityStrictness::Preferred { weight: 7 }, false),
             Some(0)
         );
         assert!(has_capacity(8, 2, 2, 16, 4, 4));

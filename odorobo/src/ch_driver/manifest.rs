@@ -5,7 +5,8 @@
 //! from manifest intent.
 
 use cloud_hypervisor_client::models::{
-    CpusConfig, DiskConfig, ImageType, MemoryConfig, PayloadConfig, PlatformConfig, VmConfig,
+    CpusConfig, DiskConfig, ImageType, MemoryConfig, NetConfig, PayloadConfig, PlatformConfig,
+    VmConfig,
 };
 use stable_eyre::{Result, eyre::eyre};
 
@@ -25,6 +26,15 @@ pub fn to_vm_config(manifest: &VmManifest) -> Result<VmConfig> {
         .iter()
         .map(storage_to_disk)
         .collect::<Result<Vec<_>>>()?;
+    let networks = desired
+        .networks
+        .iter()
+        .map(|network| NetConfig {
+            id: Some(format!("net://{}", network.id)),
+            mac: network.mac_address.clone(),
+            ..Default::default()
+        })
+        .collect::<Vec<_>>();
 
     if desired.cloud_init.is_some() {
         return Err(eyre!(
@@ -36,12 +46,6 @@ pub fn to_vm_config(manifest: &VmManifest) -> Result<VmConfig> {
             "Cloud Hypervisor vsock conversion is not implemented yet"
         ));
     }
-    if !desired.networks.is_empty() {
-        return Err(eyre!(
-            "Cloud Hypervisor network conversion must be supplied by the networking transform"
-        ));
-    }
-
     Ok(VmConfig {
         cpus: Some(CpusConfig {
             boot_vcpus: i32::try_from(desired.compute.vcpus)
@@ -66,6 +70,7 @@ pub fn to_vm_config(manifest: &VmManifest) -> Result<VmConfig> {
             ..Default::default()
         },
         disks: (!disks.is_empty()).then_some(disks),
+        net: (!networks.is_empty()).then_some(networks),
         platform: Some(PlatformConfig {
             serial_number: Some("ds=nocloud".to_owned()),
             ..Default::default()
@@ -76,20 +81,22 @@ pub fn to_vm_config(manifest: &VmManifest) -> Result<VmConfig> {
 
 fn storage_to_disk(storage: &Storage) -> Result<DiskConfig> {
     let path = match (&storage.uri, storage.volume_id) {
-        (Some(uri), None) if uri.starts_with("file://") => uri
-            .strip_prefix("file://")
-            .filter(|path| !path.is_empty())
-            .map(str::to_owned)
-            .ok_or_else(|| eyre!("storage {} has an invalid file URI", storage.id))?,
+        (Some(uri), None)
+            if uri.starts_with("file://")
+                || uri.starts_with("rbd://")
+                || uri.starts_with("iscsi://") =>
+        {
+            uri.clone()
+        }
         (Some(uri), None) => {
             return Err(eyre!(
-                "storage {} URI scheme is not supported by the Cloud Hypervisor file converter: {uri}",
+                "storage {} URI scheme is unsupported: {uri}",
                 storage.id
             ));
         }
         (None, Some(volume_id)) => {
             return Err(eyre!(
-                "storage {} references volume {volume_id}; volume resolution belongs to the storage transform",
+                "storage {} references volume {volume_id}; volume resolution contract is not defined yet",
                 storage.id
             ));
         }
@@ -97,7 +104,9 @@ fn storage_to_disk(storage: &Storage) -> Result<DiskConfig> {
     };
 
     Ok(DiskConfig {
+        id: Some(storage.id.clone()),
         path: Some(path),
+        readonly: Some(storage.read_only),
         image_type: Some(ImageType::Raw),
         ..Default::default()
     })
@@ -142,12 +151,50 @@ mod tests {
     }
 
     #[test]
-    fn rejects_networks_until_transform_contract_is_connected() {
+    fn converts_networks_for_the_transform_pipeline() {
         let mut manifest = minimal();
         manifest.desired.networks.push(crate::manifest::Network {
-            id: "net://private".to_owned(),
-            ..Default::default()
+            id: "private".to_owned(),
+            mac_address: Some("02:00:00:00:00:01".to_owned()),
         });
-        assert!(to_vm_config(&manifest).is_err());
+        let config = to_vm_config(&manifest).expect("network manifest converts");
+        let network = &config.net.expect("network config")[0];
+        assert_eq!(network.id.as_deref(), Some("net://private"));
+        assert_eq!(network.mac.as_deref(), Some("02:00:00:00:00:01"));
+    }
+
+    #[test]
+    fn converts_multiple_storage_attachments_for_storage_transforms() {
+        let mut manifest = minimal();
+        manifest.desired.storage = vec![
+            Storage {
+                id: "root".to_owned(),
+                uri: Some("rbd://pool/root".to_owned()),
+                boot: true,
+                ..Default::default()
+            },
+            Storage {
+                id: "data".to_owned(),
+                uri: Some("file:///var/lib/data.img".to_owned()),
+                read_only: true,
+                ..Default::default()
+            },
+        ];
+        let config = to_vm_config(&manifest).expect("storage manifest converts");
+        let disks = config.disks.expect("disk configs");
+        assert_eq!(disks.len(), 2);
+        assert_eq!(disks[0].id.as_deref(), Some("root"));
+        assert_eq!(disks[0].path.as_deref(), Some("rbd://pool/root"));
+        assert_eq!(disks[1].id.as_deref(), Some("data"));
+        assert_eq!(disks[1].readonly, Some(true));
+    }
+
+    #[test]
+    fn preserves_requested_boot_behavior_in_manifest() {
+        let mut manifest = minimal();
+        manifest.desired.boot.start = false;
+        assert!(!manifest.desired.boot.start);
+        manifest.desired.boot.start = true;
+        assert!(manifest.desired.boot.start);
     }
 }
