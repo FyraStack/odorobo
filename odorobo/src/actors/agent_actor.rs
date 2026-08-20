@@ -364,7 +364,11 @@ impl Message<GetAgentStatus> for AgentActor {
             hostname: self.config.get_hostname().to_owned(),
             vcpus: self.vcpus,
             ram: self.memory,
-            vms: self.vms.keys().copied().collect(),
+            vms: {
+                let mut vms: Vec<_> = self.vms.keys().copied().collect();
+                vms.sort_unstable();
+                vms
+            },
             used_vcpus,
             used_ram,
             metadata: self.metadata.clone(),
@@ -383,8 +387,8 @@ impl Message<GetAgentStatus> for AgentActor {
             };
         }
 
-        let mut added = Vec::new();
-        let mut removed = Vec::new();
+        let mut added = Vec::with_capacity(self.status_history.len());
+        let mut removed = Vec::with_capacity(self.status_history.len());
         for change in self
             .status_history
             .iter()

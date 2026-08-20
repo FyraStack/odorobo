@@ -69,8 +69,17 @@ pub fn apply_status_update(status: &mut AgentStatus, update: AgentStatusUpdate) 
             used_vcpus,
             used_ram,
         } => {
-            status.vms.retain(|vmid| !removed.contains(vmid));
-            status.vms.extend(added);
+            for vmid in removed {
+                if let Ok(index) = status.vms.binary_search(&vmid) {
+                    status.vms.remove(index);
+                }
+            }
+            for vmid in added {
+                match status.vms.binary_search(&vmid) {
+                    Ok(_) => {}
+                    Err(index) => status.vms.insert(index, vmid),
+                }
+            }
             status.used_vcpus = used_vcpus;
             status.used_ram = used_ram;
             revision

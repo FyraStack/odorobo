@@ -122,6 +122,8 @@ pub struct SchedulerActor {
     /// this is a vec because a vmid/ulid can be scheduled on multiple boxes simultaneously during migration
     pub vm_data_cache: AHashMap<Ulid, Vec<CachedVMActor>>,
     pub vm_keepalive_tasks: AHashMap<ActorId, JoinHandle<()>>,
+    pending_resources_cache: Option<AHashMap<ActorId, (u32, u64)>>,
+    agent_vm_index: AHashMap<ActorId, AHashSet<Ulid>>,
     actor_kinds: AHashMap<ActorId, CachedActorKind>,
 
     pub cache_actor_finder: Option<JoinHandle<()>>,
@@ -189,11 +191,20 @@ impl SchedulerActor {
     /// avoiding a temporary hash table on every affinity evaluation.
     fn placement_vm_ids(
         placements: &AHashMap<Ulid, Vec<VmPlacement>>,
+        indexed: Option<&AHashSet<Ulid>>,
         agent_id: ActorId,
         observed: &[Ulid],
     ) -> Vec<Ulid> {
-        let mut vmids = Vec::with_capacity(observed.len());
+        let indexed_len = indexed.map_or(0, |index| index.len());
+        let mut vmids = Vec::with_capacity(observed.len().max(indexed_len));
         vmids.extend_from_slice(observed);
+        if let Some(indexed) = indexed {
+            for vmid in indexed {
+                if !vmids.contains(vmid) {
+                    vmids.push(*vmid);
+                }
+            }
+        }
         for vmid in placements.iter().filter_map(|(vmid, entries)| {
             entries
                 .iter()
@@ -282,6 +293,8 @@ impl SchedulerActor {
             keepalive_task.abort();
         }
         self.agent_data_cache.remove(&actor_id);
+        self.agent_vm_index.remove(&actor_id);
+        self.invalidate_pending_resources();
         Self::remove_agent_placements(
             actor_id,
             &mut self.vm_manifests,
@@ -296,6 +309,7 @@ impl SchedulerActor {
             keepalive_task.abort();
         }
         let vmid = self.vm_actorid_ulid_map.remove(&actor_id);
+        self.invalidate_pending_resources();
         Self::remove_vm_actor(actor_id, &mut self.vm_data_cache);
         if let Some(vmid) = vmid
             && self
@@ -599,13 +613,33 @@ impl SchedulerActor {
     ///  - the cache likely needs to be updated automatically when a new vm is scheduled for info like used resources, because otherwise we have to deal with latency on that data we are using
     ///    and then if someone tries to schedule lets say 10 VMs in a batch, we could end up scheduling them all to the same agent because the metadata hasn't updated.
     ///    - there are a few solutions for this but they all kinda suck, mostly due to also making sure we deal with latency properly. I am ignoring the issue for now.
-    fn schedule_agent(&self, msg: &CreateVM) -> Result<RemoteActorRef<AgentActor>, Report> {
-        let pending_resources = pending_resources_by_agent(&self.vm_manifests, &self.vm_placements);
+    fn pending_resources(&mut self) -> &AHashMap<ActorId, (u32, u64)> {
+        if self.pending_resources_cache.is_none() {
+            self.pending_resources_cache = Some(pending_resources_by_agent(
+                &self.vm_manifests,
+                &self.vm_placements,
+            ));
+        }
+        self.pending_resources_cache
+            .as_ref()
+            .expect("pending resources cache was just initialized")
+    }
+
+    fn invalidate_pending_resources(&mut self) {
+        self.pending_resources_cache = None;
+    }
+
+    fn schedule_agent(&mut self, msg: &CreateVM) -> Result<RemoteActorRef<AgentActor>, Report> {
+        self.pending_resources();
+        let pending_resources = self
+            .pending_resources_cache
+            .as_ref()
+            .expect("pending resources cache was just initialized");
         let mut best_agent = None;
         let mut best_score = AgentScore::REJECTED;
 
         for agent in self.agent_data_cache.values() {
-            let score = self.score_agent(msg, agent, &pending_resources);
+            let score = self.score_agent(msg, agent, pending_resources);
 
             if score > best_score {
                 best_agent = Some(agent.actor_ref.clone());
@@ -616,6 +650,32 @@ impl SchedulerActor {
         info!(?best_score, ?best_agent, "best agent");
 
         best_agent.ok_or_eyre("No valid agents found.")
+    }
+
+    #[expect(dead_code, reason = "reserved for a future batch create message")]
+    fn schedule_agents(
+        &mut self,
+        msgs: &[CreateVM],
+    ) -> Vec<Result<RemoteActorRef<AgentActor>, Report>> {
+        self.pending_resources();
+        let pending_resources = self
+            .pending_resources_cache
+            .as_ref()
+            .expect("pending resources cache was just initialized");
+        msgs.iter()
+            .map(|msg| {
+                let mut best_agent = None;
+                let mut best_score = AgentScore::REJECTED;
+                for agent in self.agent_data_cache.values() {
+                    let score = self.score_agent(msg, agent, pending_resources);
+                    if score > best_score {
+                        best_agent = Some(agent.actor_ref.clone());
+                        best_score = score;
+                    }
+                }
+                best_agent.ok_or_eyre("No valid agents found.")
+            })
+            .collect()
     }
 
     // this function intentionally only checks against the cache. this has some positives and negatives:
@@ -692,6 +752,7 @@ impl SchedulerActor {
                         metadata_tables.extend(
                             Self::placement_vm_ids(
                                 &self.vm_placements,
+                                self.agent_vm_index.get(&agent.actor_ref.id()),
                                 agent.actor_ref.id(),
                                 &agent.data.vms,
                             )
@@ -1079,6 +1140,8 @@ mod tests {
             )]),
             vm_data_cache: AHashMap::from([(vmid, vec![CachedVMActor { actor_ref: None }])]),
             vm_keepalive_tasks: AHashMap::new(),
+            pending_resources_cache: None,
+            agent_vm_index: AHashMap::new(),
             actor_kinds: AHashMap::from([(agent_id, CachedActorKind::Agent)]),
             cache_actor_finder: None,
         };
@@ -1104,6 +1167,8 @@ mod tests {
             vm_placements: AHashMap::new(),
             vm_data_cache: AHashMap::from([(vmid, vec![CachedVMActor { actor_ref: None }])]),
             vm_keepalive_tasks: AHashMap::new(),
+            pending_resources_cache: None,
+            agent_vm_index: AHashMap::new(),
             actor_kinds: AHashMap::from([(agent_id, CachedActorKind::Agent)]),
             cache_actor_finder: None,
         };
@@ -1267,6 +1332,8 @@ impl Actor for SchedulerActor {
             vm_placements: AHashMap::new(),
             vm_data_cache: AHashMap::new(),
             vm_keepalive_tasks: AHashMap::new(),
+            pending_resources_cache: None,
+            agent_vm_index: AHashMap::new(),
             actor_kinds: AHashMap::new(),
             cache_actor_finder: None,
         };
@@ -1405,12 +1472,16 @@ impl Message<AgentUpdated> for SchedulerActor {
     async fn handle(&mut self, msg: AgentUpdated, _ctx: &mut Context<Self, Self::Reply>) {
         let Some(cached) = self.agent_data_cache.get_mut(&msg.actor_id) else {
             if let AgentStatusUpdate::Full { revision, status } = msg.update {
+                self.agent_vm_index
+                    .insert(msg.actor_id, status.vms.iter().copied().collect());
+                self.invalidate_pending_resources();
                 Self::reconcile_agent_placements(
                     msg.actor_id,
                     &status,
                     &self.vm_manifests,
                     &mut self.vm_placements,
                 );
+                self.invalidate_pending_resources();
                 self.agent_data_cache.insert(
                     msg.actor_id,
                     CachedAgentActor {
@@ -1435,6 +1506,16 @@ impl Message<AgentUpdated> for SchedulerActor {
             let removed = removed.clone();
             cached.status_revision = apply_status_update(&mut cached.data, msg.update);
             cached.actor_ref = msg.actor_ref;
+            self.agent_vm_index
+                .entry(msg.actor_id)
+                .or_default()
+                .extend(added.iter().copied());
+            if let Some(index) = self.agent_vm_index.get_mut(&msg.actor_id) {
+                for vmid in &removed {
+                    index.remove(vmid);
+                }
+            }
+            self.invalidate_pending_resources();
             Self::reconcile_agent_delta(
                 msg.actor_id,
                 &added,
@@ -1445,12 +1526,15 @@ impl Message<AgentUpdated> for SchedulerActor {
         } else {
             cached.status_revision = apply_status_update(&mut cached.data, msg.update);
             cached.actor_ref = msg.actor_ref;
+            self.agent_vm_index
+                .insert(msg.actor_id, cached.data.vms.iter().copied().collect());
             Self::reconcile_agent_placements(
                 msg.actor_id,
                 &cached.data,
                 &self.vm_manifests,
                 &mut self.vm_placements,
             );
+            self.invalidate_pending_resources();
         }
     }
 }
@@ -1480,6 +1564,7 @@ impl Message<ReconcileVmPlacements> for SchedulerActor {
             &mut self.vm_placements,
             &mut self.vm_data_cache,
         );
+        self.invalidate_pending_resources();
     }
 }
 
@@ -1494,6 +1579,7 @@ impl Message<CreateVM> for SchedulerActor {
         let target_agent = self.schedule_agent(&msg)?;
 
         self.vm_manifests.insert(msg.vmid, msg.config.clone());
+        self.invalidate_pending_resources();
         self.vm_placements
             .entry(msg.vmid)
             .or_default()

@@ -13,7 +13,11 @@ fn status(vm_count: usize) -> AgentStatus {
         ram: ByteSize::gb(256),
         used_vcpus: u32::try_from(vm_count).expect("benchmark VM count fits in u32"),
         used_ram: ByteSize::gb(vm_count as u64),
-        vms: (0..vm_count).map(|_| Ulid::generate()).collect(),
+        vms: {
+            let mut vms: Vec<_> = (0..vm_count).map(|_| Ulid::generate()).collect();
+            vms.sort_unstable();
+            vms
+        },
         metadata: ObjectMetadata::default(),
     }
 }
