@@ -1,12 +1,18 @@
 use bytesize::ByteSize;
 use kameo::Reply;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
+
 use ulid::Ulid;
 
 use crate::types::ObjectMetadata;
 
-#[derive(Serialize, Deserialize)]
-pub struct GetAgentStatus;
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+pub struct GetAgentStatus {
+    /// Membership revision already applied by the caller. Revision zero requests
+    /// a full snapshot; stale revisions are also answered with a full snapshot.
+    pub since_revision: u64,
+}
 
 #[derive(Serialize, Deserialize, Reply, Debug, Clone)]
 pub struct AgentStatus {
@@ -19,4 +25,55 @@ pub struct AgentStatus {
     pub used_ram: ByteSize,
     pub vms: Vec<Ulid>,
     pub metadata: ObjectMetadata,
+}
+
+#[derive(Serialize, Deserialize, Reply, Debug, Clone)]
+pub enum AgentStatusUpdate {
+    Full {
+        revision: u64,
+        status: AgentStatus,
+    },
+    Delta {
+        revision: u64,
+        added: Vec<Ulid>,
+        removed: Vec<Ulid>,
+        used_vcpus: u32,
+        used_ram: ByteSize,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct MembershipChange {
+    pub revision: u64,
+    pub vmid: Ulid,
+    pub added: bool,
+}
+
+pub const STATUS_CHANGE_HISTORY_LIMIT: usize = 256;
+
+pub type StatusChangeHistory = VecDeque<MembershipChange>;
+
+pub fn apply_status_update(status: &mut AgentStatus, update: AgentStatusUpdate) -> u64 {
+    match update {
+        AgentStatusUpdate::Full {
+            revision,
+            status: next,
+        } => {
+            *status = next;
+            revision
+        }
+        AgentStatusUpdate::Delta {
+            revision,
+            added,
+            removed,
+            used_vcpus,
+            used_ram,
+        } => {
+            status.vms.retain(|vmid| !removed.contains(vmid));
+            status.vms.extend(added);
+            status.used_vcpus = used_vcpus;
+            status.used_ram = used_ram;
+            revision
+        }
+    }
 }

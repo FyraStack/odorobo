@@ -9,7 +9,7 @@ use crate::ch_driver::actor::VMActor;
 use crate::manifest::{
     AffinityRequirement, AffinityStrictness, AffinityType, MetadataTable, Operator, VmManifest,
 };
-use crate::messages::agent::{AgentStatus, GetAgentStatus};
+use crate::messages::agent::{AgentStatus, AgentStatusUpdate, GetAgentStatus, apply_status_update};
 use crate::messages::vm::{
     AgentListVMs, AgentListVMsReply, CreateVM, CreateVMReply, DeleteVM, DeleteVMReply,
     GetConsoleHistory, GetConsoleHistoryReply, GetVMHeartbeat, GetVMInfo, GetVMInfoReply,
@@ -60,7 +60,7 @@ struct VmUpdaterStopped {
 struct AgentUpdated {
     actor_id: ActorId,
     actor_ref: RemoteActorRef<AgentActor>,
-    data: AgentStatus,
+    update: AgentStatusUpdate,
 }
 
 #[derive(Debug)]
@@ -75,6 +75,7 @@ struct ReconcileVmPlacements;
 pub struct CachedAgentActor {
     pub actor_ref: RemoteActorRef<AgentActor>,
     pub data: AgentStatus,
+    pub status_revision: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -469,14 +470,24 @@ impl SchedulerActor {
 
     async fn agent_updater_task(scheduler: ActorRef<Self>, actor_ref: RemoteActorRef<AgentActor>) {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
+        let mut status_revision = 0;
         let mut fails: u8 = 0;
         loop {
-            if let Ok(data) = actor_ref.ask(&GetAgentStatus).await {
+            if let Ok(update) = actor_ref
+                .ask(&GetAgentStatus {
+                    since_revision: status_revision,
+                })
+                .await
+            {
+                status_revision = match &update {
+                    AgentStatusUpdate::Full { revision, .. }
+                    | AgentStatusUpdate::Delta { revision, .. } => *revision,
+                };
                 let send_result = scheduler
                     .tell(AgentUpdated {
                         actor_id: actor_ref.id(),
                         actor_ref: actor_ref.clone(),
-                        data,
+                        update,
                     })
                     .send()
                     .await
@@ -1352,18 +1363,40 @@ impl Message<AgentUpdated> for SchedulerActor {
     type Reply = ();
 
     async fn handle(&mut self, msg: AgentUpdated, _ctx: &mut Context<Self, Self::Reply>) {
+        let Some(cached) = self.agent_data_cache.get_mut(&msg.actor_id) else {
+            if let AgentStatusUpdate::Full { revision, status } = msg.update {
+                Self::reconcile_agent_placements(
+                    msg.actor_id,
+                    &status,
+                    &self.vm_manifests,
+                    &mut self.vm_placements,
+                );
+                self.agent_data_cache.insert(
+                    msg.actor_id,
+                    CachedAgentActor {
+                        actor_ref: msg.actor_ref,
+                        data: status,
+                        status_revision: revision,
+                    },
+                );
+            }
+            return;
+        };
+
+        let revision = match &msg.update {
+            AgentStatusUpdate::Full { revision, .. }
+            | AgentStatusUpdate::Delta { revision, .. } => *revision,
+        };
+        if revision <= cached.status_revision {
+            return;
+        }
+        cached.status_revision = apply_status_update(&mut cached.data, msg.update);
+        cached.actor_ref = msg.actor_ref;
         Self::reconcile_agent_placements(
             msg.actor_id,
-            &msg.data,
+            &cached.data,
             &self.vm_manifests,
             &mut self.vm_placements,
-        );
-        self.agent_data_cache.insert(
-            msg.actor_id,
-            CachedAgentActor {
-                actor_ref: msg.actor_ref,
-                data: msg.data,
-            },
         );
     }
 }

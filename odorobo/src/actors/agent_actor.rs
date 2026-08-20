@@ -3,7 +3,10 @@ use crate::{
     config::Config,
     messages::{
         Ping, Pong,
-        agent::{AgentStatus, GetAgentStatus},
+        agent::{
+            AgentStatus, AgentStatusUpdate, GetAgentStatus, MembershipChange,
+            STATUS_CHANGE_HISTORY_LIMIT, StatusChangeHistory,
+        },
         debug::PanicAgent,
         vm::{
             AgentListVMs, AgentListVMsReply, CreateVM, CreateVMReply, DeleteVM, DeleteVMReply,
@@ -38,6 +41,8 @@ pub struct AgentActor {
     pub memory: ByteSize,
     used_vcpus: u32,
     used_memory_bytes: u64,
+    membership_revision: u64,
+    status_history: StatusChangeHistory,
     pub config: Config,
     pub vms: AHashMap<Ulid, VMCacheData>,
     // pub network_actor: ActorRef<NetworkAgentActor>,
@@ -45,12 +50,26 @@ pub struct AgentActor {
 }
 
 impl AgentActor {
+    fn record_membership_change(&mut self, vmid: Ulid, added: bool) {
+        self.membership_revision = self.membership_revision.saturating_add(1);
+        self.status_history.push_back(MembershipChange {
+            revision: self.membership_revision,
+            vmid,
+            added,
+        });
+        while self.status_history.len() > STATUS_CHANGE_HISTORY_LIMIT {
+            self.status_history.pop_front();
+        }
+    }
+
     fn insert_vm(&mut self, vmid: Ulid, cache: VMCacheData) {
         let vcpus = cache.vcpus;
         let memory_bytes = cache.memory_bytes;
         if let Some(previous) = self.vms.insert(vmid, cache) {
             self.used_vcpus = self.used_vcpus.saturating_sub(previous.vcpus);
             self.used_memory_bytes = self.used_memory_bytes.saturating_sub(previous.memory_bytes);
+        } else {
+            self.record_membership_change(vmid, true);
         }
         self.used_vcpus = self.used_vcpus.saturating_add(vcpus);
         self.used_memory_bytes = self.used_memory_bytes.saturating_add(memory_bytes);
@@ -58,6 +77,7 @@ impl AgentActor {
 
     fn remove_vm(&mut self, vmid: Ulid) -> Option<VMCacheData> {
         let removed = self.vms.remove(&vmid)?;
+        self.record_membership_change(vmid, false);
         self.used_vcpus = self.used_vcpus.saturating_sub(removed.vcpus);
         self.used_memory_bytes = self.used_memory_bytes.saturating_sub(removed.memory_bytes);
         Some(removed)
@@ -95,6 +115,8 @@ impl Actor for AgentActor {
             vms: AHashMap::new(),
             used_vcpus: 0,
             used_memory_bytes: 0,
+            membership_revision: 0,
+            status_history: StatusChangeHistory::new(),
             metadata: ObjectMetadata::default(),
         })
     }
@@ -327,23 +349,59 @@ impl Message<PanicAgent> for AgentActor {
 #[remote_message]
 #[allow(clippy::unused_async_trait_impl)]
 impl Message<GetAgentStatus> for AgentActor {
-    type Reply = AgentStatus;
+    type Reply = AgentStatusUpdate;
 
     async fn handle(
         &mut self,
-        _msg: GetAgentStatus,
+        msg: GetAgentStatus,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        AgentStatus {
+        let used_vcpus = self
+            .used_vcpus
+            .saturating_add(self.config.get_reserved_vcpus());
+        let used_ram = ByteSize::b(self.used_memory_bytes);
+        let full_status = || AgentStatus {
             hostname: self.config.get_hostname().to_owned(),
             vcpus: self.vcpus,
             ram: self.memory,
             vms: self.vms.keys().copied().collect(),
-            used_vcpus: self
-                .used_vcpus
-                .saturating_add(self.config.get_reserved_vcpus()),
-            used_ram: ByteSize::b(self.used_memory_bytes),
+            used_vcpus,
+            used_ram,
             metadata: self.metadata.clone(),
+        };
+
+        if msg.since_revision == 0
+            || msg.since_revision > self.membership_revision
+            || self
+                .status_history
+                .front()
+                .is_some_and(|change| msg.since_revision.saturating_add(1) < change.revision)
+        {
+            return AgentStatusUpdate::Full {
+                revision: self.membership_revision,
+                status: full_status(),
+            };
+        }
+
+        let mut added = Vec::new();
+        let mut removed = Vec::new();
+        for change in self
+            .status_history
+            .iter()
+            .filter(|change| change.revision > msg.since_revision)
+        {
+            if change.added {
+                added.push(change.vmid);
+            } else {
+                removed.push(change.vmid);
+            }
+        }
+        AgentStatusUpdate::Delta {
+            revision: self.membership_revision,
+            added,
+            removed,
+            used_vcpus,
+            used_ram,
         }
     }
 }
