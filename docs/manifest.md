@@ -60,7 +60,8 @@ non-zero vCPUs and memory, and satisfy these relationships:
 - Every storage attachment must have a non-empty ID and exactly one usable source (URI or volume reference), and
   a boot storage attachment cannot be read-only. At most one storage attachment may be marked as boot.
 - Affinity requirements within a rule are OR-ed; rules are combined according to
-  their strictness and direction.
+  their strictness and direction. `lt` and `gt` comparisons require exactly one
+  finite numeric value.
 - Every network must have a non-empty, non-whitespace ID.
 - Cloud-init must provide non-empty configuration with user-data and meta-data
   supplied together.
