@@ -370,25 +370,37 @@ impl Message<MigrateVMReceive> for VMActor {
         if let Some(migration_state) = &self.migration_state {
             return MigrateVMReceiveReply {
                 listening_address: migration_state.listening_address.clone(),
+                error: None,
             };
         }
 
         let prep_config = msg.config.clone();
 
-        // Start receiving migration on the destination VM (this actor)
-        // todo: handle unwrap properly
-        let (listening_address, migration_task) = self
-            .vm_instance
-            .receive_migration()
-            .await
-            .expect("sending migration request failed");
+        let config = match to_vm_config(&msg.config) {
+            Ok(config) => config,
+            Err(error) => {
+                return MigrateVMReceiveReply {
+                    listening_address: String::new(),
+                    error: Some(error.to_string()),
+                };
+            }
+        };
 
-        // create ongoing migration state
+        // Start receiving migration on the destination VM (this actor).
+        let (listening_address, migration_task) = match self.vm_instance.receive_migration().await {
+            Ok(result) => result,
+            Err(error) => {
+                return MigrateVMReceiveReply {
+                    listening_address: String::new(),
+                    error: Some(error.to_string()),
+                };
+            }
+        };
+
         self.migration_state = Some(MigrationState {
             migration_task: Some(migration_task),
             listening_address: listening_address.clone(),
-            config: to_vm_config(&msg.config)
-                .expect("migration manifest must convert to Cloud Hypervisor config"),
+            config,
         });
 
         let console = self.console.clone();
@@ -444,7 +456,10 @@ impl Message<MigrateVMReceive> for VMActor {
             }
         }
 
-        MigrateVMReceiveReply { listening_address }
+        MigrateVMReceiveReply {
+            listening_address,
+            error: None,
+        }
     }
 }
 
@@ -478,9 +493,16 @@ impl Message<PrepMigration> for VMActor {
     ) -> Self::Reply {
         info!(vmid = %self.vmid, "PrepMigration handler invoked");
         // todo: prepare devices, volumes, and apply migrated config
-        let config = to_vm_config(&msg.config)
-            .expect("migration manifest must convert to Cloud Hypervisor config");
-        self.vm_instance.prep_config(config).await.unwrap();
+        let config = match to_vm_config(&msg.config) {
+            Ok(config) => config,
+            Err(error) => {
+                error!(?error, "failed to convert migration manifest");
+                return;
+            }
+        };
+        if let Err(error) = self.vm_instance.prep_config(config).await {
+            error!(?error, "failed to prepare migrated VM configuration");
+        }
     }
 }
 

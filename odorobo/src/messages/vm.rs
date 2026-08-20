@@ -58,6 +58,7 @@ pub struct PrepMigration {
 #[derive(Serialize, Deserialize, Debug, Clone, Reply)]
 pub struct MigrateVMReceiveReply {
     pub listening_address: String,
+    pub error: Option<String>,
 }
 
 /// Message to delete a VM

@@ -6,7 +6,7 @@
 
 use cloud_hypervisor_client::models::{
     CpusConfig, DiskConfig, ImageType, MemoryConfig, NetConfig, PayloadConfig, PlatformConfig,
-    VmConfig,
+    VmConfig, VsockConfig,
 };
 use stable_eyre::{Result, eyre::eyre};
 
@@ -41,11 +41,13 @@ pub fn to_vm_config(manifest: &VmManifest) -> Result<VmConfig> {
             "Cloud Hypervisor cloud-init conversion is not implemented yet"
         ));
     }
-    if desired.vsock.is_some() {
-        return Err(eyre!(
-            "Cloud Hypervisor vsock conversion is not implemented yet"
-        ));
-    }
+    let vsock = desired.vsock.as_ref().map(|vsock| VsockConfig {
+        cid: i64::from(vsock.guest_cid),
+        socket: vsock.socket.clone(),
+        id: Some("odorobo-vsock".to_owned()),
+        ..Default::default()
+    });
+
     Ok(VmConfig {
         cpus: Some(CpusConfig {
             boot_vcpus: i32::try_from(desired.compute.vcpus)
@@ -71,6 +73,7 @@ pub fn to_vm_config(manifest: &VmManifest) -> Result<VmConfig> {
         },
         disks: (!disks.is_empty()).then_some(disks),
         net: (!networks.is_empty()).then_some(networks),
+        vsock,
         platform: Some(PlatformConfig {
             serial_number: Some("ds=nocloud".to_owned()),
             ..Default::default()
@@ -190,11 +193,27 @@ mod tests {
     }
 
     #[test]
-    fn preserves_requested_boot_behavior_in_manifest() {
+    fn converts_vsock_configuration() {
         let mut manifest = minimal();
-        manifest.desired.boot.start = false;
-        assert!(!manifest.desired.boot.start);
-        manifest.desired.boot.start = true;
-        assert!(manifest.desired.boot.start);
+        manifest.desired.vsock = Some(crate::manifest::Vsock {
+            guest_cid: 42,
+            socket: "/run/odorobo/vsock.sock".to_owned(),
+        });
+        let config = to_vm_config(&manifest).expect("vsock manifest converts");
+        let vsock = config.vsock.expect("vsock config");
+        assert_eq!(vsock.cid, 42);
+        assert_eq!(vsock.socket, "/run/odorobo/vsock.sock");
+        assert_eq!(vsock.id.as_deref(), Some("odorobo-vsock"));
+    }
+
+    #[test]
+    fn rejects_cloud_init_without_a_transport_contract() {
+        let mut manifest = minimal();
+        manifest.desired.cloud_init = Some(crate::manifest::CloudInit {
+            user_data: Some("#cloud-config\n".to_owned()),
+            meta_data: Some("instance-id: test\n".to_owned()),
+        });
+        let error = to_vm_config(&manifest).expect_err("cloud-init transport is not defined");
+        assert!(error.to_string().contains("cloud-init"));
     }
 }
