@@ -28,8 +28,12 @@ Odorobo should provision. It contains:
 - `metadata`: stable name, labels, and annotations.
 - `compute`: boot vCPUs, optional scaling ceiling, and memory in bytes.
 - `storage`: ordered storage attachments. An attachment references either a storage URI or a
-  provisioned volume ID; `boot` identifies the boot attachment.
-- `networks`: stable network IDs and optional guest MAC addresses.
+  provisioned volume ID; `boot` identifies the boot attachment. The control plane owns
+  attachment identity and ordering; the provider driver/storage transform resolves the
+  URI or volume ID to a node-local device path.
+- `networks`: stable network IDs and optional guest MAC addresses. The control plane owns
+  the attachment identity and requested MAC; the provider networking transform resolves
+  the network to a host interface or tap device.
 - `placement`: scheduling hints, including an optional node, required node labels,
   and affinity rules. Affinity rules support required or weighted-preferred
   VM/agent normal or anti-affinity, with OR-ed label/annotation requirements.
@@ -43,13 +47,17 @@ status, the node currently running the VM, the provider's runtime state, and an
 error message when applicable. Cloud Hypervisor configuration and generated
 paths are observed/driver-owned implementation details, not manifest fields.
 
+Providers may reject a valid manifest field when they cannot implement it, but
+must report that explicitly. They must not silently discard storage, network,
+boot, cloud-init, or vsock intent.
+
 ## Validation and evolution
 
 A manifest must use a supported `api_version`, have a non-empty metadata name,
 non-zero vCPUs and memory, and satisfy these relationships:
 
 - `max_vcpus` must be at least `vcpus`.
-- Every storage attachment must have exactly one usable source (URI or volume reference), and
+- Every storage attachment must have a non-empty ID and exactly one usable source (URI or volume reference), and
   a boot storage attachment cannot be read-only. At most one storage attachment may be marked as boot.
 - Affinity requirements within a rule are OR-ed; rules are combined according to
   their strictness and direction.

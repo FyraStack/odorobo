@@ -6,6 +6,7 @@
 
 use std::{collections::BTreeMap, path::Path};
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::Error as DeError};
 use thiserror::Error;
 use ulid::Ulid;
@@ -53,12 +54,13 @@ pub enum ManifestError {
     InvalidVsockSocket,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct VmManifest {
     /// Version of this manifest's serialized contract, not the hypervisor API.
     pub api_version: u32,
     /// Stable identity used to correlate desired state with runtime reports.
+    #[schemars(with = "String")]
     pub id: Ulid,
     /// Control-plane intent that Odorobo should reconcile onto a node.
     pub desired: DesiredState,
@@ -109,7 +111,7 @@ impl VmManifest {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DesiredState {
     pub metadata: Metadata,
@@ -216,7 +218,7 @@ impl DesiredState {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Metadata {
     pub name: String,
@@ -226,7 +228,7 @@ pub struct Metadata {
     pub annotations: BTreeMap<String, String>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Compute {
     pub vcpus: u32,
@@ -235,13 +237,14 @@ pub struct Compute {
     pub memory_bytes: u64,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Storage {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uri: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<String>")]
     pub volume_id: Option<Ulid>,
     #[serde(default)]
     pub boot: bool,
@@ -249,7 +252,7 @@ pub struct Storage {
     pub read_only: bool,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Network {
     pub id: String,
@@ -257,7 +260,7 @@ pub struct Network {
     pub mac_address: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Placement {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -268,7 +271,7 @@ pub struct Placement {
     pub affinity: Vec<AffinityRule>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AffinityRule {
     pub strictness: AffinityStrictness,
@@ -277,28 +280,28 @@ pub struct AffinityRule {
     pub requirements: Vec<AffinityRequirement>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AffinityStrictness {
     Required,
     Preferred { weight: i64 },
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AffinityType {
     VirtualMachine,
     Agent,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AffinityDirection {
     Normal,
     Anti,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AffinityRequirement {
     pub key: String,
@@ -307,14 +310,14 @@ pub struct AffinityRequirement {
     pub values: Vec<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MetadataTable {
     Label,
     Annotation,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Operator {
     In,
@@ -323,7 +326,7 @@ pub enum Operator {
     Gt,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Boot {
     #[serde(default)]
@@ -336,7 +339,7 @@ pub struct Boot {
     pub cmdline: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CloudInit {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -345,14 +348,14 @@ pub struct CloudInit {
     pub meta_data: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Vsock {
     pub guest_cid: u32,
     pub socket: String,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ObservedState {
     /// Odorobo's normalized view of the VM lifecycle.
@@ -370,7 +373,7 @@ pub struct ObservedState {
     pub error: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ObservedStatus {
     #[default]
@@ -422,6 +425,38 @@ mod tests {
     fn minimal_manifest() -> VmManifest {
         serde_json::from_str(include_str!("../../docs/fixtures/manifest/minimal.json"))
             .expect("valid minimal fixture")
+    }
+
+    #[test]
+    fn rejects_unsupported_version_during_validation_and_deserialization() {
+        let mut manifest = minimal_manifest();
+        manifest.api_version = MANIFEST_VERSION + 1;
+        assert_eq!(
+            manifest.validate(),
+            Err(ManifestError::UnsupportedVersion(MANIFEST_VERSION + 1))
+        );
+
+        let json = include_str!("../../docs/fixtures/manifest/minimal.json")
+            .replace("\"api_version\": 1", "\"api_version\": 2");
+        serde_json::from_str::<VmManifest>(&json).expect_err("unsupported version must reject");
+    }
+
+    #[test]
+    fn generated_schema_describes_manifest_shape() {
+        let schema = schemars::schema_for!(VmManifest);
+        let schema = serde_json::to_value(schema).expect("schema is serializable");
+        let properties = schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .expect("manifest schema has properties");
+
+        for field in ["api_version", "id", "desired", "observed"] {
+            assert!(
+                properties.contains_key(field),
+                "missing schema field {field}"
+            );
+        }
+        assert_eq!(properties["id"]["type"], "string");
     }
 
     #[test]
@@ -501,6 +536,19 @@ mod tests {
         assert!(matches!(
             manifest.validate(),
             Err(ManifestError::MultipleBootStorageAttachments)
+        ));
+
+        manifest.desired.storage.clear();
+        manifest.desired.storage.push(Storage {
+            id: "root".to_owned(),
+            uri: Some("file:///disk.img".to_owned()),
+            boot: true,
+            read_only: true,
+            ..Default::default()
+        });
+        assert!(matches!(
+            manifest.validate(),
+            Err(ManifestError::ReadOnlyBootStorage(_))
         ));
     }
 
