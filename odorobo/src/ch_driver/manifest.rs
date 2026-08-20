@@ -14,18 +14,24 @@ use crate::manifest::{Storage, VmManifest};
 
 /// Convert a validated Odorobo manifest to a Cloud Hypervisor configuration.
 ///
-/// Node-local storage and networking are deliberately left to the existing
-/// transform pipeline. This conversion only handles deterministic provider
-/// fields and rejects manifest fields that cannot yet be represented safely.
+/// This is the provider boundary: callers provide only Odorobo intent, while
+/// this module chooses Cloud Hypervisor defaults and emits logical storage and
+/// network references for the node-local transform pipeline to resolve.
+/// Fields without a defined Cloud Hypervisor transport are rejected rather than
+/// silently omitted.
 pub fn to_vm_config(manifest: &VmManifest) -> Result<VmConfig> {
     manifest.validate()?;
 
     let desired = &manifest.desired;
+    // Keep URI-backed disks logical until StorageDriverTransformer resolves them
+    // to node-local paths. This preserves enough source identity for teardown.
     let disks = desired
         .storage
         .iter()
         .map(storage_to_disk)
         .collect::<Result<Vec<_>>>()?;
+    // NetworkTransform recognizes these net:// IDs and assigns deterministic TAP
+    // names without making the provider-neutral manifest host-specific.
     let networks = desired
         .networks
         .iter()
@@ -41,6 +47,8 @@ pub fn to_vm_config(manifest: &VmManifest) -> Result<VmConfig> {
             "Cloud Hypervisor cloud-init conversion is not implemented yet"
         ));
     }
+    // Unlike cloud-init, vsock has a direct Cloud Hypervisor representation, so
+    // the declarative manifest fields can be passed through without a sidecar.
     let vsock = desired.vsock.as_ref().map(|vsock| VsockConfig {
         cid: i64::from(vsock.guest_cid),
         socket: vsock.socket.clone(),
@@ -82,6 +90,9 @@ pub fn to_vm_config(manifest: &VmManifest) -> Result<VmConfig> {
     })
 }
 
+/// Build a logical disk config while retaining the source URI for the storage
+/// transform. Volume IDs are rejected until their resolution contract defines
+/// how an agent obtains a device path.
 fn storage_to_disk(storage: &Storage) -> Result<DiskConfig> {
     let path = match (&storage.uri, storage.volume_id) {
         (Some(uri), None)

@@ -21,8 +21,11 @@ use tokio::{
 };
 use tracing::{debug, error, info, trace, warn};
 
-/// A migration state that holds the listening address and VM config for a migration,
-/// used to pass live migration data between actors.
+/// Cloud Hypervisor-specific state for an in-progress receive migration.
+///
+/// The public migration messages carry `VmManifest`; the translated `VmConfig`
+/// stays private to the CH actor because another backend could use different
+/// migration metadata.
 pub struct MigrationState {
     pub listening_address: String,
     pub config: VmConfig,
@@ -191,16 +194,20 @@ pub struct VMActor {
     pub vm_instance: VMInstance,
     pub migration_state: Option<MigrationState>,
     pub console: Console,
+    /// Desired provider-neutral intent retained for VM info and migration.
+    /// The translated Cloud Hypervisor config lives only in `VMInstance`.
     pub manifest: Option<VmManifest>,
 }
 
 impl Actor for VMActor {
-    // tuple of VM ID and optional provider-neutral manifest
+    // The actor accepts intent; CH conversion happens inside on_start.
     type Args = (ulid::Ulid, Option<VmManifest>);
     type Error = Report;
 
     #[tracing::instrument(skip_all)]
     async fn on_start((vmid, vm_config): Self::Args, actor_ref: ActorRef<Self>) -> Result<Self> {
+        // Boot is manifest intent, not a Cloud Hypervisor default. Preserve it
+        // separately because VMInstance also supports create-without-boot paths.
         let boot = vm_config
             .as_ref()
             .is_some_and(|manifest| manifest.desired.boot.start);
@@ -376,6 +383,8 @@ impl Message<MigrateVMReceive> for VMActor {
 
         let prep_config = msg.config.clone();
 
+        // Translate before opening a receive socket so invalid intent cannot
+        // leave behind a migration listener that can never complete.
         let config = match to_vm_config(&msg.config) {
             Ok(config) => config,
             Err(error) => {
@@ -492,7 +501,9 @@ impl Message<PrepMigration> for VMActor {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         info!(vmid = %self.vmid, "PrepMigration handler invoked");
-        // todo: prepare devices, volumes, and apply migrated config
+        // Preparation is best-effort here because the remote receive operation
+        // has no fallible reply channel; report failures and let migration state
+        // cleanup handle the failed attempt.
         let config = match to_vm_config(&msg.config) {
             Ok(config) => config,
             Err(error) => {

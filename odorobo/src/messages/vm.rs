@@ -12,7 +12,8 @@ use crate::manifest::VmManifest;
 //  additionally, when the VmConfig is created, this determines the MAC address of the server. meaning as soon as we have this info, we need to hit the router via the scheduler, because the router might be slow.
 /// Message to create a new VM
 ///
-/// `VmConfig` is a Cloud Hypervisor VM spec, containing the VM's full configuration (untransformed by odorobo)
+/// The message carries provider-neutral VM intent. The destination agent
+/// translates it into Cloud Hypervisor configuration locally.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CreateVM {
     /// the ULID of the VM to create
@@ -54,10 +55,13 @@ pub struct PrepMigration {
     pub config: VmManifest,
 }
 
-/// Reply to a `MigrateVMReceive` message, containing the listening address of the VM
+/// Reply to a migration receive request. A non-empty `error` means no valid
+/// receive operation was started and `listening_address` is empty.
 #[derive(Serialize, Deserialize, Debug, Clone, Reply)]
 pub struct MigrateVMReceiveReply {
+    /// Address the source should connect to when migration receive started.
     pub listening_address: String,
+    /// Structured operation failure returned without panicking the VM actor.
     pub error: Option<String>,
 }
 
