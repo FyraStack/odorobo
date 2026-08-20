@@ -312,6 +312,46 @@ impl SchedulerActor {
         }
     }
 
+    fn reconcile_agent_delta(
+        agent_id: ActorId,
+        added: &[Ulid],
+        removed: &[Ulid],
+        manifests: &AHashMap<Ulid, VmManifest>,
+        placements: &mut AHashMap<Ulid, Vec<VmPlacement>>,
+    ) {
+        let now = Instant::now();
+        for vmid in added {
+            if !manifests.contains_key(vmid) {
+                continue;
+            }
+            let entries = placements.entry(*vmid).or_default();
+            if let Some(entry) = entries.iter_mut().find(|entry| entry.agent_id == agent_id) {
+                entry.lifecycle = VmLifecycle::Running;
+                entry.last_confirmed_at = Some(now);
+            } else {
+                entries.push(VmPlacement {
+                    agent_id,
+                    lifecycle: VmLifecycle::Running,
+                    created_at: now,
+                    last_confirmed_at: Some(now),
+                });
+            }
+        }
+
+        for vmid in removed {
+            let Some(entries) = placements.get_mut(vmid) else {
+                continue;
+            };
+            entries.retain(|entry| {
+                entry.agent_id != agent_id || entry.lifecycle == VmLifecycle::Pending
+            });
+            Self::shrink_non_migrating_entries(entries);
+            if entries.is_empty() {
+                placements.remove(vmid);
+            }
+        }
+    }
+
     fn reconcile_agent_placements(
         agent_id: ActorId,
         status: &AgentStatus,
@@ -1390,14 +1430,28 @@ impl Message<AgentUpdated> for SchedulerActor {
         if revision <= cached.status_revision {
             return;
         }
-        cached.status_revision = apply_status_update(&mut cached.data, msg.update);
-        cached.actor_ref = msg.actor_ref;
-        Self::reconcile_agent_placements(
-            msg.actor_id,
-            &cached.data,
-            &self.vm_manifests,
-            &mut self.vm_placements,
-        );
+        if let AgentStatusUpdate::Delta { added, removed, .. } = &msg.update {
+            let added = added.clone();
+            let removed = removed.clone();
+            cached.status_revision = apply_status_update(&mut cached.data, msg.update);
+            cached.actor_ref = msg.actor_ref;
+            Self::reconcile_agent_delta(
+                msg.actor_id,
+                &added,
+                &removed,
+                &self.vm_manifests,
+                &mut self.vm_placements,
+            );
+        } else {
+            cached.status_revision = apply_status_update(&mut cached.data, msg.update);
+            cached.actor_ref = msg.actor_ref;
+            Self::reconcile_agent_placements(
+                msg.actor_id,
+                &cached.data,
+                &self.vm_manifests,
+                &mut self.vm_placements,
+            );
+        }
     }
 }
 
