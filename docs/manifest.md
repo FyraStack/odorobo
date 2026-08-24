@@ -36,7 +36,8 @@ Odorobo should provision. It contains:
   the network to a host interface or tap device.
 - `placement`: scheduling hints, including an optional node, required node labels,
   and affinity rules. Affinity rules support required or weighted-preferred
-  VM/agent normal or anti-affinity, with OR-ed label/annotation requirements.
+  VM/agent matching; `inverse` selects anti-affinity, with OR-ed
+  label/annotation requirements.
 - `boot`: whether to start after provisioning and optional firmware/kernel/
   command-line intent.
 - `cloud_init`: paired NoCloud user-data and meta-data.
@@ -60,7 +61,7 @@ non-zero vCPUs and memory, and satisfy these relationships:
 - Every storage attachment must have a non-empty ID and exactly one usable source (URI or volume reference), and
   a boot storage attachment cannot be read-only. At most one storage attachment may be marked as boot.
 - Affinity requirements within a rule are OR-ed; rules are combined according to
-  their strictness and direction. `lt` and `gt` comparisons require exactly one
+  their strictness, and `inverse` negates a rule's result. `lt` and `gt` comparisons require exactly one
   finite numeric value.
 - Every network must have a non-empty, non-whitespace ID.
 - Cloud-init must provide non-empty configuration with user-data and meta-data

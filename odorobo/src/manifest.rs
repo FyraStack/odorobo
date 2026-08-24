@@ -6,6 +6,7 @@
 
 use std::{collections::BTreeMap, path::Path};
 
+use bytesize::ByteSize;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::Error as DeError};
 use thiserror::Error;
@@ -17,6 +18,20 @@ use ulid::Ulid;
 /// driver may translate one manifest version into a different provider API
 /// shape, while callers continue to exchange the same Odorobo-level intent.
 pub const MANIFEST_VERSION: u32 = 1;
+
+mod bytesize_as_u64 {
+    use bytesize::ByteSize;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    pub fn serialize<S: Serializer>(size: &ByteSize, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u64(size.as_u64())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<ByteSize, D::Error> {
+        Ok(ByteSize(u64::deserialize(deserializer)?))
+    }
+}
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ManifestError {
@@ -149,7 +164,7 @@ impl DesiredState {
                 max,
             });
         }
-        if self.compute.memory_bytes == 0 {
+        if self.compute.memory.as_u64() == 0 {
             return Err(ManifestError::NoMemory);
         }
         // A disk source remains abstract here. URI resolution and volume
@@ -250,7 +265,9 @@ pub struct Compute {
     pub vcpus: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_vcpus: Option<u32>,
-    pub memory_bytes: u64,
+    #[schemars(with = "u64")]
+    #[serde(rename = "memory_bytes", with = "bytesize_as_u64")]
+    pub memory: ByteSize,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
@@ -292,7 +309,9 @@ pub struct Placement {
 pub struct AffinityRule {
     pub strictness: AffinityStrictness,
     pub affinity_type: AffinityType,
-    pub direction: AffinityDirection,
+    /// If true, the outcome of the requirements is inverted.
+    #[serde(default)]
+    pub inverse: bool,
     pub requirements: Vec<AffinityRequirement>,
 }
 
@@ -308,13 +327,6 @@ pub enum AffinityStrictness {
 pub enum AffinityType {
     VirtualMachine,
     Agent,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum AffinityDirection {
-    Normal,
-    Anti,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
@@ -492,7 +504,7 @@ mod tests {
         ));
 
         manifest.desired.compute.max_vcpus = None;
-        manifest.desired.compute.memory_bytes = 0;
+        manifest.desired.compute.memory = ByteSize::b(0);
         assert_eq!(manifest.validate(), Err(ManifestError::NoMemory));
 
         let invalid_json = include_str!("../../docs/fixtures/manifest/minimal.json")
@@ -711,7 +723,7 @@ mod tests {
             manifest.desired.placement.affinity = vec![AffinityRule {
                 strictness: AffinityStrictness::Required,
                 affinity_type: AffinityType::Agent,
-                direction: AffinityDirection::Normal,
+                inverse: false,
                 requirements: vec![AffinityRequirement {
                     key: "capacity".to_owned(),
                     table: MetadataTable::Annotation,
@@ -734,7 +746,7 @@ mod tests {
         manifest.desired.placement.affinity.push(AffinityRule {
             strictness: AffinityStrictness::Preferred { weight: 10 },
             affinity_type: AffinityType::VirtualMachine,
-            direction: AffinityDirection::Anti,
+            inverse: true,
             requirements: vec![AffinityRequirement {
                 key: "tier".to_owned(),
                 table: MetadataTable::Label,
@@ -745,6 +757,6 @@ mod tests {
         let encoded = serde_json::to_string(&manifest).expect("affinity is serializable");
         assert!(encoded.contains("preferred"));
         assert!(encoded.contains("virtual_machine"));
-        assert!(encoded.contains("anti"));
+        assert!(encoded.contains("\"inverse\":true"));
     }
 }
