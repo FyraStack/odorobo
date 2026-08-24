@@ -4,6 +4,7 @@ use crate::messages::vm::{
     DeleteVM, GetConsoleHistory, GetConsoleHistoryReply, GetVMInfo, GetVMInfoReply,
     MigrateVMReceive, MigrateVMReceiveReply, PrepMigration, SendConsoleInput,
     SendConsoleInputReply, ShutdownVM,
+    GetVMHeartbeat, GetVMHeartbeatReply
 };
 use crate::{ch_driver::VMInstance, types::VirtualMachine};
 use cloud_hypervisor_client::models::{
@@ -189,17 +190,22 @@ pub struct VMActor {
     pub vm_instance: VMInstance,
     pub migration_state: Option<MigrationState>,
     pub console: Console,
+    pub manifest: Option<VirtualMachine>,
 }
 
 impl Actor for VMActor {
-    // tuple of VM ID and optional config
+    // tuple of VM ID and manifest
     type Args = (ulid::Ulid, Option<VirtualMachine>);
     type Error = Report;
 
     #[tracing::instrument(skip_all)]
     async fn on_start((vmid, vm_config): Self::Args, actor_ref: ActorRef<Self>) -> Result<Self> {
-        let mut vminstance =
-            VMInstance::spawn(&vmid.to_string(), vm_config.map(VmConfig::from), None).await?;
+        let mut vminstance = VMInstance::spawn(
+            &vmid.to_string(),
+            vm_config.clone().map(VmConfig::from),
+            None,
+        )
+        .await?;
 
         // attach console on startup for spooling
         let console = Console::attach(vminstance.console_socket_path()).await?;
@@ -235,6 +241,7 @@ impl Actor for VMActor {
             vm_instance: vminstance,
             migration_state: None,
             console,
+            manifest: vm_config,
         })
     }
 
@@ -363,8 +370,21 @@ impl Message<GetVMInfo> for VMActor {
     ) -> Self::Reply {
         GetVMInfoReply {
             vmid: self.vmid,
-            config: self.vm_instance.vm_config.clone(),
+            config: self.manifest.clone(), // we likely dont want to send the entire manifest on every update, but some of this data is required and this is easier for now.
         }
+    }
+}
+
+#[remote_message]
+impl Message<GetVMHeartbeat> for VMActor {
+    type Reply = GetVMHeartbeatReply;
+
+    async fn handle(
+        &mut self,
+        _msg: GetVMHeartbeat,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        GetVMHeartbeatReply { vmid: self.vmid }
     }
 }
 
