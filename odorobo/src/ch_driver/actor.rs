@@ -1,10 +1,9 @@
 use std::{collections::VecDeque, sync::Arc};
 
 use crate::messages::vm::{
-    DeleteVM, GetConsoleHistory, GetConsoleHistoryReply, GetVMInfo, GetVMInfoReply,
-    MigrateVMReceive, MigrateVMReceiveReply, PrepMigration, SendConsoleInput,
-    SendConsoleInputReply, ShutdownVM,
-    GetVMHeartbeat, GetVMHeartbeatReply
+    DeleteVM, GetConsoleHistory, GetConsoleHistoryReply, GetVMHeartbeat, GetVMHeartbeatReply,
+    GetVMInfo, GetVMInfoReply, MigrateVMReceive, MigrateVMReceiveReply, PrepMigration,
+    SendConsoleInput, SendConsoleInputReply, ShutdownVM,
 };
 use crate::{ch_driver::VMInstance, types::VirtualMachine};
 use cloud_hypervisor_client::models::{

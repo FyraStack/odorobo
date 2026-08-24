@@ -9,9 +9,8 @@ use crate::ch_driver::actor::VMActor;
 use crate::messages::agent::{AgentStatus, GetAgentStatus};
 use crate::messages::vm::{
     AgentListVMs, AgentListVMsReply, CreateVM, CreateVMReply, DeleteVM, DeleteVMReply,
-    GetConsoleHistory, GetConsoleHistoryReply, GetVMInfo, GetVMInfoReply, SendConsoleInput,
-    SendConsoleInputReply, ShutdownVM, ShutdownVMReply,
-    GetVMHeartbeat
+    GetConsoleHistory, GetConsoleHistoryReply, GetVMHeartbeat, GetVMInfo, GetVMInfoReply,
+    SendConsoleInput, SendConsoleInputReply, ShutdownVM, ShutdownVMReply,
 };
 use crate::messages::{Ping, Pong};
 use crate::types::AffinityRequirement;
