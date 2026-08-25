@@ -6,7 +6,6 @@
 
 use std::{collections::BTreeMap, path::Path};
 
-use bytesize::ByteSize;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::Error as DeError};
 use thiserror::Error;
@@ -18,20 +17,6 @@ use ulid::Ulid;
 /// driver may translate one manifest version into a different provider API
 /// shape, while callers continue to exchange the same Odorobo-level intent.
 pub const MANIFEST_VERSION: u32 = 1;
-
-mod bytesize_as_u64 {
-    use bytesize::ByteSize;
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    #[allow(clippy::trivially_copy_pass_by_ref)]
-    pub fn serialize<S: Serializer>(size: &ByteSize, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_u64(size.as_u64())
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<ByteSize, D::Error> {
-        Ok(ByteSize(u64::deserialize(deserializer)?))
-    }
-}
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ManifestError {
@@ -65,8 +50,10 @@ pub enum ManifestError {
     EmptyCloudInitData,
     #[error("vsock requires a non-zero guest CID")]
     InvalidVsockCid,
-    #[error("vsock requires a non-empty socket path")]
+    #[error("vsock requires a non-empty absolute socket path")]
     InvalidVsockSocket,
+    #[error("affinity comparison for key {0} requires exactly one finite numeric value")]
+    InvalidAffinityComparison(String),
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema, PartialEq, Eq)]
@@ -162,7 +149,7 @@ impl DesiredState {
                 max,
             });
         }
-        if self.compute.memory.as_u64() == 0 {
+        if self.compute.memory_bytes == 0 {
             return Err(ManifestError::NoMemory);
         }
         // A disk source remains abstract here. URI resolution and volume
@@ -198,6 +185,20 @@ impl DesiredState {
         for (index, network) in self.networks.iter().enumerate() {
             if network.id.trim().is_empty() {
                 return Err(ManifestError::NetworkWithoutId(index));
+            }
+        }
+        for rule in &self.placement.affinity {
+            for requirement in &rule.requirements {
+                let valid_comparison = match requirement.values.as_slice() {
+                    [value] => value.parse::<f64>().is_ok_and(f64::is_finite),
+                    _ => false,
+                };
+                if matches!(requirement.operator, Operator::Lt | Operator::Gt) && !valid_comparison
+                {
+                    return Err(ManifestError::InvalidAffinityComparison(
+                        requirement.key.clone(),
+                    ));
+                }
             }
         }
         // NoCloud treats user-data and meta-data as one instance-data set.
@@ -249,9 +250,7 @@ pub struct Compute {
     pub vcpus: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_vcpus: Option<u32>,
-    #[serde(rename = "memory_bytes", with = "bytesize_as_u64")]
-    #[schemars(with = "u64")]
-    pub memory: ByteSize,
+    pub memory_bytes: u64,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
@@ -293,9 +292,8 @@ pub struct Placement {
 pub struct AffinityRule {
     pub strictness: AffinityStrictness,
     pub affinity_type: AffinityType,
-    /// If true, the outcome of the requirements is inverted.
     #[serde(default)]
-    pub inverse: bool,
+    pub direction: AffinityDirection,
     pub requirements: Vec<AffinityRequirement>,
 }
 
@@ -313,9 +311,10 @@ pub enum AffinityType {
     Agent,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AffinityDirection {
+    #[default]
     Normal,
     Anti,
 }
@@ -447,8 +446,47 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_compute() {
+    fn rejects_unsupported_version_during_validation_and_deserialization() {
         let mut manifest = minimal_manifest();
+        manifest.api_version = MANIFEST_VERSION + 1;
+        assert_eq!(
+            manifest.validate(),
+            Err(ManifestError::UnsupportedVersion(MANIFEST_VERSION + 1))
+        );
+
+        let json = include_str!("../../docs/fixtures/manifest/minimal.json")
+            .replace("\"api_version\": 1", "\"api_version\": 2");
+        serde_json::from_str::<VmManifest>(&json).expect_err("unsupported version must reject");
+    }
+
+    #[test]
+    fn generated_schema_describes_manifest_shape() {
+        let schema = schemars::schema_for!(VmManifest);
+        let schema = serde_json::to_value(schema).expect("schema is serializable");
+        let properties = schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .expect("manifest schema has properties");
+
+        for field in ["api_version", "id", "desired", "observed"] {
+            assert!(
+                properties.contains_key(field),
+                "missing schema field {field}"
+            );
+        }
+        assert_eq!(properties["id"]["type"], "string");
+    }
+
+    #[test]
+    fn validates_compute_boundaries() {
+        let mut manifest = minimal_manifest();
+        manifest.desired.compute.max_vcpus = Some(manifest.desired.compute.vcpus);
+        assert_eq!(manifest.validate(), Ok(()));
+
+        manifest.desired.compute.vcpus = 0;
+        assert_eq!(manifest.validate(), Err(ManifestError::NoVcpus));
+
+        manifest.desired.compute.vcpus = 1;
         manifest.desired.compute.max_vcpus = Some(0);
         assert!(matches!(
             manifest.validate(),
@@ -456,7 +494,7 @@ mod tests {
         ));
 
         manifest.desired.compute.max_vcpus = None;
-        manifest.desired.compute.memory = ByteSize::b(0);
+        manifest.desired.compute.memory_bytes = 0;
         assert_eq!(manifest.validate(), Err(ManifestError::NoMemory));
 
         let invalid_json = include_str!("../../docs/fixtures/manifest/minimal.json")
@@ -480,6 +518,16 @@ mod tests {
     #[test]
     fn rejects_invalid_storage() {
         let mut manifest = minimal_manifest();
+        manifest.desired.storage.push(Storage {
+            id: "missing-source".to_owned(),
+            ..Default::default()
+        });
+        assert!(matches!(
+            manifest.validate(),
+            Err(ManifestError::InvalidStorageSource(_))
+        ));
+
+        manifest.desired.storage.clear();
         manifest.desired.storage.push(Storage {
             id: "invalid".to_owned(),
             uri: Some("file:///disk.img".to_owned()),
@@ -541,6 +589,19 @@ mod tests {
             manifest.validate(),
             Err(ManifestError::MultipleBootStorageAttachments)
         ));
+
+        manifest.desired.storage.clear();
+        manifest.desired.storage.push(Storage {
+            id: "root".to_owned(),
+            uri: Some("file:///disk.img".to_owned()),
+            boot: true,
+            read_only: true,
+            ..Default::default()
+        });
+        assert!(matches!(
+            manifest.validate(),
+            Err(ManifestError::ReadOnlyBootStorage(_))
+        ));
     }
 
     #[test]
@@ -548,12 +609,30 @@ mod tests {
         let mut manifest = minimal_manifest();
         manifest.desired.vsock = Some(Vsock {
             guest_cid: 42,
-            socket: "relative.sock".to_owned(),
+            socket: "/run/odorobo/vsock.sock".to_owned(),
         });
-        assert!(matches!(
-            manifest.validate(),
-            Err(ManifestError::InvalidVsockSocket)
-        ));
+        assert_eq!(manifest.validate(), Ok(()));
+
+        manifest
+            .desired
+            .vsock
+            .as_mut()
+            .expect("vsock exists")
+            .guest_cid = 0;
+        assert_eq!(manifest.validate(), Err(ManifestError::InvalidVsockCid));
+
+        let vsock = manifest.desired.vsock.as_mut().expect("vsock exists");
+        vsock.guest_cid = 42;
+        vsock.socket = "  ".to_owned();
+        assert_eq!(manifest.validate(), Err(ManifestError::InvalidVsockSocket));
+
+        manifest
+            .desired
+            .vsock
+            .as_mut()
+            .expect("vsock exists")
+            .socket = "relative.sock".to_owned();
+        assert_eq!(manifest.validate(), Err(ManifestError::InvalidVsockSocket));
 
         manifest.desired.vsock = None;
         manifest.desired.metadata.name = "  ".to_owned();
@@ -576,20 +655,34 @@ mod tests {
         ));
 
         manifest.desired.networks.clear();
-        manifest.desired.cloud_init = Some(CloudInit::default());
-        assert!(matches!(
-            manifest.validate(),
-            Err(ManifestError::IncompleteCloudInit)
-        ));
+        for cloud_init in [
+            CloudInit::default(),
+            CloudInit {
+                user_data: Some("#cloud-config".to_owned()),
+                meta_data: None,
+            },
+            CloudInit {
+                user_data: None,
+                meta_data: Some("instance-id: vm".to_owned()),
+            },
+        ] {
+            manifest.desired.cloud_init = Some(cloud_init);
+            assert_eq!(manifest.validate(), Err(ManifestError::IncompleteCloudInit));
+        }
 
-        manifest.desired.cloud_init = Some(CloudInit {
-            user_data: Some("  ".to_owned()),
-            meta_data: Some("instance-id: vm".to_owned()),
-        });
-        assert!(matches!(
-            manifest.validate(),
-            Err(ManifestError::EmptyCloudInitData)
-        ));
+        for cloud_init in [
+            CloudInit {
+                user_data: Some("  ".to_owned()),
+                meta_data: Some("instance-id: vm".to_owned()),
+            },
+            CloudInit {
+                user_data: Some("#cloud-config".to_owned()),
+                meta_data: Some("  ".to_owned()),
+            },
+        ] {
+            manifest.desired.cloud_init = Some(cloud_init);
+            assert_eq!(manifest.validate(), Err(ManifestError::EmptyCloudInitData));
+        }
     }
 
     #[test]
@@ -612,12 +705,41 @@ mod tests {
     }
 
     #[test]
+    fn rejects_invalid_affinity_comparisons() {
+        let mut manifest = minimal_manifest();
+        for values in [
+            Vec::new(),
+            vec!["1".to_owned(), "2".to_owned()],
+            vec!["not-a-number".to_owned()],
+            vec!["NaN".to_owned()],
+        ] {
+            manifest.desired.placement.affinity = vec![AffinityRule {
+                strictness: AffinityStrictness::Required,
+                affinity_type: AffinityType::Agent,
+                direction: AffinityDirection::Normal,
+                requirements: vec![AffinityRequirement {
+                    key: "capacity".to_owned(),
+                    table: MetadataTable::Annotation,
+                    operator: Operator::Gt,
+                    values,
+                }],
+            }];
+            assert_eq!(
+                manifest.validate(),
+                Err(ManifestError::InvalidAffinityComparison(
+                    "capacity".to_owned()
+                ))
+            );
+        }
+    }
+
+    #[test]
     fn serializes_affinity() {
         let mut manifest = minimal_manifest();
         manifest.desired.placement.affinity.push(AffinityRule {
             strictness: AffinityStrictness::Preferred { weight: 10 },
             affinity_type: AffinityType::VirtualMachine,
-            inverse: true,
+            direction: AffinityDirection::Anti,
             requirements: vec![AffinityRequirement {
                 key: "tier".to_owned(),
                 table: MetadataTable::Label,
@@ -628,6 +750,6 @@ mod tests {
         let encoded = serde_json::to_string(&manifest).expect("affinity is serializable");
         assert!(encoded.contains("preferred"));
         assert!(encoded.contains("virtual_machine"));
-        assert!(encoded.contains("\"inverse\":true"));
+        assert!(encoded.contains("\"direction\":\"anti\""));
     }
 }
