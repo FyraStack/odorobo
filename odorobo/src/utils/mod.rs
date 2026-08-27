@@ -13,7 +13,7 @@ use tracing::level_filters::LevelFilter;
 use tracing::{debug, error, info, trace, warn};
 use tracing_subscriber::EnvFilter;
 
-// todo: wrap with axum-responses, return this type on request failure
+/// Application error returned by request handlers.
 #[derive(Error, Debug, ApiError, OperationIo)]
 #[aide(output)]
 pub enum OdoroboError {

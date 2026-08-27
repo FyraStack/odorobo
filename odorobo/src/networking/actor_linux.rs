@@ -215,30 +215,6 @@ impl NetworkAgentActor {
         })
     }
 
-    // todo: IPv6, refer to libvirt's impl:
-    // ```nft
-    // table ip6 libvirt_network {
-    //         chain forward {
-    //                 type filter hook forward priority filter; policy accept;
-    //                 counter packets 0 bytes 0 jump guest_cross
-    //                 counter packets 0 bytes 0 jump guest_input
-    //                 counter packets 0 bytes 0 jump guest_output
-    //         }
-
-    //         chain guest_output {
-    //         }
-
-    //         chain guest_input {
-    //         }
-
-    //         chain guest_cross {
-    //         }
-
-    //         chain guest_nat {
-    //                 type nat hook postrouting priority srcnat; policy accept;
-    //         }
-    // }
-    // ```
     /// Ensures the host-only NAT masquerade rule exists for the configured
     /// upstream interface.
     ///

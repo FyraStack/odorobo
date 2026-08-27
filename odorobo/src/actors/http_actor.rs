@@ -1,6 +1,7 @@
 use crate::messages::vm::{
     AgentListVMs, AgentListVMsReply, CreateVM, CreateVMReply, DeleteVM, DeleteVMReply,
-    GetConsoleHistory, GetConsoleHistoryReply, ShutdownVM, ShutdownVMReply,
+    GetConsoleHistory, GetConsoleHistoryReply, GetVMInfo, GetVMInfoReply, ShutdownVM,
+    ShutdownVMReply,
 };
 use kameo::prelude::*;
 use stable_eyre::{
@@ -99,6 +100,22 @@ impl Message<ShutdownVM> for HTTPActor {
             .await
             .map_err(|err| eyre!(err.to_string()))
             .wrap_err("failed to shut down VM via scheduler")
+    }
+}
+
+impl Message<GetVMInfo> for HTTPActor {
+    type Reply = Result<GetVMInfoReply, Report>;
+
+    async fn handle(
+        &mut self,
+        msg: GetVMInfo,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.scheduler
+            .ask(msg)
+            .await
+            .map_err(|err| eyre!(err.to_string()))
+            .wrap_err("failed to get VM info via scheduler")
     }
 }
 

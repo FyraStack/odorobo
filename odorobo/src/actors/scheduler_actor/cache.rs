@@ -14,6 +14,7 @@ use crate::manifest::VmManifest;
 use super::{CachedVMActor, SchedulerActor, VmLifecycle, VmPlacement};
 
 const UNRESOLVED_VM_CACHE_TIMEOUT: Duration = Duration::from_secs(30);
+const UNCONFIRMED_RUNNING_PLACEMENT_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl SchedulerActor {
     /// Releases excess allocation once an entry list no longer represents migration.
@@ -51,11 +52,11 @@ impl SchedulerActor {
     /// Expires pending placements that were never confirmed by agent status.
     ///
     /// Pending entries expire after 30 seconds. The five-second discovery loop
-    /// triggers this maintenance, so a slow-to-report create can be forgotten.
-    /// When the expired placement was the last placement for a VM, all correlated
-    /// manifest, placement, and actor-cache state is removed.
+    /// triggers this maintenance. Expiry removes only the unconfirmed placement:
+    /// the manifest remains scheduler intent, allowing periodic reconciliation to
+    /// dispatch a replacement create request.
     pub(super) fn cleanup_unresolved_vm_cache(
-        manifests: &mut AHashMap<Ulid, VmManifest>,
+        _manifests: &mut AHashMap<Ulid, VmManifest>,
         placements: &mut AHashMap<Ulid, Vec<VmPlacement>>,
         data_cache: &mut AHashMap<Ulid, Vec<CachedVMActor>>,
     ) {
@@ -73,8 +74,16 @@ impl SchedulerActor {
             .collect();
 
         for vmid in empty_vmids {
-            Self::remove_vm_state(vmid, manifests, placements, data_cache);
+            if data_cache
+                .get(&vmid)
+                .is_some_and(|entries| entries.iter().all(|entry| entry.actor_ref.is_none()))
+            {
+                data_cache.remove(&vmid);
+            }
         }
+
+        // Keep manifests and empty placement entries: they represent desired VM
+        // state and are consumed by `ReconcileVmPlacements`.
     }
 
     /// Returns every VM that could be on an agent, deduplicating each source in
@@ -153,27 +162,15 @@ impl SchedulerActor {
         }
     }
 
-    /// Removes placements assigned to a departed agent and drops VM state only
-    /// when no placement remains.
-    // TODO: Preserve VM intent and enqueue replacement placement or recreation
-    // when an agent disappears instead of dropping the last VM state.
+    /// Removes placements assigned to a departed agent while retaining empty
+    /// placement entries as VM intent for periodic reconciliation.
     pub(super) fn remove_agent_placements(
         agent_id: ActorId,
-        manifests: &mut AHashMap<Ulid, VmManifest>,
         placements: &mut AHashMap<Ulid, Vec<VmPlacement>>,
-        data_cache: &mut AHashMap<Ulid, Vec<CachedVMActor>>,
     ) {
-        let empty_vmids: Vec<_> = placements
-            .iter_mut()
-            .filter_map(|(vmid, entries)| {
-                entries.retain(|entry| entry.agent_id != agent_id);
-                Self::shrink_non_migrating_entries(entries);
-                entries.is_empty().then_some(*vmid)
-            })
-            .collect();
-
-        for vmid in empty_vmids {
-            Self::remove_vm_state(vmid, manifests, placements, data_cache);
+        for entries in placements.values_mut() {
+            entries.retain(|entry| entry.agent_id != agent_id);
+            Self::shrink_non_migrating_entries(entries);
         }
     }
 
@@ -209,16 +206,16 @@ impl SchedulerActor {
         self.agent_data_cache.remove(&actor_id);
         self.agent_vm_index.remove(&actor_id);
         self.invalidate_pending_resources();
-        Self::remove_agent_placements(
-            actor_id,
-            &mut self.vm_manifests,
-            &mut self.vm_placements,
-            &mut self.vm_data_cache,
-        );
+        Self::remove_agent_placements(actor_id, &mut self.vm_placements);
     }
 
-    /// Aborts VM polling and removes actor state, retaining a VM only when
-    /// another discovered actor or unresolved placement can still represent it.
+    /// Aborts VM polling and makes an unrepresented VM placement recoverable.
+    ///
+    /// A VM actor is not associated with a particular migration entry. Therefore
+    /// placements are cleared only when no discovered actor remains for that VM;
+    /// pending destination placements are retained to avoid racing an in-flight
+    /// migration. Empty placement entries retain the manifest's desired intent
+    /// for periodic reconciliation.
     pub(super) fn cleanup_vm_actor(&mut self, actor_id: ActorId) {
         if let Some(keepalive_task) = self.vm_keepalive_tasks.remove(&actor_id) {
             trace!(?actor_id, "Aborting VM keepalive task");
@@ -227,29 +224,32 @@ impl SchedulerActor {
         let vmid = self.vm_actorid_ulid_map.remove(&actor_id);
         self.invalidate_pending_resources();
         Self::remove_vm_actor(actor_id, &mut self.vm_data_cache);
-        if let Some(vmid) = vmid
-            && self
-                .vm_data_cache
-                .get(&vmid)
-                .is_none_or(|entries| entries.iter().all(|entry| entry.actor_ref.is_none()))
-        {
-            Self::remove_vm_state(
-                vmid,
-                &mut self.vm_manifests,
-                &mut self.vm_placements,
-                &mut self.vm_data_cache,
-            );
+
+        let Some(vmid) = vmid else {
+            return;
+        };
+        let has_discovered_actor = self
+            .vm_data_cache
+            .get(&vmid)
+            .is_some_and(|entries| entries.iter().any(|entry| entry.actor_ref.is_some()));
+        if !has_discovered_actor {
+            if let Some(entries) = self.vm_placements.get_mut(&vmid) {
+                entries.retain(|entry| entry.lifecycle == VmLifecycle::Pending);
+                Self::shrink_non_migrating_entries(entries);
+            }
+            self.invalidate_pending_resources();
         }
     }
 
-    /// Incorporates additions from a status delta into placement observations.
+    /// Incorporates additions and removals from a status delta into placement observations.
     ///
-    /// Removals deliberately do not delete desired placements: they may be
-    /// transient observations and reconciliation must be able to recreate the VM.
+    /// A removal is authoritative for a confirmed (`Running`) placement on this
+    /// agent. Pending placements are retained through their timeout because a
+    /// create can race the next status delta.
     pub(super) fn reconcile_agent_delta(
         agent_id: ActorId,
         added: &[Ulid],
-        _removed: &[Ulid],
+        removed: &[Ulid],
         manifests: &AHashMap<Ulid, VmManifest>,
         placements: &mut AHashMap<Ulid, Vec<VmPlacement>>,
     ) {
@@ -272,17 +272,22 @@ impl SchedulerActor {
             }
         }
 
-        // A removal is an observation about the agent, not a change to the
-        // scheduler's desired state. Keep the placement so reconciliation can
-        // schedule the VM again. The full status path performs the same
-        // distinction for snapshots.
+        for vmid in removed {
+            if let Some(entries) = placements.get_mut(vmid) {
+                entries.retain(|entry| {
+                    entry.agent_id != agent_id || entry.lifecycle == VmLifecycle::Pending
+                });
+                Self::shrink_non_migrating_entries(entries);
+            }
+        }
     }
 
     /// Reconciles scheduler placement observations with a complete agent snapshot.
     ///
     /// Known, reported VMs gain or refresh `Running` placements. Unknown VMs are
-    /// ignored because the scheduler has no retained intent for them. Absent VMs
-    /// leave existing desired placements intact so future reconciliation can act.
+    /// ignored because the scheduler has no retained intent for them. An absent
+    /// running placement expires after its confirmation timeout; an absent pending
+    /// placement stays reserved through its pending timeout.
     pub(super) fn reconcile_agent_placements(
         agent_id: ActorId,
         status: &AgentStatus,
@@ -313,17 +318,27 @@ impl SchedulerActor {
         let empty_vmids: Vec<_> = placements
             .iter_mut()
             .filter_map(|(vmid, entries)| {
-                // TODO: Expire or repair `Running` placements that remain absent
-                // from repeated full snapshots; they are retained indefinitely now.
-                for entry in entries
-                    .iter_mut()
-                    .filter(|entry| entry.agent_id == agent_id)
-                {
-                    if observed.contains(vmid) {
-                        entry.lifecycle = VmLifecycle::Running;
-                        entry.last_confirmed_at = Some(now);
+                entries.retain_mut(|entry| {
+                    if entry.agent_id != agent_id || observed.contains(vmid) {
+                        if entry.agent_id == agent_id {
+                            entry.lifecycle = VmLifecycle::Running;
+                            entry.last_confirmed_at = Some(now);
+                        }
+                        return true;
                     }
-                }
+
+                    match entry.lifecycle {
+                        VmLifecycle::Pending => {
+                            now.duration_since(entry.created_at) < UNRESOLVED_VM_CACHE_TIMEOUT
+                        }
+                        VmLifecycle::Running => {
+                            entry.last_confirmed_at.is_some_and(|last_confirmed_at| {
+                                now.duration_since(last_confirmed_at)
+                                    < UNCONFIRMED_RUNNING_PLACEMENT_TIMEOUT
+                            })
+                        }
+                    }
+                });
                 Self::shrink_non_migrating_entries(entries);
                 entries.is_empty().then_some(*vmid)
             })
