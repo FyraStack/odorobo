@@ -1,3 +1,4 @@
+use bytesize::ByteSize;
 use clap::{Parser, Subcommand};
 use odorobo::{
     manifest::{Boot, Compute, DesiredState, Metadata, Storage, VmManifest},
@@ -112,7 +113,7 @@ pub async fn run_command(cli: Cli) -> Result<()> {
                     },
                     compute: Compute {
                         vcpus: 4,
-                        memory_bytes: 4 * 1024 * 1024 * 1024,
+                        memory: ByteSize::gib(4),
                         ..Default::default()
                     },
                     storage: vec![Storage {

@@ -574,7 +574,7 @@ impl SchedulerActor {
         let used_vcpus = agent.data.used_vcpus.saturating_add(pending_vcpus);
         let used_ram = agent.data.used_ram.as_u64().saturating_add(pending_ram);
         let requested_vcpus = msg.config.desired.compute.vcpus;
-        let requested_memory = msg.config.desired.compute.memory_bytes;
+        let requested_memory = msg.config.desired.compute.memory.as_u64();
         let agent_used_vcpus = used_vcpus.saturating_add(requested_vcpus);
 
         if !has_capacity(
@@ -686,7 +686,7 @@ fn pending_resources_by_agent(
                 totals.0 = totals.0.saturating_add(manifest.desired.compute.vcpus);
                 totals.1 = totals
                     .1
-                    .saturating_add(manifest.desired.compute.memory_bytes);
+                    .saturating_add(manifest.desired.compute.memory.as_u64());
             }
         }
     }
@@ -742,9 +742,10 @@ fn evaluate_affinity_rule(
         }
     }
 
-    match rule.direction {
-        crate::manifest::AffinityDirection::Normal => follows_rule,
-        crate::manifest::AffinityDirection::Anti => !follows_rule,
+    if rule.inverse {
+        !follows_rule
+    } else {
+        follows_rule
     }
 }
 
@@ -786,8 +787,8 @@ mod tests {
     };
 
     use crate::manifest::{
-        AffinityDirection, AffinityRequirement, AffinityRule, AffinityStrictness, AffinityType,
-        Boot, Compute, DesiredState, Metadata, MetadataTable, Operator, VmManifest,
+        AffinityRequirement, AffinityRule, AffinityStrictness, AffinityType, Boot, Compute,
+        DesiredState, Metadata, MetadataTable, Operator, VmManifest,
     };
     use crate::messages::agent::AgentStatus;
     use crate::types::ObjectMetadata;
@@ -808,7 +809,7 @@ mod tests {
                 },
                 compute: Compute {
                     vcpus,
-                    memory_bytes,
+                    memory: ByteSize::b(memory_bytes),
                     ..Default::default()
                 },
                 boot: Boot::default(),
@@ -1093,7 +1094,7 @@ mod tests {
         let rule = AffinityRule {
             strictness: AffinityStrictness::Required,
             affinity_type: AffinityType::Agent,
-            direction: AffinityDirection::Anti,
+            inverse: true,
             requirements: vec![requirement(Operator::In, &["frontend"])],
         };
         assert!(!evaluate_affinity_rule(&[&metadata], &rule));
@@ -1101,7 +1102,7 @@ mod tests {
         let empty_rule = AffinityRule {
             strictness: AffinityStrictness::Required,
             affinity_type: AffinityType::Agent,
-            direction: AffinityDirection::Normal,
+            inverse: false,
             requirements: Vec::new(),
         };
         assert!(!evaluate_affinity_rule(&[], &empty_rule));
