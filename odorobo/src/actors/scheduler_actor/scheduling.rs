@@ -127,7 +127,7 @@ impl SchedulerActor {
             .saturating_mul(VCPU_OVERPROVISIONMENT_NUMERATOR)
             .checked_div(VCPU_OVERPROVISIONMENT_DENOMINATOR)
             .unwrap_or(u32::MAX);
-        // todo: do we care about VMData.max_vcpus?
+
         let (pending_vcpus, pending_ram) = pending_resources
             .get(&agent.actor_ref.id())
             .copied()
@@ -160,7 +160,6 @@ impl SchedulerActor {
         let vcpu_headroom = (agent_max_vcpus - agent_used_vcpus) as f32 / agent_max_vcpus as f32;
         score.general += vcpu_headroom;
 
-        // todo: add ram overprovisionment. not adding this to scheduler until it works on the hypervisor side.
         let agent_max_ram = agent.data.ram;
         let agent_used_ram = bytesize::ByteSize::b(used_ram.saturating_add(requested_memory));
 
@@ -214,13 +213,6 @@ impl SchedulerActor {
                 score.affinity = score.affinity.saturating_add(affinity_delta);
             }
         }
-
-        // todo (future): possibly keep a percent of agents completely empty, to be able to be converted to dedis automatically.
-        // they would have their agent score set to like f32::MIN, so they can be scheduled to if there is no other available agents.
-        // rough pseudo code to implement this:
-        // if agent.metadata.vms.len() == 0 && hash(agent.config.hostname) % total_chance < threshold {
-        //     agent_score = 1;
-        // }
 
         score
     }

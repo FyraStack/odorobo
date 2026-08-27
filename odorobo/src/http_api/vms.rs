@@ -1,9 +1,9 @@
 //! VM management API handlers.
-use crate::messages::vm::{AgentListVMs, DeleteVM, GetConsoleHistory, ShutdownVM};
+use crate::messages::vm::{AgentListVMs, DeleteVM, GetConsoleHistory, GetVMInfo, ShutdownVM};
 use crate::{
     actors::http_actor::HTTPActor,
     messages::vm::CreateVM,
-    types::{CreateVMRequest, UpdateVMRequest, VMListResponse, VirtualMachine, VmId},
+    types::{CreateVMRequest, UpdateVMRequest, VMListResponse, VmId},
     utils::OdoroboError,
 };
 use aide::axum::{
@@ -14,6 +14,7 @@ use axum::{
     Json,
     extract::{Path, State},
     http::header,
+    response::IntoResponse,
 };
 use kameo::actor::ActorRef;
 
@@ -40,11 +41,14 @@ async fn list_vms(
 
 /// Get detailed information about a specific VM
 async fn vm_info(
-    State(_state): State<ActorRef<HTTPActor>>,
-    Path(VmId(_vmid)): Path<VmId>,
+    State(state): State<ActorRef<HTTPActor>>,
+    Path(VmId(vmid)): Path<VmId>,
 ) -> Result<impl IntoApiResponse, OdoroboError> {
-    // stub,
-    Ok(Json(VirtualMachine::default()))
+    let reply = state.ask(GetVMInfo { vmid: Some(vmid) }).await?;
+    let response = serde_json::to_value(reply)
+        .map_err(|error| OdoroboError::Report(stable_eyre::Report::from(error)))?;
+
+    Ok(Json(response))
 }
 
 async fn create_vm(
@@ -93,15 +97,16 @@ async fn console_history(
     ))
 }
 
-/// Update an existing VM's configuration (e.g. resize, change resources, etc.)
-///
-/// todo: make new schema for update request that allows partial updates
+/// VM configuration updates are not supported by the scheduler yet.
 async fn update_vm(
-    State(_state): State<ActorRef<HTTPActor>>,
     Path(VmId(_vmid)): Path<VmId>,
     Json(_request): Json<UpdateVMRequest>,
-) -> Result<impl IntoApiResponse, OdoroboError> {
-    // stub
-
-    Ok(Json(VirtualMachine::default()))
+) -> axum::response::Response {
+    (
+        axum::http::StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({
+            "message": "VM configuration updates are not supported"
+        })),
+    )
+        .into_response()
 }
