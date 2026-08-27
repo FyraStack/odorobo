@@ -104,21 +104,33 @@ type MetadataTables<'a> = [(
 
 #[derive(RemoteActor)]
 pub struct SchedulerActor {
+    /// Latest status snapshot for each known agent, used for scheduling decisions.
     pub agent_data_cache: AHashMap<ActorId, CachedAgentActor>,
+    /// Heartbeat tasks that refresh the corresponding entry in `agent_data_cache`.
     pub agent_keepalive_tasks: AHashMap<ActorId, JoinHandle<()>>,
 
+    /// Maps discovered VM actor IDs to their canonical VM IDs.
     pub vm_actorid_ulid_map: AHashMap<ActorId, Ulid>,
-    /// Canonical manifest storage; placements and actor entries refer to the VM ID.
+    /// Canonical VM intent. A manifest remains available while the VM is being
+    /// reconciled or migrated.
     pub vm_manifests: AHashMap<Ulid, VmManifest>,
-    /// A VM may be placed on multiple agents while it is migrating.
+    /// Desired VM placements. Entries are retained when an agent observation says
+    /// a VM is absent so reconciliation can restore the desired placement.
     pub vm_placements: AHashMap<Ulid, Vec<VmPlacement>>,
-    /// this is a vec because a vmid/ulid can be scheduled on multiple boxes simultaneously during migration
+    /// Cached VM actor references, with one entry per concurrent placement during
+    /// migration. `None` represents a placement whose actor is not discovered yet.
     pub vm_data_cache: AHashMap<Ulid, Vec<CachedVMActor>>,
+    /// Heartbeat tasks that refresh the corresponding VM actor cache entry.
     pub vm_keepalive_tasks: AHashMap<ActorId, JoinHandle<()>>,
+    /// Cached resource totals for pending placements; invalidated on state changes.
     pending_resources_cache: Option<AHashMap<ActorId, (u32, u64)>>,
+    /// VM membership observed from each agent, used to discover placements without
+    /// scanning every placement during scheduling.
     agent_vm_index: AHashMap<ActorId, AHashSet<Ulid>>,
+    /// Whether a discovered actor is an agent or VM actor.
     actor_kinds: AHashMap<ActorId, CachedActorKind>,
 
+    /// Background task that discovers actors and periodically triggers cleanup.
     pub cache_actor_finder: Option<JoinHandle<()>>,
 }
 
@@ -325,7 +337,7 @@ impl SchedulerActor {
     fn reconcile_agent_delta(
         agent_id: ActorId,
         added: &[Ulid],
-        removed: &[Ulid],
+        _removed: &[Ulid],
         manifests: &AHashMap<Ulid, VmManifest>,
         placements: &mut AHashMap<Ulid, Vec<VmPlacement>>,
     ) {
@@ -348,18 +360,10 @@ impl SchedulerActor {
             }
         }
 
-        for vmid in removed {
-            let Some(entries) = placements.get_mut(vmid) else {
-                continue;
-            };
-            entries.retain(|entry| {
-                entry.agent_id != agent_id || entry.lifecycle == VmLifecycle::Pending
-            });
-            Self::shrink_non_migrating_entries(entries);
-            if entries.is_empty() {
-                placements.remove(vmid);
-            }
-        }
+        // A removal is an observation about the agent, not a change to the
+        // scheduler's desired state. Keep the placement so reconciliation can
+        // schedule the VM again. The full status path performs the same
+        // distinction for snapshots.
     }
 
     fn reconcile_agent_placements(
@@ -392,11 +396,6 @@ impl SchedulerActor {
         let empty_vmids: Vec<_> = placements
             .iter_mut()
             .filter_map(|(vmid, entries)| {
-                entries.retain(|entry| {
-                    entry.agent_id != agent_id
-                        || entry.lifecycle == VmLifecycle::Pending
-                        || observed.contains(vmid)
-                });
                 for entry in entries
                     .iter_mut()
                     .filter(|entry| entry.agent_id == agent_id)
@@ -591,24 +590,6 @@ impl SchedulerActor {
         }));
     }
 
-    /// Determine the best agent to schedule a specific VM creation request to.
-    ///
-    /// Rough explanation of the algorithm:
-    ///     Loop through every known agent.
-    ///         Go through a set of rules to determine if the VM can be scheduled on this agent at all, and an affinity score and a general score.
-    ///
-    ///     Based on these scores, pick the best agent.
-    ///         First the affinity score is used, because these are things the customer specifically wanted.
-    ///         If the affinity score is tied, we use the general score as a tie breaker.
-    ///         The general score uses things like resource utilization to not over load any specific agent.
-    ///
-    ///
-    /// Affinity rules are roughly based on <https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/>.
-    ///
-    /// todo:
-    ///  - the cache likely needs to be updated automatically when a new vm is scheduled for info like used resources, because otherwise we have to deal with latency on that data we are using
-    ///    and then if someone tries to schedule lets say 10 VMs in a batch, we could end up scheduling them all to the same agent because the metadata hasn't updated.
-    ///    - there are a few solutions for this but they all kinda suck, mostly due to also making sure we deal with latency properly. I am ignoring the issue for now.
     fn pending_resources(&mut self) -> &AHashMap<ActorId, (u32, u64)> {
         if self.pending_resources_cache.is_none() {
             self.pending_resources_cache = Some(pending_resources_by_agent(
@@ -625,6 +606,12 @@ impl SchedulerActor {
         self.pending_resources_cache = None;
     }
 
+    /// Determine the best agent to schedule a specific VM creation request to.
+    ///
+    /// The scheduler first filters agents by capacity and affinity requirements,
+    /// then uses affinity and general resource scores to select the best match.
+    /// Affinity rules are roughly based on
+    /// <https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/>.
     fn schedule_agent(&mut self, msg: &CreateVM) -> Result<RemoteActorRef<AgentActor>, Report> {
         self.pending_resources();
         let pending_resources = self
@@ -1058,8 +1045,34 @@ mod tests {
         let remaining = placements
             .get(&vmid)
             .expect("destination placement remains");
-        assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining[0].agent_id, destination_agent);
+        assert_eq!(remaining.len(), 2);
+        assert!(remaining.iter().any(|entry| entry.agent_id == source_agent));
+        assert!(
+            remaining
+                .iter()
+                .any(|entry| entry.agent_id == destination_agent)
+        );
+    }
+
+    #[test]
+    fn agent_removal_preserves_desired_placement() {
+        let vmid = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("valid ulid");
+        let agent_id = super::ActorId::new(1);
+        let manifests = AHashMap::from([(vmid, test_manifest(1, 1))]);
+        let mut placements = AHashMap::from([(
+            vmid,
+            vec![VmPlacement {
+                agent_id,
+                lifecycle: VmLifecycle::Running,
+                created_at: Instant::now(),
+                last_confirmed_at: Some(Instant::now()),
+            }],
+        )]);
+
+        SchedulerActor::reconcile_agent_delta(agent_id, &[], &[vmid], &manifests, &mut placements);
+
+        assert_eq!(placements[&vmid].len(), 1);
+        assert_eq!(placements[&vmid][0].agent_id, agent_id);
     }
 
     #[test]
