@@ -19,6 +19,10 @@ use crate::utils::actor_names::vm_actor_id;
 
 use super::{CachedActorKind, CachedVMActor, SchedulerActor, VmLifecycle, VmPlacement};
 
+/// Owns scheduler initialization and cleanup for linked remote actors.
+///
+/// Losing an agent removes its placements. Losing a VM removes only its actor
+/// cache entry unless no discovered actor or placeholder remains for that VM.
 impl Actor for SchedulerActor {
     type Args = ();
     type Error = Report;
@@ -71,6 +75,11 @@ impl Actor for SchedulerActor {
         Ok(ControlFlow::Continue(()))
     }
 }
+/// Optimistically reserves a placement, then forwards VM creation to the chosen agent.
+///
+/// A successful reply confirms agent acceptance, not observed VM execution. A failed
+/// request is rolled back only when discovery cannot find a VM actor, preserving state
+/// for eventual reconciliation when the request result was lost or delayed.
 impl Message<CreateVM> for SchedulerActor {
     type Reply = Result<CreateVMReply, Report>;
 
@@ -173,6 +182,9 @@ impl Message<SendConsoleInput> for SchedulerActor {
     }
 }
 
+/// Looks up a VM actor and forwards deletion without eagerly altering scheduler caches.
+///
+/// Cache cleanup waits for actor link death or updater reachability failure.
 impl Message<DeleteVM> for SchedulerActor {
     type Reply = Result<DeleteVMReply, Report>;
 
@@ -193,6 +205,9 @@ impl Message<DeleteVM> for SchedulerActor {
     }
 }
 
+/// Looks up a VM actor and forwards shutdown without eagerly altering scheduler caches.
+///
+/// Cache cleanup waits for actor link death or updater reachability failure.
 impl Message<ShutdownVM> for SchedulerActor {
     type Reply = Result<ShutdownVMReply, Report>;
 
@@ -213,9 +228,10 @@ impl Message<ShutdownVM> for SchedulerActor {
     }
 }
 
-/// this only gets data from the cache from agents
-/// we may need a different message that actually forcibly runs/updates everything.
-/// and/or messages that get data directly from the `VMActors`.
+/// Returns the concatenated VM IDs from cached agent status snapshots.
+///
+/// This is a potentially stale, non-deduplicated observation rather than an
+/// authoritative inventory; it performs neither polling nor direct VM-actor queries.
 impl Message<AgentListVMs> for SchedulerActor {
     type Reply = Result<AgentListVMsReply, Report>;
 
@@ -239,6 +255,7 @@ impl Message<AgentListVMs> for SchedulerActor {
     }
 }
 
+/// Provides scheduler actor liveness only; it does not imply cache freshness or readiness.
 impl Message<Ping> for SchedulerActor {
     type Reply = Pong;
 

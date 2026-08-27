@@ -24,6 +24,10 @@ type MetadataTables<'a> = [(
 )];
 
 impl SchedulerActor {
+    /// Returns resources reserved by `Pending` placements, computing them lazily.
+    ///
+    /// Running usage comes from cached agent status; only unconfirmed placements
+    /// are added here to prevent concurrent create requests from overcommitting.
     pub(super) fn pending_resources(&mut self) -> &AHashMap<ActorId, (u32, u64)> {
         if self.pending_resources_cache.is_none() {
             self.pending_resources_cache = Some(pending_resources_by_agent(
@@ -36,15 +40,19 @@ impl SchedulerActor {
             .expect("pending resources cache was just initialized")
     }
 
+    /// Marks pending-placement resource totals stale after a relevant cache change.
     pub(super) fn invalidate_pending_resources(&mut self) {
         self.pending_resources_cache = None;
     }
 
     /// Determine the best agent to schedule a specific VM creation request to.
     ///
-    /// The scheduler first filters agents by capacity and affinity requirements,
-    /// then uses affinity and general resource scores to select the best match.
-    /// Affinity rules are roughly based on
+    /// The scheduler first filters agents by capacity and required affinity, then
+    /// ranks preferred-affinity totals before CPU/RAM headroom. Equal scores have
+    /// no deterministic tie-breaker because the agent cache is a hash map.
+    ///
+    /// Scoring performs no network I/O and therefore uses an eventually consistent
+    /// cache. Affinity rules are roughly based on
     /// <https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/>.
     pub(super) fn schedule_agent(
         &mut self,
@@ -98,9 +106,13 @@ impl SchedulerActor {
             .collect()
     }
 
-    // this function intentionally only checks against the cache. this has some positives and negatives:
-    // positive: it will never trigger any network requests so its very fast, and having to do network requests for scoring whenever we want to schedule a vm is likely a bad idea
-    // negative: it technically has a delayed view of the cluster, meaning that some things that happened in the future, may not exist yet. so we need to be careful about how this is done so affinity rules are not accidentally broken. mostly this means, if we do anything that could affect the outcome of an affinity rule (ex: network request to an agent), we need to update the cache, before we do the action.
+    /// Scores one agent from cached state without performing network I/O.
+    ///
+    /// vCPUs may use 2× overprovisioning; RAM is not overprovisioned. Pending
+    /// placements reserve their requested resources until agent status confirms
+    /// them, while running usage comes directly from the cached agent snapshot.
+    /// Cache-affecting actions must update cache state before a later affinity
+    /// decision depends on them.
     fn score_agent(
         &self,
         msg: &CreateVM,
@@ -214,6 +226,9 @@ impl SchedulerActor {
     }
 }
 
+/// Returns whether a request fits within supplied vCPU and RAM limits.
+///
+/// Arguments must already include applicable overprovisioning and pending reservations.
 pub(super) const fn has_capacity(
     max_vcpus: u32,
     used_vcpus: u32,
@@ -260,6 +275,9 @@ pub(super) fn pending_resources_for_agent(
         .unwrap_or_default()
 }
 
+/// Converts an affinity result into a score contribution or rejection.
+///
+/// Failed required rules reject an agent; unmet preferred rules contribute zero.
 pub(super) fn affinity_delta(strictness: &AffinityStrictness, follows_rule: bool) -> Option<i64> {
     match strictness {
         AffinityStrictness::Required if !follows_rule => None,
@@ -270,6 +288,12 @@ pub(super) fn affinity_delta(strictness: &AffinityStrictness, follows_rule: bool
     }
 }
 
+/// Evaluates a rule against the metadata objects in its selected affinity scope.
+///
+/// Requirements are OR-ed. For a requirement to match, every supplied metadata
+/// object must satisfy it; empty metadata therefore does not match. `inverse`
+/// negates the aggregate result, and a rule without requirements is false before
+/// inversion.
 pub(super) fn evaluate_affinity_rule(
     metadata_tables: &MetadataTables<'_>,
     rule: &crate::manifest::AffinityRule,
@@ -304,6 +328,10 @@ pub(super) fn evaluate_affinity_rule(
     }
 }
 
+/// Evaluates one metadata value against a requirement.
+///
+/// Missing keys match only `NotIn`. Numeric `Lt` and `Gt` comparisons require
+/// exactly one parseable numeric requirement value; malformed comparisons are false.
 pub(super) fn evaluate_table_value(
     value_option: Option<&String>,
     requirement: &AffinityRequirement,
@@ -336,6 +364,7 @@ pub(super) fn evaluate_table_value(
         }
     }
 }
+/// Lexicographic scheduling score: affinity takes precedence over resource headroom.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct AgentScore {
     general: f32,

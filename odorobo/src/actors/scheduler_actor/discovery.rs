@@ -20,6 +20,7 @@ use super::{
 };
 
 impl SchedulerActor {
+    /// Enumerates currently discoverable VM actors and forwards each to the scheduler.
     async fn vm_actor_finder(parent_actor_ref: ActorRef<Self>) -> Result<(), Report> {
         trace!("running vm_actor_finder");
 
@@ -37,6 +38,9 @@ impl SchedulerActor {
         Ok(())
     }
 
+    /// Resolves a VM's identity once, then heartbeats it every second.
+    ///
+    /// Six consecutive failed requests stop the task and request cache cleanup.
     async fn vm_updater_task(scheduler: ActorRef<Self>, actor_ref: RemoteActorRef<VMActor>) {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         let mut fails: u8 = 0;
@@ -91,6 +95,7 @@ impl SchedulerActor {
         }
     }
 
+    /// Enumerates currently discoverable agents and forwards each to the scheduler.
     async fn agent_actor_finder(parent_actor_ref: ActorRef<Self>) -> Result<(), Report> {
         trace!("running agent_actor_finder");
 
@@ -108,6 +113,10 @@ impl SchedulerActor {
         Ok(())
     }
 
+    /// Polls revisioned agent status every second and forwards accepted responses.
+    ///
+    /// The task begins with revision zero so its first response establishes a
+    /// full snapshot. Six consecutive failed requests stop it and request cleanup.
     async fn agent_updater_task(scheduler: ActorRef<Self>, actor_ref: RemoteActorRef<AgentActor>) {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         let mut status_revision = 0;
@@ -166,6 +175,10 @@ impl SchedulerActor {
         }
     }
 
+    /// Starts the periodic discovery and pending-placement maintenance loop.
+    ///
+    /// Each five-second pass discovers both actor types, then asks the scheduler
+    /// to expire unresolved pending placements.
     pub(super) fn start_actor_finder(&mut self, actor_ref: ActorRef<Self>) {
         self.cache_actor_finder = Some(tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(5));
@@ -185,6 +198,7 @@ impl SchedulerActor {
     }
 }
 
+/// Registers a discovered VM actor and starts its single polling task.
 impl Message<VmActorDiscovered> for SchedulerActor {
     type Reply = ();
 
@@ -212,6 +226,7 @@ impl Message<VmActorDiscovered> for SchedulerActor {
     }
 }
 
+/// Registers a discovered agent and starts its single status-polling task.
 impl Message<AgentActorDiscovered> for SchedulerActor {
     type Reply = ();
 
@@ -239,6 +254,7 @@ impl Message<AgentActorDiscovered> for SchedulerActor {
     }
 }
 
+/// Caches a VM's canonical ID, manifest when supplied, and discovered actor reference.
 impl Message<VmUpdated> for SchedulerActor {
     type Reply = ();
 
@@ -257,6 +273,7 @@ impl Message<VmUpdated> for SchedulerActor {
     }
 }
 
+/// Removes cache state after a VM updater determines its actor is unreachable.
 impl Message<VmUpdaterStopped> for SchedulerActor {
     type Reply = ();
 
@@ -282,6 +299,7 @@ impl Message<VmUpdaterStopped> for SchedulerActor {
     }
 }
 
+/// Applies a newer agent update, requiring a full snapshot before accepting deltas.
 impl Message<AgentUpdated> for SchedulerActor {
     type Reply = ();
 
@@ -355,6 +373,7 @@ impl Message<AgentUpdated> for SchedulerActor {
     }
 }
 
+/// Removes cache state and placements owned by an unreachable agent.
 impl Message<AgentUpdaterStopped> for SchedulerActor {
     type Reply = ();
 
@@ -373,6 +392,7 @@ impl Message<AgentUpdaterStopped> for SchedulerActor {
     }
 }
 
+/// Performs periodic pending-placement expiry and refreshes resource accounting.
 impl Message<ReconcileVmPlacements> for SchedulerActor {
     type Reply = ();
 
