@@ -121,20 +121,16 @@ impl Actor for AgentActor {
         })
     }
 
-    // async fn on_panic(state: Self::Args, weak_actor_ref: WeakActorRef<Self>, _panic: &PanicError) {
-    //     panic!("Agent panicked: {:?}", _panic);
-    // }
-    //
     async fn on_panic(
         &mut self,
         _actor_ref: WeakActorRef<Self>,
         err: PanicError,
-    ) -> Result<std::ops::ControlFlow<ActorStopReason>> {
-        error!("Agent panicked: {:?}", err);
-
-        // todo: if we panic, we should completely regen the self struct from scratch. The assumption should be that memory corruption could have possibly happened becauew
-
-        Ok(ControlFlow::Continue(()))
+    ) -> Result<ControlFlow<ActorStopReason>> {
+        error!(
+            ?err,
+            "Agent actor panicked; stopping because its state cannot be safely rebuilt here"
+        );
+        Ok(ControlFlow::Break(ActorStopReason::Panicked(err)))
     }
 
     async fn on_link_died(
