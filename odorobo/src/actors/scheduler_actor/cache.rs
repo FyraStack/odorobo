@@ -155,6 +155,8 @@ impl SchedulerActor {
 
     /// Removes placements assigned to a departed agent and drops VM state only
     /// when no placement remains.
+    // TODO: Preserve VM intent and enqueue replacement placement or recreation
+    // when an agent disappears instead of dropping the last VM state.
     pub(super) fn remove_agent_placements(
         agent_id: ActorId,
         manifests: &mut AHashMap<Ulid, VmManifest>,
@@ -311,6 +313,8 @@ impl SchedulerActor {
         let empty_vmids: Vec<_> = placements
             .iter_mut()
             .filter_map(|(vmid, entries)| {
+                // TODO: Expire or repair `Running` placements that remain absent
+                // from repeated full snapshots; they are retained indefinitely now.
                 for entry in entries
                     .iter_mut()
                     .filter(|entry| entry.agent_id == agent_id)

@@ -90,6 +90,8 @@ impl Message<CreateVM> for SchedulerActor {
     ) -> Self::Reply {
         let target_agent = self.schedule_agent(&msg)?;
 
+        // TODO: Define duplicate VM-ID semantics before overwriting intent and
+        // appending another pending placement; reject conflicts or make retries idempotent.
         self.vm_manifests.insert(msg.vmid, msg.config.clone());
         self.invalidate_pending_resources();
         self.vm_placements
