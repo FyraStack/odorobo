@@ -102,13 +102,6 @@ type MetadataTables<'a> = [(
     &'a std::collections::BTreeMap<String, String>,
 )];
 
-// todo: we should improve the cache to not have agents and vms send the full data on every update.
-//  I looked at kameo streams to make this better, but they aren't really intended for this kind of long term update use case.
-//  They use rust futures::stream which seems to be more intended for you have an iterator for example that will create data, but not like full on sending messages.
-//  This could likely be done pretty easily by having two get data messages.
-//   Option 1: One that creates a session and sends the full data and then only sends diffs after that.
-//   Option 2: One that sends full data, and then another that only sends data that changes.
-//  Option 2 is easier to write and uses less compute, but uses more network bandwidth.
 #[derive(RemoteActor)]
 pub struct SchedulerActor {
     pub agent_data_cache: AHashMap<ActorId, CachedAgentActor>,
@@ -184,11 +177,8 @@ impl SchedulerActor {
         }
     }
 
-    /// Returns every VM that could be on an agent, without allocating a hash set.
-    ///
-    /// The observed list is normally the dominant source and is already unique;
-    /// migration placements are checked linearly to preserve deduplication while
-    /// avoiding a temporary hash table on every affinity evaluation.
+    /// Returns every VM that could be on an agent, deduplicating each source in
+    /// constant expected time.
     fn placement_vm_ids(
         placements: &AHashMap<Ulid, Vec<VmPlacement>>,
         indexed: Option<&AHashSet<Ulid>>,
@@ -197,10 +187,16 @@ impl SchedulerActor {
     ) -> Vec<Ulid> {
         let indexed_len = indexed.map_or(0, |index| index.len());
         let mut vmids = Vec::with_capacity(observed.len().max(indexed_len));
-        vmids.extend_from_slice(observed);
+        let mut seen = AHashSet::with_capacity(observed.len().saturating_add(indexed_len));
+
+        for vmid in observed {
+            if seen.insert(*vmid) {
+                vmids.push(*vmid);
+            }
+        }
         if let Some(indexed) = indexed {
             for vmid in indexed {
-                if !vmids.contains(vmid) {
+                if seen.insert(*vmid) {
                     vmids.push(*vmid);
                 }
             }
@@ -211,7 +207,7 @@ impl SchedulerActor {
                 .any(|entry| entry.agent_id == agent_id)
                 .then_some(vmid)
         }) {
-            if !vmids.contains(vmid) {
+            if seen.insert(*vmid) {
                 vmids.push(*vmid);
             }
         }
