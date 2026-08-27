@@ -16,12 +16,18 @@ use super::{CachedVMActor, SchedulerActor, VmLifecycle, VmPlacement};
 const UNRESOLVED_VM_CACHE_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl SchedulerActor {
+    /// Releases excess allocation once an entry list no longer represents migration.
     pub(super) fn shrink_non_migrating_entries<T>(entries: &mut Vec<T>) {
         if entries.len() <= 1 && entries.capacity() >= 4 {
             entries.shrink_to_fit();
         }
     }
 
+    /// Replaces a matching discovered VM entry, fulfills one unresolved placeholder,
+    /// or records an additional entry for a concurrent migration placement.
+    ///
+    /// Matching is ordered by actor ID, then the first `None` placeholder, then
+    /// append. Placement and cache vectors are not positionally correlated.
     pub(super) fn update_cached_vm_entry(
         entries: &mut Vec<CachedVMActor>,
         actor_id: ActorId,
@@ -42,6 +48,12 @@ impl SchedulerActor {
         Self::shrink_non_migrating_entries(entries);
     }
 
+    /// Expires pending placements that were never confirmed by agent status.
+    ///
+    /// Pending entries expire after 30 seconds. The five-second discovery loop
+    /// triggers this maintenance, so a slow-to-report create can be forgotten.
+    /// When the expired placement was the last placement for a VM, all correlated
+    /// manifest, placement, and actor-cache state is removed.
     pub(super) fn cleanup_unresolved_vm_cache(
         manifests: &mut AHashMap<Ulid, VmManifest>,
         placements: &mut AHashMap<Ulid, Vec<VmPlacement>>,
@@ -67,6 +79,10 @@ impl SchedulerActor {
 
     /// Returns every VM that could be on an agent, deduplicating each source in
     /// constant expected time.
+    ///
+    /// The union includes current status, the status-derived index, and desired
+    /// placements to avoid affinity decisions missing in-flight changes. Output is
+    /// observation-first, then hash-map iteration order; callers must not rely on it.
     pub(super) fn placement_vm_ids(
         placements: &AHashMap<Ulid, Vec<VmPlacement>>,
         indexed: Option<&AHashSet<Ulid>>,
@@ -102,6 +118,7 @@ impl SchedulerActor {
         vmids
     }
 
+    /// Removes all scheduler state correlated with a VM identifier.
     pub(super) fn remove_vm_state(
         vmid: Ulid,
         manifests: &mut AHashMap<Ulid, VmManifest>,
@@ -113,6 +130,7 @@ impl SchedulerActor {
         data_cache.remove(&vmid);
     }
 
+    /// Removes a departed actor from every VM cache entry without altering placement intent.
     pub(super) fn remove_vm_actor(
         actor_id: ActorId,
         data_cache: &mut AHashMap<Ulid, Vec<CachedVMActor>>,
@@ -135,6 +153,8 @@ impl SchedulerActor {
         }
     }
 
+    /// Removes placements assigned to a departed agent and drops VM state only
+    /// when no placement remains.
     pub(super) fn remove_agent_placements(
         agent_id: ActorId,
         manifests: &mut AHashMap<Ulid, VmManifest>,
@@ -155,6 +175,10 @@ impl SchedulerActor {
         }
     }
 
+    /// Rolls back optimistic create state only when no VM actor was created.
+    ///
+    /// An actor may exist even if the create request failed or its reply was lost;
+    /// retaining the state in that case lets normal discovery reconcile it.
     pub(super) fn rollback_failed_create(
         vmid: Ulid,
         actor_exists: bool,
@@ -174,6 +198,7 @@ impl SchedulerActor {
         }
     }
 
+    /// Aborts polling and removes all cache state owned by a departed agent.
     pub(super) fn cleanup_agent_actor(&mut self, actor_id: ActorId) {
         if let Some(keepalive_task) = self.agent_keepalive_tasks.remove(&actor_id) {
             trace!(?actor_id, "Aborting agent keepalive task");
@@ -190,6 +215,8 @@ impl SchedulerActor {
         );
     }
 
+    /// Aborts VM polling and removes actor state, retaining a VM only when
+    /// another discovered actor or unresolved placement can still represent it.
     pub(super) fn cleanup_vm_actor(&mut self, actor_id: ActorId) {
         if let Some(keepalive_task) = self.vm_keepalive_tasks.remove(&actor_id) {
             trace!(?actor_id, "Aborting VM keepalive task");
@@ -213,6 +240,10 @@ impl SchedulerActor {
         }
     }
 
+    /// Incorporates additions from a status delta into placement observations.
+    ///
+    /// Removals deliberately do not delete desired placements: they may be
+    /// transient observations and reconciliation must be able to recreate the VM.
     pub(super) fn reconcile_agent_delta(
         agent_id: ActorId,
         added: &[Ulid],
@@ -245,6 +276,11 @@ impl SchedulerActor {
         // distinction for snapshots.
     }
 
+    /// Reconciles scheduler placement observations with a complete agent snapshot.
+    ///
+    /// Known, reported VMs gain or refresh `Running` placements. Unknown VMs are
+    /// ignored because the scheduler has no retained intent for them. Absent VMs
+    /// leave existing desired placements intact so future reconciliation can act.
     pub(super) fn reconcile_agent_placements(
         agent_id: ActorId,
         status: &AgentStatus,

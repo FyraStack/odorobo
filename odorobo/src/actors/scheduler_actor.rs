@@ -36,33 +36,39 @@ use crate::manifest::VmManifest;
 use crate::messages::agent::{AgentStatus, AgentStatusUpdate};
 use crate::messages::vm::GetVMInfoReply;
 
+/// Internal discovery event that starts VM polling for a newly found actor.
 #[derive(Debug)]
 struct VmActorDiscovered {
     actor_ref: RemoteActorRef<VMActor>,
 }
 
+/// Internal discovery event that starts status polling for a newly found agent.
 #[derive(Debug)]
 struct AgentActorDiscovered {
     actor_ref: RemoteActorRef<AgentActor>,
 }
 
+/// The cache domain that owns cleanup for a linked remote actor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CachedActorKind {
     Agent,
     Vm,
 }
 
+/// A VM's initial identity and configuration snapshot from its updater task.
 #[derive(Debug)]
 struct VmUpdated {
     actor_ref: RemoteActorRef<VMActor>,
     data: GetVMInfoReply,
 }
 
+/// Notification that a VM updater exceeded its reachability-failure budget.
 #[derive(Debug)]
 struct VmUpdaterStopped {
     actor_id: ActorId,
 }
 
+/// A revisioned agent-status update forwarded by its updater task.
 #[derive(Debug)]
 struct AgentUpdated {
     actor_id: ActorId,
@@ -70,11 +76,13 @@ struct AgentUpdated {
     update: AgentStatusUpdate,
 }
 
+/// Notification that an agent updater exceeded its reachability-failure budget.
 #[derive(Debug)]
 struct AgentUpdaterStopped {
     actor_id: ActorId,
 }
 
+/// Periodic maintenance trigger for expiring unresolved VM placements.
 #[derive(Debug)]
 struct ReconcileVmPlacements;
 
@@ -142,8 +150,13 @@ pub struct SchedulerActor {
     pub vm_data_cache: AHashMap<Ulid, Vec<CachedVMActor>>,
     /// Polling tasks that refresh corresponding VM actor cache entries.
     pub vm_keepalive_tasks: AHashMap<ActorId, JoinHandle<()>>,
+    /// Lazily computed resources reserved by `Pending` placements, keyed by agent.
+    /// Invalidated whenever status or placement state that affects capacity changes.
     pending_resources_cache: Option<AHashMap<ActorId, (u32, u64)>>,
+    /// Status-derived VM membership index used to evaluate VM affinity efficiently.
+    /// This is an optimization and must never override `vm_placements` intent.
     agent_vm_index: AHashMap<ActorId, AHashSet<Ulid>>,
+    /// Classifies linked actors so link-death cleanup affects the owning cache only.
     actor_kinds: AHashMap<ActorId, CachedActorKind>,
     /// Background discovery and reconciliation task.
     pub cache_actor_finder: Option<JoinHandle<()>>,
