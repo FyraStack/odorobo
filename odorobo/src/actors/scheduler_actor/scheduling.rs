@@ -291,9 +291,9 @@ pub(super) fn affinity_delta(strictness: &AffinityStrictness, follows_rule: bool
 /// Evaluates a rule against the metadata objects in its selected affinity scope.
 ///
 /// Requirements are OR-ed. For a requirement to match, every supplied metadata
-/// object must satisfy it; empty metadata therefore does not match. `inverse`
-/// negates the aggregate result, and a rule without requirements is false before
-/// inversion.
+/// object must satisfy it; empty metadata therefore does not match. The `anti`
+/// direction negates the aggregate result, and a rule without requirements is false
+/// before direction is applied.
 pub(super) fn evaluate_affinity_rule(
     metadata_tables: &MetadataTables<'_>,
     rule: &crate::manifest::AffinityRule,
@@ -321,7 +321,7 @@ pub(super) fn evaluate_affinity_rule(
         }
     }
 
-    if rule.inverse {
+    if matches!(rule.direction, crate::manifest::AffinityDirection::Anti) {
         !follows_rule
     } else {
         follows_rule
