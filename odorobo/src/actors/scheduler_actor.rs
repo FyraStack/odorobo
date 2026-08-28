@@ -742,11 +742,7 @@ fn evaluate_affinity_rule(
         }
     }
 
-    if matches!(rule.direction, crate::manifest::AffinityDirection::Anti) {
-        !follows_rule
-    } else {
-        follows_rule
-    }
+    follows_rule ^ rule.inverse
 }
 
 fn evaluate_table_value(value_option: Option<&String>, requirement: &AffinityRequirement) -> bool {
@@ -787,8 +783,8 @@ mod tests {
     };
 
     use crate::manifest::{
-        AffinityDirection, AffinityRequirement, AffinityRule, AffinityStrictness, AffinityType,
-        Boot, Compute, DesiredState, Metadata, MetadataTable, Operator, VmManifest,
+        AffinityRequirement, AffinityRule, AffinityStrictness, AffinityType, Boot, Compute,
+        DesiredState, Metadata, MetadataTable, Operator, VmManifest,
     };
     use crate::messages::agent::AgentStatus;
     use crate::types::ObjectMetadata;
@@ -1094,15 +1090,23 @@ mod tests {
         let rule = AffinityRule {
             strictness: AffinityStrictness::Required,
             affinity_type: AffinityType::Agent,
-            direction: AffinityDirection::Anti,
+            inverse: true,
             requirements: vec![requirement(Operator::In, &["frontend"])],
         };
         assert!(!evaluate_affinity_rule(&[&metadata], &rule));
 
+        let non_matching_rule = AffinityRule {
+            strictness: AffinityStrictness::Required,
+            affinity_type: AffinityType::Agent,
+            inverse: true,
+            requirements: vec![requirement(Operator::In, &["backend"])],
+        };
+        assert!(evaluate_affinity_rule(&[&metadata], &non_matching_rule));
+
         let empty_rule = AffinityRule {
             strictness: AffinityStrictness::Required,
             affinity_type: AffinityType::Agent,
-            direction: AffinityDirection::Normal,
+            inverse: false,
             requirements: Vec::new(),
         };
         assert!(!evaluate_affinity_rule(&[], &empty_rule));

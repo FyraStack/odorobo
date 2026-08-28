@@ -292,8 +292,9 @@ pub struct Placement {
 pub struct AffinityRule {
     pub strictness: AffinityStrictness,
     pub affinity_type: AffinityType,
+    /// If true, the outcome of the requirements is inverted.
     #[serde(default)]
-    pub direction: AffinityDirection,
+    pub inverse: bool,
     pub requirements: Vec<AffinityRequirement>,
 }
 
@@ -309,14 +310,6 @@ pub enum AffinityStrictness {
 pub enum AffinityType {
     VirtualMachine,
     Agent,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum AffinityDirection {
-    #[default]
-    Normal,
-    Anti,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
@@ -716,7 +709,7 @@ mod tests {
             manifest.desired.placement.affinity = vec![AffinityRule {
                 strictness: AffinityStrictness::Required,
                 affinity_type: AffinityType::Agent,
-                direction: AffinityDirection::Normal,
+                inverse: false,
                 requirements: vec![AffinityRequirement {
                     key: "capacity".to_owned(),
                     table: MetadataTable::Annotation,
@@ -739,7 +732,7 @@ mod tests {
         manifest.desired.placement.affinity.push(AffinityRule {
             strictness: AffinityStrictness::Preferred { weight: 10 },
             affinity_type: AffinityType::VirtualMachine,
-            direction: AffinityDirection::Anti,
+            inverse: true,
             requirements: vec![AffinityRequirement {
                 key: "tier".to_owned(),
                 table: MetadataTable::Label,
@@ -750,6 +743,6 @@ mod tests {
         let encoded = serde_json::to_string(&manifest).expect("affinity is serializable");
         assert!(encoded.contains("preferred"));
         assert!(encoded.contains("virtual_machine"));
-        assert!(encoded.contains("\"direction\":\"anti\""));
+        assert!(encoded.contains("\"inverse\":true"));
     }
 }
