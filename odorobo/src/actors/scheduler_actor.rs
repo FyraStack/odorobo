@@ -1475,6 +1475,7 @@ impl Message<VmUpdaterStopped> for SchedulerActor {
     }
 }
 
+#[allow(clippy::unused_async_trait_impl)]
 impl Message<AgentUpdated> for SchedulerActor {
     type Reply = ();
 
