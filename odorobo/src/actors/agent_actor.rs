@@ -312,7 +312,7 @@ impl Message<GetAgentStatus> for AgentActor {
         let ram_used_by_vms = self
             .vms
             .values()
-            .map(|vm| vm.config.desired.compute.memory.as_u64())
+            .map(|vm| vm.config.desired.compute.memory_bytes)
             .reduce(u64::saturating_add)
             .unwrap_or(0);
 

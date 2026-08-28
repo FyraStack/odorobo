@@ -113,7 +113,7 @@ pub async fn run_command(cli: Cli) -> Result<()> {
                     },
                     compute: Compute {
                         vcpus: 4,
-                        memory: ByteSize::gib(4),
+                        memory_bytes: ByteSize::gib(4).as_u64(),
                         ..Default::default()
                     },
                     storage: vec![Storage {

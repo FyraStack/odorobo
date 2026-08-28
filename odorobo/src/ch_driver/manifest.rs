@@ -65,7 +65,7 @@ pub fn to_vm_config(manifest: &VmManifest) -> Result<VmConfig> {
             ..Default::default()
         }),
         memory: Some(MemoryConfig {
-            size: i64::try_from(desired.compute.memory.as_u64())
+            size: i64::try_from(desired.compute.memory_bytes)
                 .map_err(|_| eyre!("memory size exceeds Cloud Hypervisor limits"))?,
             ..Default::default()
         }),
@@ -130,7 +130,6 @@ fn storage_to_disk(storage: &Storage) -> Result<DiskConfig> {
 mod tests {
     use super::*;
     use crate::manifest::{Boot, Compute, DesiredState, Metadata};
-    use bytesize::ByteSize;
     use ulid::Ulid;
 
     fn minimal() -> VmManifest {
@@ -144,7 +143,7 @@ mod tests {
                 },
                 compute: Compute {
                     vcpus: 2,
-                    memory: ByteSize::b(1024),
+                    memory_bytes: 1024,
                     ..Default::default()
                 },
                 boot: Boot::default(),
