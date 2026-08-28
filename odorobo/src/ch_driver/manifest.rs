@@ -25,8 +25,8 @@ pub fn to_vm_config(manifest: &VmManifest) -> Result<VmConfig> {
     let desired = &manifest.desired;
     // Keep URI-backed disks logical until StorageDriverTransformer resolves them
     // to node-local paths. This preserves enough source identity for teardown.
-    // The manifest order is also the provider attachment order and, for Cloud
-    // Hypervisor, the preferred disk boot order.
+    // Cloud Hypervisor has no per-disk boot index; it uses the disks array
+    // order when selecting a bootable device. Keep the manifest order intact.
     let disks = desired
         .storage
         .iter()
@@ -177,6 +177,37 @@ mod tests {
         let network = &config.net.expect("network config")[0];
         assert_eq!(network.id.as_deref(), Some("net://private"));
         assert_eq!(network.mac.as_deref(), Some("02:00:00:00:00:01"));
+    }
+
+    #[test]
+    fn preserves_manifest_storage_order_for_cloud_hypervisor_boot() {
+        let mut manifest = minimal();
+        manifest.desired.storage = vec![
+            Storage {
+                id: "data".to_owned(),
+                uri: Some("file:///var/lib/data.img".to_owned()),
+                ..Default::default()
+            },
+            Storage {
+                id: "root".to_owned(),
+                uri: Some("file:///var/lib/root.img".to_owned()),
+                ..Default::default()
+            },
+        ];
+
+        let config = to_vm_config(&manifest).expect("ordered storage manifest converts");
+        let disks = config.disks.as_ref().expect("disk configs");
+        let serialized = serde_json::to_value(&config).expect("config serializes");
+
+        assert_eq!(
+            disks
+                .iter()
+                .filter_map(|disk| disk.id.as_deref())
+                .collect::<Vec<_>>(),
+            ["data", "root"]
+        );
+        assert_eq!(serialized["disks"][0]["id"].as_str(), Some("data"));
+        assert_eq!(serialized["disks"][1]["id"].as_str(), Some("root"));
     }
 
     #[test]
