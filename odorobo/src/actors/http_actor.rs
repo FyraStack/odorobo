@@ -17,6 +17,7 @@ pub struct HTTPActor {
     pub scheduler: ActorRef<SchedulerActor>,
 }
 
+#[allow(clippy::unused_async_trait_impl)]
 impl Actor for HTTPActor {
     type Args = ActorRef<SchedulerActor>;
     type Error = Report;
