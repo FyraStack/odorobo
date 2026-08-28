@@ -1258,7 +1258,10 @@ mod tests {
             inverse: true,
             requirements: vec![requirement(Operator::In, &["backend"])],
         };
-        assert!(evaluate_affinity_rule(&[&metadata], &non_matching_rule));
+        assert!(evaluate_affinity_rule(
+            &[(&metadata.labels, &metadata.annotations)],
+            &non_matching_rule,
+        ));
 
         let empty_rule = AffinityRule {
             strictness: AffinityStrictness::Required,
