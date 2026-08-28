@@ -25,6 +25,8 @@ pub fn to_vm_config(manifest: &VmManifest) -> Result<VmConfig> {
     let desired = &manifest.desired;
     // Keep URI-backed disks logical until StorageDriverTransformer resolves them
     // to node-local paths. This preserves enough source identity for teardown.
+    // The manifest order is also the provider attachment order and, for Cloud
+    // Hypervisor, the preferred disk boot order.
     let disks = desired
         .storage
         .iter()
@@ -184,7 +186,6 @@ mod tests {
             Storage {
                 id: "root".to_owned(),
                 uri: Some("rbd://pool/root".to_owned()),
-                boot: true,
                 ..Default::default()
             },
             Storage {

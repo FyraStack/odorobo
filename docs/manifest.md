@@ -28,9 +28,11 @@ Odorobo should provision. It contains:
 - `metadata`: stable name, labels, and annotations.
 - `compute`: boot vCPUs, optional scaling ceiling, and memory in bytes.
 - `storage`: ordered storage attachments. An attachment references either a storage URI or a
-  provisioned volume ID; `boot` identifies the boot attachment. The control plane owns
-  attachment identity and ordering; the provider driver/storage transform resolves the
-  URI or volume ID to a node-local device path.
+  provisioned volume ID. The array order is the attachment order and preferred disk boot
+  order: the first attachment is the preferred boot disk, followed by later attachments.
+  Cloud Hypervisor has no per-disk boot index, so providers must preserve this order when
+  translating the manifest. The control plane owns attachment identity and ordering; the
+  provider driver/storage transform resolves the URI or volume ID to a node-local device path.
 - `networks`: stable network IDs and optional guest MAC addresses. The control plane owns
   the attachment identity and requested MAC; the provider networking transform resolves
   the network to a host interface or tap device.
@@ -58,8 +60,8 @@ A manifest must use a supported `api_version`, have a non-empty metadata name,
 non-zero vCPUs and memory, and satisfy these relationships:
 
 - `max_vcpus` must be at least `vcpus`.
-- Every storage attachment must have a non-empty ID and exactly one usable source (URI or volume reference), and
-  a boot storage attachment cannot be read-only. At most one storage attachment may be marked as boot.
+- Every storage attachment must have a non-empty ID and exactly one usable source (URI or volume reference).
+  Storage order must be preserved when attachments are translated to the provider.
 - Affinity requirements within a rule are OR-ed; rules are combined according to
   their strictness, and `inverse` negates a rule's result. `lt` and `gt` comparisons require exactly one
   finite numeric value.
@@ -85,6 +87,16 @@ Representative JSON fixtures are in [`fixtures/manifest`](fixtures/manifest):
 - [`networked.json`](fixtures/manifest/networked.json)
 - [`cloud-init.json`](fixtures/manifest/cloud-init.json)
 - [`vsock.json`](fixtures/manifest/vsock.json)
+
+For example, storage attachments are listed in preferred disk boot order. Here `root` is
+presented before `data`:
+
+```json
+"storage": [
+  { "id": "root", "uri": "rbd://vms/root" },
+  { "id": "data", "volume_id": "01J00000000000000000000002" }
+]
+```
 
 For example:
 

@@ -38,10 +38,7 @@ pub enum ManifestError {
     InvalidStorageSource(String),
     #[error("storage attachment {0} has a duplicate id")]
     DuplicateStorageId(String),
-    #[error("storage attachment {0} cannot be both a boot attachment and read-only")]
-    ReadOnlyBootStorage(String),
-    #[error("manifest cannot define more than one boot storage attachment")]
-    MultipleBootStorageAttachments,
+
     #[error("network {0} must define an id")]
     NetworkWithoutId(usize),
     #[error("cloud-init user-data and meta-data must be supplied together")]
@@ -118,6 +115,7 @@ impl VmManifest {
 pub struct DesiredState {
     pub metadata: Metadata,
     pub compute: Compute,
+    /// The order of this array determines boot device order.
     #[serde(default)]
     pub storage: Vec<Storage>,
     #[serde(default)]
@@ -156,7 +154,6 @@ impl DesiredState {
         // attachment belong to storage backends, so the manifest only checks
         // that the converter has one usable source from which to begin.
         let mut storage_ids = std::collections::HashSet::with_capacity(self.storage.len());
-        let mut has_boot_storage = false;
         for storage in &self.storage {
             if storage.id.trim().is_empty() {
                 return Err(ManifestError::EmptyStorageId);
@@ -171,15 +168,6 @@ impl DesiredState {
                 || storage.uri.is_some() == storage.volume_id.is_some()
             {
                 return Err(ManifestError::InvalidStorageSource(storage.id.clone()));
-            }
-            if storage.boot && storage.read_only {
-                return Err(ManifestError::ReadOnlyBootStorage(storage.id.clone()));
-            }
-            if storage.boot {
-                if has_boot_storage {
-                    return Err(ManifestError::MultipleBootStorageAttachments);
-                }
-                has_boot_storage = true;
             }
         }
         for (index, network) in self.networks.iter().enumerate() {
@@ -262,8 +250,6 @@ pub struct Storage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(with = "Option<String>")]
     pub volume_id: Option<Ulid>,
-    #[serde(default)]
-    pub boot: bool,
     #[serde(default)]
     pub read_only: bool,
 }
@@ -563,37 +549,6 @@ mod tests {
         assert!(matches!(
             manifest.validate(),
             Err(ManifestError::EmptyStorageId)
-        ));
-
-        manifest.desired.storage.clear();
-        manifest.desired.storage.push(Storage {
-            id: "root".to_owned(),
-            uri: Some("file:///disk.img".to_owned()),
-            boot: true,
-            ..Default::default()
-        });
-        manifest.desired.storage.push(Storage {
-            id: "other".to_owned(),
-            uri: Some("file:///other.img".to_owned()),
-            boot: true,
-            ..Default::default()
-        });
-        assert!(matches!(
-            manifest.validate(),
-            Err(ManifestError::MultipleBootStorageAttachments)
-        ));
-
-        manifest.desired.storage.clear();
-        manifest.desired.storage.push(Storage {
-            id: "root".to_owned(),
-            uri: Some("file:///disk.img".to_owned()),
-            boot: true,
-            read_only: true,
-            ..Default::default()
-        });
-        assert!(matches!(
-            manifest.validate(),
-            Err(ManifestError::ReadOnlyBootStorage(_))
         ));
     }
 
