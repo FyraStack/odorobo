@@ -2,7 +2,6 @@ use std::collections::BTreeMap;
 
 use aide::OperationIo;
 use bytesize::ByteSize;
-use cloud_hypervisor_client::models::VmConfig;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
@@ -71,21 +70,6 @@ impl Default for StorageUri {
 pub struct CreateVMRequest {
     /// Provider-neutral VM intent to create.
     pub vm: VmManifest,
-    /// Whether to boot the VM immediately after creation
-    pub boot: bool,
-}
-
-/// An internal, debug-only request for creating a VM.
-///
-/// please don't use this in production, this is for debugging
-///
-/// PUT /vms/
-#[derive(Serialize, Deserialize, Debug, OperationIo, Default, Clone)]
-pub struct DebugCreateVMRequest {
-    /// Data of the VM to create
-    pub vm_config: VmConfig,
-    /// Whether to boot the VM immediately after creation
-    pub boot: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Default, Clone)]

@@ -130,7 +130,7 @@ pub async fn run_command(cli: Cli) -> Result<()> {
                 observed: None,
             };
 
-            let request = CreateVMRequest { vm, boot: true };
+            let request = CreateVMRequest { vm };
 
             let url = format!("{base_url}/vms");
             let response = client.post(&url).json(&request).send().await?;
