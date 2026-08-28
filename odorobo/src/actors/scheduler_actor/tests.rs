@@ -7,8 +7,8 @@ use super::{
 };
 
 use crate::manifest::{
-    AffinityRequirement, AffinityRule, AffinityStrictness, AffinityType, Boot, Compute,
-    DesiredState, Metadata, MetadataTable, Operator, VmManifest,
+    AffinityDirection, AffinityRequirement, AffinityRule, AffinityStrictness, AffinityType, Boot,
+    Compute, DesiredState, Metadata, MetadataTable, Operator, VmManifest,
 };
 use crate::messages::agent::AgentStatus;
 use crate::types::ObjectMetadata;
@@ -346,7 +346,7 @@ fn evaluates_inverse_and_empty_requirements() {
     let rule = AffinityRule {
         strictness: AffinityStrictness::Required,
         affinity_type: AffinityType::Agent,
-        inverse: true,
+        direction: AffinityDirection::Anti,
         requirements: vec![requirement(Operator::In, &["frontend"])],
     };
     assert!(!evaluate_affinity_rule(
@@ -357,7 +357,7 @@ fn evaluates_inverse_and_empty_requirements() {
     let empty_rule = AffinityRule {
         strictness: AffinityStrictness::Required,
         affinity_type: AffinityType::Agent,
-        inverse: false,
+        direction: AffinityDirection::Normal,
         requirements: Vec::new(),
     };
     assert!(!evaluate_affinity_rule(&[], &empty_rule));
