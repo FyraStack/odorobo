@@ -321,11 +321,7 @@ pub(super) fn evaluate_affinity_rule(
         }
     }
 
-    if matches!(rule.direction, crate::manifest::AffinityDirection::Anti) {
-        !follows_rule
-    } else {
-        follows_rule
-    }
+    follows_rule ^ rule.inverse
 }
 
 /// Evaluates one metadata value against a requirement.
