@@ -92,8 +92,8 @@ pub struct AgentListVMsReply {
     pub vms: Vec<Ulid>,
 }
 
-/// Get VM info, including the full manifest.
-#[derive(Serialize, Deserialize, Debug)]
+/// Get VM info
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct GetVMInfo {
     pub vmid: Option<Ulid>,
 }
@@ -111,4 +111,28 @@ pub struct GetVMHeartbeat;
 #[derive(Serialize, Deserialize, Reply, Debug, Clone, Copy)]
 pub struct GetVMHeartbeatReply {
     pub vmid: Ulid,
+}
+
+/// Retrieve the retained serial-console output for a VM.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct GetConsoleHistory {
+    pub vmid: Ulid,
+}
+
+#[derive(Serialize, Deserialize, Reply, Debug, Clone)]
+pub struct GetConsoleHistoryReply {
+    pub history: Vec<u8>,
+}
+
+/// Send raw input bytes to a VM's serial console.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SendConsoleInput {
+    pub vmid: Ulid,
+    pub input: Vec<u8>,
+}
+
+#[derive(Serialize, Deserialize, Reply, Debug, Clone)]
+pub struct SendConsoleInputReply {
+    pub written: usize,
+    pub error: Option<String>,
 }
