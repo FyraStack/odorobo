@@ -1,6 +1,9 @@
 use bytesize::ByteSize;
 use clap::{Parser, Subcommand};
-use odorobo::types::{CreateVMRequest, VMData, VirtualMachine};
+use odorobo::{
+    manifest::{Boot, Compute, DesiredState, Metadata, Storage, VmManifest},
+    types::CreateVMRequest,
+};
 use reqwest::{Client, Response};
 use serde::Deserialize;
 use stable_eyre::Result;
@@ -100,22 +103,34 @@ pub async fn run_command(cli: Cli) -> Result<()> {
 
     match cli.command {
         Command::Create { image } => {
-            // TODO: setup actual cli args for these parameters. or just take in arbitrary json and serialize it into a VirtualMachine.
-            let vm = VirtualMachine {
-                data: VMData {
-                    id: Ulid::generate(),
-                    name: "test_vm".to_owned(),
-                    vcpus: 4,
-                    max_vcpus: None,
-                    memory: ByteSize::gib(4),
-                    image,
+            let vm = VmManifest {
+                api_version: odorobo::manifest::MANIFEST_VERSION,
+                id: Ulid::generate(),
+                desired: DesiredState {
+                    metadata: Metadata {
+                        name: "test_vm".to_owned(),
+                        ..Default::default()
+                    },
+                    compute: Compute {
+                        vcpus: 4,
+                        memory_bytes: ByteSize::gib(4).as_u64(),
+                        ..Default::default()
+                    },
+                    storage: vec![Storage {
+                        id: "root".to_owned(),
+                        uri: Some(image),
+                        ..Default::default()
+                    }],
+                    boot: Boot {
+                        start: true,
+                        ..Default::default()
+                    },
                     ..Default::default()
                 },
-
-                ..Default::default()
+                observed: None,
             };
 
-            let request = CreateVMRequest { vm, boot: true };
+            let request = CreateVMRequest { vm };
 
             let url = format!("{base_url}/vms");
             let response = client.post(&url).json(&request).send().await?;

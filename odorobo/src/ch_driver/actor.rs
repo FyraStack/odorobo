@@ -5,10 +5,11 @@ use crate::messages::vm::{
     GetVMInfo, GetVMInfoReply, MigrateVMReceive, MigrateVMReceiveReply, PrepMigration,
     SendConsoleInput, SendConsoleInputReply, ShutdownVM,
 };
-use crate::{ch_driver::VMInstance, types::VirtualMachine};
-use cloud_hypervisor_client::models::{
-    CpusConfig, DiskConfig, ImageType, MemoryConfig, PayloadConfig, PlatformConfig, VmConfig,
+use crate::{
+    ch_driver::{VMInstance, manifest::to_vm_config},
+    manifest::VmManifest,
 };
+use cloud_hypervisor_client::models::VmConfig;
 use kameo::prelude::*;
 use serde::{Deserialize, Serialize};
 use stable_eyre::{Report, Result};
@@ -20,8 +21,11 @@ use tokio::{
 };
 use tracing::{debug, error, info, trace, warn};
 
-/// A migration state that holds the listening address and VM config for a migration,
-/// used to pass live migration data between actors.
+/// Cloud Hypervisor-specific state for an in-progress receive migration.
+///
+/// The public migration messages carry `VmManifest`; the translated `VmConfig`
+/// stays private to the CH actor because another backend could use different
+/// migration metadata.
 pub struct MigrationState {
     pub listening_address: String,
     pub config: VmConfig,
@@ -190,22 +194,26 @@ pub struct VMActor {
     pub vm_instance: VMInstance,
     pub migration_state: Option<MigrationState>,
     pub console: Console,
-    pub manifest: Option<VirtualMachine>,
+    /// Desired provider-neutral intent retained for VM info and migration.
+    /// The translated Cloud Hypervisor config lives only in `VMInstance`.
+    pub manifest: Option<VmManifest>,
 }
 
 impl Actor for VMActor {
-    // tuple of VM ID and manifest
-    type Args = (ulid::Ulid, Option<VirtualMachine>);
+    // The actor accepts intent; CH conversion happens inside on_start.
+    type Args = (ulid::Ulid, Option<VmManifest>);
     type Error = Report;
 
     #[tracing::instrument(skip_all)]
     async fn on_start((vmid, vm_config): Self::Args, actor_ref: ActorRef<Self>) -> Result<Self> {
-        let mut vminstance = VMInstance::spawn(
-            &vmid.to_string(),
-            vm_config.clone().map(VmConfig::from),
-            None,
-        )
-        .await?;
+        // Boot is manifest intent, not a Cloud Hypervisor default. Preserve it
+        // separately because VMInstance also supports create-without-boot paths.
+        let boot = vm_config
+            .as_ref()
+            .is_some_and(|manifest| manifest.desired.boot.start);
+        let vm_config_for_ch = vm_config.as_ref().map(to_vm_config).transpose()?;
+        let mut vminstance =
+            VMInstance::spawn(&vmid.to_string(), vm_config_for_ch, boot, None).await?;
 
         let console = Console::default();
         // A migration receiver has no config yet; its serial socket is created
@@ -279,45 +287,6 @@ impl Actor for VMActor {
     }
 }
 
-// todo: improve a lot of these config options. most of them should be set by the manifest
-impl From<VirtualMachine> for VmConfig {
-    fn from(vm: VirtualMachine) -> Self {
-        Self {
-            cpus: Some(CpusConfig {
-                boot_vcpus: vm.data.vcpus.cast_signed(),
-                max_vcpus: vm.data.max_vcpus.unwrap_or(vm.data.vcpus).cast_signed(),
-                ..Default::default()
-            }),
-            memory: Some(MemoryConfig {
-                size: vm.data.memory.as_u64().cast_signed(),
-                ..Default::default()
-            }),
-            payload: PayloadConfig {
-                firmware: Some("/var/lib/odorobo/CLOUDHV.fd".to_owned()),
-                ..Default::default()
-            },
-            disks: Some(vec![DiskConfig {
-                // todo: get cappy to make this auto generate this via the manifest's volumes atribute.
-                path: Some(vm.data.image),
-                image_type: Some(ImageType::Raw),
-                ..Default::default()
-            }]),
-            // todo: generate from VM network field
-            // net: Some(vec![
-            //     NetConfig {
-            //         id: Some("net://devnet".to_string()),
-            //         ..Default::default()
-            //     }
-            // ]),
-            platform: Some(PlatformConfig {
-                serial_number: Some("ds=nocloud".to_owned()),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }
-    }
-}
-
 // allow conversion from VMActor to VMInstance to call API
 impl From<VMActor> for VMInstance {
     fn from(actor: VMActor) -> Self {
@@ -376,7 +345,7 @@ impl Message<GetVMInfo> for VMActor {
     ) -> Self::Reply {
         GetVMInfoReply {
             vmid: self.vmid,
-            config: self.manifest.clone(), // we likely dont want to send the entire manifest on every update, but some of this data is required and this is easier for now.
+            config: self.manifest.clone(),
         }
     }
 }
@@ -408,24 +377,39 @@ impl Message<MigrateVMReceive> for VMActor {
         if let Some(migration_state) = &self.migration_state {
             return MigrateVMReceiveReply {
                 listening_address: migration_state.listening_address.clone(),
+                error: None,
             };
         }
 
         let prep_config = msg.config.clone();
 
-        // Start receiving migration on the destination VM (this actor)
-        // todo: handle unwrap properly
-        let (listening_address, migration_task) = self
-            .vm_instance
-            .receive_migration()
-            .await
-            .expect("sending migration request failed");
+        // Translate before opening a receive socket so invalid intent cannot
+        // leave behind a migration listener that can never complete.
+        let config = match to_vm_config(&msg.config) {
+            Ok(config) => config,
+            Err(error) => {
+                return MigrateVMReceiveReply {
+                    listening_address: String::new(),
+                    error: Some(error.to_string()),
+                };
+            }
+        };
 
-        // create ongoing migration state
+        // Start receiving migration on the destination VM (this actor).
+        let (listening_address, migration_task) = match self.vm_instance.receive_migration().await {
+            Ok(result) => result,
+            Err(error) => {
+                return MigrateVMReceiveReply {
+                    listening_address: String::new(),
+                    error: Some(error.to_string()),
+                };
+            }
+        };
+
         self.migration_state = Some(MigrationState {
             migration_task: Some(migration_task),
             listening_address: listening_address.clone(),
-            config: msg.config,
+            config,
         });
 
         let console = self.console.clone();
@@ -481,7 +465,10 @@ impl Message<MigrateVMReceive> for VMActor {
             }
         }
 
-        MigrateVMReceiveReply { listening_address }
+        MigrateVMReceiveReply {
+            listening_address,
+            error: None,
+        }
     }
 }
 
@@ -514,8 +501,19 @@ impl Message<PrepMigration> for VMActor {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         info!(vmid = %self.vmid, "PrepMigration handler invoked");
-        // todo: prepare devices, volumes, and apply migrated config
-        self.vm_instance.prep_config(msg.config).await.unwrap();
+        // Preparation is best-effort here because the remote receive operation
+        // has no fallible reply channel; report failures and let migration state
+        // cleanup handle the failed attempt.
+        let config = match to_vm_config(&msg.config) {
+            Ok(config) => config,
+            Err(error) => {
+                error!(?error, "failed to convert migration manifest");
+                return;
+            }
+        };
+        if let Err(error) = self.vm_instance.prep_config(config).await {
+            error!(?error, "failed to prepare migrated VM configuration");
+        }
     }
 }
 

@@ -368,14 +368,17 @@ impl VMInstance {
             .wrap_err(eyre!("Failed to ping VM {}", self.vm_id()))
     }
 
-    /// Spawn a new CH process and create a `VMInstance` for it.
+    /// Spawn a Cloud Hypervisor process and optionally create/boot its VM.
     ///
-    /// Waits for the socket to become available (polls up to ~30 seconds).
-    /// Calls a backend to handle the actual CH process spawning - typically a systemd unit
+    /// `vm_config` is already translated by the CH manifest boundary. The
+    /// separate `boot` flag preserves the manifest's desired start behavior;
+    /// callers can create a stopped VM without changing its provider config.
+    /// The socket is polled for up to roughly 30 seconds before failing.
     #[tracing::instrument(skip_all)]
     pub async fn spawn(
         id: &str,
         vm_config: Option<VmConfig>,
+        boot: bool,
         transformer: Option<TransformChain>,
     ) -> Result<Self> {
         let ch_socket_path = Self::runtime_dir_for(id).join(SOCKET_FILE_NAME);
@@ -396,8 +399,8 @@ impl VMInstance {
             if instance.conn().vmm_ping_get().await.is_ok() {
                 info!(vm_id = id, "CH socket available");
                 if let Some(vm_config) = vm_config {
-                    info!(?vm_config, "Creating VM config and booting");
-                    instance.create_config(vm_config, true).await?;
+                    info!(boot, ?vm_config, "Creating VM config");
+                    instance.create_config(vm_config, boot).await?;
                 }
                 return Ok(instance);
             }

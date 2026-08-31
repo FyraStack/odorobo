@@ -6,7 +6,6 @@
 
 use std::{collections::BTreeMap, path::Path};
 
-use bytesize::ByteSize;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::Error as DeError};
 use thiserror::Error;
@@ -18,20 +17,6 @@ use ulid::Ulid;
 /// driver may translate one manifest version into a different provider API
 /// shape, while callers continue to exchange the same Odorobo-level intent.
 pub const MANIFEST_VERSION: u32 = 1;
-
-mod bytesize_as_u64 {
-    use bytesize::ByteSize;
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    #[allow(clippy::trivially_copy_pass_by_ref)]
-    pub fn serialize<S: Serializer>(size: &ByteSize, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_u64(size.as_u64())
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<ByteSize, D::Error> {
-        Ok(ByteSize(u64::deserialize(deserializer)?))
-    }
-}
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ManifestError {
@@ -53,10 +38,7 @@ pub enum ManifestError {
     InvalidStorageSource(String),
     #[error("storage attachment {0} has a duplicate id")]
     DuplicateStorageId(String),
-    #[error("storage attachment {0} cannot be both a boot attachment and read-only")]
-    ReadOnlyBootStorage(String),
-    #[error("manifest cannot define more than one boot storage attachment")]
-    MultipleBootStorageAttachments,
+
     #[error("network {0} must define an id")]
     NetworkWithoutId(usize),
     #[error("cloud-init user-data and meta-data must be supplied together")]
@@ -133,6 +115,7 @@ impl VmManifest {
 pub struct DesiredState {
     pub metadata: Metadata,
     pub compute: Compute,
+    /// The order of this array determines boot device order.
     #[serde(default)]
     pub storage: Vec<Storage>,
     #[serde(default)]
@@ -164,14 +147,13 @@ impl DesiredState {
                 max,
             });
         }
-        if self.compute.memory.as_u64() == 0 {
+        if self.compute.memory_bytes == 0 {
             return Err(ManifestError::NoMemory);
         }
         // A disk source remains abstract here. URI resolution and volume
         // attachment belong to storage backends, so the manifest only checks
         // that the converter has one usable source from which to begin.
         let mut storage_ids = std::collections::HashSet::with_capacity(self.storage.len());
-        let mut has_boot_storage = false;
         for storage in &self.storage {
             if storage.id.trim().is_empty() {
                 return Err(ManifestError::EmptyStorageId);
@@ -186,15 +168,6 @@ impl DesiredState {
                 || storage.uri.is_some() == storage.volume_id.is_some()
             {
                 return Err(ManifestError::InvalidStorageSource(storage.id.clone()));
-            }
-            if storage.boot && storage.read_only {
-                return Err(ManifestError::ReadOnlyBootStorage(storage.id.clone()));
-            }
-            if storage.boot {
-                if has_boot_storage {
-                    return Err(ManifestError::MultipleBootStorageAttachments);
-                }
-                has_boot_storage = true;
             }
         }
         for (index, network) in self.networks.iter().enumerate() {
@@ -265,9 +238,7 @@ pub struct Compute {
     pub vcpus: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_vcpus: Option<u32>,
-    #[schemars(with = "u64")]
-    #[serde(rename = "memory_bytes", with = "bytesize_as_u64")]
-    pub memory: ByteSize,
+    pub memory_bytes: u64,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
@@ -280,12 +251,10 @@ pub struct Storage {
     #[schemars(with = "Option<String>")]
     pub volume_id: Option<Ulid>,
     #[serde(default)]
-    pub boot: bool,
-    #[serde(default)]
     pub read_only: bool,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Network {
     pub id: String,
@@ -293,7 +262,7 @@ pub struct Network {
     pub mac_address: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Placement {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -354,7 +323,7 @@ pub enum Operator {
     Gt,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Boot {
     #[serde(default)]
@@ -367,7 +336,7 @@ pub struct Boot {
     pub cmdline: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CloudInit {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -376,14 +345,14 @@ pub struct CloudInit {
     pub meta_data: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Vsock {
     pub guest_cid: u32,
     pub socket: String,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ObservedState {
     /// Odorobo's normalized view of the VM lifecycle.
@@ -415,6 +384,11 @@ pub enum ObservedStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn minimal_manifest() -> VmManifest {
+        serde_json::from_str(include_str!("../../docs/fixtures/manifest/minimal.json"))
+            .expect("minimal fixture is valid")
+    }
 
     #[test]
     fn fixture_round_trips() {
@@ -448,11 +422,6 @@ mod tests {
             }
         }"#;
         serde_json::from_str::<VmManifest>(json).unwrap_err();
-    }
-
-    fn minimal_manifest() -> VmManifest {
-        serde_json::from_str(include_str!("../../docs/fixtures/manifest/minimal.json"))
-            .expect("valid minimal fixture")
     }
 
     #[test]
@@ -504,7 +473,7 @@ mod tests {
         ));
 
         manifest.desired.compute.max_vcpus = None;
-        manifest.desired.compute.memory = ByteSize::b(0);
+        manifest.desired.compute.memory_bytes = 0;
         assert_eq!(manifest.validate(), Err(ManifestError::NoMemory));
 
         let invalid_json = include_str!("../../docs/fixtures/manifest/minimal.json")
@@ -581,41 +550,10 @@ mod tests {
             manifest.validate(),
             Err(ManifestError::EmptyStorageId)
         ));
-
-        manifest.desired.storage.clear();
-        manifest.desired.storage.push(Storage {
-            id: "root".to_owned(),
-            uri: Some("file:///disk.img".to_owned()),
-            boot: true,
-            ..Default::default()
-        });
-        manifest.desired.storage.push(Storage {
-            id: "other".to_owned(),
-            uri: Some("file:///other.img".to_owned()),
-            boot: true,
-            ..Default::default()
-        });
-        assert!(matches!(
-            manifest.validate(),
-            Err(ManifestError::MultipleBootStorageAttachments)
-        ));
-
-        manifest.desired.storage.clear();
-        manifest.desired.storage.push(Storage {
-            id: "root".to_owned(),
-            uri: Some("file:///disk.img".to_owned()),
-            boot: true,
-            read_only: true,
-            ..Default::default()
-        });
-        assert!(matches!(
-            manifest.validate(),
-            Err(ManifestError::ReadOnlyBootStorage(_))
-        ));
     }
 
     #[test]
-    fn validates_vsock_and_metadata_boundaries() {
+    fn rejects_invalid_vsock_and_metadata() {
         let mut manifest = minimal_manifest();
         manifest.desired.vsock = Some(Vsock {
             guest_cid: 42,
@@ -646,7 +584,10 @@ mod tests {
 
         manifest.desired.vsock = None;
         manifest.desired.metadata.name = "  ".to_owned();
-        assert_eq!(manifest.validate(), Err(ManifestError::EmptyMetadataName));
+        assert!(matches!(
+            manifest.validate(),
+            Err(ManifestError::EmptyMetadataName)
+        ));
     }
 
     #[test]
