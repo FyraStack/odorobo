@@ -1,0 +1,61 @@
+services:
+  ceph:
+    build:
+      context: ./ceph
+      dockerfile: Containerfile
+      args:
+        CEPH_IMAGE: ${CEPH_IMAGE:-quay.io/ceph/ceph:v20.2.3}
+    image: odorobo-ceph:local
+    container_name: odorobo-ceph
+    hostname: ceph
+    privileged: true
+    restart: unless-stopped
+    environment:
+      CEPH_IMAGE: ${CEPH_IMAGE:-quay.io/ceph/ceph:v20.2.3}
+      CEPH_MON_IP: ${CEPH_MON_IP:-127.0.0.1}
+      CEPH_POOL: ${CEPH_POOL:-odorobo-blockpool}
+      CEPH_CLIENT: ${CEPH_CLIENT:-odorobo}
+      CEPH_IMAGE_NAME: ${CEPH_IMAGE_NAME:-dev-disk}
+      CEPH_IMAGE_SIZE: ${CEPH_IMAGE_SIZE:-1G}
+      CEPH_OSD_SIZE: ${CEPH_OSD_SIZE:-10G}
+    volumes:
+      - ./ceph/state/etc-ceph:/etc/ceph
+      - ./ceph/state/lib-ceph:/var/lib/ceph
+      - ./ceph/state/log-ceph:/var/log/ceph
+      - ./ceph/state/run-ceph:/run/ceph
+      - ./ceph/state/odorobo-ceph:/var/lib/odorobo-ceph
+      - ./ceph/generated:/generated
+    healthcheck:
+      test: ["CMD", "ceph", "-s"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    ports:
+      - "3300:3300"
+      - "6789:6789"
+      - "8443:8443"
+      - "9283:9283"
+      - "6800-7300:6800-7300"
+
+  odorobo:
+    build:
+      context: ../..
+      dockerfile: .local/dev/odorobo/Containerfile
+    privileged: true
+    depends_on:
+      ceph:
+        condition: service_healthy
+    network_mode: service:ceph
+    pid: service:ceph
+    volumes:
+      - ../../:/workspace
+      - ./ceph/generated:/workspace/.local/dev/ceph/generated:ro
+      - /run/odorobo:/run/odorobo
+      - /dev:/dev
+    working_dir: /workspace
+    environment:
+      CEPH_CONFIG: /workspace/.local/dev/ceph/generated/ceph.conf
+      CEPH_ID: ${CEPH_CLIENT:-odorobo}
+      CEPH_KEYFILE: /workspace/.local/dev/ceph/generated/client.${CEPH_CLIENT:-odorobo}.key
+      CEPH_CLUSTER: ceph
+    command: ["cargo", "run", "--release", "-p", "odorobo", "--", "--manager-enabled"]
