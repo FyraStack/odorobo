@@ -278,26 +278,8 @@ impl Message<VmUpdaterStopped> for SchedulerActor {
     type Reply = ();
 
     async fn handle(&mut self, msg: VmUpdaterStopped, _ctx: &mut Context<Self, Self::Reply>) {
-        self.vm_keepalive_tasks.remove(&msg.actor_id);
         self.actor_kinds.remove(&msg.actor_id);
-        // TODO: Invalidate pending-resource accounting after this cleanup, as
-        // link-death cleanup already does.
-        let vmid = self.vm_actorid_ulid_map.remove(&msg.actor_id);
-        Self::remove_vm_actor(msg.actor_id, &mut self.vm_data_cache);
-
-        if let Some(vmid) = vmid
-            && self
-                .vm_data_cache
-                .get(&vmid)
-                .is_none_or(|entries| entries.iter().all(|entry| entry.actor_ref.is_none()))
-        {
-            Self::remove_vm_state(
-                vmid,
-                &mut self.vm_manifests,
-                &mut self.vm_placements,
-                &mut self.vm_data_cache,
-            );
-        }
+        self.cleanup_vm_actor(msg.actor_id);
     }
 }
 
@@ -380,19 +362,8 @@ impl Message<AgentUpdaterStopped> for SchedulerActor {
     type Reply = ();
 
     async fn handle(&mut self, msg: AgentUpdaterStopped, _ctx: &mut Context<Self, Self::Reply>) {
-        self.agent_keepalive_tasks.remove(&msg.actor_id);
         self.actor_kinds.remove(&msg.actor_id);
-        // TODO: Delegate to `cleanup_agent_actor`, or perform its equivalent
-        // index and resource-accounting cleanup, before allowing rediscovery.
-        self.agent_data_cache.remove(&msg.actor_id);
-        self.agent_vm_index.remove(&msg.actor_id);
-        Self::remove_agent_placements(
-            msg.actor_id,
-            &mut self.vm_manifests,
-            &mut self.vm_placements,
-            &mut self.vm_data_cache,
-        );
-        self.invalidate_pending_resources();
+        self.cleanup_agent_actor(msg.actor_id);
     }
 }
 
