@@ -387,19 +387,25 @@ impl Message<GetAgentStatus> for AgentActor {
             };
         }
 
-        let mut added = Vec::with_capacity(self.status_history.len());
-        let mut removed = Vec::with_capacity(self.status_history.len());
+        let mut latest_changes = AHashMap::new();
         for change in self
             .status_history
             .iter()
             .filter(|change| change.revision > msg.since_revision)
         {
-            if change.added {
-                added.push(change.vmid);
+            latest_changes.insert(change.vmid, change.added);
+        }
+        let mut added = Vec::with_capacity(latest_changes.len());
+        let mut removed = Vec::with_capacity(latest_changes.len());
+        for (vmid, added_change) in latest_changes {
+            if added_change {
+                added.push(vmid);
             } else {
-                removed.push(change.vmid);
+                removed.push(vmid);
             }
         }
+        added.sort_unstable();
+        removed.sort_unstable();
         AgentStatusUpdate::Delta {
             revision: self.membership_revision,
             added,
