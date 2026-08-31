@@ -161,7 +161,15 @@ impl Message<CreateVM> for AgentActor {
 
     async fn handle(&mut self, msg: CreateVM, ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
         let vmid = msg.vmid;
-        // spawn AND link at the same time
+        if let Some(existing) = self.vms.get(&vmid) {
+            info!(?vmid, actor_id = ?existing.actor_ref.id(), "VM already exists; treating create as idempotent");
+            return CreateVMReply {
+                config: Some(msg.config),
+                actor_id: Some(existing.actor_ref.id().to_bytes()),
+            };
+        }
+
+        // Spawn and link at the same time.
         let actor_ref =
             VMActor::spawn_link(ctx.actor_ref(), (vmid, Some(msg.config.clone()))).await;
 
