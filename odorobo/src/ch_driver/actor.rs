@@ -375,6 +375,7 @@ impl Message<GetVMInfo> for VMActor {
 }
 
 #[remote_message]
+#[allow(clippy::unused_async_trait_impl)]
 impl Message<GetVMHeartbeat> for VMActor {
     type Reply = GetVMHeartbeatReply;
 
@@ -464,6 +465,7 @@ impl Message<MigrateVMReceive> for VMActor {
 }
 
 #[remote_message]
+#[allow(clippy::unused_async_trait_impl)]
 impl Message<MigrationFinished> for VMActor {
     type Reply = ();
 

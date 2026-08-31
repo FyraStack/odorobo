@@ -1137,6 +1137,7 @@ impl PartialOrd for AgentScore {
     }
 }
 
+#[allow(clippy::unused_async_trait_impl)]
 impl Actor for SchedulerActor {
     type Args = ();
     type Error = Report;
@@ -1260,6 +1261,7 @@ impl Message<VmUpdated> for SchedulerActor {
     }
 }
 
+#[allow(clippy::unused_async_trait_impl)]
 impl Message<VmUpdaterStopped> for SchedulerActor {
     type Reply = ();
 
@@ -1465,6 +1467,7 @@ impl Message<ShutdownVM> for SchedulerActor {
 /// this only gets data from the cache from agents
 /// we may need a different message that actually forcibly runs/updates everything.
 /// and/or messages that get data directly from the `VMActors`.
+#[allow(clippy::unused_async_trait_impl)]
 impl Message<AgentListVMs> for SchedulerActor {
     type Reply = Result<AgentListVMsReply, Report>;
 
@@ -1483,6 +1486,7 @@ impl Message<AgentListVMs> for SchedulerActor {
     }
 }
 
+#[allow(clippy::unused_async_trait_impl)]
 impl Message<Ping> for SchedulerActor {
     type Reply = Pong;
 

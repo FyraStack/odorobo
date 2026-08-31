@@ -50,6 +50,7 @@ impl AgentActor {
     }
 }
 
+#[allow(clippy::unused_async_trait_impl)]
 impl Actor for AgentActor {
     type Args = Config;
     type Error = Report;
@@ -241,6 +242,7 @@ impl Message<GetVMInfo> for AgentActor {
 }
 
 #[remote_message]
+#[allow(clippy::unused_async_trait_impl)]
 impl Message<AgentListVMs> for AgentActor {
     type Reply = AgentListVMsReply;
 
@@ -266,6 +268,7 @@ impl Message<AgentListVMs> for AgentActor {
 }
 
 #[remote_message]
+#[allow(clippy::unused_async_trait_impl)]
 impl Message<Ping> for AgentActor {
     type Reply = Pong;
 
@@ -289,6 +292,7 @@ impl Message<PanicAgent> for AgentActor {
 }
 
 #[remote_message]
+#[allow(clippy::unused_async_trait_impl)]
 impl Message<GetAgentStatus> for AgentActor {
     type Reply = AgentStatus;
 
