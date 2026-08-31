@@ -1,5 +1,5 @@
 //! VM management API handlers.
-use crate::messages::vm::{AgentListVMs, DeleteVM, ShutdownVM};
+use crate::messages::vm::{AgentListVMs, DeleteVM, GetConsoleHistory, ShutdownVM};
 use crate::{
     actors::http_actor::HTTPActor,
     messages::vm::CreateVM,
@@ -13,6 +13,7 @@ use aide::axum::{
 use axum::{
     Json,
     extract::{Path, State},
+    http::header,
 };
 use kameo::actor::ActorRef;
 
@@ -24,6 +25,7 @@ pub fn router() -> ApiRouter<ActorRef<HTTPActor>> {
         .api_route("/{vmid}", patch(update_vm))
         .api_route("/{vmid}", delete(delete_vm))
         .api_route("/{vmid}/shutdown", put(shutdown_vm))
+        .api_route("/{vmid}/console/history", get(console_history))
 }
 
 async fn list_vms(
@@ -48,15 +50,17 @@ async fn vm_info(
 async fn create_vm(
     State(state): State<ActorRef<HTTPActor>>,
     Json(request): Json<CreateVMRequest>,
-) -> Result<impl IntoApiResponse, OdoroboError> {
+) -> Result<Json<serde_json::Value>, OdoroboError> {
     let message = CreateVM {
-        vmid: request.vm.data.id,
+        vmid: request.vm.id,
         config: request.vm,
     };
 
     let reply = state.ask(message).await?;
 
-    Ok(Json(reply))
+    let response = serde_json::to_value(reply)
+        .map_err(|error| OdoroboError::Report(stable_eyre::Report::from(error)))?;
+    Ok(Json(response))
 }
 
 async fn delete_vm(
@@ -75,6 +79,18 @@ async fn shutdown_vm(
     let _reply = state.ask(ShutdownVM { vmid }).await?;
 
     Ok(Json(()))
+}
+
+async fn console_history(
+    State(state): State<ActorRef<HTTPActor>>,
+    Path(VmId(vmid)): Path<VmId>,
+) -> Result<impl IntoApiResponse, OdoroboError> {
+    let reply = state.ask(GetConsoleHistory { vmid }).await?;
+
+    Ok((
+        [(header::CONTENT_TYPE, "application/octet-stream")],
+        reply.history,
+    ))
 }
 
 /// Update an existing VM's configuration (e.g. resize, change resources, etc.)

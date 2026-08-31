@@ -1,0 +1,16 @@
+{
+  "api_version": 1,
+  "id": "01J00000000000000000000004",
+  "desired": {
+    "metadata": { "name": "cloud-init", "labels": {}, "annotations": {} },
+    "compute": { "vcpus": 2, "memory_bytes": 2147483648 },
+    "storage": [],
+    "networks": [],
+    "placement": {},
+    "boot": { "start": true },
+    "cloud_init": {
+      "user_data": "#cloud-config\nusers:\n  - name: odorobo\n",
+      "meta_data": "instance-id: vm-04\nlocal-hostname: cloud-init\n"
+    }
+  }
+}

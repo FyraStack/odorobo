@@ -1,24 +1,187 @@
+use std::{collections::VecDeque, sync::Arc};
+
 use crate::messages::vm::{
-    DeleteVM, GetVMHeartbeat, GetVMHeartbeatReply, GetVMInfo, GetVMInfoReply, MigrateVMReceive,
-    MigrateVMReceiveReply, PrepMigration, ShutdownVM,
+    DeleteVM, GetConsoleHistory, GetConsoleHistoryReply, GetVMHeartbeat, GetVMHeartbeatReply,
+    GetVMInfo, GetVMInfoReply, MigrateVMReceive, MigrateVMReceiveReply, PrepMigration,
+    SendConsoleInput, SendConsoleInputReply, ShutdownVM,
 };
-use crate::{ch_driver::VMInstance, types::VirtualMachine};
-use cloud_hypervisor_client::models::{
-    CpusConfig, DiskConfig, ImageType, MemoryConfig, PayloadConfig, PlatformConfig, VmConfig,
+use crate::{
+    ch_driver::{VMInstance, manifest::to_vm_config},
+    manifest::VmManifest,
 };
+use cloud_hypervisor_client::models::VmConfig;
 use kameo::prelude::*;
 use serde::{Deserialize, Serialize};
 use stable_eyre::{Report, Result};
-use tokio::task::JoinHandle;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{UnixStream, unix::OwnedWriteHalf},
+    sync::{Mutex, broadcast},
+    task::JoinHandle,
+};
 use tracing::{debug, error, info, trace, warn};
 
-/// A migration state that holds the listening address and VM config for a migration,
-/// used to pass live migration data between actors.
+/// Cloud Hypervisor-specific state for an in-progress receive migration.
+///
+/// The public migration messages carry `VmManifest`; the translated `VmConfig`
+/// stays private to the CH actor because another backend could use different
+/// migration metadata.
 pub struct MigrationState {
     pub listening_address: String,
     pub config: VmConfig,
     /// The task handle for the migration process.
     pub migration_task: Option<JoinHandle<()>>,
+}
+
+const CONSOLE_SPOOL_SIZE: usize = 1024 * 1024;
+
+/// Bounded serial-console history shared with the task draining the CH socket.
+#[derive(Clone)]
+pub struct Console {
+    inner: Arc<Mutex<ConsoleBuffer>>,
+    output: broadcast::Sender<Vec<u8>>,
+    writer: Arc<Mutex<Option<OwnedWriteHalf>>>,
+}
+
+impl Default for Console {
+    fn default() -> Self {
+        let (output, _) = broadcast::channel(256);
+        Self {
+            inner: Arc::new(Mutex::new(ConsoleBuffer::default())),
+            output,
+            writer: Arc::new(Mutex::new(None)),
+        }
+    }
+}
+
+#[derive(Default)]
+struct ConsoleBuffer {
+    ring: VecDeque<Vec<u8>>,
+    len: usize,
+}
+
+impl Console {
+    /// Attach to a Cloud Hypervisor serial socket and start spooling its output.
+    pub async fn attach_socket(&self, socket_path: std::path::PathBuf) -> Result<()> {
+        let stream = UnixStream::connect(&socket_path).await.map_err(|err| {
+            Report::msg(format!(
+                "failed to attach console spool to {}: {err}",
+                socket_path.display()
+            ))
+        })?;
+        let (mut reader, writer) = stream.into_split();
+        let mut writer_guard = self.writer.lock().await;
+        if writer_guard.is_some() {
+            return Ok(());
+        }
+        *writer_guard = Some(writer);
+        drop(writer_guard);
+
+        let spool = self.clone();
+        tokio::spawn(async move {
+            let mut buffer = [0_u8; 16 * 1024];
+            loop {
+                match reader.read(&mut buffer).await {
+                    Ok(0) => {
+                        debug!("serial console closed");
+                        break;
+                    }
+                    Ok(read) => spool.push(buffer[..read].to_vec()).await,
+                    Err(err) => {
+                        warn!(?err, "serial console spool stopped reading");
+                        break;
+                    }
+                }
+            }
+        });
+        Ok(())
+    }
+
+    async fn push(&self, chunk: Vec<u8>) {
+        trace!(
+            bytes = chunk.len(),
+            output = %String::from_utf8_lossy(&chunk),
+            "serial console output received"
+        );
+        let _subscribers = self.output.send(chunk.clone());
+        let chunk = if chunk.len() > CONSOLE_SPOOL_SIZE {
+            chunk[chunk.len().saturating_sub(CONSOLE_SPOOL_SIZE)..].to_vec()
+        } else {
+            chunk
+        };
+        {
+            let mut buffer = self.inner.lock().await;
+            buffer.len = buffer.len.saturating_add(chunk.len());
+            buffer.ring.push_back(chunk);
+            while buffer.len > CONSOLE_SPOOL_SIZE {
+                let excess = buffer.len.saturating_sub(CONSOLE_SPOOL_SIZE);
+                if let Some(oldest) = buffer.ring.pop_front() {
+                    if oldest.len() > excess {
+                        buffer.len = buffer.len.saturating_sub(excess);
+                        buffer.ring.push_front(oldest[excess..].to_vec());
+                    } else {
+                        buffer.len = buffer.len.saturating_sub(oldest.len());
+                    }
+                } else {
+                    buffer.len = 0;
+                    break;
+                }
+            }
+            drop(buffer);
+        }
+    }
+
+    /// Subscribe to live serial output. Chunks are broadcast without replay.
+    pub fn subscribe(&self) -> broadcast::Receiver<Vec<u8>> {
+        self.output.subscribe()
+    }
+
+    /// Write input bytes to the guest serial console.
+    pub async fn write_input(&self, input: &[u8]) -> Result<()> {
+        {
+            let mut writer_guard = self.writer.lock().await;
+            let writer = writer_guard
+                .as_mut()
+                .ok_or_else(|| Report::msg("console is not attached"))?;
+            let result = writer
+                .write_all(input)
+                .await
+                .map_err(|err| Report::msg(format!("failed to write to serial console: {err}")));
+            drop(writer_guard);
+            result
+        }
+    }
+
+    /// Return the currently retained serial output, oldest bytes first.
+    pub async fn history(&self) -> Vec<u8> {
+        let mut history = Vec::new();
+        {
+            let buffer = self.inner.lock().await;
+            history.reserve(buffer.len);
+            for chunk in &buffer.ring {
+                history.extend_from_slice(chunk);
+            }
+            drop(buffer);
+        };
+        history
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CONSOLE_SPOOL_SIZE, Console};
+
+    #[tokio::test]
+    async fn console_history_is_bounded_to_one_megabyte() {
+        let console = Console::default();
+        console.push(vec![b'a'; CONSOLE_SPOOL_SIZE]).await;
+        console.push(b"tail".to_vec()).await;
+
+        let history = console.history().await;
+        assert_eq!(history.len(), CONSOLE_SPOOL_SIZE);
+        assert_eq!(&history[..4], b"aaaa");
+        assert_eq!(&history[CONSOLE_SPOOL_SIZE - 4..], b"tail");
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -30,22 +193,36 @@ pub struct VMActor {
     /// path to the Cloud Hypervisor socket, in /run/odorobo/vms/<VMID>/ch.sock
     pub vm_instance: VMInstance,
     pub migration_state: Option<MigrationState>,
-    pub manifest: Option<VirtualMachine>,
+    pub console: Console,
+    /// Desired provider-neutral intent retained for VM info and migration.
+    /// The translated Cloud Hypervisor config lives only in `VMInstance`.
+    pub manifest: Option<VmManifest>,
 }
 
 impl Actor for VMActor {
-    // tuple of VM ID and manifest
-    type Args = (ulid::Ulid, Option<VirtualMachine>);
+    // The actor accepts intent; CH conversion happens inside on_start.
+    type Args = (ulid::Ulid, Option<VmManifest>);
     type Error = Report;
 
     #[tracing::instrument(skip_all)]
     async fn on_start((vmid, vm_config): Self::Args, actor_ref: ActorRef<Self>) -> Result<Self> {
-        let mut vminstance = VMInstance::spawn(
-            &vmid.to_string(),
-            vm_config.clone().map(VmConfig::from),
-            None,
-        )
-        .await?;
+        // Boot is manifest intent, not a Cloud Hypervisor default. Preserve it
+        // separately because VMInstance also supports create-without-boot paths.
+        let boot = vm_config
+            .as_ref()
+            .is_some_and(|manifest| manifest.desired.boot.start);
+        let vm_config_for_ch = vm_config.as_ref().map(to_vm_config).transpose()?;
+        let mut vminstance =
+            VMInstance::spawn(&vmid.to_string(), vm_config_for_ch, boot, None).await?;
+
+        let console = Console::default();
+        // A migration receiver has no config yet; its serial socket is created
+        // only when the migrated VM is restored.
+        if vm_config.is_some() {
+            console
+                .attach_socket(vminstance.console_socket_path())
+                .await?;
+        }
 
         // Take the child process out so we can watch for unexpected death.
         // destroy() handles a missing child_process gracefully.
@@ -77,6 +254,7 @@ impl Actor for VMActor {
             vmid,
             vm_instance: vminstance,
             migration_state: None,
+            console,
             manifest: vm_config,
         })
     }
@@ -109,49 +287,51 @@ impl Actor for VMActor {
     }
 }
 
-// todo: improve a lot of these config options. most of them should be set by the manifest
-impl From<VirtualMachine> for VmConfig {
-    fn from(vm: VirtualMachine) -> Self {
-        Self {
-            cpus: Some(CpusConfig {
-                boot_vcpus: vm.data.vcpus.cast_signed(),
-                max_vcpus: vm.data.max_vcpus.unwrap_or(vm.data.vcpus).cast_signed(),
-                ..Default::default()
-            }),
-            memory: Some(MemoryConfig {
-                size: vm.data.memory.as_u64().cast_signed(),
-                ..Default::default()
-            }),
-            payload: PayloadConfig {
-                firmware: Some("/var/lib/odorobo/CLOUDHV.fd".to_owned()),
-                ..Default::default()
-            },
-            disks: Some(vec![DiskConfig {
-                // todo: get cappy to make this auto generate this via the manifest's volumes atribute.
-                path: Some(vm.data.image),
-                image_type: Some(ImageType::Raw),
-                ..Default::default()
-            }]),
-            // todo: generate from VM network field
-            // net: Some(vec![
-            //     NetConfig {
-            //         id: Some("net://devnet".to_string()),
-            //         ..Default::default()
-            //     }
-            // ]),
-            platform: Some(PlatformConfig {
-                serial_number: Some("ds=nocloud".to_owned()),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }
-    }
-}
-
 // allow conversion from VMActor to VMInstance to call API
 impl From<VMActor> for VMInstance {
     fn from(actor: VMActor) -> Self {
         actor.vm_instance
+    }
+}
+
+#[remote_message]
+impl Message<GetConsoleHistory> for VMActor {
+    type Reply = GetConsoleHistoryReply;
+
+    async fn handle(
+        &mut self,
+        _msg: GetConsoleHistory,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        GetConsoleHistoryReply {
+            history: self.console.history().await,
+        }
+    }
+}
+
+#[remote_message]
+impl Message<SendConsoleInput> for VMActor {
+    type Reply = SendConsoleInputReply;
+
+    async fn handle(
+        &mut self,
+        msg: SendConsoleInput,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let written = msg.input.len();
+        match self.console.write_input(&msg.input).await {
+            Ok(()) => SendConsoleInputReply {
+                written,
+                error: None,
+            },
+            Err(err) => {
+                error!(vmid = %self.vmid, ?err, "failed to write to serial console");
+                SendConsoleInputReply {
+                    written: 0,
+                    error: Some(err.to_string()),
+                }
+            }
+        }
     }
 }
 
@@ -165,12 +345,13 @@ impl Message<GetVMInfo> for VMActor {
     ) -> Self::Reply {
         GetVMInfoReply {
             vmid: self.vmid,
-            config: self.manifest.clone(), // we likely dont want to send the entire manifest on every update, but some of this data is required and this is easier for now.
+            config: self.manifest.clone(),
         }
     }
 }
 
 #[remote_message]
+#[allow(clippy::unused_async_trait_impl)]
 impl Message<GetVMHeartbeat> for VMActor {
     type Reply = GetVMHeartbeatReply;
 
@@ -196,24 +377,53 @@ impl Message<MigrateVMReceive> for VMActor {
         if let Some(migration_state) = &self.migration_state {
             return MigrateVMReceiveReply {
                 listening_address: migration_state.listening_address.clone(),
+                error: None,
             };
         }
 
         let prep_config = msg.config.clone();
 
-        // Start receiving migration on the destination VM (this actor)
-        // todo: handle unwrap properly
-        let (listening_address, migration_task) = self
-            .vm_instance
-            .receive_migration()
-            .await
-            .expect("sending migration request failed");
+        // Translate before opening a receive socket so invalid intent cannot
+        // leave behind a migration listener that can never complete.
+        let config = match to_vm_config(&msg.config) {
+            Ok(config) => config,
+            Err(error) => {
+                return MigrateVMReceiveReply {
+                    listening_address: String::new(),
+                    error: Some(error.to_string()),
+                };
+            }
+        };
 
-        // create ongoing migration state
+        // Start receiving migration on the destination VM (this actor).
+        let (listening_address, migration_task) = match self.vm_instance.receive_migration().await {
+            Ok(result) => result,
+            Err(error) => {
+                return MigrateVMReceiveReply {
+                    listening_address: String::new(),
+                    error: Some(error.to_string()),
+                };
+            }
+        };
+
         self.migration_state = Some(MigrationState {
             migration_task: Some(migration_task),
             listening_address: listening_address.clone(),
-            config: msg.config,
+            config,
+        });
+
+        let console = self.console.clone();
+        let console_socket_path = self.vm_instance.console_socket_path();
+        tokio::spawn(async move {
+            loop {
+                match console.attach_socket(console_socket_path.clone()).await {
+                    Ok(()) => break,
+                    Err(err) => {
+                        trace!(?err, "serial console socket not ready during migration");
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                }
+            }
         });
 
         let actor_ref = ctx.actor_ref().clone();
@@ -255,11 +465,15 @@ impl Message<MigrateVMReceive> for VMActor {
             }
         }
 
-        MigrateVMReceiveReply { listening_address }
+        MigrateVMReceiveReply {
+            listening_address,
+            error: None,
+        }
     }
 }
 
 #[remote_message]
+#[allow(clippy::unused_async_trait_impl)]
 impl Message<MigrationFinished> for VMActor {
     type Reply = ();
 
@@ -287,8 +501,19 @@ impl Message<PrepMigration> for VMActor {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         info!(vmid = %self.vmid, "PrepMigration handler invoked");
-        // todo: prepare devices, volumes, and apply migrated config
-        self.vm_instance.prep_config(msg.config).await.unwrap();
+        // Preparation is best-effort here because the remote receive operation
+        // has no fallible reply channel; report failures and let migration state
+        // cleanup handle the failed attempt.
+        let config = match to_vm_config(&msg.config) {
+            Ok(config) => config,
+            Err(error) => {
+                error!(?error, "failed to convert migration manifest");
+                return;
+            }
+        };
+        if let Err(error) = self.vm_instance.prep_config(config).await {
+            error!(?error, "failed to prepare migrated VM configuration");
+        }
     }
 }
 

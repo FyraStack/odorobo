@@ -1,6 +1,6 @@
 use crate::messages::vm::{
-    AgentListVMs, AgentListVMsReply, CreateVM, CreateVMReply, DeleteVM, DeleteVMReply, ShutdownVM,
-    ShutdownVMReply,
+    AgentListVMs, AgentListVMsReply, CreateVM, CreateVMReply, DeleteVM, DeleteVMReply,
+    GetConsoleHistory, GetConsoleHistoryReply, ShutdownVM, ShutdownVMReply,
 };
 use kameo::prelude::*;
 use stable_eyre::{
@@ -17,6 +17,7 @@ pub struct HTTPActor {
     pub scheduler: ActorRef<SchedulerActor>,
 }
 
+#[allow(clippy::unused_async_trait_impl)]
 impl Actor for HTTPActor {
     type Args = ActorRef<SchedulerActor>;
     type Error = Report;
@@ -66,6 +67,22 @@ impl Message<DeleteVM> for HTTPActor {
             .await
             .map_err(|err| eyre!(err.to_string()))
             .wrap_err("failed to delete VM via scheduler")
+    }
+}
+
+impl Message<GetConsoleHistory> for HTTPActor {
+    type Reply = Result<GetConsoleHistoryReply, Report>;
+
+    async fn handle(
+        &mut self,
+        msg: GetConsoleHistory,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.scheduler
+            .ask(msg)
+            .await
+            .map_err(|err| eyre!(err.to_string()))
+            .wrap_err("failed to retrieve VM console history via scheduler")
     }
 }
 

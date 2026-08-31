@@ -1,6 +1,7 @@
 use crate::{
     ch_driver::actor::VMActor,
     config::Config,
+    manifest::VmManifest,
     messages::{
         Ping, Pong,
         agent::{AgentStatus, GetAgentStatus},
@@ -12,7 +13,7 @@ use crate::{
         },
     },
     networking::actor::NetworkAgentActor,
-    types::{ObjectMetadata, VirtualMachine},
+    types::ObjectMetadata,
     utils::actor_names::{NETWORK, VM, vm_actor_id},
 };
 use ahash::AHashMap;
@@ -28,7 +29,7 @@ use kameo::error::PanicError;
 
 pub struct VMCacheData {
     actor_ref: ActorRef<VMActor>,
-    config: VirtualMachine,
+    config: VmManifest,
 }
 
 #[derive(RemoteActor)]
@@ -50,6 +51,7 @@ impl AgentActor {
     }
 }
 
+#[allow(clippy::unused_async_trait_impl)]
 impl Actor for AgentActor {
     type Args = Config;
     type Error = Report;
@@ -151,7 +153,7 @@ impl Message<MigrateVMReceive> for AgentActor {
             vmid,
             VMCacheData {
                 actor_ref: actor_ref.clone(),
-                config: VirtualMachine::default(),
+                config: msg.config.clone(),
             },
         );
 
@@ -241,6 +243,7 @@ impl Message<GetVMInfo> for AgentActor {
 }
 
 #[remote_message]
+#[allow(clippy::unused_async_trait_impl)]
 impl Message<AgentListVMs> for AgentActor {
     type Reply = AgentListVMsReply;
 
@@ -266,6 +269,7 @@ impl Message<AgentListVMs> for AgentActor {
 }
 
 #[remote_message]
+#[allow(clippy::unused_async_trait_impl)]
 impl Message<Ping> for AgentActor {
     type Reply = Pong;
 
@@ -289,6 +293,7 @@ impl Message<PanicAgent> for AgentActor {
 }
 
 #[remote_message]
+#[allow(clippy::unused_async_trait_impl)]
 impl Message<GetAgentStatus> for AgentActor {
     type Reply = AgentStatus;
 
@@ -300,14 +305,14 @@ impl Message<GetAgentStatus> for AgentActor {
         let vcpus_used_by_vms = self
             .vms
             .values()
-            .map(|vm| vm.config.data.vcpus)
+            .map(|vm| vm.config.desired.compute.vcpus)
             .reduce(u32::saturating_add)
             .unwrap_or(0);
 
         let ram_used_by_vms = self
             .vms
             .values()
-            .map(|vm| vm.config.data.memory.as_u64())
+            .map(|vm| vm.config.desired.compute.memory_bytes)
             .reduce(u64::saturating_add)
             .unwrap_or(0);
 

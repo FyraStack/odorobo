@@ -28,6 +28,7 @@ pub struct NetworkConfigCommon {
     pub upstream_iface: Option<String>,
 }
 
+#[allow(clippy::unused_async_trait_impl)]
 impl Actor for DhcpActor {
     type Args = (DhcpConfig, String);
     type Error = Report;

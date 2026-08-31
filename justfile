@@ -21,8 +21,8 @@ build_cli:
 build_debug:
     cargo build -p odorobo
 
-debug: build_debug
-    sudo target/debug/odorobo
+debug *args: build_debug
+    sudo target/debug/odorobo {{ args }}
 
 install: install_unit install_agent install_ctl
 

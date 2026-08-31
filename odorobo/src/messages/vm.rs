@@ -1,34 +1,31 @@
 //! VM-related messages
-use cloud_hypervisor_client::models::VmConfig;
+
 use kameo::prelude::*;
-use schemars::JsonSchema;
+
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use crate::types::VirtualMachine;
+use crate::manifest::VmManifest;
 
 // TODO: when scheduler does createVM it also stores which server we put the Ulid on so it can do a in memory cache and doesn't need to hit the Server
 //  for failover, the new node when it fails over will need to rebuild this cache via hitting a GetAllVMs message on every server
 //  additionally, when the VmConfig is created, this determines the MAC address of the server. meaning as soon as we have this info, we need to hit the router via the scheduler, because the router might be slow.
 /// Message to create a new VM
 ///
-/// `VmConfig` is a Cloud Hypervisor VM spec, containing the VM's full configuration (untransformed by odorobo)
+/// The message carries provider-neutral VM intent. The destination agent
+/// translates it into Cloud Hypervisor configuration locally.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CreateVM {
     /// the ULID of the VM to create
     pub vmid: Ulid,
-    /// `VmConfig` in message, untransformed.
-    ///
-    /// Transformer API will transform this `VmConfig` into proper
-    /// node-specific, paths, i.e attach LUNs, networking?
-    ///
-    /// this data would go to `state::instance::spawn()`
-    pub config: VirtualMachine,
+    /// Provider-neutral VM intent. Cloud Hypervisor conversion happens in the
+    /// Cloud Hypervisor driver on the destination agent.
+    pub config: VmManifest,
 }
 
-#[derive(Serialize, Deserialize, Reply, Debug, JsonSchema)]
+#[derive(Serialize, Deserialize, Reply, Debug)]
 pub struct CreateVMReply {
-    pub config: Option<VirtualMachine>,
+    pub config: Option<VmManifest>,
     /// Serialized ID of the VM actor created by the agent.
     pub actor_id: Option<Vec<u8>>,
 }
@@ -49,19 +46,23 @@ pub struct MigrateVMSend {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct MigrateVMReceive {
     pub vmid: Ulid,
-    pub config: VmConfig,
+    pub config: VmManifest,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PrepMigration {
     pub vmid: Ulid,
-    pub config: VmConfig,
+    pub config: VmManifest,
 }
 
-/// Reply to a `MigrateVMReceive` message, containing the listening address of the VM
+/// Reply to a migration receive request. A non-empty `error` means no valid
+/// receive operation was started and `listening_address` is empty.
 #[derive(Serialize, Deserialize, Debug, Clone, Reply)]
 pub struct MigrateVMReceiveReply {
+    /// Address the source should connect to when migration receive started.
     pub listening_address: String,
+    /// Structured operation failure returned without panicking the VM actor.
+    pub error: Option<String>,
 }
 
 /// Message to delete a VM
@@ -92,8 +93,8 @@ pub struct AgentListVMsReply {
     pub vms: Vec<Ulid>,
 }
 
-/// Get VM info, including the full manifest.
-#[derive(Serialize, Deserialize, Debug)]
+/// Get VM info
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct GetVMInfo {
     pub vmid: Option<Ulid>,
 }
@@ -101,7 +102,7 @@ pub struct GetVMInfo {
 #[derive(Serialize, Deserialize, Reply, Debug, Clone)]
 pub struct GetVMInfoReply {
     pub vmid: Ulid,
-    pub config: Option<VirtualMachine>,
+    pub config: Option<VmManifest>,
 }
 
 /// Lightweight VM liveness check used by the scheduler heartbeat.
@@ -111,4 +112,28 @@ pub struct GetVMHeartbeat;
 #[derive(Serialize, Deserialize, Reply, Debug, Clone, Copy)]
 pub struct GetVMHeartbeatReply {
     pub vmid: Ulid,
+}
+
+/// Retrieve the retained serial-console output for a VM.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct GetConsoleHistory {
+    pub vmid: Ulid,
+}
+
+#[derive(Serialize, Deserialize, Reply, Debug, Clone)]
+pub struct GetConsoleHistoryReply {
+    pub history: Vec<u8>,
+}
+
+/// Send raw input bytes to a VM's serial console.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SendConsoleInput {
+    pub vmid: Ulid,
+    pub input: Vec<u8>,
+}
+
+#[derive(Serialize, Deserialize, Reply, Debug, Clone)]
+pub struct SendConsoleInputReply {
+    pub written: usize,
+    pub error: Option<String>,
 }

@@ -6,19 +6,17 @@ use std::time::{Duration, Instant};
 
 use crate::actors::agent_actor::AgentActor;
 use crate::ch_driver::actor::VMActor;
+use crate::manifest::{
+    AffinityRequirement, AffinityStrictness, AffinityType, MetadataTable, Operator, VmManifest,
+};
 use crate::messages::agent::{AgentStatus, GetAgentStatus};
 use crate::messages::vm::{
     AgentListVMs, AgentListVMsReply, CreateVM, CreateVMReply, DeleteVM, DeleteVMReply,
-    GetVMHeartbeat, GetVMInfo, GetVMInfoReply, ShutdownVM, ShutdownVMReply,
+    GetConsoleHistory, GetConsoleHistoryReply, GetVMHeartbeat, GetVMInfo, GetVMInfoReply,
+    SendConsoleInput, SendConsoleInputReply, ShutdownVM, ShutdownVMReply,
 };
 use crate::messages::{Ping, Pong};
-use crate::types::AffinityRequirement;
-use crate::types::AffinityStrictness;
-use crate::types::AffinityType;
-use crate::types::MetadataTable;
 use crate::types::ObjectMetadata;
-use crate::types::Operator;
-use crate::types::VirtualMachine;
 use crate::utils::actor_names::AGENT;
 use crate::utils::actor_names::VM;
 use crate::utils::actor_names::vm_actor_id;
@@ -113,7 +111,7 @@ pub struct SchedulerActor {
 
     pub vm_actorid_ulid_map: AHashMap<ActorId, Ulid>,
     /// Canonical manifest storage; placements and actor entries refer to the VM ID.
-    pub vm_manifests: AHashMap<Ulid, VirtualMachine>,
+    pub vm_manifests: AHashMap<Ulid, VmManifest>,
     /// A VM may be placed on multiple agents while it is migrating.
     pub vm_placements: AHashMap<Ulid, Vec<VmPlacement>>,
     /// this is a vec because a vmid/ulid can be scheduled on multiple boxes simultaneously during migration
@@ -157,7 +155,7 @@ impl SchedulerActor {
     }
 
     fn cleanup_unresolved_vm_cache(
-        manifests: &mut AHashMap<Ulid, VirtualMachine>,
+        manifests: &mut AHashMap<Ulid, VmManifest>,
         placements: &mut AHashMap<Ulid, Vec<VmPlacement>>,
         data_cache: &mut AHashMap<Ulid, Vec<CachedVMActor>>,
     ) {
@@ -199,7 +197,7 @@ impl SchedulerActor {
 
     fn remove_vm_state(
         vmid: Ulid,
-        manifests: &mut AHashMap<Ulid, VirtualMachine>,
+        manifests: &mut AHashMap<Ulid, VmManifest>,
         placements: &mut AHashMap<Ulid, Vec<VmPlacement>>,
         data_cache: &mut AHashMap<Ulid, Vec<CachedVMActor>>,
     ) {
@@ -229,7 +227,7 @@ impl SchedulerActor {
 
     fn remove_agent_placements(
         agent_id: ActorId,
-        manifests: &mut AHashMap<Ulid, VirtualMachine>,
+        manifests: &mut AHashMap<Ulid, VmManifest>,
         placements: &mut AHashMap<Ulid, Vec<VmPlacement>>,
         data_cache: &mut AHashMap<Ulid, Vec<CachedVMActor>>,
     ) {
@@ -250,7 +248,7 @@ impl SchedulerActor {
     fn rollback_failed_create(
         vmid: Ulid,
         actor_exists: bool,
-        manifests: &mut AHashMap<Ulid, VirtualMachine>,
+        manifests: &mut AHashMap<Ulid, VmManifest>,
         placements: &mut AHashMap<Ulid, Vec<VmPlacement>>,
         data_cache: &mut AHashMap<Ulid, Vec<CachedVMActor>>,
     ) {
@@ -298,7 +296,7 @@ impl SchedulerActor {
     fn reconcile_agent_placements(
         agent_id: ActorId,
         status: &AgentStatus,
-        manifests: &AHashMap<Ulid, VirtualMachine>,
+        manifests: &AHashMap<Ulid, VmManifest>,
         placements: &mut AHashMap<Ulid, Vec<VmPlacement>>,
     ) {
         let now = Instant::now();
@@ -575,15 +573,17 @@ impl SchedulerActor {
             .unwrap_or_default();
         let used_vcpus = agent.data.used_vcpus.saturating_add(pending_vcpus);
         let used_ram = agent.data.used_ram.as_u64().saturating_add(pending_ram);
-        let agent_used_vcpus = used_vcpus.saturating_add(msg.config.data.vcpus);
+        let requested_vcpus = msg.config.desired.compute.vcpus;
+        let requested_memory = msg.config.desired.compute.memory_bytes;
+        let agent_used_vcpus = used_vcpus.saturating_add(requested_vcpus);
 
         if !has_capacity(
             agent_max_vcpus,
             used_vcpus,
-            msg.config.data.vcpus,
+            requested_vcpus,
             agent.data.ram.as_u64(),
             used_ram,
-            msg.config.data.memory.as_u64(),
+            requested_memory,
         ) {
             return AgentScore::REJECTED;
         }
@@ -601,8 +601,7 @@ impl SchedulerActor {
 
         // todo: add ram overprovisionment. not adding this to scheduler until it works on the hypervisor side.
         let agent_max_ram = agent.data.ram;
-        let agent_used_ram =
-            bytesize::ByteSize::b(used_ram.saturating_add(msg.config.data.memory.as_u64()));
+        let agent_used_ram = bytesize::ByteSize::b(used_ram.saturating_add(requested_memory));
 
         #[expect(
             clippy::cast_precision_loss,
@@ -615,33 +614,34 @@ impl SchedulerActor {
         score.general += ram_headroom;
 
         // Roughly based on <https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/>.
-        if let Some(affinity_rules) = &msg.config.affinity {
+        if !msg.config.desired.placement.affinity.is_empty() {
+            let affinity_rules = &msg.config.desired.placement.affinity;
             for rule in affinity_rules {
                 let mut metadata_tables: Vec<&ObjectMetadata> = Vec::with_capacity(1);
 
-                match rule.affinity_type {
-                    AffinityType::VirtualMachine => {
-                        let vmids = Self::placement_vm_ids(
-                            &self.vm_placements,
-                            agent.actor_ref.id(),
-                            &agent.data.vms,
-                        );
-                        for vmid in vmids {
-                            if let Some(metadata) = self
-                                .vm_manifests
-                                .get(&vmid)
-                                .and_then(|manifest| manifest.metadata.as_ref())
-                            {
-                                metadata_tables.push(metadata);
-                            }
-                        }
-                    }
-                    AffinityType::Agent => metadata_tables.push(&agent.data.metadata),
+                let vm_metadata: Vec<ObjectMetadata> = match rule.affinity_type {
+                    AffinityType::VirtualMachine => Self::placement_vm_ids(
+                        &self.vm_placements,
+                        agent.actor_ref.id(),
+                        &agent.data.vms,
+                    )
+                    .into_iter()
+                    .filter_map(|vmid| self.vm_manifests.get(&vmid))
+                    .map(|manifest| ObjectMetadata {
+                        labels: manifest.desired.metadata.labels.clone(),
+                        annotations: manifest.desired.metadata.annotations.clone(),
+                    })
+                    .collect(),
+                    AffinityType::Agent => Vec::new(),
+                };
+                metadata_tables.extend(vm_metadata.iter());
+                if matches!(rule.affinity_type, AffinityType::Agent) {
+                    metadata_tables.push(&agent.data.metadata);
                 }
 
                 let follows_rule = evaluate_affinity_rule(&metadata_tables, rule);
 
-                let Some(affinity_delta) = affinity_delta(rule.strictness, follows_rule) else {
+                let Some(affinity_delta) = affinity_delta(&rule.strictness, follows_rule) else {
                     return AgentScore::REJECTED;
                 };
                 score.affinity = score.affinity.saturating_add(affinity_delta);
@@ -672,7 +672,7 @@ const fn has_capacity(
 }
 
 fn pending_resources_by_agent(
-    manifests: &AHashMap<Ulid, VirtualMachine>,
+    manifests: &AHashMap<Ulid, VmManifest>,
     placements: &AHashMap<Ulid, Vec<VmPlacement>>,
 ) -> AHashMap<ActorId, (u32, u64)> {
     let mut resources = AHashMap::new();
@@ -683,8 +683,10 @@ fn pending_resources_by_agent(
         for entry in entries {
             if entry.lifecycle == VmLifecycle::Pending {
                 let totals = resources.entry(entry.agent_id).or_insert((0u32, 0u64));
-                totals.0 = totals.0.saturating_add(manifest.data.vcpus);
-                totals.1 = totals.1.saturating_add(manifest.data.memory.as_u64());
+                totals.0 = totals.0.saturating_add(manifest.desired.compute.vcpus);
+                totals.1 = totals
+                    .1
+                    .saturating_add(manifest.desired.compute.memory_bytes);
             }
         }
     }
@@ -693,7 +695,7 @@ fn pending_resources_by_agent(
 
 #[cfg(test)]
 fn pending_resources_for_agent(
-    manifests: &AHashMap<Ulid, VirtualMachine>,
+    manifests: &AHashMap<Ulid, VmManifest>,
     placements: &AHashMap<Ulid, Vec<VmPlacement>>,
     agent_id: ActorId,
 ) -> (u32, u64) {
@@ -703,19 +705,19 @@ fn pending_resources_for_agent(
         .unwrap_or_default()
 }
 
-fn affinity_delta(strictness: AffinityStrictness, follows_rule: bool) -> Option<i64> {
+fn affinity_delta(strictness: &AffinityStrictness, follows_rule: bool) -> Option<i64> {
     match strictness {
         AffinityStrictness::Required if !follows_rule => None,
         AffinityStrictness::Required => Some(0),
         AffinityStrictness::Preferred { weight } => {
-            Some(i64::from(follows_rule).saturating_mul(weight))
+            Some(i64::from(follows_rule).saturating_mul(*weight))
         }
     }
 }
 
 fn evaluate_affinity_rule(
     metadata_tables: &[&ObjectMetadata],
-    rule: &crate::types::AffinityRule,
+    rule: &crate::manifest::AffinityRule,
 ) -> bool {
     let mut follows_rule = false;
 
@@ -780,16 +782,38 @@ mod tests {
         evaluate_affinity_rule, evaluate_table_value, has_capacity, pending_resources_for_agent,
     };
 
-    use crate::messages::agent::AgentStatus;
-    use crate::types::{
-        AffinityRequirement, AffinityRule, AffinityStrictness, AffinityType, MetadataTable,
-        ObjectMetadata, Operator, VirtualMachine,
+    use crate::manifest::{
+        AffinityRequirement, AffinityRule, AffinityStrictness, AffinityType, Boot, Compute,
+        DesiredState, Metadata, MetadataTable, Operator, VmManifest,
     };
+    use crate::messages::agent::AgentStatus;
+    use crate::types::ObjectMetadata;
     use ahash::AHashMap;
     use bytesize::ByteSize;
     use std::collections::BTreeMap;
     use std::time::{Duration, Instant};
     use ulid::Ulid;
+
+    fn test_manifest(vcpus: u32, memory_bytes: u64) -> VmManifest {
+        VmManifest {
+            api_version: crate::manifest::MANIFEST_VERSION,
+            id: Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("valid ulid"),
+            desired: DesiredState {
+                metadata: Metadata {
+                    name: "test".to_owned(),
+                    ..Default::default()
+                },
+                compute: Compute {
+                    vcpus,
+                    memory_bytes,
+                    ..Default::default()
+                },
+                boot: Boot::default(),
+                ..Default::default()
+            },
+            observed: None,
+        }
+    }
 
     fn requirement(operator: Operator, values: &[&str]) -> AffinityRequirement {
         AffinityRequirement {
@@ -816,7 +840,7 @@ mod tests {
                 last_confirmed_at: None,
             }],
         );
-        let mut manifests = AHashMap::from([(vmid, VirtualMachine::default())]);
+        let mut manifests = AHashMap::from([(vmid, test_manifest(1, 1))]);
         let mut data_cache: AHashMap<Ulid, Vec<CachedVMActor>> = AHashMap::new();
 
         SchedulerActor::cleanup_unresolved_vm_cache(
@@ -834,9 +858,7 @@ mod tests {
     fn reserves_pending_vm_resources_until_agent_status_confirms_them() {
         let vmid = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("valid ulid");
         let agent_id = super::ActorId::new(1);
-        let mut config = VirtualMachine::default();
-        config.data.vcpus = 4;
-        config.data.memory = ByteSize::gib(8);
+        let config = test_manifest(4, ByteSize::gib(8).as_u64());
         let mut placements: AHashMap<Ulid, Vec<VmPlacement>> = AHashMap::new();
         placements.insert(
             vmid,
@@ -866,7 +888,7 @@ mod tests {
             created_at: Instant::now(),
             last_confirmed_at: Some(Instant::now()),
         };
-        let manifests = AHashMap::from([(vmid, VirtualMachine::default())]);
+        let manifests = AHashMap::from([(vmid, test_manifest(1, 1))]);
         let mut placements = AHashMap::from([(vmid, vec![running_placement(source_agent)])]);
         let destination_status = AgentStatus {
             hostname: "destination".to_owned(),
@@ -912,7 +934,7 @@ mod tests {
     #[test]
     fn failed_create_rolls_back_state_without_an_actor() {
         let vmid = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("valid ulid");
-        let mut manifests = AHashMap::from([(vmid, VirtualMachine::default())]);
+        let mut manifests = AHashMap::from([(vmid, test_manifest(1, 1))]);
         let mut placements = AHashMap::from([(
             vmid,
             vec![VmPlacement {
@@ -940,7 +962,7 @@ mod tests {
     #[test]
     fn failed_create_keeps_state_if_actor_exists() {
         let vmid = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("valid ulid");
-        let mut manifests = AHashMap::from([(vmid, VirtualMachine::default())]);
+        let mut manifests = AHashMap::from([(vmid, test_manifest(1, 1))]);
         let mut placements = AHashMap::new();
         let mut data_cache = AHashMap::new();
 
@@ -965,7 +987,7 @@ mod tests {
             agent_data_cache: AHashMap::new(),
             agent_keepalive_tasks: AHashMap::new(),
             vm_actorid_ulid_map: AHashMap::from([(vm_actor_id, vmid)]),
-            vm_manifests: AHashMap::from([(vmid, VirtualMachine::default())]),
+            vm_manifests: AHashMap::from([(vmid, test_manifest(1, 1))]),
             vm_placements: AHashMap::from([(
                 vmid,
                 vec![VmPlacement {
@@ -998,7 +1020,7 @@ mod tests {
             agent_data_cache: AHashMap::new(),
             agent_keepalive_tasks: AHashMap::new(),
             vm_actorid_ulid_map: AHashMap::from([(vm_actor_id, vmid)]),
-            vm_manifests: AHashMap::from([(vmid, VirtualMachine::default())]),
+            vm_manifests: AHashMap::from([(vmid, test_manifest(1, 1))]),
             vm_placements: AHashMap::new(),
             vm_data_cache: AHashMap::from([(vmid, vec![CachedVMActor { actor_ref: None }])]),
             vm_keepalive_tasks: AHashMap::new(),
@@ -1073,6 +1095,14 @@ mod tests {
         };
         assert!(!evaluate_affinity_rule(&[&metadata], &rule));
 
+        let non_matching_rule = AffinityRule {
+            strictness: AffinityStrictness::Required,
+            affinity_type: AffinityType::Agent,
+            inverse: true,
+            requirements: vec![requirement(Operator::In, &["backend"])],
+        };
+        assert!(evaluate_affinity_rule(&[&metadata], &non_matching_rule));
+
         let empty_rule = AffinityRule {
             strictness: AffinityStrictness::Required,
             affinity_type: AffinityType::Agent,
@@ -1084,14 +1114,14 @@ mod tests {
 
     #[test]
     fn evaluates_required_preferred_and_capacity_rules() {
-        assert_eq!(affinity_delta(AffinityStrictness::Required, true), Some(0));
-        assert_eq!(affinity_delta(AffinityStrictness::Required, false), None);
+        assert_eq!(affinity_delta(&AffinityStrictness::Required, true), Some(0));
+        assert_eq!(affinity_delta(&AffinityStrictness::Required, false), None);
         assert_eq!(
-            affinity_delta(AffinityStrictness::Preferred { weight: 7 }, true),
+            affinity_delta(&AffinityStrictness::Preferred { weight: 7 }, true),
             Some(7)
         );
         assert_eq!(
-            affinity_delta(AffinityStrictness::Preferred { weight: 7 }, false),
+            affinity_delta(&AffinityStrictness::Preferred { weight: 7 }, false),
             Some(0)
         );
         assert!(has_capacity(8, 2, 2, 16, 4, 4));
@@ -1136,6 +1166,7 @@ impl PartialOrd for AgentScore {
     }
 }
 
+#[allow(clippy::unused_async_trait_impl)]
 impl Actor for SchedulerActor {
     type Args = ();
     type Error = Report;
@@ -1259,6 +1290,7 @@ impl Message<VmUpdated> for SchedulerActor {
     }
 }
 
+#[allow(clippy::unused_async_trait_impl)]
 impl Message<VmUpdaterStopped> for SchedulerActor {
     type Reply = ();
 
@@ -1385,6 +1417,42 @@ impl Message<CreateVM> for SchedulerActor {
     }
 }
 
+impl Message<GetConsoleHistory> for SchedulerActor {
+    type Reply = Result<GetConsoleHistoryReply, Report>;
+
+    async fn handle(
+        &mut self,
+        msg: GetConsoleHistory,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let vm = RemoteActorRef::<VMActor>::lookup(vm_actor_id(msg.vmid)).await?;
+        tracing::trace!(?vm, vmid = %msg.vmid, "GetConsoleHistory");
+        if let Some(vm) = vm {
+            Ok(vm.ask(&msg).await?)
+        } else {
+            Err(eyre!("VM not found"))
+        }
+    }
+}
+
+impl Message<SendConsoleInput> for SchedulerActor {
+    type Reply = Result<SendConsoleInputReply, Report>;
+
+    async fn handle(
+        &mut self,
+        msg: SendConsoleInput,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let vm = RemoteActorRef::<VMActor>::lookup(vm_actor_id(msg.vmid)).await?;
+        tracing::trace!(?vm, vmid = %msg.vmid, bytes = msg.input.len(), "SendConsoleInput");
+        if let Some(vm) = vm {
+            Ok(vm.ask(&msg).await?)
+        } else {
+            Err(eyre!("VM not found"))
+        }
+    }
+}
+
 impl Message<DeleteVM> for SchedulerActor {
     type Reply = Result<DeleteVMReply, Report>;
 
@@ -1428,6 +1496,7 @@ impl Message<ShutdownVM> for SchedulerActor {
 /// this only gets data from the cache from agents
 /// we may need a different message that actually forcibly runs/updates everything.
 /// and/or messages that get data directly from the `VMActors`.
+#[allow(clippy::unused_async_trait_impl)]
 impl Message<AgentListVMs> for SchedulerActor {
     type Reply = Result<AgentListVMsReply, Report>;
 
@@ -1446,6 +1515,7 @@ impl Message<AgentListVMs> for SchedulerActor {
     }
 }
 
+#[allow(clippy::unused_async_trait_impl)]
 impl Message<Ping> for SchedulerActor {
     type Reply = Pong;
 

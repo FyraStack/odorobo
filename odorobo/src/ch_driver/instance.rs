@@ -286,16 +286,28 @@ impl VMInstance {
         &self.id
     }
 
-    /// Returns the PTY path for this VM's serial console by querying the CH API.
+    /// Returns the configured PTY/file path for this VM's serial console.
     #[tracing::instrument]
     pub async fn console_path(&self) -> Result<PathBuf> {
-        trace!("Getting console PTY path from CH API");
-        let info = self.info().await?;
-        let path =
-            info.config.serial.and_then(|s| s.file).ok_or_else(|| {
-                eyre!("No serial console PTY path available for {}", self.vm_id())
-            })?;
+        trace!("Getting console file path from CH API");
+        let serial = self
+            .info()
+            .await?
+            .config
+            .serial
+            .ok_or_else(|| eyre!("No serial console configured for {}", self.vm_id()))?;
+        let path = serial.file.ok_or_else(|| {
+            eyre!(
+                "Serial console is not configured as a file for {}",
+                self.vm_id()
+            )
+        })?;
         Ok(PathBuf::from(path))
+    }
+
+    /// Returns the configured UNIX socket path for this VM's serial console.
+    pub fn console_socket_path(&self) -> PathBuf {
+        self.runtime_dir().join("console.sock")
     }
 
     /// Opens the PTY console device for this VM and returns a connected stream.
@@ -356,14 +368,17 @@ impl VMInstance {
             .wrap_err(eyre!("Failed to ping VM {}", self.vm_id()))
     }
 
-    /// Spawn a new CH process and create a `VMInstance` for it.
+    /// Spawn a Cloud Hypervisor process and optionally create/boot its VM.
     ///
-    /// Waits for the socket to become available (polls up to ~30 seconds).
-    /// Calls a backend to handle the actual CH process spawning - typically a systemd unit
+    /// `vm_config` is already translated by the CH manifest boundary. The
+    /// separate `boot` flag preserves the manifest's desired start behavior;
+    /// callers can create a stopped VM without changing its provider config.
+    /// The socket is polled for up to roughly 30 seconds before failing.
     #[tracing::instrument(skip_all)]
     pub async fn spawn(
         id: &str,
         vm_config: Option<VmConfig>,
+        boot: bool,
         transformer: Option<TransformChain>,
     ) -> Result<Self> {
         let ch_socket_path = Self::runtime_dir_for(id).join(SOCKET_FILE_NAME);
@@ -384,8 +399,8 @@ impl VMInstance {
             if instance.conn().vmm_ping_get().await.is_ok() {
                 info!(vm_id = id, "CH socket available");
                 if let Some(vm_config) = vm_config {
-                    info!(?vm_config, "Creating VM config and booting");
-                    instance.create_config(vm_config, true).await?;
+                    info!(boot, ?vm_config, "Creating VM config");
+                    instance.create_config(vm_config, boot).await?;
                 }
                 return Ok(instance);
             }
