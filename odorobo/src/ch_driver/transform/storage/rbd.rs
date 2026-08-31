@@ -108,16 +108,17 @@ impl RbdImage {
         }
 
         info!(?rbd_path, "Mapping RBD image to device");
-        let status = Command::new("rbd")
+        let output = Command::new("rbd")
             .args(rbd_extra_args())
             .arg("device")
             .arg("map")
             .arg(&rbd_path)
-            .status()
+            .output()
             .await
             .map_err(|e| eyre!("Failed to execute rbd command: {e}"))?;
-        if !status.success() {
-            return Err(eyre!("rbd map failed with status {status}"));
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(eyre!("rbd map failed: {stderr}"));
         }
         Ok(())
     }
@@ -127,16 +128,17 @@ impl RbdImage {
     pub async fn unmap(&self) -> Result<()> {
         let rbd_path = self.rbd_path();
         info!(?rbd_path, "Unmapping RBD image");
-        let status = Command::new("rbd")
+        let output = Command::new("rbd")
             .args(rbd_extra_args())
             .arg("device")
             .arg("unmap")
             .arg(&rbd_path)
-            .status()
+            .output()
             .await
             .map_err(|e| eyre!("Failed to execute rbd command: {e}"))?;
-        if !status.success() {
-            return Err(eyre!("rbd unmap failed with status {status}"));
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(eyre!("rbd unmap failed: {stderr}"));
         }
         Ok(())
     }

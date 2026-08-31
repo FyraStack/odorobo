@@ -374,7 +374,7 @@ impl Message<GetAgentStatus> for AgentActor {
             metadata: self.metadata.clone(),
         };
 
-        if msg.since_revision == 0
+        if msg.initial
             || msg.since_revision > self.membership_revision
             || self
                 .status_history

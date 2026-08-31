@@ -9,9 +9,11 @@ use crate::types::ObjectMetadata;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy)]
 pub struct GetAgentStatus {
-    /// Membership revision already applied by the caller. Revision zero requests
-    /// a full snapshot; stale revisions are also answered with a full snapshot.
+    /// Membership revision already applied by the caller.
     pub since_revision: u64,
+    /// Requests the initial full snapshot. Later requests can use revision zero
+    /// without forcing a full snapshot when the agent has not changed.
+    pub initial: bool,
 }
 
 #[derive(Serialize, Deserialize, Reply, Debug, Clone)]

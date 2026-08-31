@@ -33,22 +33,30 @@ impl ISCSITarget {
         // do iscsiadm login to the target, then find the corresponding device path in /dev/disk/by-path
         info!(?self, "Attaching iSCSI target");
 
-        Command::new("iscsiadm")
+        let output = Command::new("iscsiadm")
             .args(["-m", "node", "-T", &self.iqn, "-p", &self.host, "--login"])
-            .status()
+            .output()
             .await
             .map_err(|e| eyre!("Failed to execute iscsiadm command: {e}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(eyre!("iscsiadm login failed: {stderr}"));
+        }
         Ok(self.to_device_path())
     }
 
     #[tracing::instrument(skip(self))]
     pub async fn detach(&self) -> Result<()> {
         info!(?self, "Detaching iSCSI target");
-        Command::new("iscsiadm")
+        let output = Command::new("iscsiadm")
             .args(["-m", "node", "-T", &self.iqn, "-p", &self.host, "--logout"])
-            .status()
+            .output()
             .await
             .map_err(|e| eyre!("Failed to execute iscsiadm command: {e}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(eyre!("iscsiadm logout failed: {stderr}"));
+        }
         Ok(())
     }
 }

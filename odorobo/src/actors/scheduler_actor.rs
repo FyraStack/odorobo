@@ -520,11 +520,13 @@ impl SchedulerActor {
     async fn agent_updater_task(scheduler: ActorRef<Self>, actor_ref: RemoteActorRef<AgentActor>) {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         let mut status_revision = 0;
+        let mut initial_status = true;
         let mut fails: u8 = 0;
         loop {
             if let Ok(update) = actor_ref
                 .ask(&GetAgentStatus {
                     since_revision: status_revision,
+                    initial: initial_status,
                 })
                 .await
             {
@@ -532,6 +534,7 @@ impl SchedulerActor {
                     AgentStatusUpdate::Full { revision, .. }
                     | AgentStatusUpdate::Delta { revision, .. } => *revision,
                 };
+                initial_status = false;
                 let send_result = scheduler
                     .tell(AgentUpdated {
                         actor_id: actor_ref.id(),
@@ -1559,12 +1562,14 @@ impl Message<AgentUpdaterStopped> for SchedulerActor {
         self.agent_keepalive_tasks.remove(&msg.actor_id);
         self.actor_kinds.remove(&msg.actor_id);
         self.agent_data_cache.remove(&msg.actor_id);
+        self.agent_vm_index.remove(&msg.actor_id);
         Self::remove_agent_placements(
             msg.actor_id,
             &mut self.vm_manifests,
             &mut self.vm_placements,
             &mut self.vm_data_cache,
         );
+        self.invalidate_pending_resources();
     }
 }
 
