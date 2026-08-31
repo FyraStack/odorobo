@@ -58,7 +58,7 @@ struct ConsoleBuffer {
 
 impl Console {
     /// Attach to a Cloud Hypervisor serial socket and start spooling its output.
-    pub async fn attach(socket_path: std::path::PathBuf) -> Result<Self> {
+    pub async fn attach_socket(&self, socket_path: std::path::PathBuf) -> Result<()> {
         let stream = UnixStream::connect(&socket_path).await.map_err(|err| {
             Report::msg(format!(
                 "failed to attach console spool to {}: {err}",
@@ -66,13 +66,14 @@ impl Console {
             ))
         })?;
         let (mut reader, writer) = stream.into_split();
-        let (output, _) = broadcast::channel(256);
-        let console = Self {
-            inner: Arc::new(Mutex::new(ConsoleBuffer::default())),
-            output,
-            writer: Arc::new(Mutex::new(Some(writer))),
-        };
-        let spool = console.clone();
+        let mut writer_guard = self.writer.lock().await;
+        if writer_guard.is_some() {
+            return Ok(());
+        }
+        *writer_guard = Some(writer);
+        drop(writer_guard);
+
+        let spool = self.clone();
         tokio::spawn(async move {
             let mut buffer = [0_u8; 16 * 1024];
             loop {
@@ -89,7 +90,7 @@ impl Console {
                 }
             }
         });
-        Ok(console)
+        Ok(())
     }
 
     async fn push(&self, chunk: Vec<u8>) {
@@ -206,8 +207,14 @@ impl Actor for VMActor {
         )
         .await?;
 
-        // attach console on startup for spooling
-        let console = Console::attach(vminstance.console_socket_path()).await?;
+        let console = Console::default();
+        // A migration receiver has no config yet; its serial socket is created
+        // only when the migrated VM is restored.
+        if vm_config.is_some() {
+            console
+                .attach_socket(vminstance.console_socket_path())
+                .await?;
+        }
 
         // Take the child process out so we can watch for unexpected death.
         // destroy() handles a missing child_process gracefully.
@@ -419,6 +426,20 @@ impl Message<MigrateVMReceive> for VMActor {
             migration_task: Some(migration_task),
             listening_address: listening_address.clone(),
             config: msg.config,
+        });
+
+        let console = self.console.clone();
+        let console_socket_path = self.vm_instance.console_socket_path();
+        tokio::spawn(async move {
+            loop {
+                match console.attach_socket(console_socket_path.clone()).await {
+                    Ok(()) => break,
+                    Err(err) => {
+                        trace!(?err, "serial console socket not ready during migration");
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                }
+            }
         });
 
         let actor_ref = ctx.actor_ref().clone();
