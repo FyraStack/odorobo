@@ -60,7 +60,6 @@ pub struct DhcpConfig {
     pub lease_time: String,
 }
 
-// TODO: move config into a separate module
 #[derive(Serialize, Deserialize, Default, Clone, Debug)]
 pub struct NetworkConfig {
     pub dhcp_config: Option<DhcpConfig>,
