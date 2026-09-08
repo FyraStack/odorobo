@@ -1,0 +1,9 @@
+ARG CEPH_IMAGE=quay.io/ceph/ceph:v20.2.3
+FROM ${CEPH_IMAGE}
+
+USER root
+
+COPY entrypoint.sh /usr/local/bin/odorobo-ceph
+RUN chmod 0755 /usr/local/bin/odorobo-ceph
+
+ENTRYPOINT ["/usr/local/bin/odorobo-ceph"]
