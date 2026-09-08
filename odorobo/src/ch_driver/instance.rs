@@ -9,7 +9,9 @@ use stable_eyre::{
     eyre::{Context, eyre},
 };
 use std::{
-    env, fs,
+    env,
+    fs::{self, File},
+    io::BufWriter,
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
 };
@@ -333,6 +335,13 @@ impl VMInstance {
         &self.ch_socket_path
     }
 
+    async fn stop_child_after_failed_start(&mut self) {
+        if let Some(mut child) = self.child_process.take() {
+            _ = child.start_kill();
+            _ = child.wait().await;
+        }
+    }
+
     pub async fn info(&self) -> Result<VmInfo> {
         self.conn()
             .vm_info_get()
@@ -400,7 +409,10 @@ impl VMInstance {
                 info!(vm_id = id, "CH socket available");
                 if let Some(vm_config) = vm_config {
                     info!(boot, ?vm_config, "Creating VM config");
-                    instance.create_config(vm_config, boot).await?;
+                    if let Err(error) = instance.create_config(vm_config, boot).await {
+                        instance.stop_child_after_failed_start().await;
+                        return Err(error);
+                    }
                 }
                 return Ok(instance);
             }
@@ -410,6 +422,7 @@ impl VMInstance {
             }
         }
 
+        instance.stop_child_after_failed_start().await;
         Err(eyre!(
             "CH socket not available after {} attempts for VM {}",
             MAX_ATTEMPTS,
@@ -494,19 +507,18 @@ impl VMInstance {
 
     /// Load desired VM config from disk.
     pub fn load_config(&self) -> Result<models::VmConfig> {
-        let config_data = fs::read_to_string(self.config_path())
-            .wrap_err(eyre!("Failed to read config file for {}", self.vm_id()))?;
-
-        serde_json::from_str(&config_data)
-            .wrap_err(eyre!("Failed to parse config JSON for {}", self.vm_id()))
+        serde_json::from_reader(
+            File::open(self.config_path())
+                .wrap_err(eyre!("Failed to read config file for {}", self.vm_id()))?,
+        )
+        .wrap_err(eyre!("Failed to parse config JSON for {}", self.vm_id()))
     }
 
     /// Save desired VM config to disk.
     pub fn save_config(&self, config: &models::VmConfig) -> Result<()> {
-        let config_data =
-            serde_json::to_string_pretty(config).wrap_err("Failed to serialize config to JSON")?;
-
-        fs::write(self.config_path(), config_data)
+        let file = File::create(self.config_path())
+            .wrap_err(eyre!("Failed to open config file for {}", self.vm_id()))?;
+        serde_json::to_writer_pretty(BufWriter::new(file), config)
             .wrap_err(eyre!("Failed to write config file for {}", self.vm_id()))
     }
 
@@ -519,7 +531,7 @@ impl VMInstance {
         trace!(vm_id = self.vm_id(), "Creating VM with provided config");
 
         trace!(vm_id = self.vm_id(), "Applying config transforms");
-        let mut transformed_config = config.clone();
+        let mut transformed_config = config;
         self.transformer
             .transform(self.vm_id(), &mut transformed_config)
             .wrap_err(eyre!(
@@ -562,9 +574,7 @@ impl VMInstance {
                 self.vm_id()
             ))?;
 
-        self.hook_manager
-            .before_boot(self.vm_id(), &config.clone())
-            .await?;
+        self.hook_manager.before_boot(self.vm_id(), &config).await?;
 
         Ok(())
     }
