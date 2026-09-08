@@ -116,8 +116,8 @@ impl Actor for AgentActor {
 
         let sys = System::new_all();
         let mut vms = AHashMap::new();
-        let mut used_vcpus = 0;
-        let mut used_memory_bytes = 0;
+        let mut used_vcpus: u32 = 0;
+        let mut used_memory_bytes: u64 = 0;
         let placements = state_store.list::<PlacementRecord>(PLACEMENT_PREFIX).await;
         match (
             placements,

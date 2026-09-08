@@ -265,6 +265,7 @@ fn agent_cleanup_does_not_remove_unrelated_vm_state() {
     assert!(scheduler.vm_manifests.contains_key(&vmid));
     assert!(scheduler.vm_actorid_ulid_map.contains_key(&vm_actor_id));
     assert!(scheduler.vm_data_cache.contains_key(&vmid));
+    drop(scheduler);
 }
 
 #[test]
@@ -292,6 +293,7 @@ fn vm_cleanup_does_not_remove_unrelated_agent_state() {
     assert!(scheduler.actor_kinds.contains_key(&agent_id));
     assert!(!scheduler.vm_manifests.contains_key(&vmid));
     assert!(!scheduler.vm_data_cache.contains_key(&vmid));
+    drop(scheduler);
 }
 
 #[test]

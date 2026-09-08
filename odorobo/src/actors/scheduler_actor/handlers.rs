@@ -29,10 +29,7 @@ impl Actor for SchedulerActor {
     type Args = Arc<StateStore>;
     type Error = Report;
 
-    async fn on_start(
-        state_store: Self::Args,
-        actor_ref: ActorRef<Self>,
-    ) -> Result<Self, Self::Error> {
+    async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
         let peer_id = *actor_ref.id().peer_id().unwrap();
 
         info!(?peer_id, "Scheduler Actor started!");
@@ -49,7 +46,7 @@ impl Actor for SchedulerActor {
             agent_vm_index: AHashMap::new(),
             actor_kinds: AHashMap::new(),
             cache_actor_finder: None,
-            state_store,
+            state_store: args,
         };
 
         scheduler_actor.start_actor_finder(actor_ref);
@@ -95,6 +92,7 @@ impl Message<CreateVM> for SchedulerActor {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         let target_agent = self.schedule_agent(&msg)?;
+        let target_agent_id = target_agent.id();
 
         // TODO: Define duplicate VM-ID semantics before overwriting intent and
         // appending another pending placement; reject conflicts or make retries idempotent.
@@ -104,7 +102,7 @@ impl Message<CreateVM> for SchedulerActor {
             .entry(msg.vmid)
             .or_default()
             .push(VmPlacement {
-                agent_id: target_agent.id(),
+                agent_id: target_agent_id,
                 lifecycle: VmLifecycle::Pending,
                 created_at: Instant::now(),
                 last_confirmed_at: None,
@@ -148,8 +146,9 @@ impl Message<CreateVM> for SchedulerActor {
         let reply = reply?;
         let node = self
             .agent_data_cache
-            .get(&target_agent.id())
+            .get(&target_agent_id)
             .map_or_else(|| "unknown".to_owned(), |agent| agent.data.hostname.clone());
+        drop(target_agent);
         let placement = PlacementRecord {
             vmid: msg.vmid,
             node,
