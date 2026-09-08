@@ -243,6 +243,12 @@ impl Config {
     pub fn get_reserved_vcpus(&self) -> u32 {
         self.reserved_vcpus.unwrap_or(2)
     }
+    #[must_use]
+    pub fn get_etcd_endpoints(&self) -> Vec<String> {
+        self.etcd_endpoints
+            .clone()
+            .unwrap_or_else(|| vec![default_etcd_endpoint()])
+    }
 }
 
 #[cfg(test)]
@@ -270,5 +276,13 @@ mod tests {
         let json = serde_json::to_string_pretty(&config).unwrap();
         // assert_eq!(json, )
         println!("{json}");
+    }
+
+    #[test]
+    fn default_etcd_endpoint_is_available_without_a_config_file() {
+        assert_eq!(
+            Config::default().get_etcd_endpoints(),
+            vec!["http://127.0.0.1:2379"]
+        );
     }
 }

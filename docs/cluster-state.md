@@ -5,7 +5,7 @@ Odorobo stores desired VM manifests and scheduler placement records in etcd unde
 
 ## Key layout
 
-- `/odorobo/v1/vm-manifests/<vmid>` — serialized `VirtualMachine` manifests.
+- `/odorobo/v1/vm-manifests/<vmid>` — serialized provider-neutral `VmManifest` records.
 - `/odorobo/v1/placement/<vmid>` — the selected node for a VM.
 - `/odorobo/v1/node-state/<node>` — reserved for node-state records.
 - `/odorobo/v1/operations/<operation>` — reserved for operation records.

@@ -15,11 +15,11 @@ use crate::messages::vm::{
 };
 use crate::messages::{Ping, Pong};
 use crate::utils::actor_names::vm_actor_id;
-use odorobo::cluster_state::{ClusterStateStore, PLACEMENT_PREFIX, StateStore, key};
-
-use super::{
-    CachedActorKind, CachedVMActor, PlacementRecord, SchedulerActor, VmLifecycle, VmPlacement,
+use odorobo::cluster_state::{
+    ClusterStateStore, PLACEMENT_PREFIX, PlacementRecord, StateStore, key,
 };
+
+use super::{CachedActorKind, CachedVMActor, SchedulerActor, VmLifecycle, VmPlacement};
 
 /// Owns scheduler initialization and cleanup for linked remote actors.
 ///

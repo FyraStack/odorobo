@@ -1,6 +1,7 @@
 use crate::{
     ch_driver::actor::VMActor,
     config::Config,
+    manifest::VmManifest,
     messages::{
         Ping, Pong,
         agent::{
@@ -18,10 +19,12 @@ use crate::{
     types::ObjectMetadata,
     utils::actor_names::{NETWORK, VM, vm_actor_id},
 };
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use bytesize::ByteSize;
 use kameo::prelude::*;
-use odorobo::cluster_state::{ClusterStateStore, StateStore, VM_MANIFESTS_PREFIX, key};
+use odorobo::cluster_state::{
+    ClusterStateStore, PLACEMENT_PREFIX, PlacementRecord, StateStore, VM_MANIFESTS_PREFIX, key,
+};
 use stable_eyre::{Report, Result};
 use std::{ops::ControlFlow, sync::Arc};
 use sysinfo::System;
@@ -113,13 +116,25 @@ impl Actor for AgentActor {
 
         let sys = System::new_all();
         let mut vms = AHashMap::new();
-        match state_store
-            .list::<VirtualMachine>(VM_MANIFESTS_PREFIX)
-            .await
-        {
-            Ok(records) => {
-                for (_, vm_config) in records {
-                    let vmid = vm_config.data.id;
+        let mut used_vcpus = 0;
+        let mut used_memory_bytes = 0;
+        let placements = state_store.list::<PlacementRecord>(PLACEMENT_PREFIX).await;
+        match (
+            placements,
+            state_store.list::<VmManifest>(VM_MANIFESTS_PREFIX).await,
+        ) {
+            (Ok(placements), Ok(records)) => {
+                let local_vmids: AHashSet<_> = placements
+                    .into_iter()
+                    .map(|(_, placement)| placement)
+                    .filter(|placement| placement.node == config.get_hostname())
+                    .map(|placement| placement.vmid)
+                    .collect();
+                for (_, vm_config) in records
+                    .into_iter()
+                    .filter(|(_, vm_config)| local_vmids.contains(&vm_config.id))
+                {
+                    let vmid = vm_config.id;
                     let actor =
                         VMActor::spawn_link(&actor_ref, (vmid, Some(vm_config.clone()))).await;
                     _ = actor.register(vm_actor_id(vmid)).await;
@@ -128,17 +143,24 @@ impl Actor for AgentActor {
                         vmid,
                         VMCacheData {
                             actor_ref: actor,
-                            vcpus: vm_config.data.desired.compute.vcpus,
-                            memory_bytes: vm_config.data.desired.compute.memory_bytes,
+                            vcpus: vm_config.desired.compute.vcpus,
+                            memory_bytes: vm_config.desired.compute.memory_bytes,
                         },
                     );
+                    used_vcpus = used_vcpus.saturating_add(vm_config.desired.compute.vcpus);
+                    used_memory_bytes =
+                        used_memory_bytes.saturating_add(vm_config.desired.compute.memory_bytes);
                 }
                 info!(
                     count = vms.len(),
                     "Recovered VM manifests from cluster state"
                 );
             }
-            Err(error) => warn!(
+            (Err(error), _) => warn!(
+                ?error,
+                "Unable to recover VM placements; retaining empty local cache"
+            ),
+            (_, Err(error)) => warn!(
                 ?error,
                 "Unable to recover VM manifests; retaining empty local cache"
             ),
@@ -149,8 +171,8 @@ impl Actor for AgentActor {
             memory: ByteSize::b(sys.total_memory()),
             config,
             vms,
-            used_vcpus: 0,
-            used_memory_bytes: 0,
+            used_vcpus,
+            used_memory_bytes,
             membership_revision: 0,
             status_history: StatusChangeHistory::new(),
             metadata: ObjectMetadata::default(),

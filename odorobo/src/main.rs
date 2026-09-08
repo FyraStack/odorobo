@@ -62,7 +62,7 @@ fn mainloop(term: &Arc<AtomicBool>, config: Config) -> Result<()> {
 async fn inner_main(config: Config) -> Result<()> {
     tracing::info!("Starting odorobo");
 
-    let endpoints = config.etcd_endpoints.clone().unwrap_or_default();
+    let endpoints = config.get_etcd_endpoints();
     let tls = config.etcd_tls.unwrap_or(false).then(|| TlsConfig {
         ca_file: config.etcd_ca_file.clone().unwrap_or_default(),
     });

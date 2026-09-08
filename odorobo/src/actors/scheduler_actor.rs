@@ -37,12 +37,6 @@ use crate::manifest::VmManifest;
 use crate::messages::agent::{AgentStatus, AgentStatusUpdate};
 use crate::messages::vm::GetVMInfoReply;
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct PlacementRecord {
-    vmid: Ulid,
-    node: String,
-}
-
 /// Internal discovery event that starts VM polling for a newly found actor.
 #[derive(Debug)]
 struct VmActorDiscovered {

@@ -11,6 +11,7 @@ use etcd_client::{Certificate, Client, ConnectOptions, TlsOptions};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use tokio::sync::RwLock;
+use ulid::Ulid;
 
 pub const KEY_PREFIX: &str = "/odorobo/v1";
 pub const VM_MANIFESTS_PREFIX: &str = "/odorobo/v1/vm-manifests";
@@ -18,6 +19,13 @@ pub const PLACEMENT_PREFIX: &str = "/odorobo/v1/placement";
 pub const NODE_STATE_PREFIX: &str = "/odorobo/v1/node-state";
 pub const OPERATIONS_PREFIX: &str = "/odorobo/v1/operations";
 pub const RECORD_VERSION: u16 = 1;
+
+/// The agent hostname selected to run a VM manifest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlacementRecord {
+    pub vmid: Ulid,
+    pub node: String,
+}
 
 #[derive(Debug, Error)]
 pub enum StateError {
