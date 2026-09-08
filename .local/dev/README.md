@@ -2,7 +2,7 @@
 
 This directory runs the local development stack in containers:
 
-- `ceph` provides a single-node Ceph cluster and a file-backed raw OSD.
+- `ceph` provides a single-node Ceph cluster and a file-backed OSD.
 - `odorobo` runs the agent in the same network, PID, and device namespaces as Ceph.
 
 Odorobo must run in the container for the `rbd://` storage path. It invokes `rbd device map`, which creates a kernel block device, and then passes that device to Cloud Hypervisor. A host-side process would not see the container's `/dev/rbd*` device or have the required device and privilege context.
@@ -17,10 +17,11 @@ For Fedora, the host needs the container engine and kernel modules:
 
 ```bash
 sudo dnf install -y podman podman-compose kmod
-sudo modprobe rbd
+sudo modprobe rbd loop
+sudo losetup -f
 ```
 
-The container image installs `ceph-common`, Rust tooling, and Cloud Hypervisor tooling. The host does not need `cephadm`, `ceph-common`, `qemu-nbd`, or systemd Ceph units.
+The container image installs Ceph directly and starts the MON and OSD daemons itself; it intentionally does not start MGR because the MGR's optional Python modules require host udev/system services unavailable in this container. It does not use `cephadm`, nested Podman, or systemd. The OSD uses a persistent raw file attached through a host loop device, initialized directly with `ceph-osd` rather than `ceph-volume`.
 
 ## Usage
 
@@ -30,7 +31,7 @@ Initialize Ceph and start Odorobo:
 bash .local/dev/init.sh
 ```
 
-This builds both images, starts both services, provisions the `odorobo-blockpool/dev-disk` RBD image, and starts Odorobo with manager mode enabled.
+This builds both images, starts Ceph and waits up to two minutes for it to become healthy, provisions the `odorobo-blockpool/dev-disk` RBD image, and then starts Odorobo with manager mode enabled. On a bootstrap failure, it prints the last 200 Ceph log lines instead of waiting indefinitely.
 
 Start and stop the complete stack without deleting data:
 
@@ -68,6 +69,8 @@ podman compose -f .local/dev/compose.yml logs -f odorobo
 ```
 
 The agent runs as:
+
+By default, the container limits Cargo to two concurrent build jobs to reduce CPU and memory pressure during the initial release build. Override it when starting the stack, for example `CARGO_BUILD_JOBS=4 bash .local/dev/init.sh`.
 
 ```text
 cargo run --release -p odorobo -- --manager-enabled
@@ -110,7 +113,7 @@ CEPH_OSD_SIZE=10G
 
 - `compose.yml` — Ceph and Odorobo services, shared namespaces, privilege, mounts, and ports.
 - `ceph/Containerfile` — pinned Ceph image.
-- `ceph/entrypoint.sh` — bootstrap, OSD, pool, client, and image provisioning.
+- `ceph/entrypoint.sh` — direct MON bootstrap, filesystem-backed OSD initialization, pool/client/image provisioning, and daemon lifecycle.
 - `odorobo/Containerfile` — runnable Odorobo development image.
 - `ceph/generated/` — generated Ceph credentials shared read-only with Odorobo; ignored by git.
 - `ceph/state/` — Ceph configuration, daemons, logs, and file-backed OSD; ignored by git.
