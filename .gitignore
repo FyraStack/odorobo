@@ -24,6 +24,9 @@ dev
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 .idea/
 
+# Zed launch configurations are machine-specific.
+.zed/debug.json
+
 # AI Slop
 # Anyone who uses LLMs for slop gets to keep their own slop context.
 # sharing context is technically good, but bad for optics for the anti-AI crowd, so

@@ -3,3 +3,11 @@
 # You can also set the target-cpu to do cross compilation if you know the exact micro architecture of the target machine.
 [build]
 #rustflags = ["-C", "target-cpu=native"]
+
+# Cross-build aliases. These select compilation targets without changing the
+# host toolchain used to run Cargo on the development machine.
+[alias]
+build-linux-x86_64 = "build --target x86_64-unknown-linux-gnu"
+build-linux-x86_64-release = "build --release --target x86_64-unknown-linux-gnu"
+build-linux-rva23 = "build --target riscv64a23-unknown-linux-gnu"
+build-linux-rva23-release = "build --release --target riscv64a23-unknown-linux-gnu"

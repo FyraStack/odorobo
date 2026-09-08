@@ -66,8 +66,12 @@ cloud-hypervisor-client = { git = "https://github.com/FyraStack/cloud-hypervisor
 signal-hook = "0.4.4"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-rtnetlink = "0.21"
+rtnetlink = "0.23"
 nftables = { version = "0.6", features = ["tokio"] }
+
+[[bench]]
+name = "agent_status"
+harness = false
 
 [lints]
 workspace = true

@@ -20,6 +20,7 @@ pub fn calculate_mac_address(ip: [u8; 4]) -> [u8; 6] {
 #[derive(RemoteActor)]
 pub struct IPManagementActor;
 
+#[allow(clippy::unused_async_trait_impl)]
 impl Actor for IPManagementActor {
     type Args = ();
     type Error = Report;

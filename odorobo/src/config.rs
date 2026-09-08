@@ -25,26 +25,27 @@ fn default_etcd_endpoint() -> String {
 }
 /// Infers the default upstream interface from the system's default route
 fn default_upstream_iface() -> String {
-    // ip route
-    let Some(iface) = std::process::Command::new("ip")
-        .arg("route")
-        .output()
-        .ok()
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .and_then(|routes| {
-            routes
-                .lines()
-                .find(|line| line.starts_with("default"))
-                .and_then(|route| route.split_whitespace().nth(4))
-                .map(str::to_owned)
-        })
-    else {
-        warn!("cannot infer default upstream interface; using eth0");
+    let Ok(output) = std::process::Command::new("ip").arg("route").output() else {
+        warn!("cannot inspect routes; defaulting upstream interface to eth0");
         return "eth0".to_owned();
     };
 
-    info!("inferring default upstream interface: {iface}");
-    iface
+    let Ok(output) = String::from_utf8(output.stdout) else {
+        warn!("route output is not valid UTF-8; defaulting upstream interface to eth0");
+        return "eth0".to_owned();
+    };
+
+    let Some(iface) = output
+        .lines()
+        .find(|line| line.starts_with("default"))
+        .and_then(|line| line.split_whitespace().nth(4))
+    else {
+        warn!("no default route found; defaulting upstream interface to eth0");
+        return "eth0".to_owned();
+    };
+
+    info!("inferring default upstream interface: {}", iface);
+    iface.to_owned()
 }
 
 /// DHCP server config
@@ -260,7 +261,7 @@ mod tests {
                     bridge: "vmbr0".to_owned(),
                     gateway: Ipv4Addr::new(10, 10, 100, 1),
                     subnet: Ipv4Net::new(Ipv4Addr::new(10, 10, 100, 0), 24).unwrap(),
-                    upstream_iface: "eth0".to_owned(),
+                    upstream_iface: "test0".to_owned(),
                 },
             },
             ..Default::default()

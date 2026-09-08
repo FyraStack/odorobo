@@ -1,375 +1,172 @@
-use std::{ops::ControlFlow, sync::Arc};
+//! The scheduler actor and its in-memory cluster view.
+//!
+//! `SchedulerActor` makes placement decisions from periodically refreshed agent
+//! status rather than issuing network requests while scoring. Its state is
+//! eventually consistent and is not a durable source of truth:
+//!
+//! - [`SchedulerActor::vm_manifests`] records VM intent.
+//! - [`SchedulerActor::vm_placements`] records desired and observed placements.
+//!   A VM can have more than one entry while it is migrating.
+//! - [`SchedulerActor::vm_data_cache`] tracks discovered VM actors. A `None`
+//!   actor reference is a deliberate unresolved-placement placeholder.
+//! - [`SchedulerActor::agent_vm_index`] is an observation index, not placement
+//!   authority.
+//!
+//! Implementation is split by responsibility into cache reconciliation,
+//! discovery/polling, scheduling policy, and actor message handlers.
+
+mod cache;
+mod discovery;
+mod handlers;
+mod scheduling;
+
+#[cfg(test)]
+mod tests;
+
+use std::{sync::Arc, time::Instant};
+
+use ahash::{AHashMap, AHashSet};
+use kameo::prelude::*;
+use odorobo::cluster_state::StateStore;
+use tokio::task::JoinHandle;
+use ulid::Ulid;
 
 use crate::actors::agent_actor::AgentActor;
 use crate::ch_driver::actor::VMActor;
-use crate::messages::agent::{AgentStatus, GetAgentStatus};
-use crate::messages::vm::{
-    AgentListVMs, AgentListVMsReply, CreateVM, CreateVMReply, DeleteVM, DeleteVMReply, GetVMInfo,
-    GetVMInfoReply, ShutdownVM, ShutdownVMReply,
-};
-use crate::messages::{Ping, Pong};
-use crate::utils::actor_cache::ActorCache;
-use crate::utils::actor_cache::ActorCacheUpdater;
-use crate::utils::actor_names::AGENT;
-use crate::utils::actor_names::VM;
-use crate::utils::actor_names::vm_actor_id;
-use async_trait::async_trait;
-use kameo::prelude::*;
-use libp2p::futures::TryStreamExt;
-use odorobo::cluster_state::{ClusterStateStore, PLACEMENT_PREFIX, StateStore, key};
-use stable_eyre::eyre::OptionExt;
-use stable_eyre::{Report, Result, eyre::eyre};
-use tracing::info_span;
-use tracing::{info, warn};
-
-#[derive(RemoteActor)]
-pub struct SchedulerActor {
-    pub agent_actor_cache: ActorCache<Self, AgentActor, CachedAgentActor>,
-    pub vm_actor_cache: ActorCache<Self, VMActor, CachedVMActor>,
-    pub state_store: Arc<StateStore>,
-}
-
-// todo: this might need to be a runtime thing but this makes it easy to write for now and could easily be switched out later.
-static VCPU_OVERPROVISIONMENT_NUMERATOR: u32 = 2;
-static VCPU_OVERPROVISIONMENT_DENOMINATOR: u32 = 1;
-
-impl SchedulerActor {
-    #[expect(
-        dead_code,
-        reason = "scheduler lookup helper reserved for explicit placement by actor id"
-    )]
-    fn lookup_by_actor_id(&self, actor_id: &ActorId) -> Option<RemoteActorRef<AgentActor>> {
-        self.agent_actor_cache
-            .data_cache
-            .get(actor_id)
-            .map(|data| data.actor_ref.clone())
-    }
-
-    #[expect(
-        dead_code,
-        reason = "scheduler lookup helper reserved for explicit placement by hostname"
-    )]
-    fn lookup_by_hostname(&self, hostname: &str) -> Option<RemoteActorRef<AgentActor>> {
-        self.agent_actor_cache
-            .data_cache
-            .iter()
-            .find(|data| data.metadata.hostname == hostname)
-            .map(|data| data.actor_ref.clone())
-    }
-
-    /// current scheduling algo info:
-    /// this is vaguely based on <https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node>/
-    /// when a vm is attempted to be scheduled, we loop through every agent and score it based on some rules
-    /// there are hard rules that will simply throw out an agent entirely.
-    /// otherwise, we take whatever the best agent we can find is.
-    ///
-    /// additionally, because caleb is way too performance brained, he used integer math for the entire scoring algorithm just so we didnt have to convert to floats.
-    fn schedule_agent(&self, _msg: &CreateVM) -> Result<RemoteActorRef<AgentActor>, Report> {
-        let mut best_agent = None;
-        let mut best_agent_score = 0u32;
-
-        // todo: this arguably could be done as map-reduce. is that better?
-        let span = info_span!("schedule_agent");
-        span.in_scope(|| {
-            for agent in self.agent_actor_cache.data_cache.iter() {
-                let mut agent_score = 0u32;
-
-                let agent_max_vcpus = agent
-                    .metadata
-                    .vcpus
-                    .checked_mul(VCPU_OVERPROVISIONMENT_NUMERATOR)
-                    .and_then(|value| value.checked_div(VCPU_OVERPROVISIONMENT_DENOMINATOR))
-                    .unwrap_or(u32::MAX);
-
-                if agent.metadata.used_vcpus >= agent_max_vcpus {
-                    continue;
-                }
-
-                agent_score = agent_score.saturating_add(
-                    agent_max_vcpus
-                        .saturating_sub(agent.metadata.used_vcpus)
-                        .checked_mul(1024)
-                        .and_then(|value| value.checked_div(agent_max_vcpus))
-                        .unwrap_or(u32::MAX),
-                );
-
-                // todo: add ram overprovisionment.     not adding this to scheduler until it works on the hypervisor side.
-                let agent_max_ram = agent.metadata.ram;
-
-                if agent.metadata.used_ram >= agent_max_ram {
-                    continue;
-                }
-
-                agent_score = agent_score.saturating_add(
-                    u32::try_from(
-                        agent_max_ram
-                            .as_u64()
-                            .saturating_sub(agent.metadata.used_ram.as_u64())
-                            .checked_mul(1024)
-                            .and_then(|value| value.checked_div(agent_max_ram.as_u64()))
-                            .unwrap_or(u64::MAX),
-                    )
-                    .unwrap_or(u32::MAX),
-                );
-
-                // todo: https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/
-
-                // todo (future): possibly keep a percent of agents completely empty, to be able to be converted to dedis automatically.
-                // they would have their agent score set to 1, so they can be scheduled to if there is no other avaliable agents.
-                // rough pseudo code to implement this:
-                // if agent.metadata.vms.len() == 0 && hash(agent.config.hostname) % total_chance < threshold {
-                //     agent_score = 1;
-                // }
-
-                info!(agent=?agent.value(), score=agent_score);
-
-                if agent_score > best_agent_score {
-                    best_agent = Some(agent.actor_ref.clone());
-                    best_agent_score = agent_score;
-                }
-            }
-        });
-
-        best_agent.ok_or_eyre("No valid agents found.")
-    }
-}
-
-#[derive(Copy, Clone)]
-struct AgentActorCacheUpdater;
-
-#[derive(Debug, Clone)]
-pub struct CachedAgentActor {
-    pub actor_ref: RemoteActorRef<AgentActor>,
-    pub metadata: AgentStatus,
-}
-
-#[async_trait]
-impl ActorCacheUpdater<AgentActor, CachedAgentActor> for AgentActorCacheUpdater {
-    async fn get_actor_refs(&self) -> Result<Vec<RemoteActorRef<AgentActor>>> {
-        let mut agent_actors_lookup = RemoteActorRef::<AgentActor>::lookup_all(AGENT);
-        let mut actor_ref_vec = Vec::new();
-
-        loop {
-            let next_agent = agent_actors_lookup.try_next().await?;
-            let Some(agent_actor) = next_agent else { break };
-            actor_ref_vec.push(agent_actor);
-        }
-
-        Ok(actor_ref_vec)
-    }
-
-    async fn on_update(
-        &self,
-        actor_ref: &RemoteActorRef<AgentActor>,
-        previous_value: Option<CachedAgentActor>,
-    ) -> Result<CachedAgentActor, Report> {
-        let output_actor_ref = match previous_value {
-            Some(value) => value.actor_ref,
-            _ => actor_ref.clone(),
-        };
-
-        Ok(CachedAgentActor {
-            actor_ref: output_actor_ref,
-            metadata: actor_ref.ask(&GetAgentStatus).await?,
-        })
-    }
-}
-
-// todo: this code is really bad, and we should not have effectively two copies of ths same thing.
-#[derive(Copy, Clone)]
-struct VMActorCacheUpdater;
-
-#[derive(Debug, Clone)]
-pub struct CachedVMActor {
-    pub actor_ref: RemoteActorRef<VMActor>,
-    pub metadata: GetVMInfoReply,
-}
+use crate::manifest::VmManifest;
+use crate::messages::agent::{AgentStatus, AgentStatusUpdate};
+use crate::messages::vm::GetVMInfoReply;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct PlacementRecord {
-    vmid: ulid::Ulid,
+    vmid: Ulid,
     node: String,
 }
 
-#[async_trait]
-impl ActorCacheUpdater<VMActor, CachedVMActor> for VMActorCacheUpdater {
-    async fn get_actor_refs(&self) -> Result<Vec<RemoteActorRef<VMActor>>> {
-        let mut agent_actors_lookup = RemoteActorRef::<VMActor>::lookup_all(VM);
-        let mut actor_ref_vec = Vec::new();
-
-        loop {
-            let next_agent = agent_actors_lookup.try_next().await?;
-            let Some(agent_actor) = next_agent else { break };
-            actor_ref_vec.push(agent_actor);
-        }
-
-        Ok(actor_ref_vec)
-    }
-
-    async fn on_update(
-        &self,
-        actor_ref: &RemoteActorRef<VMActor>,
-        previous_value: Option<CachedVMActor>,
-    ) -> Result<CachedVMActor, Report> {
-        let output_actor_ref = match previous_value {
-            Some(value) => value.actor_ref,
-            _ => actor_ref.clone(),
-        };
-
-        Ok(CachedVMActor {
-            actor_ref: output_actor_ref,
-            metadata: actor_ref.ask(&GetVMInfo { vmid: None }).await?,
-        })
-    }
+/// Internal discovery event that starts VM polling for a newly found actor.
+#[derive(Debug)]
+struct VmActorDiscovered {
+    actor_ref: RemoteActorRef<VMActor>,
 }
 
-impl Actor for SchedulerActor {
-    type Args = Arc<StateStore>;
-    type Error = Report;
-
-    async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
-        let state_store = args;
-        let peer_id = *actor_ref.id().peer_id().unwrap();
-
-        info!(?peer_id, "Scheduler Actor started!");
-
-        Ok(Self {
-            agent_actor_cache: ActorCache::new(actor_ref.clone(), AgentActorCacheUpdater),
-            vm_actor_cache: ActorCache::new(actor_ref, VMActorCacheUpdater),
-            state_store,
-        })
-    }
-
-    async fn on_link_died(
-        &mut self,
-        actor_ref: WeakActorRef<Self>,
-        id: ActorId,
-        reason: ActorStopReason,
-    ) -> Result<ControlFlow<ActorStopReason>, Self::Error> {
-        warn!("Linked actor {id:?} died with reason {reason:?}");
-
-        let Some(_) = actor_ref.upgrade() else {
-            return Ok(ControlFlow::Break(ActorStopReason::Killed));
-        };
-
-        self.agent_actor_cache.on_link_died(id);
-        self.vm_actor_cache.on_link_died(id);
-
-        info!(vm_actor_cache=?self.agent_actor_cache.data_cache, agent_actor_cache=?self.vm_actor_cache.data_cache, "data caches post actor removal");
-
-        Ok(ControlFlow::Continue(()))
-    }
+/// Internal discovery event that starts status polling for a newly found agent.
+#[derive(Debug)]
+struct AgentActorDiscovered {
+    actor_ref: RemoteActorRef<AgentActor>,
 }
 
-impl Message<CreateVM> for SchedulerActor {
-    type Reply = Result<CreateVMReply, Report>;
-
-    async fn handle(
-        &mut self,
-        msg: CreateVM,
-        _ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
-        loop {
-            let target_agent = self.schedule_agent(&msg)?;
-
-            match target_agent.ask(&msg).await {
-                Ok(reply) => {
-                    let node = target_agent
-                        .ask(&GetAgentStatus)
-                        .await
-                        .map_or_else(|_| "unknown".to_owned(), |status| status.hostname);
-                    let placement = PlacementRecord {
-                        vmid: msg.vmid,
-                        node,
-                    };
-                    if let Err(error) = self
-                        .state_store
-                        .put(&key(PLACEMENT_PREFIX, &msg.vmid), &placement)
-                        .await
-                    {
-                        warn!(?error, vm_id = %msg.vmid, "Unable to persist VM placement; retaining local state");
-                    }
-                    drop(target_agent);
-                    return Ok(reply);
-                }
-                Err(err) => {
-                    warn!("CreateVM forwarding failed, trying again: {err}");
-                }
-            }
-        }
-    }
+/// The cache domain that owns cleanup for a linked remote actor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CachedActorKind {
+    Agent,
+    Vm,
 }
 
-impl Message<DeleteVM> for SchedulerActor {
-    type Reply = Result<DeleteVMReply, Report>;
-
-    async fn handle(
-        &mut self,
-        msg: DeleteVM,
-        _ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
-        let vm = RemoteActorRef::<VMActor>::lookup(vm_actor_id(msg.vmid)).await?;
-        tracing::trace!(?vm, "DeleteVM");
-        if let Some(vm) = vm {
-            vm.tell(&msg).send()?;
-            if let Err(error) = self
-                .state_store
-                .delete(&key(PLACEMENT_PREFIX, &msg.vmid))
-                .await
-            {
-                warn!(?error, vm_id = %msg.vmid, "Unable to delete VM placement; retaining durable record");
-            }
-            Ok(DeleteVMReply)
-        } else {
-            Err(eyre!("VM not found"))
-        }
-    }
+/// A VM's initial identity and configuration snapshot from its updater task.
+#[derive(Debug)]
+struct VmUpdated {
+    actor_ref: RemoteActorRef<VMActor>,
+    data: GetVMInfoReply,
 }
 
-impl Message<ShutdownVM> for SchedulerActor {
-    type Reply = Result<ShutdownVMReply, Report>;
-
-    async fn handle(
-        &mut self,
-        msg: ShutdownVM,
-        _ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
-        let vm = RemoteActorRef::<VMActor>::lookup(vm_actor_id(msg.vmid)).await?;
-        tracing::trace!(?vm, "ShutdownVM");
-        if let Some(vm) = vm {
-            vm.tell(&msg).send()?;
-            Ok(ShutdownVMReply)
-        } else {
-            Err(eyre!("VM not found"))
-        }
-    }
+/// Notification that a VM updater exceeded its reachability-failure budget.
+#[derive(Debug)]
+struct VmUpdaterStopped {
+    actor_id: ActorId,
 }
 
-/// this only gets data from the cache from agents
-/// we may need a different message that actually forcibly runs/updates everything.
-/// and/or messages that get data directly from the `VMActors`.
-impl Message<AgentListVMs> for SchedulerActor {
-    type Reply = Result<AgentListVMsReply, Report>;
-
-    async fn handle(
-        &mut self,
-        _msg: AgentListVMs,
-        _ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
-        let mut vms = Vec::new();
-
-        for agent in self.agent_actor_cache.data_cache.iter() {
-            vms.extend_from_slice(agent.metadata.vms.as_slice());
-        }
-
-        Ok(AgentListVMsReply { vms })
-    }
+/// A revisioned agent-status update forwarded by its updater task.
+#[derive(Debug)]
+struct AgentUpdated {
+    actor_id: ActorId,
+    actor_ref: RemoteActorRef<AgentActor>,
+    update: AgentStatusUpdate,
 }
 
-impl Message<Ping> for SchedulerActor {
-    type Reply = Pong;
+/// Notification that an agent updater exceeded its reachability-failure budget.
+#[derive(Debug)]
+struct AgentUpdaterStopped {
+    actor_id: ActorId,
+}
 
-    async fn handle(&mut self, _msg: Ping, _ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
-        Pong
-    }
+/// Periodic maintenance trigger for expiring unresolved VM placements.
+#[derive(Debug)]
+struct ReconcileVmPlacements;
+
+/// The latest scheduler-approved status snapshot for an agent.
+///
+/// The first accepted update must be a full snapshot. Later updates are
+/// revision-ordered; stale or duplicate revisions are ignored.
+#[derive(Debug, Clone)]
+pub struct CachedAgentActor {
+    pub actor_ref: RemoteActorRef<AgentActor>,
+    pub data: AgentStatus,
+    pub status_revision: u64,
+}
+
+/// Scheduler-side lifecycle for a VM placement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VmLifecycle {
+    /// Resources are reserved after create dispatch but before the destination
+    /// agent has reported the VM. This does not prove the VM process exists.
+    Pending,
+    /// The destination agent has reported the VM in its status.
+    Running,
+}
+
+/// A desired or observed placement of a VM on an agent.
+///
+/// Multiple entries for one VM are valid during migration. `last_confirmed_at`
+/// is updated only from agent status; `created_at` is used to expire unresolved
+/// pending placeholders.
+#[derive(Debug, Clone)]
+pub struct VmPlacement {
+    pub agent_id: ActorId,
+    pub lifecycle: VmLifecycle,
+    pub created_at: Instant,
+    pub last_confirmed_at: Option<Instant>,
+}
+
+/// A discovered VM actor associated with one concurrent placement.
+///
+/// `actor_ref: None` intentionally represents a placement reserved before its
+/// VM actor is discovered.
+#[derive(Debug, Clone)]
+pub struct CachedVMActor {
+    pub actor_ref: Option<RemoteActorRef<VMActor>>,
+}
+
+/// An eventually consistent, in-memory VM scheduler.
+///
+/// Public caches are exposed for inspection, but correlated maps must be
+/// updated together through the actor's message handlers to preserve placement
+/// and pending-resource accounting invariants.
+#[derive(RemoteActor)]
+pub struct SchedulerActor {
+    /// Latest status snapshot for each known agent, used for scheduling decisions.
+    pub agent_data_cache: AHashMap<ActorId, CachedAgentActor>,
+    /// Polling tasks that refresh corresponding agent cache entries.
+    pub agent_keepalive_tasks: AHashMap<ActorId, JoinHandle<()>>,
+    /// Maps discovered VM actor IDs to canonical VM IDs.
+    pub vm_actorid_ulid_map: AHashMap<ActorId, Ulid>,
+    /// Canonical VM intent retained while a VM is reconciled or migrated.
+    pub vm_manifests: AHashMap<Ulid, VmManifest>,
+    /// Desired and observed VM placements; multiple entries allow migration.
+    pub vm_placements: AHashMap<Ulid, Vec<VmPlacement>>,
+    /// VM actor references. `None` marks a placement awaiting discovery.
+    pub vm_data_cache: AHashMap<Ulid, Vec<CachedVMActor>>,
+    /// Polling tasks that refresh corresponding VM actor cache entries.
+    pub vm_keepalive_tasks: AHashMap<ActorId, JoinHandle<()>>,
+    /// Lazily computed resources reserved by `Pending` placements, keyed by agent.
+    /// Invalidated whenever status or placement state that affects capacity changes.
+    pending_resources_cache: Option<AHashMap<ActorId, (u32, u64)>>,
+    /// Status-derived VM membership index used to evaluate VM affinity efficiently.
+    /// This is an optimization and must never override `vm_placements` intent.
+    agent_vm_index: AHashMap<ActorId, AHashSet<Ulid>>,
+    /// Classifies linked actors so link-death cleanup affects the owning cache only.
+    actor_kinds: AHashMap<ActorId, CachedActorKind>,
+    /// Background discovery and reconciliation task.
+    pub cache_actor_finder: Option<JoinHandle<()>>,
+    /// Durable cluster state shared with agents for VM placement recovery.
+    pub state_store: Arc<StateStore>,
 }

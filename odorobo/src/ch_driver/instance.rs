@@ -9,7 +9,9 @@ use stable_eyre::{
     eyre::{Context, eyre},
 };
 use std::{
-    env, fs,
+    env,
+    fs::{self, File},
+    io::BufWriter,
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
 };
@@ -286,16 +288,28 @@ impl VMInstance {
         &self.id
     }
 
-    /// Returns the PTY path for this VM's serial console by querying the CH API.
+    /// Returns the configured PTY/file path for this VM's serial console.
     #[tracing::instrument]
     pub async fn console_path(&self) -> Result<PathBuf> {
-        trace!("Getting console PTY path from CH API");
-        let info = self.info().await?;
-        let path =
-            info.config.serial.and_then(|s| s.file).ok_or_else(|| {
-                eyre!("No serial console PTY path available for {}", self.vm_id())
-            })?;
+        trace!("Getting console file path from CH API");
+        let serial = self
+            .info()
+            .await?
+            .config
+            .serial
+            .ok_or_else(|| eyre!("No serial console configured for {}", self.vm_id()))?;
+        let path = serial.file.ok_or_else(|| {
+            eyre!(
+                "Serial console is not configured as a file for {}",
+                self.vm_id()
+            )
+        })?;
         Ok(PathBuf::from(path))
+    }
+
+    /// Returns the configured UNIX socket path for this VM's serial console.
+    pub fn console_socket_path(&self) -> PathBuf {
+        self.runtime_dir().join("console.sock")
     }
 
     /// Opens the PTY console device for this VM and returns a connected stream.
@@ -319,6 +333,13 @@ impl VMInstance {
 
     pub fn ch_socket_path(&self) -> &Path {
         &self.ch_socket_path
+    }
+
+    async fn stop_child_after_failed_start(&mut self) {
+        if let Some(mut child) = self.child_process.take() {
+            _ = child.start_kill();
+            _ = child.wait().await;
+        }
     }
 
     pub async fn info(&self) -> Result<VmInfo> {
@@ -356,14 +377,17 @@ impl VMInstance {
             .wrap_err(eyre!("Failed to ping VM {}", self.vm_id()))
     }
 
-    /// Spawn a new CH process and create a `VMInstance` for it.
+    /// Spawn a Cloud Hypervisor process and optionally create/boot its VM.
     ///
-    /// Waits for the socket to become available (polls up to ~30 seconds).
-    /// Calls a backend to handle the actual CH process spawning - typically a systemd unit
+    /// `vm_config` is already translated by the CH manifest boundary. The
+    /// separate `boot` flag preserves the manifest's desired start behavior;
+    /// callers can create a stopped VM without changing its provider config.
+    /// The socket is polled for up to roughly 30 seconds before failing.
     #[tracing::instrument(skip_all)]
     pub async fn spawn(
         id: &str,
         vm_config: Option<VmConfig>,
+        boot: bool,
         transformer: Option<TransformChain>,
     ) -> Result<Self> {
         let ch_socket_path = Self::runtime_dir_for(id).join(SOCKET_FILE_NAME);
@@ -384,8 +408,11 @@ impl VMInstance {
             if instance.conn().vmm_ping_get().await.is_ok() {
                 info!(vm_id = id, "CH socket available");
                 if let Some(vm_config) = vm_config {
-                    info!(?vm_config, "Creating VM config and booting");
-                    instance.create_config(vm_config, true).await?;
+                    info!(boot, ?vm_config, "Creating VM config");
+                    if let Err(error) = instance.create_config(vm_config, boot).await {
+                        instance.stop_child_after_failed_start().await;
+                        return Err(error);
+                    }
                 }
                 return Ok(instance);
             }
@@ -395,6 +422,7 @@ impl VMInstance {
             }
         }
 
+        instance.stop_child_after_failed_start().await;
         Err(eyre!(
             "CH socket not available after {} attempts for VM {}",
             MAX_ATTEMPTS,
@@ -479,19 +507,18 @@ impl VMInstance {
 
     /// Load desired VM config from disk.
     pub fn load_config(&self) -> Result<models::VmConfig> {
-        let config_data = fs::read_to_string(self.config_path())
-            .wrap_err(eyre!("Failed to read config file for {}", self.vm_id()))?;
-
-        serde_json::from_str(&config_data)
-            .wrap_err(eyre!("Failed to parse config JSON for {}", self.vm_id()))
+        serde_json::from_reader(
+            File::open(self.config_path())
+                .wrap_err(eyre!("Failed to read config file for {}", self.vm_id()))?,
+        )
+        .wrap_err(eyre!("Failed to parse config JSON for {}", self.vm_id()))
     }
 
     /// Save desired VM config to disk.
     pub fn save_config(&self, config: &models::VmConfig) -> Result<()> {
-        let config_data =
-            serde_json::to_string_pretty(config).wrap_err("Failed to serialize config to JSON")?;
-
-        fs::write(self.config_path(), config_data)
+        let file = File::create(self.config_path())
+            .wrap_err(eyre!("Failed to open config file for {}", self.vm_id()))?;
+        serde_json::to_writer_pretty(BufWriter::new(file), config)
             .wrap_err(eyre!("Failed to write config file for {}", self.vm_id()))
     }
 
@@ -504,7 +531,7 @@ impl VMInstance {
         trace!(vm_id = self.vm_id(), "Creating VM with provided config");
 
         trace!(vm_id = self.vm_id(), "Applying config transforms");
-        let mut transformed_config = config.clone();
+        let mut transformed_config = config;
         self.transformer
             .transform(self.vm_id(), &mut transformed_config)
             .wrap_err(eyre!(
@@ -547,9 +574,7 @@ impl VMInstance {
                 self.vm_id()
             ))?;
 
-        self.hook_manager
-            .before_boot(self.vm_id(), &config.clone())
-            .await?;
+        self.hook_manager.before_boot(self.vm_id(), &config).await?;
 
         Ok(())
     }

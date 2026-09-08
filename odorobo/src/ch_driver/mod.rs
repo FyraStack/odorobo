@@ -1,12 +1,13 @@
-//! Temporary state management for the agent.
+//! Cloud Hypervisor-backed VM runtime.
 //!
-//! Runtime state (in /run) is not persisted across reboots, so we use it for
-//! ephemeral VM state like running instances. Persistent state goes in the database.
+//! The agent supplies provider-neutral manifests; this module owns conversion
+//! into Cloud Hypervisor configuration and all provider-specific runtime work.
 
 pub mod actor;
 pub mod api;
 pub mod devices;
 pub mod instance;
+pub mod manifest;
 pub mod provisioning;
 pub mod transform;
 
