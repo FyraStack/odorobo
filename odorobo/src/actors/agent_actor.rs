@@ -121,20 +121,16 @@ impl Actor for AgentActor {
         })
     }
 
-    // async fn on_panic(state: Self::Args, weak_actor_ref: WeakActorRef<Self>, _panic: &PanicError) {
-    //     panic!("Agent panicked: {:?}", _panic);
-    // }
-    //
     async fn on_panic(
         &mut self,
         _actor_ref: WeakActorRef<Self>,
         err: PanicError,
-    ) -> Result<std::ops::ControlFlow<ActorStopReason>> {
-        error!("Agent panicked: {:?}", err);
-
-        // todo: if we panic, we should completely regen the self struct from scratch. The assumption should be that memory corruption could have possibly happened becauew
-
-        Ok(ControlFlow::Continue(()))
+    ) -> Result<ControlFlow<ActorStopReason>> {
+        error!(
+            ?err,
+            "Agent actor panicked; stopping because its state cannot be safely rebuilt here"
+        );
+        Ok(ControlFlow::Break(ActorStopReason::Panicked(err)))
     }
 
     async fn on_link_died(
@@ -165,7 +161,15 @@ impl Message<CreateVM> for AgentActor {
 
     async fn handle(&mut self, msg: CreateVM, ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
         let vmid = msg.vmid;
-        // spawn AND link at the same time
+        if let Some(existing) = self.vms.get(&vmid) {
+            info!(?vmid, actor_id = ?existing.actor_ref.id(), "VM already exists; treating create as idempotent");
+            return CreateVMReply {
+                config: Some(msg.config),
+                actor_id: Some(existing.actor_ref.id().to_bytes()),
+            };
+        }
+
+        // Spawn and link at the same time.
         let actor_ref =
             VMActor::spawn_link(ctx.actor_ref(), (vmid, Some(msg.config.clone()))).await;
 

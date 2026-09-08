@@ -378,8 +378,46 @@ impl Message<ReconcileVmPlacements> for SchedulerActor {
             &mut self.vm_data_cache,
         );
         self.invalidate_pending_resources();
-        // TODO: Reconcile desired placements absent from agent status by choosing
-        // a healthy agent and issuing `CreateVM`; this currently only expires
-        // unconfirmed pending reservations.
+
+        let unplaced_vms: Vec<_> = self
+            .vm_manifests
+            .iter()
+            .filter_map(|(vmid, manifest)| {
+                self.vm_placements
+                    .get(vmid)
+                    .is_none_or(Vec::is_empty)
+                    .then_some((*vmid, manifest.clone()))
+            })
+            .collect();
+
+        for (vmid, config) in unplaced_vms {
+            let request = crate::messages::vm::CreateVM { vmid, config };
+            match self.schedule_agent(&request) {
+                Ok(agent) => {
+                    self.vm_placements
+                        .entry(vmid)
+                        .or_default()
+                        .push(super::VmPlacement {
+                            agent_id: agent.id(),
+                            lifecycle: super::VmLifecycle::Pending,
+                            created_at: std::time::Instant::now(),
+                            last_confirmed_at: None,
+                        });
+                    self.vm_data_cache
+                        .entry(vmid)
+                        .or_default()
+                        .push(CachedVMActor { actor_ref: None });
+                    self.invalidate_pending_resources();
+
+                    if let Err(error) = agent.tell(&request).send() {
+                        warn!(?error, %vmid, "failed to recreate unplaced VM");
+                        self.vm_placements.insert(vmid, Vec::new());
+                        self.vm_data_cache.remove(&vmid);
+                        self.invalidate_pending_resources();
+                    }
+                }
+                Err(error) => trace!(?error, %vmid, "no eligible agent to recreate VM"),
+            }
+        }
     }
 }
