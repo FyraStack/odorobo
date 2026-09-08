@@ -55,6 +55,35 @@ pub struct AgentActor {
 }
 
 impl AgentActor {
+    fn manifests_for_node(
+        placements: Vec<(String, PlacementRecord)>,
+        records: Vec<(String, VmManifest)>,
+        hostname: &str,
+    ) -> Vec<VmManifest> {
+        let local_vmids: AHashSet<_> = placements
+            .into_iter()
+            .map(|(_, placement)| placement)
+            .filter(|placement| placement.node == hostname)
+            .map(|placement| placement.vmid)
+            .collect();
+        records
+            .into_iter()
+            .map(|(_, manifest)| manifest)
+            .filter(|manifest| local_vmids.contains(&manifest.id))
+            .collect()
+    }
+
+    fn recovered_resources(manifests: &[VmManifest]) -> (u32, u64) {
+        manifests
+            .iter()
+            .fold((0, 0), |(vcpus, memory_bytes), manifest| {
+                (
+                    vcpus.saturating_add(manifest.desired.compute.vcpus),
+                    memory_bytes.saturating_add(manifest.desired.compute.memory_bytes),
+                )
+            })
+    }
+
     fn record_membership_change(&mut self, vmid: Ulid, added: bool) {
         self.membership_revision = self.membership_revision.saturating_add(1);
         self.status_history.push_back(MembershipChange {
@@ -124,16 +153,10 @@ impl Actor for AgentActor {
             state_store.list::<VmManifest>(VM_MANIFESTS_PREFIX).await,
         ) {
             (Ok(placements), Ok(records)) => {
-                let local_vmids: AHashSet<_> = placements
-                    .into_iter()
-                    .map(|(_, placement)| placement)
-                    .filter(|placement| placement.node == config.get_hostname())
-                    .map(|placement| placement.vmid)
-                    .collect();
-                for (_, vm_config) in records
-                    .into_iter()
-                    .filter(|(_, vm_config)| local_vmids.contains(&vm_config.id))
-                {
+                let recovered_manifests =
+                    Self::manifests_for_node(placements, records, config.get_hostname());
+                (used_vcpus, used_memory_bytes) = Self::recovered_resources(&recovered_manifests);
+                for vm_config in recovered_manifests {
                     let vmid = vm_config.id;
                     let actor =
                         VMActor::spawn_link(&actor_ref, (vmid, Some(vm_config.clone()))).await;
@@ -147,9 +170,6 @@ impl Actor for AgentActor {
                             memory_bytes: vm_config.desired.compute.memory_bytes,
                         },
                     );
-                    used_vcpus = used_vcpus.saturating_add(vm_config.desired.compute.vcpus);
-                    used_memory_bytes =
-                        used_memory_bytes.saturating_add(vm_config.desired.compute.memory_bytes);
                 }
                 info!(
                     count = vms.len(),
@@ -486,5 +506,69 @@ impl Message<GetAgentStatus> for AgentActor {
             used_vcpus,
             used_ram,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AgentActor;
+    use crate::manifest::{Boot, Compute, DesiredState, MANIFEST_VERSION, Metadata, VmManifest};
+    use odorobo::cluster_state::PlacementRecord;
+    use ulid::Ulid;
+
+    fn manifest(id: Ulid, vcpus: u32, memory_bytes: u64) -> VmManifest {
+        VmManifest {
+            api_version: MANIFEST_VERSION,
+            id,
+            desired: DesiredState {
+                metadata: Metadata {
+                    name: id.to_string(),
+                    ..Default::default()
+                },
+                compute: Compute {
+                    vcpus,
+                    memory_bytes,
+                    ..Default::default()
+                },
+                boot: Boot::default(),
+                ..Default::default()
+            },
+            observed: None,
+        }
+    }
+
+    #[test]
+    fn recovery_selects_local_manifests_and_restores_resource_usage() {
+        let local_id = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("valid ULID");
+        let remote_id = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAW").expect("valid ULID");
+        let orphan_id = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAX").expect("valid ULID");
+        let recovered = AgentActor::manifests_for_node(
+            vec![
+                (
+                    "placement/local".to_owned(),
+                    PlacementRecord {
+                        vmid: local_id,
+                        node: "node-a".to_owned(),
+                    },
+                ),
+                (
+                    "placement/remote".to_owned(),
+                    PlacementRecord {
+                        vmid: remote_id,
+                        node: "node-b".to_owned(),
+                    },
+                ),
+            ],
+            vec![
+                ("manifest/local".to_owned(), manifest(local_id, 2, 512)),
+                ("manifest/remote".to_owned(), manifest(remote_id, 4, 1024)),
+                ("manifest/orphan".to_owned(), manifest(orphan_id, 8, 2048)),
+            ],
+            "node-a",
+        );
+
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].id, local_id);
+        assert_eq!(AgentActor::recovered_resources(&recovered), (2, 512));
     }
 }
