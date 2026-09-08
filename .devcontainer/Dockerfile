@@ -4,6 +4,7 @@ FROM ghcr.io/ultramarine-linux/ultramarine:44
 RUN dnf do -y --action=install \
     rustup \
     clang-devel \
+    protobuf-compiler \
     cmake \
     ninja \
     just \

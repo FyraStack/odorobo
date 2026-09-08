@@ -19,6 +19,10 @@ fn default_subnet() -> Ipv4Net {
 fn default_gateway() -> Ipv4Addr {
     "10.0.0.1".parse().unwrap()
 }
+
+fn default_etcd_endpoint() -> String {
+    "http://127.0.0.1:2379".to_owned()
+}
 /// Infers the default upstream interface from the system's default route
 fn default_upstream_iface() -> String {
     let Ok(output) = std::process::Command::new("ip").arg("route").output() else {
@@ -148,6 +152,50 @@ pub struct Config {
     /// Ignore lockfiles and do not create a lockfile
     #[clap(long, action = clap::ArgAction::SetTrue)]
     pub no_lockfile: Option<bool>,
+
+    /// etcd endpoints used for durable cluster state.
+    #[clap(long, value_delimiter = ',')]
+    #[serde(default = "default_etcd_endpoints")]
+    #[allow(clippy::unnecessary_wraps)]
+    pub etcd_endpoints: Option<Vec<String>>,
+    /// Optional etcd username.
+    #[clap(long)]
+    pub etcd_username: Option<String>,
+    /// Optional etcd password. Prefer the `ODOROBO_ETCD_PASSWORD` environment variable.
+    #[clap(long, env = "ODOROBO_ETCD_PASSWORD", hide_env_values = true)]
+    pub etcd_password: Option<String>,
+    /// Enable TLS for etcd connections.
+    #[clap(long)]
+    #[serde(default)]
+    pub etcd_tls: Option<bool>,
+    /// CA certificate PEM file for etcd TLS.
+    #[clap(long)]
+    pub etcd_ca_file: Option<String>,
+    /// Per-request etcd timeout in milliseconds.
+    #[clap(long)]
+    #[serde(default = "default_etcd_timeout_ms")]
+    #[allow(clippy::unnecessary_wraps)]
+    pub etcd_timeout_ms: Option<u64>,
+    /// Number of connection attempts when creating the etcd client.
+    #[clap(long)]
+    #[serde(default = "default_etcd_retries")]
+    #[allow(clippy::unnecessary_wraps)]
+    pub etcd_retries: Option<u32>,
+}
+
+#[allow(clippy::unnecessary_wraps)]
+fn default_etcd_endpoints() -> Option<Vec<String>> {
+    Some(vec![default_etcd_endpoint()])
+}
+
+#[allow(clippy::unnecessary_wraps)]
+const fn default_etcd_timeout_ms() -> Option<u64> {
+    Some(5_000)
+}
+
+#[allow(clippy::unnecessary_wraps)]
+const fn default_etcd_retries() -> Option<u32> {
+    Some(3)
 }
 
 impl Config {
@@ -195,6 +243,12 @@ impl Config {
     pub fn get_reserved_vcpus(&self) -> u32 {
         self.reserved_vcpus.unwrap_or(2)
     }
+    #[must_use]
+    pub fn get_etcd_endpoints(&self) -> Vec<String> {
+        self.etcd_endpoints
+            .clone()
+            .unwrap_or_else(|| vec![default_etcd_endpoint()])
+    }
 }
 
 #[cfg(test)]
@@ -222,5 +276,13 @@ mod tests {
         let json = serde_json::to_string_pretty(&config).unwrap();
         // assert_eq!(json, )
         println!("{json}");
+    }
+
+    #[test]
+    fn default_etcd_endpoint_is_available_without_a_config_file() {
+        assert_eq!(
+            Config::default().get_etcd_endpoints(),
+            vec!["http://127.0.0.1:2379"]
+        );
     }
 }
