@@ -31,22 +31,21 @@ Initialize Ceph and start Odorobo:
 bash .local/dev/init.sh
 ```
 
-This builds both images, starts Ceph and waits up to two minutes for it to become healthy, provisions the `odorobo-blockpool/dev-disk` RBD image, and then starts Odorobo with manager mode enabled. On a bootstrap failure, it prints the last 200 Ceph log lines instead of waiting indefinitely.
+This builds both images, starts Ceph and waits up to two minutes for it to become healthy, provisions the `odorobo-blockpool/dev-disk` RBD image, and then starts Odorobo with manager mode enabled. On a bootstrap failure, it prints the last 200 Ceph log lines instead of waiting indefinitely. It prefers `podman compose` and falls back to `docker compose` when Podman Compose is unavailable.
 
-Start and stop the complete stack without deleting data:
-
-```bash
-bash .local/dev/start.sh
-bash .local/dev/stop.sh
-```
-
-Destructively remove the containers and all local Ceph state:
+Start and stop the complete stack without deleting data. `start` only works on existing containers; after a reset, run `init.sh` again:
 
 ```bash
-bash .local/dev/reset.sh
+podman compose -f .local/dev/compose.yml start ceph odorobo
+podman compose -f .local/dev/compose.yml stop odorobo ceph
 ```
 
-The scripts prefer `podman compose` and fall back to `docker compose` when Podman Compose is unavailable.
+Destructively remove the containers and all local Ceph state. 
+
+```bash
+podman compose -f .local/dev/compose.yml down --remove-orphans --volumes
+sudo rm -rf .local/dev/ceph/generated .local/dev/ceph/state
+```
 
 Useful direct commands:
 
@@ -68,12 +67,12 @@ podman compose -f .local/dev/compose.yml up -d odorobo
 podman compose -f .local/dev/compose.yml logs -f odorobo
 ```
 
-The agent runs as:
-
 By default, the container limits Cargo to two concurrent build jobs to reduce CPU and memory pressure during the initial release build. Override it when starting the stack, for example `CARGO_BUILD_JOBS=4 bash .local/dev/init.sh`.
 
+The agent runs as:
+
 ```text
-cargo run --release -p odorobo -- --manager-enabled
+cargo run --release -p odorobo -- --manager-enabled true
 ```
 
 Its runtime directory is shared through `/run/odorobo`, and Cloud Hypervisor processes and RBD devices are visible in the same namespaces as the agent.
@@ -111,6 +110,7 @@ CEPH_OSD_SIZE=10G
 
 ## Layout
 
+- `init.sh` — builds and starts the stack, waits for Ceph health, and reports bootstrap failures with logs.
 - `compose.yml` — Ceph and Odorobo services, shared namespaces, privilege, mounts, and ports.
 - `ceph/Containerfile` — pinned Ceph image.
 - `ceph/entrypoint.sh` — direct MON bootstrap, filesystem-backed OSD initialization, pool/client/image provisioning, and daemon lifecycle.
