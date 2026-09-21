@@ -13,7 +13,6 @@ services:
     # them instead of silently repeating a failed initialization.
     restart: "no"
     environment:
-      CEPH_IMAGE: ${CEPH_IMAGE:-quay.io/ceph/ceph:v20.2.3}
       CEPH_MON_IP: ${CEPH_MON_IP:-127.0.0.1}
       CEPH_POOL: ${CEPH_POOL:-odorobo-blockpool}
       CEPH_CLIENT: ${CEPH_CLIENT:-odorobo}
@@ -35,17 +34,11 @@ services:
       interval: 5s
       timeout: 5s
       retries: 30
-    ports:
-      - "3300:3300"
-      - "6789:6789"
-      - "8443:8443"
-      - "9283:9283"
-      - "6800-7300:6800-7300"
 
   odorobo:
     build:
-      context: ../..
-      dockerfile: .local/dev/odorobo/Containerfile
+      context: ./odorobo
+      dockerfile: Containerfile
     privileged: true
     depends_on:
       ceph:

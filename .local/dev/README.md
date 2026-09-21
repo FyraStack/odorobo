@@ -3,9 +3,9 @@
 This directory runs the local development stack in containers:
 
 - `ceph` provides a single-node Ceph cluster and a file-backed OSD.
-- `odorobo` runs the agent in the same network, PID, and device namespaces as Ceph.
+- `odorobo` runs the agent, sharing Ceph's network and PID namespaces and the host's `/dev`.
 
-Odorobo must run in the container for the `rbd://` storage path. It invokes `rbd device map`, which creates a kernel block device, and then passes that device to Cloud Hypervisor. A host-side process would not see the container's `/dev/rbd*` device or have the required device and privilege context.
+Odorobo must run in the container for the `rbd://` storage path. It invokes `rbd device map` using the generated Ceph credentials, which creates a kernel block device, and then passes that device to Cloud Hypervisor. The container provides the credential files, the privileged device access, and the shared namespaces that a host-side process would have to replicate.
 
 This is intended for Linux development with a rootful container engine. The stack uses privileged containers because kernel RBD mapping, Cloud Hypervisor, networking, and Ceph's daemon management require host kernel access.
 
@@ -21,7 +21,7 @@ sudo modprobe rbd loop
 sudo losetup -f
 ```
 
-The container image installs Ceph directly and starts the MON and OSD daemons itself; it intentionally does not start MGR because the MGR's optional Python modules require host udev/system services unavailable in this container. It does not use `cephadm`, nested Podman, or systemd. The OSD uses a persistent raw file attached through a host loop device, initialized directly with `ceph-osd` rather than `ceph-volume`.
+The Ceph image is based on the official `quay.io/ceph/ceph` image and starts the MON and OSD daemons itself; it intentionally does not start MGR because the MGR's optional Python modules require host udev/system services unavailable in this container. It does not use `cephadm`, nested Podman, or systemd. The OSD uses a persistent raw file attached through a host loop device, initialized directly with `ceph-osd` rather than `ceph-volume`.
 
 ## Usage
 
@@ -88,7 +88,7 @@ podman compose -f .local/dev/compose.yml exec ceph rbd \
   ls --pool odorobo-blockpool
 ```
 
-Expected output includes `dev-disk`. A one-node cluster may report `HEALTH_WARN`; reduced redundancy and a single monitor are expected for local development.
+Expected output includes `dev-disk`. A one-node cluster may report `HEALTH_WARN`; reduced redundancy, a single monitor, and no running MGR are expected for local development.
 
 Do not map the image from the host. To test the exact application path, use an Odorobo manifest with `rbd://odorobo-blockpool/dev-disk`; the `odorobo` service will execute `rbd device map` and pass the resulting device to Cloud Hypervisor.
 

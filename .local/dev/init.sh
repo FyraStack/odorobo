@@ -62,8 +62,8 @@ Config: $ROOT_DIR/ceph/generated/ceph.conf
 Key: $ROOT_DIR/ceph/generated/client.${CEPH_CLIENT:-odorobo}.key
 
 Generated credentials (for tools running inside the Odorobo container):
-  export CEPH_CONFIG=$ROOT_DIR/ceph/generated/ceph.conf
+  export CEPH_CONFIG=/workspace/.local/dev/ceph/generated/ceph.conf
   export CEPH_ID=${CEPH_CLIENT:-odorobo}
-  export CEPH_KEYFILE=$ROOT_DIR/ceph/generated/client.${CEPH_CLIENT:-odorobo}.key
+  export CEPH_KEYFILE=/workspace/.local/dev/ceph/generated/client.${CEPH_CLIENT:-odorobo}.key
   export CEPH_CLUSTER=ceph
 EOF

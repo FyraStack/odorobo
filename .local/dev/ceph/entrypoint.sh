@@ -10,7 +10,6 @@ set -euo pipefail
 
 CLUSTER=ceph
 MON_ID=ceph
-MGR_ID=ceph
 CEPH_CONF=/etc/ceph/ceph.conf
 CEPH_DATA_DIR=/var/lib/ceph
 OSD_STATE_DIR=/var/lib/odorobo-ceph
@@ -20,17 +19,16 @@ OSD_ID_FILE="$OSD_STATE_DIR/osd.id"
 OSD_UUID_FILE="$OSD_STATE_DIR/osd.uuid"
 LOOP_DEVICE=""
 MON_PID=""
-MGR_PID=""
 OSD_PID=""
 
 cleanup() {
   local pid
   trap - EXIT INT TERM
-  for pid in "$OSD_PID" "$MGR_PID" "$MON_PID"; do
+  for pid in "$OSD_PID" "$MON_PID"; do
     [[ -n "$pid" ]] || continue
     kill -TERM "$pid" 2>/dev/null || true
   done
-  for pid in "$OSD_PID" "$MGR_PID" "$MON_PID"; do
+  for pid in "$OSD_PID" "$MON_PID"; do
     [[ -n "$pid" ]] || continue
     wait "$pid" 2>/dev/null || true
   done
@@ -45,7 +43,6 @@ chown ceph:ceph /run/ceph
 # previous interrupted or root-run initialization.
 for directory in \
   "$CEPH_DATA_DIR/mon" \
-  "$CEPH_DATA_DIR/mgr" \
   "$CEPH_DATA_DIR/bootstrap-osd" \
   "$CEPH_DATA_DIR/osd" \
   "$OSD_STATE_DIR"; do
@@ -68,16 +65,9 @@ osd pool default size = 1
 osd pool default min size = 1
 osd crush chooseleaf type = 0
 osd objectstore = bluestore
-
-[mgr]
-# This stack runs daemons directly and does not use cephadm orchestration.
-# The direct-daemon container does not provide the host udev/system services used
-# by optional MGR Python modules. RBD and Ceph CLI operations do not require them.
-mgr disabled modules = alerts,balancer,cephadm,crash,dashboard,devicehealth,diskprediction_local,dynatrace,influx,insights,iostat,k8sevents,loki,nfs,orchestrator,pg_autoscaler,prometheus,restful,selftest,snap_schedule,stats,telemetry,telegraf,volumes,zabbix
 EOF
 
   install -d -o ceph -g ceph "$CEPH_DATA_DIR/mon/$CLUSTER-$MON_ID"
-  install -d -o ceph -g ceph "$CEPH_DATA_DIR/mgr/$CLUSTER-$MGR_ID"
   install -d -o ceph -g ceph "$CEPH_DATA_DIR/bootstrap-osd"
 
   ceph-authtool --create-keyring /tmp/ceph.mon.keyring --gen-key -n mon.
@@ -211,4 +201,7 @@ cp "$OSD_STATE_DIR/ceph.conf" /generated/ceph.conf
 cp "$OSD_STATE_DIR/client.$CEPH_CLIENT.key" /generated/client."$CEPH_CLIENT".key
 chmod 600 /generated/client."$CEPH_CLIENT".key
 
-wait "$MON_PID" "$MGR_PID" "$OSD_PID"
+for pid in "$MON_PID" "$OSD_PID"; do
+  [[ -n "$pid" ]] || continue
+  wait "$pid"
+done

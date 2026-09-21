@@ -15,4 +15,4 @@ RUN dnf do -y --action=install \
 
 WORKDIR /workspace
 
-CMD ["cargo", "run", "--release", "-p", "odorobo", "--", "--manager-enabled"]
+CMD ["cargo", "run", "--release", "-p", "odorobo", "--", "--manager-enabled", "true"]
