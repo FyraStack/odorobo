@@ -113,13 +113,31 @@ CEPH_OSD_SIZE=10G
 
 `CEPH_MON_IP` should remain `127.0.0.1` with the provided Compose topology. If you change the network topology, it must be an address reachable from both services.
 
+## End-to-end test
+
+`test.sh` boots Fedora 44 Cloud Base via rust-hypervisor-firmware (UEFI, no
+direct kernel boot) from the `odorobo-blockpool/dev-disk` RBD image, then
+hands the serial console to you so you can log in (`fedora`/`fedora`) and
+verify by hand:
+
+```bash
+sudo bash .local/dev/test.sh
+```
+
+It fetches and caches the firmware and the image into `test-assets/`, writes
+the image into the pool (host-side `dd` into the mapped RBD device), creates
+the VM through the agent with a firmware boot, watches the boot stages, and
+cleans up after you detach. See TEST.md for details and overrides.
+
 ## Layout
 
 - `init.sh` — builds and starts the stack, waits for Ceph health, and reports bootstrap failures with logs.
+- `test.sh` — the end-to-end firmware-boot test (run from the host; see TEST.md).
 - `compose.yml` — Ceph and Odorobo services, shared namespaces, privilege, mounts, and ports.
 - `ceph/Containerfile` — pinned Ceph image.
 - `ceph/entrypoint.sh` — direct MON bootstrap, filesystem-backed OSD initialization, pool/client/image provisioning, and daemon lifecycle.
 - `odorobo/Containerfile` — runnable Odorobo development image.
+- `test-assets/` — firmware and guest image downloaded by `test.sh`; ignored by git.
 - `ceph/generated/` — generated Ceph credentials shared read-only with Odorobo; ignored by git.
 - `ceph/state/` — Ceph configuration, daemons, logs, and file-backed OSD; ignored by git.
 
