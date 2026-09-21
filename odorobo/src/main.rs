@@ -1,3 +1,6 @@
+#![allow(unknown_lints)] // Supports Clippy releases before `unused_async_trait_impl` was introduced.
+#![allow(clippy::unused_async_trait_impl)] // Kameo requires async trait methods even when a handler has no await points.
+
 pub mod actors;
 mod ch_driver;
 pub mod config;

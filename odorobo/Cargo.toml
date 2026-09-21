@@ -68,5 +68,9 @@ signal-hook = "0.4.4"
 rtnetlink = "0.23"
 nftables = { version = "0.6", features = ["tokio"] }
 
+[[bench]]
+name = "agent_status"
+harness = false
+
 [lints]
 workspace = true

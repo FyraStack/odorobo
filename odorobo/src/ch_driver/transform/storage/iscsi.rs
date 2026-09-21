@@ -33,22 +33,30 @@ impl ISCSITarget {
         // do iscsiadm login to the target, then find the corresponding device path in /dev/disk/by-path
         info!(?self, "Attaching iSCSI target");
 
-        Command::new("iscsiadm")
+        let output = Command::new("iscsiadm")
             .args(["-m", "node", "-T", &self.iqn, "-p", &self.host, "--login"])
             .output()
             .await
             .map_err(|e| eyre!("Failed to execute iscsiadm command: {e}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(eyre!("iscsiadm login failed: {stderr}"));
+        }
         Ok(self.to_device_path())
     }
 
     #[tracing::instrument(skip(self))]
     pub async fn detach(&self) -> Result<()> {
         info!(?self, "Detaching iSCSI target");
-        Command::new("iscsiadm")
+        let output = Command::new("iscsiadm")
             .args(["-m", "node", "-T", &self.iqn, "-p", &self.host, "--logout"])
             .output()
             .await
             .map_err(|e| eyre!("Failed to execute iscsiadm command: {e}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(eyre!("iscsiadm logout failed: {stderr}"));
+        }
         Ok(())
     }
 }
@@ -64,12 +72,9 @@ impl From<&Url> for ISCSITarget {
         let host_ip = uri.host_str().unwrap_or_default().to_owned();
         let port = uri.port().unwrap_or(3260);
         let host = format!("{host_ip}:{port}");
-        let path_segments: Vec<&str> = uri
-            .path_segments()
-            .map(std::iter::Iterator::collect)
-            .unwrap_or_default();
-        let iqn = path_segments.first().unwrap_or(&"").to_string();
-        let lun_str = path_segments.get(1).unwrap_or(&"");
+        let mut path_segments = uri.path_segments().into_iter().flatten();
+        let iqn = path_segments.next().unwrap_or_default().to_owned();
+        let lun_str = path_segments.next().unwrap_or_default();
         let lun = lun_str
             .strip_prefix("lun")
             .unwrap_or(lun_str)
