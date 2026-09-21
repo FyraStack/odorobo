@@ -16,8 +16,8 @@ else
 fi
 
 
-if ! losetup -f >/dev/null 2>&1; then
-  echo "No loop device is available. Run: sudo modprobe loop && sudo losetup -f" >&2
+if [[ -z "$(losetup -f 2>/dev/null)" ]]; then
+  echo "No free loop device is available. Run: sudo modprobe loop" >&2
   exit 1
 fi
 

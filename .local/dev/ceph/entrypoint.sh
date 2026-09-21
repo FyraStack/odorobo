@@ -113,7 +113,13 @@ if ! timeout 5 ceph -s; then
   exit 1
 fi
 
-echo "[odorobo-ceph] monitor ready; preparing OSD"
+echo "[odorobo-ceph] monitor ready; enabling msgr2"
+# Ceph v20's kernel-RBD client defaults to msgr2 and rejects a monmap that
+# advertises only the legacy v1 endpoint. This also makes the generated minimal
+# client config contain an address usable by `rbd device map`.
+ceph mon enable-msgr2
+
+echo "[odorobo-ceph] preparing OSD"
 
 if [[ -f "$OSD_ID_FILE" ]]; then
   OSD_ID=$(<"$OSD_ID_FILE")

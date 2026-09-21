@@ -52,6 +52,11 @@ services:
       - ./ceph/generated:/workspace/.local/dev/ceph/generated:ro
       - /run/odorobo:/run/odorobo
       - /dev:/dev
+      # The rbd CLI runs `modprobe rbd` before mapping; the container's own
+      # /lib/modules won't match the host's running kernel, so bind the host's
+      # module tree in. modprobe finds rbd, sees it's already loaded on the
+      # shared kernel, and skips the insmod.
+      - /lib/modules:/lib/modules:ro
     working_dir: /workspace
     environment:
       CEPH_CONFIG: /workspace/.local/dev/ceph/generated/ceph.conf

@@ -21,6 +21,10 @@ sudo modprobe rbd loop
 sudo losetup -f
 ```
 
+`podman compose` prefers the `docker-compose` plugin when it is installed, and that provider talks to Podman's API socket, which must be running (`systemctl --user enable --now podman.socket` for rootless, `sudo systemctl enable --now podman.socket` for rootful). If you hit `failed to connect to the docker API at unix:///run/user/<uid>/podman/podman.sock`, either enable that socket or select the standalone tool as the provider: `compose_providers = ["podman-compose"]` in `~/.config/containers/containers.conf` (or `export PODMAN_COMPOSE_PROVIDER=podman-compose`).
+
+The stack must run on a **rootful** engine. Rootless Podman cannot work: the Ceph container attaches the OSD file through a host loop device, and the kernel's loop driver requires `CAP_SYS_ADMIN` in the initial user namespace, which a rootless container never has (even `privileged` + a `/dev` bind mount do not help). Run everything rootful, e.g. `sudo bash .local/dev/init.sh`, and prefix the `podman compose` commands below with `sudo` accordingly.
+
 The Ceph image is based on the official `quay.io/ceph/ceph` image and starts the MON and OSD daemons itself; it intentionally does not start MGR because the MGR's optional Python modules require host udev/system services unavailable in this container. It does not use `cephadm`, nested Podman, or systemd. The OSD uses a persistent raw file attached through a host loop device, initialized directly with `ceph-osd` rather than `ceph-volume`.
 
 ## Usage
@@ -28,7 +32,7 @@ The Ceph image is based on the official `quay.io/ceph/ceph` image and starts the
 Initialize Ceph and start Odorobo:
 
 ```bash
-bash .local/dev/init.sh
+sudo bash .local/dev/init.sh
 ```
 
 This builds both images, starts Ceph and waits up to two minutes for it to become healthy, provisions the `odorobo-blockpool/dev-disk` RBD image, and then starts Odorobo with manager mode enabled. On a bootstrap failure, it prints the last 200 Ceph log lines instead of waiting indefinitely. It prefers `podman compose` and falls back to `docker compose` when Podman Compose is unavailable.
@@ -36,23 +40,24 @@ This builds both images, starts Ceph and waits up to two minutes for it to becom
 Start and stop the complete stack without deleting data. `start` only works on existing containers; after a reset, run `init.sh` again:
 
 ```bash
-podman compose -f .local/dev/compose.yml start ceph odorobo
-podman compose -f .local/dev/compose.yml stop odorobo ceph
+sudo podman compose -f .local/dev/compose.yml start ceph odorobo
+sudo podman compose -f .local/dev/compose.yml stop odorobo ceph
 ```
 
 Destructively remove the containers and all local Ceph state. 
 
 ```bash
-podman compose -f .local/dev/compose.yml down --remove-orphans --volumes
+sudo podman compose -f .local/dev/compose.yml down --remove-orphans --volumes
 sudo rm -rf .local/dev/ceph/generated .local/dev/ceph/state
 ```
 
 Useful direct commands:
 
 ```bash
-podman compose -f .local/dev/compose.yml ps
-podman compose -f .local/dev/compose.yml logs -f ceph odorobo
-podman compose -f .local/dev/compose.yml exec ceph ceph -s
+sudo podman compose -f .local/dev/compose.yml ps
+sudo podman compose -f .local/dev/compose.yml logs -f ceph odorobo
+sudo podman compose -f .local/dev/compose.yml exec ceph ceph -s
+sudo podman compose -f .local/dev/compose.yml exec -it odorobo sh
 ```
 
 Because `odorobo` uses Ceph's network namespace, the generated Ceph config intentionally uses `127.0.0.1` for the monitor. The application and monitor share that namespace.
