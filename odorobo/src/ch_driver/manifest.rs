@@ -72,22 +72,18 @@ pub fn to_vm_config(manifest: &VmManifest) -> Result<VmConfig> {
             ..Default::default()
         }),
         payload: PayloadConfig {
-            firmware: desired
-                .boot
-                .firmware
-                .clone()
-                .or_else(|| {
-                    // Only default to the firmware when doing a firmware boot
-                    // (no kernel specified). Direct kernel boot must not set a
-                    // firmware, or Cloud Hypervisor rejects the config with
-                    // "Specifying a kernel is not supported when a firmware is
-                    // provided".
-                    if desired.boot.kernel.is_some() {
-                        None
-                    } else {
-                        Some("/var/lib/odorobo/CLOUDHV.fd".to_owned())
-                    }
-                }),
+            firmware: desired.boot.firmware.clone().or_else(|| {
+                // Only default to the firmware when doing a firmware boot
+                // (no kernel specified). Direct kernel boot must not set a
+                // firmware, or Cloud Hypervisor rejects the config with
+                // "Specifying a kernel is not supported when a firmware is
+                // provided".
+                if desired.boot.kernel.is_some() {
+                    None
+                } else {
+                    Some("/var/lib/odorobo/CLOUDHV.fd".to_owned())
+                }
+            }),
             kernel: desired.boot.kernel.clone(),
             cmdline: desired.boot.cmdline.clone(),
             ..Default::default()
