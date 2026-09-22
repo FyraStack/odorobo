@@ -72,11 +72,18 @@ pub fn to_vm_config(manifest: &VmManifest) -> Result<VmConfig> {
             ..Default::default()
         }),
         payload: PayloadConfig {
-            firmware: desired
-                .boot
-                .firmware
-                .clone()
-                .or_else(|| Some("/var/lib/odorobo/CLOUDHV.fd".to_owned())),
+            firmware: desired.boot.firmware.clone().or_else(|| {
+                // Only default to the firmware when doing a firmware boot
+                // (no kernel specified). Direct kernel boot must not set a
+                // firmware, or Cloud Hypervisor rejects the config with
+                // "Specifying a kernel is not supported when a firmware is
+                // provided".
+                if desired.boot.kernel.is_some() {
+                    None
+                } else {
+                    Some("/var/lib/odorobo/CLOUDHV.fd".to_owned())
+                }
+            }),
             kernel: desired.boot.kernel.clone(),
             cmdline: desired.boot.cmdline.clone(),
             ..Default::default()
@@ -164,6 +171,30 @@ mod tests {
             config.platform.expect("platform").serial_number.as_deref(),
             Some("ds=nocloud")
         );
+    }
+
+    #[test]
+    fn firmware_default_only_for_firmware_boot() {
+        // No kernel, no explicit firmware -> defaults to the firmware.
+        let config = to_vm_config(&minimal()).expect("minimal manifest converts");
+        assert_eq!(
+            config.payload.firmware.as_deref(),
+            Some("/var/lib/odorobo/CLOUDHV.fd")
+        );
+
+        // Kernel set, no explicit firmware -> no firmware (direct kernel boot).
+        let mut manifest = minimal();
+        manifest.desired.boot.kernel = Some("/tmp/vmlinuz".to_owned());
+        let config = to_vm_config(&manifest).expect("kernel manifest converts");
+        assert_eq!(config.payload.firmware, None);
+        assert_eq!(config.payload.kernel.as_deref(), Some("/tmp/vmlinuz"));
+
+        // Explicit firmware wins even when a kernel is also set.
+        let mut manifest = minimal();
+        manifest.desired.boot.kernel = Some("/tmp/vmlinuz".to_owned());
+        manifest.desired.boot.firmware = Some("/custom/fw.fd".to_owned());
+        let config = to_vm_config(&manifest).expect("explicit firmware manifest converts");
+        assert_eq!(config.payload.firmware.as_deref(), Some("/custom/fw.fd"));
     }
 
     #[test]

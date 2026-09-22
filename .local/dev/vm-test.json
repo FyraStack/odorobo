@@ -1,0 +1,18 @@
+{
+  "vm": {
+    "api_version": 1,
+    "id": "01J0TESTVM0000000000000001",
+    "desired": {
+      "metadata": { "name": "ceph-test", "labels": {}, "annotations": {} },
+      "compute": { "vcpus": 2, "memory_bytes": 2147483648 },
+      "storage": [ { "id": "root", "uri": "rbd://odorobo-blockpool/dev-disk" } ],
+      "networks": [],
+      "placement": {},
+      "boot": {
+        "start": true,
+        "kernel": "/tmp/vmlinuz-virt",
+        "cmdline": "console=ttyS0 root=/dev/vda init=/init"
+      }
+    }
+  }
+}

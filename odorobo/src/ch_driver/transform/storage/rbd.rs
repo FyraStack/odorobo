@@ -112,6 +112,8 @@ impl RbdImage {
             .args(rbd_extra_args())
             .arg("device")
             .arg("map")
+            .arg("--options")
+            .arg("noudev")
             .arg(&rbd_path)
             .output()
             .await
@@ -132,6 +134,8 @@ impl RbdImage {
             .args(rbd_extra_args())
             .arg("device")
             .arg("unmap")
+            .arg("--options")
+            .arg("noudev")
             .arg(&rbd_path)
             .output()
             .await
