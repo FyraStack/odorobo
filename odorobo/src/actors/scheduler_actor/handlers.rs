@@ -11,8 +11,8 @@ use tracing::{info, warn};
 use crate::ch_driver::actor::VMActor;
 use crate::messages::vm::{
     AgentListVMs, AgentListVMsReply, CreateVM, CreateVMReply, DeleteVM, DeleteVMReply,
-    GetConsoleHistory, GetConsoleHistoryReply, SendConsoleInput, SendConsoleInputReply, ShutdownVM,
-    ShutdownVMReply,
+    GetConsoleHistory, GetConsoleHistoryReply, GetVMInfo, GetVMInfoReply, SendConsoleInput,
+    SendConsoleInputReply, ShutdownVM, ShutdownVMReply,
 };
 use crate::messages::{Ping, Pong};
 use crate::utils::actor_names::vm_actor_id;
@@ -70,8 +70,6 @@ impl Actor for SchedulerActor {
             None => {}
         }
 
-        // todo: attempt vm restarts if necessary.
-
         Ok(ControlFlow::Continue(()))
     }
 }
@@ -88,10 +86,23 @@ impl Message<CreateVM> for SchedulerActor {
         msg: CreateVM,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
+        if let Some(existing) = self.vm_manifests.get(&msg.vmid) {
+            if existing != &msg.config {
+                return Err(eyre!("conflicting create request for existing VM ID"));
+            }
+
+            let actor_id = self
+                .vm_actorid_ulid_map
+                .iter()
+                .find_map(|(actor_id, vmid)| (*vmid == msg.vmid).then(|| actor_id.to_bytes()));
+            return Ok(CreateVMReply {
+                config: Some(existing.clone()),
+                actor_id,
+            });
+        }
+
         let target_agent = self.schedule_agent(&msg)?;
 
-        // TODO: Define duplicate VM-ID semantics before overwriting intent and
-        // appending another pending placement; reject conflicts or make retries idempotent.
         self.vm_manifests.insert(msg.vmid, msg.config.clone());
         self.invalidate_pending_resources();
         self.vm_placements
@@ -227,6 +238,26 @@ impl Message<ShutdownVM> for SchedulerActor {
         } else {
             Err(eyre!("VM not found"))
         }
+    }
+}
+
+/// Looks up a VM actor and forwards an info request.
+impl Message<GetVMInfo> for SchedulerActor {
+    type Reply = Result<GetVMInfoReply, Report>;
+
+    async fn handle(
+        &mut self,
+        msg: GetVMInfo,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let vmid = msg.vmid.ok_or_else(|| eyre!("VM ID is required"))?;
+        let vm = RemoteActorRef::<VMActor>::lookup(vm_actor_id(vmid)).await?;
+
+        let Some(vm) = vm else {
+            return Err(eyre!("VM not found"));
+        };
+
+        Ok(vm.ask(&msg).await?)
     }
 }
 

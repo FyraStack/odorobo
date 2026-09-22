@@ -7,9 +7,6 @@ use ulid::Ulid;
 
 use crate::manifest::VmManifest;
 
-// TODO: when scheduler does createVM it also stores which server we put the Ulid on so it can do a in memory cache and doesn't need to hit the Server
-//  for failover, the new node when it fails over will need to rebuild this cache via hitting a GetAllVMs message on every server
-//  additionally, when the VmConfig is created, this determines the MAC address of the server. meaning as soon as we have this info, we need to hit the router via the scheduler, because the router might be slow.
 /// Message to create a new VM
 ///
 /// The message carries provider-neutral VM intent. The destination agent
