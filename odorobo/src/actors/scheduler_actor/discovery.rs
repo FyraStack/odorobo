@@ -101,7 +101,10 @@ impl SchedulerActor {
 
         let mut agent_actor_stream = RemoteActorRef::<AgentActor>::lookup_all(AGENT);
 
-        while let Some(agent_actor) = agent_actor_stream.try_next().await? {
+        loop {
+            let Some(agent_actor) = agent_actor_stream.try_next().await? else {
+                break;
+            };
             parent_actor_ref
                 .tell(AgentActorDiscovered {
                     actor_ref: agent_actor,

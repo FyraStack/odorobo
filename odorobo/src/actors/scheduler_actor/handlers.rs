@@ -1,7 +1,6 @@
 //! Actor lifecycle implementation and public scheduler message handlers.
 
-use std::ops::ControlFlow;
-use std::time::Instant;
+use std::{ops::ControlFlow, sync::Arc, time::Instant};
 
 use ahash::AHashMap;
 use kameo::prelude::*;
@@ -16,6 +15,9 @@ use crate::messages::vm::{
 };
 use crate::messages::{Ping, Pong};
 use crate::utils::actor_names::vm_actor_id;
+use odorobo::cluster_state::{
+    ClusterStateStore, PLACEMENT_PREFIX, PlacementRecord, StateStore, key,
+};
 
 use super::{CachedActorKind, CachedVMActor, SchedulerActor, VmLifecycle, VmPlacement};
 
@@ -24,10 +26,10 @@ use super::{CachedActorKind, CachedVMActor, SchedulerActor, VmLifecycle, VmPlace
 /// Losing an agent removes its placements. Losing a VM removes only its actor
 /// cache entry unless no discovered actor or placeholder remains for that VM.
 impl Actor for SchedulerActor {
-    type Args = ();
+    type Args = Arc<StateStore>;
     type Error = Report;
 
-    async fn on_start(_state: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
+    async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
         let peer_id = *actor_ref.id().peer_id().unwrap();
 
         info!(?peer_id, "Scheduler Actor started!");
@@ -44,6 +46,7 @@ impl Actor for SchedulerActor {
             agent_vm_index: AHashMap::new(),
             actor_kinds: AHashMap::new(),
             cache_actor_finder: None,
+            state_store: args,
         };
 
         scheduler_actor.start_actor_finder(actor_ref);
@@ -89,6 +92,7 @@ impl Message<CreateVM> for SchedulerActor {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         let target_agent = self.schedule_agent(&msg)?;
+        let target_agent_id = target_agent.id();
 
         // TODO: Define duplicate VM-ID semantics before overwriting intent and
         // appending another pending placement; reject conflicts or make retries idempotent.
@@ -98,7 +102,7 @@ impl Message<CreateVM> for SchedulerActor {
             .entry(msg.vmid)
             .or_default()
             .push(VmPlacement {
-                agent_id: target_agent.id(),
+                agent_id: target_agent_id,
                 lifecycle: VmLifecycle::Pending,
                 created_at: Instant::now(),
                 last_confirmed_at: None,
@@ -139,7 +143,25 @@ impl Message<CreateVM> for SchedulerActor {
             );
         }
 
-        Ok(reply?)
+        let reply = reply?;
+        let node = self
+            .agent_data_cache
+            .get(&target_agent_id)
+            .map_or_else(|| "unknown".to_owned(), |agent| agent.data.hostname.clone());
+        drop(target_agent);
+        let placement = PlacementRecord {
+            vmid: msg.vmid,
+            node,
+        };
+        if let Err(error) = self
+            .state_store
+            .put(&key(PLACEMENT_PREFIX, &msg.vmid), &placement)
+            .await
+        {
+            warn!(?error, vm_id = %msg.vmid, "Unable to persist VM placement; retaining local state");
+        }
+
+        Ok(reply)
     }
 }
 
@@ -200,6 +222,13 @@ impl Message<DeleteVM> for SchedulerActor {
         if let Some(vm) = vm {
             // don't update cache, because we rely on link dying and updater task to remove from cache once the VM is fully down.
             vm.tell(&msg).send()?;
+            if let Err(error) = self
+                .state_store
+                .delete(&key(PLACEMENT_PREFIX, &msg.vmid))
+                .await
+            {
+                warn!(?error, vm_id = %msg.vmid, "Unable to delete VM placement; retaining durable record");
+            }
             Ok(DeleteVMReply)
         } else {
             Err(eyre!("VM not found"))

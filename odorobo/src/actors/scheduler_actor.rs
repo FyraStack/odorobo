@@ -23,10 +23,11 @@ mod scheduling;
 #[cfg(test)]
 mod tests;
 
-use std::time::Instant;
+use std::{sync::Arc, time::Instant};
 
 use ahash::{AHashMap, AHashSet};
 use kameo::prelude::*;
+use odorobo::cluster_state::StateStore;
 use tokio::task::JoinHandle;
 use ulid::Ulid;
 
@@ -160,4 +161,6 @@ pub struct SchedulerActor {
     actor_kinds: AHashMap<ActorId, CachedActorKind>,
     /// Background discovery and reconciliation task.
     pub cache_actor_finder: Option<JoinHandle<()>>,
+    /// Durable cluster state shared with agents for VM placement recovery.
+    pub state_store: Arc<StateStore>,
 }

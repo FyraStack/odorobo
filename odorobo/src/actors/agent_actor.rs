@@ -1,6 +1,7 @@
 use crate::{
     ch_driver::actor::VMActor,
     config::Config,
+    manifest::VmManifest,
     messages::{
         Ping, Pong,
         agent::{
@@ -18,11 +19,14 @@ use crate::{
     types::ObjectMetadata,
     utils::actor_names::{NETWORK, VM, vm_actor_id},
 };
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use bytesize::ByteSize;
 use kameo::prelude::*;
+use odorobo::cluster_state::{
+    ClusterStateStore, PLACEMENT_PREFIX, PlacementRecord, StateStore, VM_MANIFESTS_PREFIX, key,
+};
 use stable_eyre::{Report, Result};
-use std::ops::ControlFlow;
+use std::{ops::ControlFlow, sync::Arc};
 use sysinfo::System;
 use tracing::{error, info, trace, warn};
 use ulid::Ulid;
@@ -47,9 +51,39 @@ pub struct AgentActor {
     pub vms: AHashMap<Ulid, VMCacheData>,
     // pub network_actor: ActorRef<NetworkAgentActor>,
     pub metadata: ObjectMetadata,
+    pub state_store: Arc<StateStore>,
 }
 
 impl AgentActor {
+    fn manifests_for_node(
+        placements: Vec<(String, PlacementRecord)>,
+        records: Vec<(String, VmManifest)>,
+        hostname: &str,
+    ) -> Vec<VmManifest> {
+        let local_vmids: AHashSet<_> = placements
+            .into_iter()
+            .map(|(_, placement)| placement)
+            .filter(|placement| placement.node == hostname)
+            .map(|placement| placement.vmid)
+            .collect();
+        records
+            .into_iter()
+            .map(|(_, manifest)| manifest)
+            .filter(|manifest| local_vmids.contains(&manifest.id))
+            .collect()
+    }
+
+    fn recovered_resources(manifests: &[VmManifest]) -> (u32, u64) {
+        manifests
+            .iter()
+            .fold((0, 0), |(vcpus, memory_bytes), manifest| {
+                (
+                    vcpus.saturating_add(manifest.desired.compute.vcpus),
+                    memory_bytes.saturating_add(manifest.desired.compute.memory_bytes),
+                )
+            })
+    }
+
     fn record_membership_change(&mut self, vmid: Ulid, added: bool) {
         self.membership_revision = self.membership_revision.saturating_add(1);
         self.status_history.push_back(MembershipChange {
@@ -93,31 +127,76 @@ impl AgentActor {
 
 #[allow(clippy::unused_async_trait_impl)]
 impl Actor for AgentActor {
-    type Args = Config;
+    type Args = (Config, Arc<StateStore>);
     type Error = Report;
 
-    async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self> {
+    async fn on_start(
+        (config, state_store): Self::Args,
+        actor_ref: ActorRef<Self>,
+    ) -> Result<Self> {
         let peer_id = *actor_ref.id().peer_id().unwrap();
 
         info!(?peer_id, "Agent Actor started!");
 
         // spawn networking actor
         let network_actor: ActorRef<NetworkAgentActor> =
-            NetworkAgentActor::spawn_link(&actor_ref, args.network.clone()).await;
+            NetworkAgentActor::spawn_link(&actor_ref, config.network.clone()).await;
         network_actor.register(NETWORK).await?;
 
         let sys = System::new_all();
+        let mut vms = AHashMap::new();
+        let mut used_vcpus: u32 = 0;
+        let mut used_memory_bytes: u64 = 0;
+        let placements = state_store.list::<PlacementRecord>(PLACEMENT_PREFIX).await;
+        match (
+            placements,
+            state_store.list::<VmManifest>(VM_MANIFESTS_PREFIX).await,
+        ) {
+            (Ok(placements), Ok(records)) => {
+                let recovered_manifests =
+                    Self::manifests_for_node(placements, records, config.get_hostname());
+                (used_vcpus, used_memory_bytes) = Self::recovered_resources(&recovered_manifests);
+                for vm_config in recovered_manifests {
+                    let vmid = vm_config.id;
+                    let actor =
+                        VMActor::spawn_link(&actor_ref, (vmid, Some(vm_config.clone()))).await;
+                    _ = actor.register(vm_actor_id(vmid)).await;
+                    _ = actor.register(VM).await;
+                    vms.insert(
+                        vmid,
+                        VMCacheData {
+                            actor_ref: actor,
+                            vcpus: vm_config.desired.compute.vcpus,
+                            memory_bytes: vm_config.desired.compute.memory_bytes,
+                        },
+                    );
+                }
+                info!(
+                    count = vms.len(),
+                    "Recovered VM manifests from cluster state"
+                );
+            }
+            (Err(error), _) => warn!(
+                ?error,
+                "Unable to recover VM placements; retaining empty local cache"
+            ),
+            (_, Err(error)) => warn!(
+                ?error,
+                "Unable to recover VM manifests; retaining empty local cache"
+            ),
+        }
 
         Ok(Self {
             vcpus: u32::try_from(sys.cpus().len()).unwrap_or(u32::MAX),
             memory: ByteSize::b(sys.total_memory()),
-            config: args,
-            vms: AHashMap::new(),
-            used_vcpus: 0,
-            used_memory_bytes: 0,
+            config,
+            vms,
+            used_vcpus,
+            used_memory_bytes,
             membership_revision: 0,
             status_history: StatusChangeHistory::new(),
             metadata: ObjectMetadata::default(),
+            state_store,
         })
     }
 
@@ -165,6 +244,13 @@ impl Message<CreateVM> for AgentActor {
 
     async fn handle(&mut self, msg: CreateVM, ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
         let vmid = msg.vmid;
+        if let Err(error) = self
+            .state_store
+            .put(&key(VM_MANIFESTS_PREFIX, &vmid), &msg.config)
+            .await
+        {
+            warn!(?error, vm_id = %vmid, "Unable to persist VM manifest; continuing without durable state");
+        }
         // spawn AND link at the same time
         let actor_ref =
             VMActor::spawn_link(ctx.actor_ref(), (vmid, Some(msg.config.clone()))).await;
@@ -242,6 +328,13 @@ impl Message<DeleteVM> for AgentActor {
             }
         }
 
+        if let Err(error) = self
+            .state_store
+            .delete(&key(VM_MANIFESTS_PREFIX, &msg.vmid))
+            .await
+        {
+            warn!(?error, vm_id = %msg.vmid, "Unable to delete VM manifest; retaining durable record for recovery");
+        }
         DeleteVMReply
     }
 }
@@ -413,5 +506,69 @@ impl Message<GetAgentStatus> for AgentActor {
             used_vcpus,
             used_ram,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AgentActor;
+    use crate::manifest::{Boot, Compute, DesiredState, MANIFEST_VERSION, Metadata, VmManifest};
+    use odorobo::cluster_state::PlacementRecord;
+    use ulid::Ulid;
+
+    fn manifest(id: Ulid, vcpus: u32, memory_bytes: u64) -> VmManifest {
+        VmManifest {
+            api_version: MANIFEST_VERSION,
+            id,
+            desired: DesiredState {
+                metadata: Metadata {
+                    name: id.to_string(),
+                    ..Default::default()
+                },
+                compute: Compute {
+                    vcpus,
+                    memory_bytes,
+                    ..Default::default()
+                },
+                boot: Boot::default(),
+                ..Default::default()
+            },
+            observed: None,
+        }
+    }
+
+    #[test]
+    fn recovery_selects_local_manifests_and_restores_resource_usage() {
+        let local_id = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("valid ULID");
+        let remote_id = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAW").expect("valid ULID");
+        let orphan_id = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAX").expect("valid ULID");
+        let recovered = AgentActor::manifests_for_node(
+            vec![
+                (
+                    "placement/local".to_owned(),
+                    PlacementRecord {
+                        vmid: local_id,
+                        node: "node-a".to_owned(),
+                    },
+                ),
+                (
+                    "placement/remote".to_owned(),
+                    PlacementRecord {
+                        vmid: remote_id,
+                        node: "node-b".to_owned(),
+                    },
+                ),
+            ],
+            vec![
+                ("manifest/local".to_owned(), manifest(local_id, 2, 512)),
+                ("manifest/remote".to_owned(), manifest(remote_id, 4, 1024)),
+                ("manifest/orphan".to_owned(), manifest(orphan_id, 8, 2048)),
+            ],
+            "node-a",
+        );
+
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].id, local_id);
+        assert_eq!(AgentActor::recovered_resources(&recovered), (2, 512));
     }
 }
