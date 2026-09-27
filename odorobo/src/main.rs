@@ -24,6 +24,9 @@ use crate::config::Config;
 use crate::utils::actor_names::{AGENT, HTTP_API_SERVER, SCHEDULER};
 use crate::utils::{connect_to_swarm, init};
 
+const SENTRY_DSN: &str =
+    "https://d59168172bd8827b19a9b8700cc56582@o271654.ingest.us.sentry.io/4512154284785664";
+
 fn main() -> Result<()> {
     let config = Config::init();
     let _sentry_guard = init_sentry();
@@ -37,15 +40,14 @@ fn main() -> Result<()> {
     mainloop(&term, config)
 }
 
-fn init_sentry() -> Option<sentry::ClientInitGuard> {
-    let dsn = std::env::var("SENTRY_DSN").ok()?;
+fn init_sentry() -> sentry::ClientInitGuard {
     let mut options = sentry::ClientOptions::default();
     options.release = sentry::release_name!();
     options.send_default_pii = false;
 
-    let guard = sentry::init((dsn, options));
+    let guard = sentry::init((SENTRY_DSN, options));
     tracing::info!("Sentry error reporting enabled");
-    Some(guard)
+    guard
 }
 
 fn mainloop(term: &Arc<AtomicBool>, config: Config) -> Result<()> {
