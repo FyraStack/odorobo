@@ -26,6 +26,7 @@ use crate::utils::{connect_to_swarm, init};
 
 fn main() -> Result<()> {
     let config = Config::init();
+    let _sentry_guard = init_sentry();
 
     init(Some("odorobo"))?;
     let term = utils::lockfile::register_termsigs()?;
@@ -34,6 +35,17 @@ fn main() -> Result<()> {
     })?;
 
     mainloop(&term, config)
+}
+
+fn init_sentry() -> Option<sentry::ClientInitGuard> {
+    let dsn = std::env::var("SENTRY_DSN").ok()?;
+    let mut options = sentry::ClientOptions::default();
+    options.release = sentry::release_name!();
+    options.send_default_pii = false;
+
+    let guard = sentry::init((dsn, options));
+    tracing::info!("Sentry error reporting enabled");
+    Some(guard)
 }
 
 fn mainloop(term: &Arc<AtomicBool>, config: Config) -> Result<()> {

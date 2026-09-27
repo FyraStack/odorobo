@@ -41,6 +41,24 @@ sudo ./target/release/odorobo --manager-enabled # or set ODOROBO_MANAGER_ENABLED
 sudo ./target/release/odorobo
 ```
 
+### Sentry error reporting
+
+Sentry is enabled when `SENTRY_DSN` is set. For the systemd service, add the DSN to
+`/etc/odorobo/config.env` (keep this file private):
+
+```dotenv
+SENTRY_DSN=https://<key>@o<org>.ingest.us.sentry.io/<project>
+```
+
+Odorobo does not send default PII to Sentry, including user IPs or potentially
+sensitive HTTP headers.
+
+Restart the service after changing the file:
+
+```bash
+sudo systemctl restart odorobo
+```
+
 You can run multiple managers for load balancing and HA, but it is not required.
 
 Install the CLI helper
