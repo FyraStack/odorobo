@@ -6,6 +6,7 @@ members = ["odorobo", "odoroboctl"]
 rust-version = "1.95.0"
 
 [workspace.dependencies]
+sentry = "0.49.3"
 stable-eyre = "0.2"
 clap = { version = "4", features = ["derive", "env"] }
 tokio = { version = "1" }

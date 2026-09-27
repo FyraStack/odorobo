@@ -6,6 +6,7 @@ license = "AGPL-3.0-or-later"
 
 [dependencies]
 stable-eyre = { workspace = true }
+sentry = { workspace = true, features = ["tracing"] }
 clap = { workspace = true, features = ["derive", "env"] }
 fyra-proc-macros = { workspace = true }
 tokio = { workspace = true, features = ["full"] }

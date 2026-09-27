@@ -11,7 +11,7 @@ use stable_eyre::{Report, Result};
 use thiserror::Error;
 use tracing::level_filters::LevelFilter;
 use tracing::{debug, error, info, trace, warn};
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
 // todo: wrap with axum-responses, return this type on request failure
 #[derive(Error, Debug, ApiError, OperationIo)]
@@ -89,16 +89,18 @@ pub fn env_filter(debug_target: Option<&str>) -> EnvFilter {
 
 pub fn init(debug_target: Option<&str>) -> Result<()> {
     stable_eyre::install()?;
-    let fmt = tracing_subscriber::fmt().with_env_filter(env_filter(debug_target));
+    let fmt = tracing_subscriber::fmt::layer();
     #[cfg(debug_assertions)]
-    let fmt = {
-        fmt.pretty()
-            .with_file(true)
-            .with_line_number(true)
-            .with_ansi(true)
-    };
+    let fmt = fmt
+        .pretty()
+        .with_file(true)
+        .with_line_number(true)
+        .with_ansi(true);
 
-    fmt.init();
+    tracing_subscriber::registry()
+        .with(sentry::integrations::tracing::layer())
+        .with(fmt.with_filter(env_filter(debug_target)))
+        .init();
 
     Ok(())
 }
