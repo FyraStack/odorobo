@@ -24,12 +24,9 @@ use crate::config::Config;
 use crate::utils::actor_names::{AGENT, HTTP_API_SERVER, SCHEDULER};
 use crate::utils::{connect_to_swarm, init};
 
-const SENTRY_DSN: &str =
-    "https://d59168172bd8827b19a9b8700cc56582@o271654.ingest.us.sentry.io/4512154284785664";
-
 fn main() -> Result<()> {
     let config = Config::init();
-    let _sentry_guard = init_sentry();
+    let _sentry_guard = init_sentry(config.sentry_dsn.as_deref());
 
     init(Some("odorobo"))?;
     let term = utils::lockfile::register_termsigs()?;
@@ -40,14 +37,15 @@ fn main() -> Result<()> {
     mainloop(&term, config)
 }
 
-fn init_sentry() -> sentry::ClientInitGuard {
+fn init_sentry(dsn: Option<&str>) -> Option<sentry::ClientInitGuard> {
+    let dsn = dsn?;
     let mut options = sentry::ClientOptions::default();
     options.release = sentry::release_name!();
     options.send_default_pii = false;
 
-    let guard = sentry::init((SENTRY_DSN, options));
+    let guard = sentry::init((dsn, options));
     tracing::info!("Sentry error reporting enabled");
-    guard
+    Some(guard)
 }
 
 fn mainloop(term: &Arc<AtomicBool>, config: Config) -> Result<()> {
@@ -71,7 +69,7 @@ fn mainloop(term: &Arc<AtomicBool>, config: Config) -> Result<()> {
 }
 
 async fn inner_main(config: Config) -> Result<()> {
-    tracing::info!(?config, "Starting odorobo");
+    tracing::info!("Starting odorobo");
 
     let local_peer_id = connect_to_swarm().unwrap();
     tracing::info!(?local_peer_id, "Peer ID");

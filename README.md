@@ -43,9 +43,9 @@ sudo ./target/release/odorobo
 
 ### Sentry error reporting
 
-Sentry is initialized with the project DSN defined in `odorobo/src/main.rs`.
-Odorobo does not send default PII to Sentry, including user IPs or potentially
-sensitive HTTP headers.
+Sentry is initialized with the project DSN from the `sentry_dsn` field in
+`odorobo/config.json`. Odorobo does not send default PII to Sentry, including
+user IPs or potentially sensitive HTTP headers.
 
 You can run multiple managers for load balancing and HA, but it is not required.
 
