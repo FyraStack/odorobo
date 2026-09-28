@@ -167,11 +167,6 @@ impl TryFrom<&Url> for RbdImage {
 
 pub struct RbdStorage;
 
-/// How long to wait for the host's udev to create the stable
-/// `/dev/rbd/<pool>/<image>` path before falling back to the kernel
-/// device name.
-const UDEV_SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-
 #[async_trait]
 impl StorageDriver for RbdStorage {
     fn scheme(&self) -> &'static str {
@@ -185,17 +180,13 @@ impl StorageDriver for RbdStorage {
         // for a udev event in its own network namespace, but rbd devices are
         // created in the host's namespace, so that wait never completes in a
         // container. The kernel uevent still reaches the host's udevd, so the
-        // stable path appears shortly after the map. Wait for it, and fall
-        // back to the kernel device name (e.g. /dev/rbd0) when the host has
-        // no ceph udev rule.
+        // stable path appears shortly after the map. Wait up to 10s (100 x
+        // 100ms steps) for it, and fall back to the kernel device name (e.g.
+        // /dev/rbd0) when the host has no ceph udev rule.
         let udev_path = image.device_path();
-        let deadline = std::time::Instant::now() + UDEV_SETTLE_TIMEOUT;
-        loop {
+        for _ in 0..100 {
             if udev_path.exists() {
                 return Ok(udev_path);
-            }
-            if std::time::Instant::now() >= deadline {
-                break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
