@@ -3,7 +3,7 @@ use crate::messages::vm::{AgentListVMs, DeleteVM, GetConsoleHistory, GetVMInfo, 
 use crate::{
     actors::http_actor::HTTPActor,
     messages::vm::CreateVM,
-    types::{CreateVMRequest, UpdateVMRequest, VMListResponse, VmId},
+    types::{CreateVMRequest, VMListResponse, VmId},
     utils::OdoroboError,
 };
 use aide::axum::{
@@ -45,6 +45,9 @@ async fn vm_info(
     Path(VmId(vmid)): Path<VmId>,
 ) -> Result<impl IntoApiResponse, OdoroboError> {
     let reply = state.ask(GetVMInfo { vmid: Some(vmid) }).await?;
+    if reply.config.is_none() {
+        return Err(OdoroboError::NotFound(format!("VM {vmid} not found")));
+    }
     let response = serde_json::to_value(reply)
         .map_err(|error| OdoroboError::Report(stable_eyre::Report::from(error)))?;
 
@@ -98,10 +101,7 @@ async fn console_history(
 }
 
 /// VM configuration updates are not supported by the scheduler yet.
-async fn update_vm(
-    Path(VmId(_vmid)): Path<VmId>,
-    Json(_request): Json<UpdateVMRequest>,
-) -> axum::response::Response {
+async fn update_vm(Path(VmId(_vmid)): Path<VmId>) -> axum::response::Response {
     (
         axum::http::StatusCode::NOT_IMPLEMENTED,
         Json(serde_json::json!({

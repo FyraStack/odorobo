@@ -264,6 +264,13 @@ impl Message<VmUpdated> for SchedulerActor {
         self.vm_actorid_ulid_map.insert(actor_id, vmid);
         if let Some(manifest) = msg.data.config {
             self.vm_manifests.insert(vmid, manifest);
+            Self::reconcile_discovered_vm(
+                vmid,
+                &self.agent_vm_index,
+                &self.vm_manifests,
+                &mut self.vm_placements,
+            );
+            self.invalidate_pending_resources();
         }
         let cached_vm = CachedVMActor {
             actor_ref: Some(msg.actor_ref),

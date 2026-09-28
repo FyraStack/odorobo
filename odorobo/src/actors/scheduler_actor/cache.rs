@@ -13,7 +13,7 @@ use crate::manifest::VmManifest;
 
 use super::{CachedVMActor, SchedulerActor, VmLifecycle, VmPlacement};
 
-const UNRESOLVED_VM_CACHE_TIMEOUT: Duration = Duration::from_secs(30);
+const UNRESOLVED_VM_CACHE_TIMEOUT: Duration = Duration::from_secs(120);
 const UNCONFIRMED_RUNNING_PLACEMENT_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl SchedulerActor {
@@ -51,7 +51,7 @@ impl SchedulerActor {
 
     /// Expires pending placements that were never confirmed by agent status.
     ///
-    /// Pending entries expire after 30 seconds. The five-second discovery loop
+    /// Pending entries expire after two minutes. The five-second discovery loop
     /// triggers this maintenance. Expiry removes only the unconfirmed placement:
     /// the manifest remains scheduler intent, allowing periodic reconciliation to
     /// dispatch a replacement create request.
@@ -61,11 +61,21 @@ impl SchedulerActor {
         data_cache: &mut AHashMap<Ulid, Vec<CachedVMActor>>,
     ) {
         let now = Instant::now();
+        let discovered_vmids: AHashSet<_> = data_cache
+            .iter()
+            .filter_map(|(vmid, entries)| {
+                entries
+                    .iter()
+                    .any(|entry| entry.actor_ref.is_some())
+                    .then_some(*vmid)
+            })
+            .collect();
         let empty_vmids: Vec<_> = placements
             .iter_mut()
             .filter_map(|(vmid, entries)| {
                 entries.retain(|entry| {
                     entry.lifecycle != VmLifecycle::Pending
+                        || discovered_vmids.contains(vmid)
                         || now.duration_since(entry.created_at) < UNRESOLVED_VM_CACHE_TIMEOUT
                 });
                 Self::shrink_non_migrating_entries(entries);
@@ -139,6 +149,23 @@ impl SchedulerActor {
         data_cache.remove(&vmid);
     }
 
+    /// Removes VM intent and every actor-ID association so reconciliation cannot
+    /// recreate a VM after an explicit stop or delete request.
+    pub(super) fn remove_vm_intent(&mut self, vmid: Ulid) {
+        Self::remove_vm_state(
+            vmid,
+            &mut self.vm_manifests,
+            &mut self.vm_placements,
+            &mut self.vm_data_cache,
+        );
+        self.vm_actorid_ulid_map
+            .retain(|_, mapped_vmid| *mapped_vmid != vmid);
+        for index in self.agent_vm_index.values_mut() {
+            index.remove(&vmid);
+        }
+        self.invalidate_pending_resources();
+    }
+
     /// Removes a departed actor from every VM cache entry without altering placement intent.
     pub(super) fn remove_vm_actor(
         actor_id: ActorId,
@@ -166,10 +193,11 @@ impl SchedulerActor {
     /// placement entries as VM intent for periodic reconciliation.
     pub(super) fn remove_agent_placements(
         agent_id: ActorId,
+        reachable_vmids: &AHashSet<Ulid>,
         placements: &mut AHashMap<Ulid, Vec<VmPlacement>>,
     ) {
-        for entries in placements.values_mut() {
-            entries.retain(|entry| entry.agent_id != agent_id);
+        for (vmid, entries) in placements.iter_mut() {
+            entries.retain(|entry| entry.agent_id != agent_id || reachable_vmids.contains(vmid));
             Self::shrink_non_migrating_entries(entries);
         }
     }
@@ -203,10 +231,22 @@ impl SchedulerActor {
             trace!(?actor_id, "Aborting agent keepalive task");
             keepalive_task.abort();
         }
+        let reachable_vmids = self
+            .agent_vm_index
+            .get(&actor_id)
+            .into_iter()
+            .flatten()
+            .filter(|vmid| {
+                self.vm_data_cache
+                    .get(vmid)
+                    .is_some_and(|entries| entries.iter().any(|entry| entry.actor_ref.is_some()))
+            })
+            .copied()
+            .collect();
         self.agent_data_cache.remove(&actor_id);
         self.agent_vm_index.remove(&actor_id);
         self.invalidate_pending_resources();
-        Self::remove_agent_placements(actor_id, &mut self.vm_placements);
+        Self::remove_agent_placements(actor_id, &reachable_vmids, &mut self.vm_placements);
     }
 
     /// Aborts VM polling and makes an unrepresented VM placement recoverable.
@@ -279,6 +319,22 @@ impl SchedulerActor {
                 });
                 Self::shrink_non_migrating_entries(entries);
             }
+        }
+    }
+
+    /// Reconciles a newly discovered VM manifest against agent snapshots that
+    /// may have arrived before the VM actor was queried.
+    pub(super) fn reconcile_discovered_vm(
+        vmid: Ulid,
+        agent_vm_index: &AHashMap<ActorId, AHashSet<Ulid>>,
+        manifests: &AHashMap<Ulid, VmManifest>,
+        placements: &mut AHashMap<Ulid, Vec<VmPlacement>>,
+    ) {
+        for agent_id in agent_vm_index
+            .iter()
+            .filter_map(|(agent_id, vmids)| vmids.contains(&vmid).then_some(*agent_id))
+        {
+            Self::reconcile_agent_delta(agent_id, &[vmid], &[], manifests, placements);
         }
     }
 

@@ -195,9 +195,7 @@ impl Message<SendConsoleInput> for SchedulerActor {
     }
 }
 
-/// Looks up a VM actor and forwards deletion without eagerly altering scheduler caches.
-///
-/// Cache cleanup waits for actor link death or updater reachability failure.
+/// Looks up a VM actor, forwards deletion, and removes desired intent.
 impl Message<DeleteVM> for SchedulerActor {
     type Reply = Result<DeleteVMReply, Report>;
 
@@ -209,8 +207,8 @@ impl Message<DeleteVM> for SchedulerActor {
         let vm = RemoteActorRef::<VMActor>::lookup(vm_actor_id(msg.vmid)).await?;
         tracing::trace!(?vm, "DeleteVM");
         if let Some(vm) = vm {
-            // don't update cache, because we rely on link dying and updater task to remove from cache once the VM is fully down.
             vm.tell(&msg).send()?;
+            self.remove_vm_intent(msg.vmid);
             Ok(DeleteVMReply)
         } else {
             Err(eyre!("VM not found"))
@@ -218,9 +216,7 @@ impl Message<DeleteVM> for SchedulerActor {
     }
 }
 
-/// Looks up a VM actor and forwards shutdown without eagerly altering scheduler caches.
-///
-/// Cache cleanup waits for actor link death or updater reachability failure.
+/// Looks up a VM actor, forwards shutdown, and suppresses automatic recreation.
 impl Message<ShutdownVM> for SchedulerActor {
     type Reply = Result<ShutdownVMReply, Report>;
 
@@ -232,8 +228,8 @@ impl Message<ShutdownVM> for SchedulerActor {
         let vm = RemoteActorRef::<VMActor>::lookup(vm_actor_id(msg.vmid)).await?;
         tracing::trace!(?vm, "ShutdownVM");
         if let Some(vm) = vm {
-            // don't update cache, because we rely on link dying and updater task to remove from cache once the VM is fully down.
             vm.tell(&msg).send()?;
+            self.remove_vm_intent(msg.vmid);
             Ok(ShutdownVMReply)
         } else {
             Err(eyre!("VM not found"))
@@ -254,7 +250,7 @@ impl Message<GetVMInfo> for SchedulerActor {
         let vm = RemoteActorRef::<VMActor>::lookup(vm_actor_id(vmid)).await?;
 
         let Some(vm) = vm else {
-            return Err(eyre!("VM not found"));
+            return Ok(GetVMInfoReply { vmid, config: None });
         };
 
         Ok(vm.ask(&msg).await?)
