@@ -1,12 +1,18 @@
 //! Actor lifecycle implementation and public scheduler message handlers.
 
-use std::{ops::ControlFlow, sync::Arc, time::Instant};
+use std::{
+    ops::ControlFlow,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use ahash::AHashMap;
 use kameo::prelude::*;
 use stable_eyre::{Report, eyre::eyre};
 use tracing::{info, warn};
+use ulid::Ulid;
 
+use crate::ch_driver::VMInstance;
 use crate::ch_driver::actor::VMActor;
 use crate::messages::vm::{
     AgentListVMs, AgentListVMsReply, CreateVM, CreateVMReply, DeleteVM, DeleteVMReply,
@@ -15,9 +21,7 @@ use crate::messages::vm::{
 };
 use crate::messages::{Ping, Pong};
 use crate::utils::actor_names::vm_actor_id;
-use odorobo::cluster_state::{
-    ClusterStateStore, PLACEMENT_PREFIX, PlacementRecord, StateStore, VM_MANIFESTS_PREFIX, key,
-};
+use odorobo::cluster_state::{PlacementRecord, StateStore};
 
 use super::{CachedActorKind, CachedVMActor, SchedulerActor, VmLifecycle, VmPlacement};
 
@@ -27,21 +31,19 @@ async fn persist_create_state(
     placement: &PlacementRecord,
 ) -> Result<(), Report> {
     state_store
-        .put(&key(VM_MANIFESTS_PREFIX, &msg.vmid), &msg.config)
+        .create_vm_state(msg.vmid, &msg.config, placement)
         .await
-        .map_err(|error| eyre!("unable to persist VM manifest: {error}"))?;
-    if let Err(error) = state_store
-        .put(&key(PLACEMENT_PREFIX, &msg.vmid), placement)
-        .await
-    {
-        if let Err(cleanup_error) = state_store
-            .delete(&key(VM_MANIFESTS_PREFIX, &msg.vmid))
-            .await
-        {
-            warn!(?cleanup_error, vm_id = %msg.vmid, "Unable to roll back VM manifest after placement persistence failure");
+        .map_err(|error| eyre!("unable to persist VM state: {error}"))
+}
+
+async fn wait_for_vm_shutdown(vmid: Ulid) -> Result<(), Report> {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while VMInstance::is_running(&vmid.to_string()).await {
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        return Err(eyre!("unable to persist VM placement: {error}"));
-    }
+    })
+    .await
+    .map_err(|_| eyre!("timed out waiting for VM {vmid} to stop"))?;
     Ok(())
 }
 
@@ -178,21 +180,8 @@ impl Message<CreateVM> for SchedulerActor {
                 &mut self.vm_placements,
                 &mut self.vm_data_cache,
             );
-            if !actor_exists {
-                if let Err(error) = self
-                    .state_store
-                    .delete(&key(PLACEMENT_PREFIX, &msg.vmid))
-                    .await
-                {
-                    warn!(?error, vm_id = %msg.vmid, "Unable to roll back VM placement after failed create");
-                }
-                if let Err(error) = self
-                    .state_store
-                    .delete(&key(VM_MANIFESTS_PREFIX, &msg.vmid))
-                    .await
-                {
-                    warn!(?error, vm_id = %msg.vmid, "Unable to roll back VM manifest after failed create");
-                }
+            if !actor_exists && let Err(error) = self.state_store.delete_vm_state(msg.vmid).await {
+                warn!(?error, vm_id = %msg.vmid, "Unable to roll back VM state after failed create");
             }
         }
 
@@ -258,20 +247,9 @@ impl Message<DeleteVM> for SchedulerActor {
         if let Some(vm) = vm {
             // don't update cache, because we rely on link dying and updater task to remove from cache once the VM is fully down.
             vm.ask(&msg).await?;
-            if let Err(error) = self
-                .state_store
-                .delete(&key(PLACEMENT_PREFIX, &msg.vmid))
-                .await
-            {
-                warn!(?error, vm_id = %msg.vmid, "Unable to delete VM placement; retaining durable record");
-                return Ok(DeleteVMReply);
-            }
-            if let Err(error) = self
-                .state_store
-                .delete(&key(VM_MANIFESTS_PREFIX, &msg.vmid))
-                .await
-            {
-                warn!(?error, vm_id = %msg.vmid, "Unable to delete VM manifest; retaining durable record");
+            wait_for_vm_shutdown(msg.vmid).await?;
+            if let Err(error) = self.state_store.delete_vm_state(msg.vmid).await {
+                return Err(eyre!("unable to delete durable VM state: {error}"));
             }
             Ok(DeleteVMReply)
         } else {

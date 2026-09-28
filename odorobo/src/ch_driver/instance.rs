@@ -335,6 +335,17 @@ impl VMInstance {
         &self.ch_socket_path
     }
 
+    /// Returns whether a Cloud Hypervisor VMM is already serving this VM's
+    /// runtime socket. This lets a restarted agent reattach instead of spawning
+    /// a second process for the same VM.
+    pub async fn is_running(id: &str) -> bool {
+        let socket = Self::runtime_dir_for(id).join(SOCKET_FILE_NAME);
+        cloud_hypervisor_client::socket_based_api_client(socket)
+            .vmm_ping_get()
+            .await
+            .is_ok()
+    }
+
     async fn stop_child_after_failed_start(&mut self) {
         if let Some(mut child) = self.child_process.take() {
             _ = child.start_kill();
@@ -392,6 +403,10 @@ impl VMInstance {
     ) -> Result<Self> {
         let ch_socket_path = Self::runtime_dir_for(id).join(SOCKET_FILE_NAME);
         info!(?ch_socket_path, "Spawning VM");
+        if Self::is_running(id).await {
+            info!(vm_id = id, "Attaching to existing Cloud Hypervisor VMM");
+            return Ok(Self::new(id, ch_socket_path, transformer, None));
+        }
         // make sure socket path parent exists
         if !ch_socket_path.parent().unwrap().exists() {
             std::fs::create_dir_all(ch_socket_path.parent().unwrap())?;

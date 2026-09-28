@@ -23,7 +23,7 @@ use ahash::{AHashMap, AHashSet};
 use bytesize::ByteSize;
 use kameo::prelude::*;
 use odorobo::cluster_state::{
-    ClusterStateStore, PLACEMENT_PREFIX, PlacementRecord, StateStore, VM_MANIFESTS_PREFIX, key,
+    ClusterStateStore, PLACEMENT_PREFIX, PlacementRecord, StateStore, VM_MANIFESTS_PREFIX,
 };
 use stable_eyre::{Report, Result};
 use std::{ops::ControlFlow, sync::Arc};
@@ -244,13 +244,6 @@ impl Message<CreateVM> for AgentActor {
 
     async fn handle(&mut self, msg: CreateVM, ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
         let vmid = msg.vmid;
-        if let Err(error) = self
-            .state_store
-            .put(&key(VM_MANIFESTS_PREFIX, &vmid), &msg.config)
-            .await
-        {
-            warn!(?error, vm_id = %vmid, "Unable to persist VM manifest; continuing without durable state");
-        }
         // spawn AND link at the same time
         let actor_ref =
             VMActor::spawn_link(ctx.actor_ref(), (vmid, Some(msg.config.clone()))).await;

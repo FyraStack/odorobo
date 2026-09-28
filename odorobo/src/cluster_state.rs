@@ -7,7 +7,9 @@
 use std::{collections::BTreeMap, fmt::Display, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use etcd_client::{Certificate, Client, ConnectOptions, TlsOptions};
+use etcd_client::{
+    Certificate, Client, Compare, CompareOp, ConnectOptions, TlsOptions, Txn, TxnOp,
+};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use tokio::sync::RwLock;
@@ -35,6 +37,8 @@ pub enum StateError {
     UnsupportedVersion(u16),
     #[error("state record is missing")]
     Missing,
+    #[error("state record already exists")]
+    AlreadyExists,
     #[error("state serialization failed: {0}")]
     Serialization(#[from] serde_json::Error),
 }
@@ -138,6 +142,61 @@ impl StateStore {
         Ok(Self::Etcd(
             EtcdStateStore::connect(endpoints, username, password, tls, timeout, retries).await?,
         ))
+    }
+
+    /// Atomically creates the desired manifest and its placement. A VM ID may
+    /// not be reused because a retry must not replace an existing VM's intent.
+    pub async fn create_vm_state<T: Serialize + Send + Sync>(
+        &self,
+        vmid: Ulid,
+        manifest: &T,
+        placement: &PlacementRecord,
+    ) -> Result<(), StateError> {
+        let manifest_key = key(VM_MANIFESTS_PREFIX, &vmid);
+        let placement_key = key(PLACEMENT_PREFIX, &vmid);
+        let manifest = serde_json::to_vec(&VersionedRecord {
+            version: RECORD_VERSION,
+            value: manifest,
+        })?;
+        let placement = serde_json::to_vec(&VersionedRecord {
+            version: RECORD_VERSION,
+            value: placement,
+        })?;
+
+        match self {
+            Self::Etcd(store) => {
+                store
+                    .create_vm_state(&manifest_key, manifest, &placement_key, placement)
+                    .await
+            }
+            Self::Memory(store) => {
+                let mut values = store.values.write().await;
+                if values.contains_key(&manifest_key) || values.contains_key(&placement_key) {
+                    drop(values);
+                    return Err(StateError::AlreadyExists);
+                }
+                values.insert(manifest_key, manifest);
+                values.insert(placement_key, placement);
+                drop(values);
+                Ok(())
+            }
+        }
+    }
+
+    /// Atomically removes both halves of a VM's desired state.
+    pub async fn delete_vm_state(&self, vmid: Ulid) -> Result<(), StateError> {
+        let manifest_key = key(VM_MANIFESTS_PREFIX, &vmid);
+        let placement_key = key(PLACEMENT_PREFIX, &vmid);
+        match self {
+            Self::Etcd(store) => store.delete_vm_state(&manifest_key, &placement_key).await,
+            Self::Memory(store) => {
+                let mut values = store.values.write().await;
+                values.remove(&manifest_key);
+                values.remove(&placement_key);
+                drop(values);
+                Ok(())
+            }
+        }
     }
 }
 
@@ -273,6 +332,55 @@ impl ClusterStateStore for EtcdStateStore {
     }
 }
 
+impl EtcdStateStore {
+    async fn create_vm_state(
+        &self,
+        manifest_key: &str,
+        manifest: Vec<u8>,
+        placement_key: &str,
+        placement: Vec<u8>,
+    ) -> Result<(), StateError> {
+        let transaction = Txn::new()
+            .when([
+                Compare::version(manifest_key, CompareOp::Equal, 0),
+                Compare::version(placement_key, CompareOp::Equal, 0),
+            ])
+            .and_then([
+                TxnOp::put(manifest_key, manifest, None),
+                TxnOp::put(placement_key, placement, None),
+            ]);
+        let response = self
+            .client
+            .write()
+            .await
+            .txn(transaction)
+            .await
+            .map_err(|error| StateError::Backend(error.to_string()))?;
+        if response.succeeded() {
+            Ok(())
+        } else {
+            Err(StateError::AlreadyExists)
+        }
+    }
+
+    async fn delete_vm_state(
+        &self,
+        manifest_key: &str,
+        placement_key: &str,
+    ) -> Result<(), StateError> {
+        self.client
+            .write()
+            .await
+            .txn(Txn::new().and_then([
+                TxnOp::delete(manifest_key, None),
+                TxnOp::delete(placement_key, None),
+            ]))
+            .await
+            .map(|_| ())
+            .map_err(|error| StateError::Backend(error.to_string()))
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct MemoryStateStore {
     values: Arc<RwLock<BTreeMap<String, Vec<u8>>>>,
@@ -335,7 +443,12 @@ impl ClusterStateStore for MemoryStateStore {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClusterStateStore, MemoryStateStore, VM_MANIFESTS_PREFIX, key};
+    use super::{
+        ClusterStateStore, MemoryStateStore, PLACEMENT_PREFIX, PlacementRecord, StateError,
+        StateStore, VM_MANIFESTS_PREFIX, key,
+    };
+    use std::sync::Arc;
+    use ulid::Ulid;
 
     #[tokio::test]
     async fn round_trips_versioned_records_without_destructive_reads() {
@@ -389,5 +502,43 @@ mod tests {
             store.get::<serde_json::Value>(&key).await,
             Err(super::StateError::UnsupportedVersion(2))
         ));
+    }
+
+    #[tokio::test]
+    async fn creates_and_deletes_paired_vm_state_atomically() {
+        let vmid = Ulid::generate();
+        let store = Arc::new(StateStore::Memory(MemoryStateStore::default()));
+        let placement = PlacementRecord {
+            vmid,
+            node: "node-a".to_owned(),
+        };
+
+        store
+            .create_vm_state(vmid, &serde_json::json!({"name": "demo"}), &placement)
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .create_vm_state(vmid, &serde_json::json!({"name": "other"}), &placement)
+                .await,
+            Err(StateError::AlreadyExists)
+        ));
+
+        store.delete_vm_state(vmid).await.unwrap();
+        assert!(
+            store
+                .get::<serde_json::Value>(&key(VM_MANIFESTS_PREFIX, &vmid))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .get::<PlacementRecord>(&key(PLACEMENT_PREFIX, &vmid))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        drop(store);
     }
 }
