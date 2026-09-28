@@ -16,10 +16,34 @@ use crate::messages::vm::{
 use crate::messages::{Ping, Pong};
 use crate::utils::actor_names::vm_actor_id;
 use odorobo::cluster_state::{
-    ClusterStateStore, PLACEMENT_PREFIX, PlacementRecord, StateStore, key,
+    ClusterStateStore, PLACEMENT_PREFIX, PlacementRecord, StateStore, VM_MANIFESTS_PREFIX, key,
 };
 
 use super::{CachedActorKind, CachedVMActor, SchedulerActor, VmLifecycle, VmPlacement};
+
+async fn persist_create_state(
+    state_store: &StateStore,
+    msg: &CreateVM,
+    placement: &PlacementRecord,
+) -> Result<(), Report> {
+    state_store
+        .put(&key(VM_MANIFESTS_PREFIX, &msg.vmid), &msg.config)
+        .await
+        .map_err(|error| eyre!("unable to persist VM manifest: {error}"))?;
+    if let Err(error) = state_store
+        .put(&key(PLACEMENT_PREFIX, &msg.vmid), placement)
+        .await
+    {
+        if let Err(cleanup_error) = state_store
+            .delete(&key(VM_MANIFESTS_PREFIX, &msg.vmid))
+            .await
+        {
+            warn!(?cleanup_error, vm_id = %msg.vmid, "Unable to roll back VM manifest after placement persistence failure");
+        }
+        return Err(eyre!("unable to persist VM placement: {error}"));
+    }
+    Ok(())
+}
 
 /// Owns scheduler initialization and cleanup for linked remote actors.
 ///
@@ -94,6 +118,19 @@ impl Message<CreateVM> for SchedulerActor {
         let target_agent = self.schedule_agent(&msg)?;
         let target_agent_id = target_agent.id();
 
+        let node = self
+            .agent_data_cache
+            .get(&target_agent_id)
+            .map_or_else(|| "unknown".to_owned(), |agent| agent.data.hostname.clone());
+        let placement = PlacementRecord {
+            vmid: msg.vmid,
+            node,
+        };
+
+        // Record the desired state before creating anything. This prevents a
+        // manager crash after agent creation from leaving an unplaced manifest.
+        persist_create_state(&self.state_store, &msg, &placement).await?;
+
         // TODO: Define duplicate VM-ID semantics before overwriting intent and
         // appending another pending placement; reject conflicts or make retries idempotent.
         self.vm_manifests.insert(msg.vmid, msg.config.clone());
@@ -141,27 +178,26 @@ impl Message<CreateVM> for SchedulerActor {
                 &mut self.vm_placements,
                 &mut self.vm_data_cache,
             );
+            if !actor_exists {
+                if let Err(error) = self
+                    .state_store
+                    .delete(&key(PLACEMENT_PREFIX, &msg.vmid))
+                    .await
+                {
+                    warn!(?error, vm_id = %msg.vmid, "Unable to roll back VM placement after failed create");
+                }
+                if let Err(error) = self
+                    .state_store
+                    .delete(&key(VM_MANIFESTS_PREFIX, &msg.vmid))
+                    .await
+                {
+                    warn!(?error, vm_id = %msg.vmid, "Unable to roll back VM manifest after failed create");
+                }
+            }
         }
 
-        let reply = reply?;
-        let node = self
-            .agent_data_cache
-            .get(&target_agent_id)
-            .map_or_else(|| "unknown".to_owned(), |agent| agent.data.hostname.clone());
         drop(target_agent);
-        let placement = PlacementRecord {
-            vmid: msg.vmid,
-            node,
-        };
-        if let Err(error) = self
-            .state_store
-            .put(&key(PLACEMENT_PREFIX, &msg.vmid), &placement)
-            .await
-        {
-            warn!(?error, vm_id = %msg.vmid, "Unable to persist VM placement; retaining local state");
-        }
-
-        Ok(reply)
+        Ok(reply?)
     }
 }
 
@@ -221,13 +257,21 @@ impl Message<DeleteVM> for SchedulerActor {
         tracing::trace!(?vm, "DeleteVM");
         if let Some(vm) = vm {
             // don't update cache, because we rely on link dying and updater task to remove from cache once the VM is fully down.
-            vm.tell(&msg).send()?;
+            vm.ask(&msg).await?;
             if let Err(error) = self
                 .state_store
                 .delete(&key(PLACEMENT_PREFIX, &msg.vmid))
                 .await
             {
                 warn!(?error, vm_id = %msg.vmid, "Unable to delete VM placement; retaining durable record");
+                return Ok(DeleteVMReply);
+            }
+            if let Err(error) = self
+                .state_store
+                .delete(&key(VM_MANIFESTS_PREFIX, &msg.vmid))
+                .await
+            {
+                warn!(?error, vm_id = %msg.vmid, "Unable to delete VM manifest; retaining durable record");
             }
             Ok(DeleteVMReply)
         } else {
@@ -292,5 +336,71 @@ impl Message<Ping> for SchedulerActor {
 
     async fn handle(&mut self, _msg: Ping, _ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
         Pong
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::persist_create_state;
+    use crate::manifest::{Boot, Compute, DesiredState, MANIFEST_VERSION, Metadata, VmManifest};
+    use crate::messages::vm::CreateVM;
+    use odorobo::cluster_state::{
+        ClusterStateStore, MemoryStateStore, PLACEMENT_PREFIX, PlacementRecord, StateStore,
+        VM_MANIFESTS_PREFIX, key,
+    };
+    use std::sync::Arc;
+    use ulid::Ulid;
+
+    #[tokio::test]
+    async fn create_state_is_complete_before_dispatch() {
+        let vmid = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("valid ULID");
+        let manifest = VmManifest {
+            api_version: MANIFEST_VERSION,
+            id: vmid,
+            desired: DesiredState {
+                metadata: Metadata {
+                    name: "test".to_owned(),
+                    ..Default::default()
+                },
+                compute: Compute {
+                    vcpus: 1,
+                    memory_bytes: 1,
+                    ..Default::default()
+                },
+                boot: Boot::default(),
+                ..Default::default()
+            },
+            observed: None,
+        };
+        let store = Arc::new(StateStore::Memory(MemoryStateStore::default()));
+        persist_create_state(
+            &store,
+            &CreateVM {
+                vmid,
+                config: manifest.clone(),
+            },
+            &PlacementRecord {
+                vmid,
+                node: "node-a".to_owned(),
+            },
+        )
+        .await
+        .expect("state should persist");
+
+        assert_eq!(
+            store
+                .get::<VmManifest>(&key(VM_MANIFESTS_PREFIX, &vmid))
+                .await
+                .unwrap(),
+            Some(manifest)
+        );
+        assert!(
+            store
+                .get::<PlacementRecord>(&key(PLACEMENT_PREFIX, &vmid))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        drop(store);
     }
 }

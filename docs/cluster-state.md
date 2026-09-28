@@ -37,10 +37,12 @@ in-memory store so the local process can continue operating. That fallback is
 restore etcd and restart the process to recover durable state.
 
 During a temporary operation failure, local VM actors and caches are not deleted.
-A failed manifest or placement write is logged, and a failed delete intentionally
-leaves the durable record so it can be reconciled rather than losing desired
-state. Reads that fail during startup leave the local cache empty and do not
-perform destructive cleanup.
+Create persists the manifest and placement before dispatching to an agent; if
+either write fails, creation is rejected. Deletes wait for the VM actor to
+confirm deletion before removing the placement and manifest records. A failed
+delete intentionally leaves the durable record so it can be reconciled rather
+than losing desired state. Reads that fail during startup leave the local cache
+empty and do not perform destructive cleanup.
 
 The storage trait and `MemoryStateStore` provide isolated tests without requiring
 an etcd service. The etcd implementation uses the same versioned serialization,

@@ -328,13 +328,6 @@ impl Message<DeleteVM> for AgentActor {
             }
         }
 
-        if let Err(error) = self
-            .state_store
-            .delete(&key(VM_MANIFESTS_PREFIX, &msg.vmid))
-            .await
-        {
-            warn!(?error, vm_id = %msg.vmid, "Unable to delete VM manifest; retaining durable record for recovery");
-        }
         DeleteVMReply
     }
 }
