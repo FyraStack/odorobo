@@ -27,7 +27,7 @@ use std::{sync::Arc, time::Instant};
 
 use ahash::{AHashMap, AHashSet};
 use kameo::prelude::*;
-use odorobo::cluster_state::StateStore;
+use odorobo::cluster_state::{PlacementRecord, StateStore};
 use tokio::task::JoinHandle;
 use ulid::Ulid;
 
@@ -147,6 +147,8 @@ pub struct SchedulerActor {
     pub vm_manifests: AHashMap<Ulid, VmManifest>,
     /// Desired and observed VM placements; multiple entries allow migration.
     pub vm_placements: AHashMap<Ulid, Vec<VmPlacement>>,
+    /// Durable hostname assignments used to rebuild actor-specific placements.
+    pub durable_placements: AHashMap<Ulid, PlacementRecord>,
     /// VM actor references. `None` marks a placement awaiting discovery.
     pub vm_data_cache: AHashMap<Ulid, Vec<CachedVMActor>>,
     /// Polling tasks that refresh corresponding VM actor cache entries.

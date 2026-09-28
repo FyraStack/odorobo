@@ -49,6 +49,18 @@ struct VersionedRecord<T> {
     value: T,
 }
 
+fn decode_record<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, StateError> {
+    let record: VersionedRecord<serde_json::Value> = serde_json::from_slice(bytes)?;
+    if record.version != RECORD_VERSION {
+        return Err(StateError::UnsupportedVersion(record.version));
+    }
+    Ok(serde_json::from_value(record.value)?)
+}
+
+fn list_prefix(prefix: &str) -> String {
+    format!("{}/", prefix.trim_end_matches('/'))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreHealth {
     pub healthy: bool,
@@ -74,7 +86,7 @@ pub fn key<T: Display + ?Sized>(prefix: &str, id: &T) -> String {
 
 #[derive(Clone)]
 pub struct EtcdStateStore {
-    client: Arc<RwLock<Client>>,
+    client: Arc<Client>,
 }
 
 impl EtcdStateStore {
@@ -101,20 +113,22 @@ impl EtcdStateStore {
         let attempts = retries.max(1);
         let mut last_error = None;
         for attempt in 0..attempts {
-            match Client::connect(endpoints, Some(options.clone())).await {
+            let result = match Client::connect(endpoints, Some(options.clone())).await {
+                Ok(mut client) => client.status().await.map(|_| client),
+                Err(error) => Err(error),
+            };
+            match result {
                 Ok(client) => {
                     return Ok(Self {
-                        client: Arc::new(RwLock::new(client)),
+                        client: Arc::new(client),
                     });
                 }
-                Err(error) => {
-                    last_error = Some(error.to_string());
-                    let next_attempt = attempt.saturating_add(1);
-                    if next_attempt < attempts {
-                        let delay_ms = 100_u64.saturating_mul(u64::from(next_attempt));
-                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                    }
-                }
+                Err(error) => last_error = Some(error.to_string()),
+            }
+            let next_attempt = attempt.saturating_add(1);
+            if next_attempt < attempts {
+                let delay_ms = 100_u64.saturating_mul(u64::from(next_attempt));
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
             }
         }
         Err(StateError::Backend(format!(
@@ -258,8 +272,8 @@ impl ClusterStateStore for EtcdStateStore {
             value,
         })?;
         self.client
-            .write()
-            .await
+            .as_ref()
+            .clone()
             .put(key, record, None)
             .await
             .map(|_| ())
@@ -269,49 +283,48 @@ impl ClusterStateStore for EtcdStateStore {
     async fn get<T: DeserializeOwned + Send>(&self, key: &str) -> Result<Option<T>, StateError> {
         let response = self
             .client
-            .write()
-            .await
+            .as_ref()
+            .clone()
             .get(key, None)
             .await
             .map_err(|error| StateError::Backend(error.to_string()))?;
         let Some(value) = response.kvs().first() else {
             return Ok(None);
         };
-        let record: VersionedRecord<T> = serde_json::from_slice(value.value())?;
-        if record.version != RECORD_VERSION {
-            return Err(StateError::UnsupportedVersion(record.version));
-        }
-        Ok(Some(record.value))
+        Ok(Some(decode_record(value.value())?))
     }
 
     async fn list<T: DeserializeOwned + Send>(
         &self,
         prefix: &str,
     ) -> Result<Vec<(String, T)>, StateError> {
+        let prefix = list_prefix(prefix);
         let response = self
             .client
-            .write()
-            .await
-            .get(prefix, Some(etcd_client::GetOptions::new().with_prefix()))
+            .as_ref()
+            .clone()
+            .get(
+                prefix.as_str(),
+                Some(etcd_client::GetOptions::new().with_prefix()),
+            )
             .await
             .map_err(|error| StateError::Backend(error.to_string()))?;
         response
             .kvs()
             .iter()
             .map(|value| {
-                let record: VersionedRecord<T> = serde_json::from_slice(value.value())?;
-                if record.version != RECORD_VERSION {
-                    return Err(StateError::UnsupportedVersion(record.version));
-                }
-                Ok((value.key_str().unwrap_or_default().to_owned(), record.value))
+                Ok((
+                    value.key_str().unwrap_or_default().to_owned(),
+                    decode_record(value.value())?,
+                ))
             })
             .collect()
     }
 
     async fn delete(&self, key: &str) -> Result<(), StateError> {
         self.client
-            .write()
-            .await
+            .as_ref()
+            .clone()
             .delete(key, None)
             .await
             .map(|_| ())
@@ -319,7 +332,7 @@ impl ClusterStateStore for EtcdStateStore {
     }
 
     async fn health(&self) -> StoreHealth {
-        match self.client.write().await.status().await {
+        match self.client.as_ref().clone().status().await {
             Ok(_) => StoreHealth {
                 healthy: true,
                 message: "etcd is reachable".to_owned(),
@@ -351,8 +364,8 @@ impl EtcdStateStore {
             ]);
         let response = self
             .client
-            .write()
-            .await
+            .as_ref()
+            .clone()
             .txn(transaction)
             .await
             .map_err(|error| StateError::Backend(error.to_string()))?;
@@ -369,8 +382,8 @@ impl EtcdStateStore {
         placement_key: &str,
     ) -> Result<(), StateError> {
         self.client
-            .write()
-            .await
+            .as_ref()
+            .clone()
             .txn(Txn::new().and_then([
                 TxnOp::delete(manifest_key, None),
                 TxnOp::delete(placement_key, None),
@@ -405,28 +418,19 @@ impl ClusterStateStore for MemoryStateStore {
         let Some(value) = value else {
             return Ok(None);
         };
-        let record: VersionedRecord<T> = serde_json::from_slice(&value)?;
-        if record.version != RECORD_VERSION {
-            return Err(StateError::UnsupportedVersion(record.version));
-        }
-        Ok(Some(record.value))
+        Ok(Some(decode_record(&value)?))
     }
     async fn list<T: DeserializeOwned + Send>(
         &self,
         prefix: &str,
     ) -> Result<Vec<(String, T)>, StateError> {
+        let prefix = list_prefix(prefix);
         self.values
             .read()
             .await
             .iter()
-            .filter(|(key, _)| key.starts_with(prefix))
-            .map(|(key, value)| {
-                let record: VersionedRecord<T> = serde_json::from_slice(value)?;
-                if record.version != RECORD_VERSION {
-                    return Err(StateError::UnsupportedVersion(record.version));
-                }
-                Ok((key.clone(), record.value))
-            })
+            .filter(|(key, _)| key.starts_with(&prefix))
+            .map(|(key, value)| Ok((key.clone(), decode_record(value)?)))
             .collect()
     }
     async fn delete(&self, key: &str) -> Result<(), StateError> {
@@ -502,6 +506,41 @@ mod tests {
             store.get::<serde_json::Value>(&key).await,
             Err(super::StateError::UnsupportedVersion(2))
         ));
+
+        store.values.write().await.insert(
+            key.clone(),
+            serde_json::to_vec(&serde_json::json!({"version": 2, "value": "future"})).unwrap(),
+        );
+        assert!(matches!(
+            store.get::<PlacementRecord>(&key).await,
+            Err(super::StateError::UnsupportedVersion(2))
+        ));
+    }
+
+    #[tokio::test]
+    async fn list_only_matches_children_of_the_requested_prefix() {
+        let store = MemoryStateStore::default();
+        store
+            .put(
+                &key(PLACEMENT_PREFIX, &"vm-1"),
+                &serde_json::json!({"name": "included"}),
+            )
+            .await
+            .unwrap();
+        store
+            .put(
+                &format!("{PLACEMENT_PREFIX}-backup/vm-2"),
+                &serde_json::json!({"name": "excluded"}),
+            )
+            .await
+            .unwrap();
+
+        let records = store
+            .list::<serde_json::Value>(PLACEMENT_PREFIX)
+            .await
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].1, serde_json::json!({"name": "included"}));
     }
 
     #[tokio::test]

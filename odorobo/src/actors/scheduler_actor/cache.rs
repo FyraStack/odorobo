@@ -52,10 +52,10 @@ impl SchedulerActor {
     ///
     /// Pending entries expire after 30 seconds. The five-second discovery loop
     /// triggers this maintenance, so a slow-to-report create can be forgotten.
-    /// When the expired placement was the last placement for a VM, all correlated
-    /// manifest, placement, and actor-cache state is removed.
+    /// Expiration clears only transient placement and actor-cache state; durable
+    /// manifest intent remains available for another reconciliation attempt.
     pub(super) fn cleanup_unresolved_vm_cache(
-        manifests: &mut AHashMap<Ulid, VmManifest>,
+        _manifests: &mut AHashMap<Ulid, VmManifest>,
         placements: &mut AHashMap<Ulid, Vec<VmPlacement>>,
         data_cache: &mut AHashMap<Ulid, Vec<CachedVMActor>>,
     ) {
@@ -73,7 +73,8 @@ impl SchedulerActor {
             .collect();
 
         for vmid in empty_vmids {
-            Self::remove_vm_state(vmid, manifests, placements, data_cache);
+            placements.remove(&vmid);
+            data_cache.remove(&vmid);
         }
     }
 
@@ -153,13 +154,11 @@ impl SchedulerActor {
         }
     }
 
-    /// Removes placements assigned to a departed agent and drops VM state only
-    /// when no placement remains.
-    // TODO: Preserve VM intent and enqueue replacement placement or recreation
-    // when an agent disappears instead of dropping the last VM state.
+    /// Removes transient placements assigned to a departed agent while retaining
+    /// durable VM intent for reconciliation when the agent returns.
     pub(super) fn remove_agent_placements(
         agent_id: ActorId,
-        manifests: &mut AHashMap<Ulid, VmManifest>,
+        _manifests: &mut AHashMap<Ulid, VmManifest>,
         placements: &mut AHashMap<Ulid, Vec<VmPlacement>>,
         data_cache: &mut AHashMap<Ulid, Vec<CachedVMActor>>,
     ) {
@@ -173,30 +172,8 @@ impl SchedulerActor {
             .collect();
 
         for vmid in empty_vmids {
-            Self::remove_vm_state(vmid, manifests, placements, data_cache);
-        }
-    }
-
-    /// Rolls back optimistic create state only when no VM actor was created.
-    ///
-    /// An actor may exist even if the create request failed or its reply was lost;
-    /// retaining the state in that case lets normal discovery reconcile it.
-    pub(super) fn rollback_failed_create(
-        vmid: Ulid,
-        actor_exists: bool,
-        actor_id: Option<ActorId>,
-        actor_map: &mut AHashMap<ActorId, Ulid>,
-        manifests: &mut AHashMap<Ulid, VmManifest>,
-        placements: &mut AHashMap<Ulid, Vec<VmPlacement>>,
-        data_cache: &mut AHashMap<Ulid, Vec<CachedVMActor>>,
-    ) {
-        if !actor_exists {
-            if let Some(actor_id) = actor_id
-                && actor_map.get(&actor_id) == Some(&vmid)
-            {
-                actor_map.remove(&actor_id);
-            }
-            Self::remove_vm_state(vmid, manifests, placements, data_cache);
+            placements.remove(&vmid);
+            data_cache.remove(&vmid);
         }
     }
 
@@ -233,12 +210,8 @@ impl SchedulerActor {
                 .get(&vmid)
                 .is_none_or(|entries| entries.iter().all(|entry| entry.actor_ref.is_none()))
         {
-            Self::remove_vm_state(
-                vmid,
-                &mut self.vm_manifests,
-                &mut self.vm_placements,
-                &mut self.vm_data_cache,
-            );
+            self.vm_placements.remove(&vmid);
+            self.vm_data_cache.remove(&vmid);
         }
     }
 

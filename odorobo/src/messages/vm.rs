@@ -72,7 +72,9 @@ pub struct DeleteVM {
 }
 
 #[derive(Serialize, Deserialize, Reply, Debug, Clone)]
-pub struct DeleteVMReply;
+pub struct DeleteVMReply {
+    pub error: Option<String>,
+}
 
 /// Shuts down a VM temporarily
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -109,9 +111,10 @@ pub struct GetVMInfoReply {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct GetVMHeartbeat;
 
-#[derive(Serialize, Deserialize, Reply, Debug, Clone, Copy)]
+#[derive(Serialize, Deserialize, Reply, Debug, Clone)]
 pub struct GetVMHeartbeatReply {
     pub vmid: Ulid,
+    pub error: Option<String>,
 }
 
 /// Retrieve the retained serial-console output for a VM.

@@ -10,9 +10,7 @@ use ahash::AHashMap;
 use kameo::prelude::*;
 use stable_eyre::{Report, eyre::eyre};
 use tracing::{info, warn};
-use ulid::Ulid;
 
-use crate::ch_driver::VMInstance;
 use crate::ch_driver::actor::VMActor;
 use crate::messages::vm::{
     AgentListVMs, AgentListVMsReply, CreateVM, CreateVMReply, DeleteVM, DeleteVMReply,
@@ -21,7 +19,9 @@ use crate::messages::vm::{
 };
 use crate::messages::{Ping, Pong};
 use crate::utils::actor_names::vm_actor_id;
-use odorobo::cluster_state::{PlacementRecord, StateStore};
+use odorobo::cluster_state::{
+    ClusterStateStore, PLACEMENT_PREFIX, PlacementRecord, StateStore, VM_MANIFESTS_PREFIX,
+};
 
 use super::{CachedActorKind, CachedVMActor, SchedulerActor, VmLifecycle, VmPlacement};
 
@@ -34,17 +34,6 @@ async fn persist_create_state(
         .create_vm_state(msg.vmid, &msg.config, placement)
         .await
         .map_err(|error| eyre!("unable to persist VM state: {error}"))
-}
-
-async fn wait_for_vm_shutdown(vmid: Ulid) -> Result<(), Report> {
-    tokio::time::timeout(Duration::from_secs(30), async {
-        while VMInstance::is_running(&vmid.to_string()).await {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    })
-    .await
-    .map_err(|_| eyre!("timed out waiting for VM {vmid} to stop"))?;
-    Ok(())
 }
 
 /// Owns scheduler initialization and cleanup for linked remote actors.
@@ -60,12 +49,28 @@ impl Actor for SchedulerActor {
 
         info!(?peer_id, "Scheduler Actor started!");
 
+        let vm_manifests = args
+            .list::<crate::manifest::VmManifest>(VM_MANIFESTS_PREFIX)
+            .await
+            .map_err(|error| eyre!("unable to load durable VM manifests: {error}"))?
+            .into_iter()
+            .map(|(_, manifest)| (manifest.id, manifest))
+            .collect();
+        let durable_placements = args
+            .list::<PlacementRecord>(PLACEMENT_PREFIX)
+            .await
+            .map_err(|error| eyre!("unable to load durable VM placements: {error}"))?
+            .into_iter()
+            .map(|(_, placement)| (placement.vmid, placement))
+            .collect();
+
         let mut scheduler_actor = Self {
             agent_data_cache: AHashMap::new(),
             agent_keepalive_tasks: AHashMap::new(),
             vm_actorid_ulid_map: AHashMap::new(),
-            vm_manifests: AHashMap::new(),
+            vm_manifests,
             vm_placements: AHashMap::new(),
+            durable_placements,
             vm_data_cache: AHashMap::new(),
             vm_keepalive_tasks: AHashMap::new(),
             pending_resources_cache: None,
@@ -106,9 +111,8 @@ impl Actor for SchedulerActor {
 }
 /// Optimistically reserves a placement, then forwards VM creation to the chosen agent.
 ///
-/// A successful reply confirms agent acceptance, not observed VM execution. A failed
-/// request is rolled back only when discovery cannot find a VM actor, preserving state
-/// for eventual reconciliation when the request result was lost or delayed.
+/// A successful reply confirms agent acceptance, not observed VM execution. Failed or
+/// ambiguous requests retain durable intent so reconciliation can safely retry them.
 impl Message<CreateVM> for SchedulerActor {
     type Reply = Result<CreateVMReply, Report>;
 
@@ -136,6 +140,7 @@ impl Message<CreateVM> for SchedulerActor {
         // TODO: Define duplicate VM-ID semantics before overwriting intent and
         // appending another pending placement; reject conflicts or make retries idempotent.
         self.vm_manifests.insert(msg.vmid, msg.config.clone());
+        self.durable_placements.insert(msg.vmid, placement);
         self.invalidate_pending_resources();
         self.vm_placements
             .entry(msg.vmid)
@@ -151,38 +156,20 @@ impl Message<CreateVM> for SchedulerActor {
             .or_default()
             .push(CachedVMActor { actor_ref: None });
 
-        let reply = target_agent.ask(&msg).await;
+        let reply = tokio::time::timeout(Duration::from_secs(30), target_agent.ask(&msg))
+            .await
+            .map_err(|_| eyre!("timed out creating VM {}", msg.vmid))?;
 
-        if let Ok(reply) = &reply
-            && let Some(actor_id_bytes) = &reply.actor_id
-            && let Ok(actor_id) = ActorId::from_bytes(actor_id_bytes)
-        {
+        if let Ok(reply) = &reply {
+            let actor_id_bytes = reply
+                .actor_id
+                .as_deref()
+                .ok_or_else(|| eyre!("agent did not create VM {}", msg.vmid))?;
+            let actor_id = ActorId::from_bytes(actor_id_bytes)
+                .map_err(|error| eyre!("agent returned an invalid VM actor ID: {error}"))?;
             self.vm_actorid_ulid_map.insert(actor_id, msg.vmid);
-        }
-
-        if reply.is_err() {
-            let actor_exists = RemoteActorRef::<VMActor>::lookup(vm_actor_id(msg.vmid))
-                .await
-                .ok()
-                .flatten()
-                .is_some();
-            Self::rollback_failed_create(
-                msg.vmid,
-                actor_exists,
-                reply.as_ref().ok().and_then(|reply| {
-                    reply
-                        .actor_id
-                        .as_deref()
-                        .and_then(|bytes| ActorId::from_bytes(bytes).ok())
-                }),
-                &mut self.vm_actorid_ulid_map,
-                &mut self.vm_manifests,
-                &mut self.vm_placements,
-                &mut self.vm_data_cache,
-            );
-            if !actor_exists && let Err(error) = self.state_store.delete_vm_state(msg.vmid).await {
-                warn!(?error, vm_id = %msg.vmid, "Unable to roll back VM state after failed create");
-            }
+        } else {
+            warn!(vm_id = %msg.vmid, "VM create result is unknown; retaining durable state for recovery");
         }
 
         drop(target_agent);
@@ -242,19 +229,44 @@ impl Message<DeleteVM> for SchedulerActor {
         msg: DeleteVM,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        let vm = RemoteActorRef::<VMActor>::lookup(vm_actor_id(msg.vmid)).await?;
-        tracing::trace!(?vm, "DeleteVM");
-        if let Some(vm) = vm {
-            // don't update cache, because we rely on link dying and updater task to remove from cache once the VM is fully down.
-            vm.ask(&msg).await?;
-            wait_for_vm_shutdown(msg.vmid).await?;
-            if let Err(error) = self.state_store.delete_vm_state(msg.vmid).await {
-                return Err(eyre!("unable to delete durable VM state: {error}"));
-            }
-            Ok(DeleteVMReply)
+        let owner = self
+            .durable_placements
+            .get(&msg.vmid)
+            .and_then(|placement| {
+                self.agent_data_cache
+                    .values()
+                    .find(|agent| agent.data.hostname == placement.node)
+                    .map(|agent| agent.actor_ref.clone())
+            });
+        let reply = if let Some(owner) = owner.as_ref() {
+            tokio::time::timeout(Duration::from_secs(30), owner.ask(&msg))
+                .await
+                .map_err(|_| eyre!("timed out deleting VM {}", msg.vmid))??
+        } else if let Some(vm) = RemoteActorRef::<VMActor>::lookup(vm_actor_id(msg.vmid)).await? {
+            tokio::time::timeout(Duration::from_secs(30), vm.ask(&msg))
+                .await
+                .map_err(|_| eyre!("timed out deleting VM {}", msg.vmid))??
+        } else if self.durable_placements.contains_key(&msg.vmid) {
+            return Err(eyre!("VM owner is unavailable; durable state was retained"));
         } else {
-            Err(eyre!("VM not found"))
+            DeleteVMReply { error: None }
+        };
+        drop(owner);
+        if let Some(error) = reply.error {
+            return Err(eyre!("unable to delete VM: {error}"));
         }
+        self.state_store
+            .delete_vm_state(msg.vmid)
+            .await
+            .map_err(|error| eyre!("unable to delete durable VM state: {error}"))?;
+        Self::remove_vm_state(
+            msg.vmid,
+            &mut self.vm_manifests,
+            &mut self.vm_placements,
+            &mut self.vm_data_cache,
+        );
+        self.durable_placements.remove(&msg.vmid);
+        Ok(DeleteVMReply { error: None })
     }
 }
 

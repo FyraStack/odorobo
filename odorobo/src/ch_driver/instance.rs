@@ -451,30 +451,40 @@ impl VMInstance {
             vm_id = self.vm_id(),
             "Destroying VM instance, shutting down VM and cleaning up runtime state"
         );
-        if let Ok(info) = self.info().await {
-            trace!(vm_id = self.vm_id(), state = ?info.state, "Checking VM state before destroy");
-            self.hook_manager.before_stop(self.vm_id(), &info).await?;
-            if matches!(
-                info.state,
-                models::VmState::Running | models::VmState::Paused
-            ) {
-                info!(vm_id = self.vm_id(), "Shutting down VM before destroy");
-                self.shutdown().await?;
+        match self.info().await {
+            Ok(info) => {
+                trace!(vm_id = self.vm_id(), state = ?info.state, "Checking VM state before destroy");
+                self.hook_manager.before_stop(self.vm_id(), &info).await?;
+                if matches!(
+                    info.state,
+                    models::VmState::Running | models::VmState::Paused
+                ) {
+                    info!(vm_id = self.vm_id(), "Shutting down VM before destroy");
+                    self.shutdown().await?;
+                }
             }
-        } else {
-            warn!(
+            Err(error) if self.child_process.is_none() && self.ch_socket_path.exists() => {
+                return Err(error.wrap_err("cannot confirm attached VMM state before deletion"));
+            }
+            Err(error) => warn!(
                 vm_id = self.vm_id(),
-                "Failed to get VM info before destroy, proceeding with shutdown and cleanup anyway"
-            );
+                ?error,
+                "VMM is already stopped; proceeding with cleanup"
+            ),
         }
 
-        if matches!(self.conn().shutdown_vmm().await, Ok(())) {
-            debug!(vm_id = self.vm_id(), "VMM shutdown successfully");
-        } else {
+        if let Err(error) = self.conn().shutdown_vmm().await {
+            if self.child_process.is_none() && self.ch_socket_path.exists() {
+                return Err(eyre!(ChApiError::from(error))
+                    .wrap_err("failed to confirm attached VMM shutdown"));
+            }
             warn!(
                 vm_id = self.vm_id(),
-                "Failed to shutdown VMM, assuming it is already stopped or unresponsive"
+                ?error,
+                "Failed to request VMM shutdown; terminating owned process"
             );
+        } else {
+            debug!(vm_id = self.vm_id(), "VMM shutdown successfully");
         }
         let vm_config = self.vm_config.clone().unwrap_or_default();
         if let Some(mut child) = self.child_process.take() {

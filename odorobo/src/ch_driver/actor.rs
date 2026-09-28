@@ -197,6 +197,8 @@ pub struct VMActor {
     /// Desired provider-neutral intent retained for VM info and migration.
     /// The translated Cloud Hypervisor config lives only in `VMInstance`.
     pub manifest: Option<VmManifest>,
+    destroyed: bool,
+    heartbeat_failures: u8,
 }
 
 impl Actor for VMActor {
@@ -256,6 +258,8 @@ impl Actor for VMActor {
             migration_state: None,
             console,
             manifest: vm_config,
+            destroyed: false,
+            heartbeat_failures: 0,
         })
     }
 
@@ -279,7 +283,9 @@ impl Actor for VMActor {
             }
         }
 
-        self.vm_instance.destroy().await?;
+        if !self.destroyed {
+            self.vm_instance.destroy().await?;
+        }
 
         // info!(vmid = %self.vmid, ?res, "VM process exited");
 
@@ -351,16 +357,32 @@ impl Message<GetVMInfo> for VMActor {
 }
 
 #[remote_message]
-#[allow(clippy::unused_async_trait_impl)]
 impl Message<GetVMHeartbeat> for VMActor {
     type Reply = GetVMHeartbeatReply;
 
     async fn handle(
         &mut self,
         _msg: GetVMHeartbeat,
-        _ctx: &mut Context<Self, Self::Reply>,
+        ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        GetVMHeartbeatReply { vmid: self.vmid }
+        let error = self
+            .vm_instance
+            .ping()
+            .await
+            .err()
+            .map(|error| error.to_string());
+        if error.is_some() {
+            self.heartbeat_failures = self.heartbeat_failures.saturating_add(1);
+            if self.heartbeat_failures > 5 {
+                _ = ctx.actor_ref().stop_gracefully().await;
+            }
+        } else {
+            self.heartbeat_failures = 0;
+        }
+        GetVMHeartbeatReply {
+            vmid: self.vmid,
+            error,
+        }
     }
 }
 
@@ -532,14 +554,25 @@ impl Message<ShutdownVM> for VMActor {
 }
 #[remote_message]
 impl Message<DeleteVM> for VMActor {
-    type Reply = ();
+    type Reply = crate::messages::vm::DeleteVMReply;
     async fn handle(
         &mut self,
         _msg: DeleteVM,
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        trace!(vmid = %self.vmid, "Shutting down VM actor");
-        ctx.actor_ref().stop_gracefully().await.unwrap();
+        trace!(vmid = %self.vmid, "Deleting VM actor");
+        if let Err(error) = self.vm_instance.destroy().await {
+            return crate::messages::vm::DeleteVMReply {
+                error: Some(error.to_string()),
+            };
+        }
+        self.destroyed = true;
+        if let Err(error) = ctx.actor_ref().stop_gracefully().await {
+            return crate::messages::vm::DeleteVMReply {
+                error: Some(error.to_string()),
+            };
+        }
+        crate::messages::vm::DeleteVMReply { error: None }
     }
 }
 

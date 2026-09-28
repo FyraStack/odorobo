@@ -31,18 +31,17 @@ Passwords are never included in startup configuration logs.
 ## Availability behavior
 
 Startup attempts to connect to etcd with the configured timeout and retry count.
-If the connection cannot be established, Odorobo logs an error and uses an
-in-memory store so the local process can continue operating. That fallback is
-**not durable**; the health log reports the active backend. Operators should
-restore etcd and restart the process to recover durable state.
+Odorobo exits if the connection or an initial status request fails. It does not
+fall back to process-local writable state because doing so would let nodes accept
+changes that other nodes cannot observe and that disappear on restart.
 
 During a temporary operation failure, local VM actors and caches are not deleted.
 Create persists the manifest and placement before dispatching to an agent; if
 either write fails, creation is rejected. Deletes wait for the VM actor to
 confirm deletion before removing the placement and manifest records. A failed
 delete intentionally leaves the durable record so it can be reconciled rather
-than losing desired state. Reads that fail during startup leave the local cache
-empty and do not perform destructive cleanup.
+than losing desired state. Reads that fail during startup prevent the affected
+actor from starting.
 
 The storage trait and `MemoryStateStore` provide isolated tests without requiring
 an etcd service. The etcd implementation uses the same versioned serialization,
