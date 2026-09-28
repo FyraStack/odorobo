@@ -129,7 +129,7 @@ impl Actor for AgentActor {
         &mut self,
         _actor_ref: WeakActorRef<Self>,
         err: PanicError,
-    ) -> Result<std::ops::ControlFlow<ActorStopReason>> {
+    ) -> Result<ControlFlow<ActorStopReason>> {
         error!("Agent panicked: {:?}", err);
 
         // todo: if we panic, we should completely regen the self struct from scratch. The assumption should be that memory corruption could have possibly happened becauew
@@ -341,7 +341,7 @@ impl Message<PanicAgent> for AgentActor {
         _msg: PanicAgent,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        tracing::info!("panicking");
+        info!("panicking");
         panic!();
     }
 }

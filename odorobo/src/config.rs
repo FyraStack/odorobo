@@ -177,7 +177,7 @@ impl Config {
     #[must_use]
     pub fn get_hostname(&self) -> &str {
         static HOSTNAME: LazyLock<Option<String>> = LazyLock::new(System::host_name);
-        (self.hostname.as_deref()).unwrap_or_else(|| HOSTNAME.as_deref().unwrap_or("odorobo"))
+        self.hostname.as_deref().unwrap_or_else(|| HOSTNAME.as_deref().unwrap_or("odorobo"))
     }
     #[must_use]
     pub fn get_datacenter(&self) -> &str {
@@ -185,7 +185,7 @@ impl Config {
             warn!("No datacenter specified, defaulting to Dev");
             "Dev"
         });
-        (self.datacenter.as_deref()).unwrap_or_else(|| *DEFAULT_DATACENTER)
+        self.datacenter.as_deref().unwrap_or_else(|| *DEFAULT_DATACENTER)
     }
     #[must_use]
     pub fn get_region(&self) -> &str {
@@ -193,7 +193,7 @@ impl Config {
             warn!("No region specified, defaulting to Local");
             "Local"
         });
-        (self.region.as_deref()).unwrap_or_else(|| *DEFAULT_REGION)
+        self.region.as_deref().unwrap_or_else(|| *DEFAULT_REGION)
     }
     #[must_use]
     pub fn get_reserved_vcpus(&self) -> u32 {

@@ -30,7 +30,7 @@ pub async fn call(
     if body.is_some() {
         request
             .headers_mut()
-            .insert(CONTENT_TYPE, "application/json".parse().unwrap());
+            .insert(CONTENT_TYPE, "application/json".parse()?);
     }
 
     let response = call_request(socket_path, request).await?;

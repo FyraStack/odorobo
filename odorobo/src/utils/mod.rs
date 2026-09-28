@@ -22,8 +22,8 @@ pub enum OdoroboError {
     Report(#[from] Report),
 }
 
-impl<M> From<kameo::error::SendError<M, Report>> for OdoroboError {
-    fn from(value: kameo::error::SendError<M, Report>) -> Self {
+impl<M> From<SendError<M, Report>> for OdoroboError {
+    fn from(value: SendError<M, Report>) -> Self {
         let kameo_error = value.to_string();
         error!(?value);
         Self::Report(

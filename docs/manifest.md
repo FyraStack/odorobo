@@ -92,10 +92,12 @@ For example, storage attachments are listed in preferred disk boot order. Here `
 presented before `data`:
 
 ```json
-"storage": [
-  { "id": "root", "uri": "rbd://vms/root" },
-  { "id": "data", "volume_id": "01J00000000000000000000002" }
-]
+{
+  "storage": [
+    { "id": "root", "uri": "rbd://vms/root" },
+    { "id": "data", "volume_id": "01J00000000000000000000002" }
+  ]
+}
 ```
 
 For example:

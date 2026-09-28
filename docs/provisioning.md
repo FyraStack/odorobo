@@ -5,13 +5,11 @@
 To provision cloud-init-compatible images with Cloud Hypervisor, set the serial number in the VmConfig to a
 cloud-init [line config](https://docs.cloud-init.io/en/latest/reference/datasources/nocloud.html#line-configuration-in-detail).
 
-
 ```json
 {
-  ...
   "platform": {
     "serial_number": "ds=nocloud,..."
-  },
+  }
 }
 ```
 

@@ -72,7 +72,7 @@ impl Actor for DhcpActor {
         &mut self,
         _actor_ref: WeakActorRef<Self>,
         _reason: ActorStopReason,
-    ) -> std::result::Result<(), Self::Error> {
+    ) -> Result<(), Self::Error> {
         if let Some(mut dnsmasq_process) = self.dnsmasq_process.take() {
             dnsmasq_process
                 .start_kill()
@@ -553,7 +553,7 @@ impl Actor for NetworkAgentActor {
         &mut self,
         _actor_ref: WeakActorRef<Self>,
         reason: ActorStopReason,
-    ) -> std::result::Result<(), Self::Error> {
+    ) -> Result<(), Self::Error> {
         match reason {
             ActorStopReason::Normal => {
                 info!(bridge = %self.common.bridge, "stopping network agent");

@@ -194,7 +194,7 @@ mod tests {
         assert_eq!(image.rbd_path(), "my-pool/my-image");
         assert_eq!(
             image.device_path(),
-            std::path::PathBuf::from("/dev/rbd/my-pool/my-image")
+            PathBuf::from("/dev/rbd/my-pool/my-image")
         );
     }
 

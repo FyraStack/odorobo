@@ -71,7 +71,7 @@ fn mainloop(term: &Arc<AtomicBool>, config: Config) -> Result<()> {
 async fn inner_main(config: Config) -> Result<()> {
     tracing::info!("Starting odorobo");
 
-    let local_peer_id = connect_to_swarm().unwrap();
+    let local_peer_id = connect_to_swarm()?;
     tracing::info!(?local_peer_id, "Peer ID");
 
     // start agents

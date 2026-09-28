@@ -29,7 +29,7 @@ use super::api::call_request;
 pub const CONFIG_FILE_NAME: &str = "config.json";
 const SOCKET_FILE_NAME: &str = "ch.sock";
 pub const VMS_DIR_NAME: &str = "vms";
-pub type ConsoleStream = std::fs::File;
+pub type ConsoleStream = File;
 
 const DEFAULT_RUNTIME_ROOT_DIR: &str = "/run/odorobo";
 const RUNTIME_ROOT_ENV_VAR: &str = "ODOROBO_RUNTIME_DIR";
@@ -41,7 +41,7 @@ pub struct VMInstance {
     hook_manager: HookManager,
     child_process: Option<tokio::process::Child>,
     /// Pre-transformed VM config, if available
-    pub vm_config: Option<models::VmConfig>,
+    pub vm_config: Option<VmConfig>,
 }
 
 impl std::fmt::Debug for VMInstance {
@@ -394,7 +394,7 @@ impl VMInstance {
         info!(?ch_socket_path, "Spawning VM");
         // make sure socket path parent exists
         if !ch_socket_path.parent().unwrap().exists() {
-            std::fs::create_dir_all(ch_socket_path.parent().unwrap())?;
+            fs::create_dir_all(ch_socket_path.parent().unwrap())?;
         }
         let ch_process = tokio::process::Command::new("cloud-hypervisor")
             .arg("--api-socket")
@@ -506,7 +506,7 @@ impl VMInstance {
     }
 
     /// Load desired VM config from disk.
-    pub fn load_config(&self) -> Result<models::VmConfig> {
+    pub fn load_config(&self) -> Result<VmConfig> {
         serde_json::from_reader(
             File::open(self.config_path())
                 .wrap_err(eyre!("Failed to read config file for {}", self.vm_id()))?,
@@ -515,7 +515,7 @@ impl VMInstance {
     }
 
     /// Save desired VM config to disk.
-    pub fn save_config(&self, config: &models::VmConfig) -> Result<()> {
+    pub fn save_config(&self, config: &VmConfig) -> Result<()> {
         let file = File::create(self.config_path())
             .wrap_err(eyre!("Failed to open config file for {}", self.vm_id()))?;
         serde_json::to_writer_pretty(BufWriter::new(file), config)
@@ -527,7 +527,7 @@ impl VMInstance {
     /// Applies node-specific transforms, saves config to disk, then:
     /// 1. Creates the VM via CH API
     /// 2. Boots the VM (if boot is true)
-    pub async fn create_config(&mut self, config: models::VmConfig, boot: bool) -> Result<()> {
+    pub async fn create_config(&mut self, config: VmConfig, boot: bool) -> Result<()> {
         trace!(vm_id = self.vm_id(), "Creating VM with provided config");
 
         trace!(vm_id = self.vm_id(), "Applying config transforms");
@@ -560,7 +560,7 @@ impl VMInstance {
 
     /// Dry-apply a VM config without actually setting it in Cloud Hypervisor,
     /// allowing for live migration of the VM.
-    pub async fn prep_config(&mut self, config: models::VmConfig) -> Result<()> {
+    pub async fn prep_config(&mut self, config: VmConfig) -> Result<()> {
         self.vm_config = Some(config.clone());
 
         info!(vm_id = self.vm_id(), "Preparing VM config for migration");

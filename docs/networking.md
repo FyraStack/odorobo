@@ -11,7 +11,6 @@ To use the networking transformer, specify the desired `net://` URI in the `id` 
 
 ```json
 {
-  ...
   "net": [
     {
       "id": "net://devnet",
@@ -25,7 +24,6 @@ Odorobo will automatically detect the `net://` scheme and transform it before VM
 
 ```json
 {
-  ...
   "net": [
     {
       "id": "devnet",
