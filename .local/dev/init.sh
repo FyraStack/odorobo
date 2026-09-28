@@ -21,8 +21,6 @@ if [[ -z "$(losetup -f 2>/dev/null)" ]]; then
   exit 1
 fi
 
-mkdir -p ceph/generated ceph/state/{etc-ceph,lib-ceph,log-ceph,run-ceph,odorobo-ceph}
-
 # Start Ceph independently: `odorobo` depends on its health check, and starting
 # both at once hides a Ceph bootstrap failure behind Compose's dependency wait.
 "${COMPOSE[@]}" up --build -d ceph
@@ -58,12 +56,12 @@ fi
 cat <<EOF
 
 Ceph is ready.
-Config: $ROOT_DIR/ceph/generated/ceph.conf
-Key: $ROOT_DIR/ceph/generated/client.${CEPH_CLIENT:-odorobo}.key
+Credentials live in the  ceph_creds named volume, mounted at /generated
+in both containers.
 
-Generated credentials (for tools running inside the Odorobo container):
-  export CEPH_CONFIG=/workspace/.local/dev/ceph/generated/ceph.conf
+For tools running inside the Odorobo container:
+  export CEPH_CONFIG=/generated/ceph.conf
   export CEPH_ID=${CEPH_CLIENT:-odorobo}
-  export CEPH_KEYFILE=/workspace/.local/dev/ceph/generated/client.${CEPH_CLIENT:-odorobo}.key
+  export CEPH_KEYFILE=/generated/client.${CEPH_CLIENT:-odorobo}.key
   export CEPH_CLUSTER=ceph
 EOF

@@ -20,12 +20,12 @@ services:
       CEPH_IMAGE_SIZE: ${CEPH_IMAGE_SIZE:-1G}
       CEPH_OSD_SIZE: ${CEPH_OSD_SIZE:-10G}
     volumes:
-      - ./ceph/state/etc-ceph:/etc/ceph
-      - ./ceph/state/lib-ceph:/var/lib/ceph
-      - ./ceph/state/log-ceph:/var/log/ceph
-      - ./ceph/state/run-ceph:/run/ceph
-      - ./ceph/state/odorobo-ceph:/var/lib/odorobo-ceph
-      - ./ceph/generated:/generated
+      - ceph_etc:/etc/ceph
+      - ceph_lib:/var/lib/ceph
+      - ceph_log:/var/log/ceph
+      - ceph_run:/run/ceph
+      - ceph_osd:/var/lib/odorobo-ceph
+      - ceph_creds:/generated
       # Direct BlueStore initialization uses a host loop-backed block device.
       - /dev:/dev
 
@@ -50,8 +50,7 @@ services:
     pid: container:odorobo-ceph
     volumes:
       - ../../:/workspace
-      - ./ceph/generated:/workspace/.local/dev/ceph/generated:ro
-      - /run/odorobo:/run/odorobo
+      - ceph_creds:/generated:ro
       - /dev:/dev
       # The rbd CLI runs `modprobe rbd` before mapping; the container's own
       # /lib/modules won't match the host's running kernel, so bind the host's
@@ -60,11 +59,19 @@ services:
       - /lib/modules:/lib/modules:ro
     working_dir: /workspace
     environment:
-      CEPH_CONFIG: /workspace/.local/dev/ceph/generated/ceph.conf
+      CEPH_CONFIG: /generated/ceph.conf
       CEPH_ID: ${CEPH_CLIENT:-odorobo}
-      CEPH_KEYFILE: /workspace/.local/dev/ceph/generated/client.${CEPH_CLIENT:-odorobo}.key
+      CEPH_KEYFILE: /generated/client.${CEPH_CLIENT:-odorobo}.key
       CEPH_CLUSTER: ceph
       # Release compilation is memory-intensive; keep the default usable on
       # development laptops while allowing an override for faster machines.
       CARGO_BUILD_JOBS: ${CARGO_BUILD_JOBS:-2}
     command: ["cargo", "run", "--release", "-p", "odorobo", "--", "--manager-enabled", "true"]
+
+volumes:
+  ceph_etc:
+  ceph_lib:
+  ceph_log:
+  ceph_run:
+  ceph_osd:
+  ceph_creds:

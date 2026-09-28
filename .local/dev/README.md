@@ -25,6 +25,11 @@ sudo losetup -f
 
 The stack must run on a **rootful** engine. Rootless Podman cannot work: the Ceph container attaches the OSD file through a host loop device, and the kernel's loop driver requires `CAP_SYS_ADMIN` in the initial user namespace, which a rootless container never has (even `privileged` + a `/dev` bind mount do not help). Run everything rootful, e.g. `sudo bash .local/dev/init.sh`, and prefix the `podman compose` commands below with `sudo` accordingly.
 
+Two more host requirements:
+
+- **SELinux**: the Ceph entrypoint `chown`s its state directories and drops the daemons to the `ceph` user. On an enforcing SELinux host, container processes (`container_t`) are not allowed to chown host-created files, so bootstrap fails with `Permission denied`. Set the host to permissive (`sudo setenforce 0`, persist with `SELINUX=permissive` in `/etc/selinux/config`) or write a policy for the container domain.
+- **Ceph udev rule (recommended)**: the agent prefers the stable `/dev/rbd/<pool>/<image>` device path, which the host's `udevd` creates from the rbd kernel uevent using Ceph's `50-rbd.rules` and `ceph-rbdnamer` (shipped with the Ceph package). Install them on the host (e.g. `sudo dnf install ceph-common` or copy them from the Ceph container) for stable names; without them the agent falls back to the kernel device name (e.g. `/dev/rbd0`). Note that `rbd device map` with udev enabled (the default) hangs inside containers: the CLI waits for a udev event in its own network namespace, but rbd devices are created in the host's namespace. The agent and `test.sh` therefore map with `--options noudev`.
+
 The Ceph image is based on the official `quay.io/ceph/ceph` image and starts the MON and OSD daemons itself; it intentionally does not start MGR because the MGR's optional Python modules require host udev/system services unavailable in this container. It does not use `cephadm`, nested Podman, or systemd. The OSD uses a persistent raw file attached through a host loop device, initialized directly with `ceph-osd` rather than `ceph-volume`.
 
 ## Usage
@@ -44,11 +49,10 @@ sudo podman compose -f .local/dev/compose.yml start ceph odorobo
 sudo podman compose -f .local/dev/compose.yml stop odorobo ceph
 ```
 
-Destructively remove the containers and all local Ceph state. 
+Destructively remove the containers and all local Ceph state (the named volumes are removed by `--volumes`). 
 
 ```bash
 sudo podman compose -f .local/dev/compose.yml down --remove-orphans --volumes
-sudo rm -rf .local/dev/ceph/generated .local/dev/ceph/state
 ```
 
 Useful direct commands:
@@ -80,7 +84,7 @@ The agent runs as:
 cargo run --release -p odorobo -- --manager-enabled true
 ```
 
-Its runtime directory is shared through `/run/odorobo`, and Cloud Hypervisor processes and RBD devices are visible in the same namespaces as the agent.
+Its runtime directory is container-local (`/run/odorobo` in the `odorobo` container); Cloud Hypervisor processes and RBD devices are visible in the same namespaces as the agent.
 
 ## Verify the image
 
@@ -115,14 +119,33 @@ CEPH_OSD_SIZE=10G
 
 ## End-to-end test
 
-`test.sh` boots Fedora 44 Cloud Base via rust-hypervisor-firmware (UEFI, no
+`test.sh` boots a guest OS via rust-hypervisor-firmware (UEFI, no
 direct kernel boot) from the `odorobo-blockpool/dev-disk` RBD image, then
-hands the serial console to you so you can log in (`fedora`/`fedora`) and
-verify by hand:
+hands the serial console to you so you can log in and verify by hand:
 
 ```bash
 sudo bash .local/dev/test.sh
 ```
+
+The pinned default is Fedora 44 Cloud Base (login `fedora`/`fedora`). Note
+that rust-hypervisor-firmware 0.5.0 currently cannot load the GRUB from newer
+distro images (upstream
+[cloud-hypervisor/rust-hypervisor-firmware#412](https://github.com/cloud-hypervisor/rust-hypervisor-firmware/issues/412),
+tracked in HACKING.md): the firmware finds the EFI partition and bootloader on
+the RBD disk but fails with `Error loading executable: FileError`. The full
+path to the login prompt is verified with Ubuntu 22.04 (jammy) — the image the
+firmware was developed against — via the `IMAGE_URL`/`IMAGE_SHA256` overrides
+(the asset is the qcow2 generic image converted to raw with `qemu-img
+convert -f qcow2 -O raw`, then xz-compressed):
+
+```bash
+IMAGE_URL="https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64-raw.img.xz" \
+IMAGE_SHA256=28bd1513fb0903e37a483279d83fd34b79ddf9785c3d033df99067e14fc1abdc \
+  sudo bash .local/dev/test.sh
+```
+
+(For the jammy run, log in as `ubuntu`/`ubuntu` if the image allows password
+login; the login prompt itself proves the OS booted.)
 
 It fetches and caches the firmware and the image into `test-assets/`, writes
 the image into the pool (host-side `dd` into the mapped RBD device), creates
@@ -138,7 +161,6 @@ cleans up after you detach. See TEST.md for details and overrides.
 - `ceph/entrypoint.sh` — direct MON bootstrap, filesystem-backed OSD initialization, pool/client/image provisioning, and daemon lifecycle.
 - `odorobo/Containerfile` — runnable Odorobo development image.
 - `test-assets/` — firmware and guest image downloaded by `test.sh`; ignored by git.
-- `ceph/generated/` — generated Ceph credentials shared read-only with Odorobo; ignored by git.
-- `ceph/state/` — Ceph configuration, daemons, logs, and file-backed OSD; ignored by git.
+- Ceph state (config, daemons, logs, file-backed OSD) and the generated credentials live in podman named volumes (`ceph_etc`, `ceph_lib`, `ceph_log`, `ceph_run`, `ceph_osd`, `ceph_creds`); `ceph_creds` is shared read-only with Odorobo. They are removed by `compose down --volumes`.
 
 This setup is intentionally not production-ready: it has one monitor, one OSD, no redundancy, and privileged containers.

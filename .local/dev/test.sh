@@ -61,7 +61,7 @@ CEPH_CLIENT="${CEPH_CLIENT:-odorobo}"
 FIRMWARE_PATH_IN_CONTAINER="/workspace/.local/dev/test-assets/hypervisor-fw"
 
 FIRMWARE_FILE="$ASSET_DIR/hypervisor-fw"
-IMAGE_FILE="$ASSET_DIR/Fedora-Cloud-Base-AmazonEC2-44-1.7.x86_64.raw.xz"
+IMAGE_FILE="$ASSET_DIR/$(basename "$IMAGE_URL")"
 
 VMID=""
 ENGINE=()
@@ -110,9 +110,9 @@ in_container() { "${ENGINE[@]}" exec -i odorobo "$@"; }
 # rbd with the generated credentials (mirrors the agent's own rbd invocations).
 rbd() {
   in_container rbd \
-    --conf="/workspace/.local/dev/ceph/generated/ceph.conf" \
+    --conf="/generated/ceph.conf" \
     --id="$CEPH_CLIENT" \
-    --keyfile="/workspace/.local/dev/ceph/generated/client.$CEPH_CLIENT.key" \
+    --keyfile="/generated/client.$CEPH_CLIENT.key" \
     --cluster=ceph "$@"
 }
 
@@ -182,6 +182,7 @@ fi
 # Uncompressed size straight from the xz index (no decompression needed).
 RAW_SIZE_BYTES=$(xz -l "$IMAGE_FILE" | awk 'NR == 2 {
   val = $5; unit = $6
+  gsub(/,/, "", val)   # xz >= 5.8 prints thousands separators (5,120.0 MiB)
   if (unit == "KiB") print val * 1024
   else if (unit == "MiB") print val * 1024 * 1024
   else if (unit == "GiB") print val * 1024 * 1024 * 1024
@@ -210,10 +211,24 @@ else
   rbd device unmap "$CEPH_POOL/$CEPH_IMAGE_NAME" --options noudev >/dev/null 2>&1 || true
 
   log "mapping the RBD and writing the image from the host"
-  rbd device map "$CEPH_POOL/$CEPH_IMAGE_NAME" --options noudev
+  # Map with noudev: with udev enabled, the rbd CLI waits for a udev event
+  # in its own network namespace, which never arrives for a host-created
+  # rbd device inside a container. The host's udevd still creates the
+  # stable path, so wait for it and fall back to the kernel name.
+  DEV_PATH=$(rbd device map "$CEPH_POOL/$CEPH_IMAGE_NAME" --options noudev)
+  for _ in $(seq 1 30); do
+    if [[ -e "/dev/rbd/$CEPH_POOL/$CEPH_IMAGE_NAME" ]]; then
+      DEV_PATH="/dev/rbd/$CEPH_POOL/$CEPH_IMAGE_NAME"
+      break
+    fi
+    sleep 0.5
+  done
+  echo "[test] writing to $DEV_PATH"
   # The mapping is a kernel object and /dev is shared with the host, so a
-  # host-side dd writes straight into the pool.
-  xz -d "$IMAGE_FILE" | dd of="/dev/rbd/$CEPH_POOL/$CEPH_IMAGE_NAME" bs=1M status=progress
+  # host-side dd writes straight into the pool. `xz -dc` keeps the .xz and
+  # sends the decompressed stream to stdout (newer xz writes to a file
+  # otherwise, which would starve the pipe).
+  xz -dc "$IMAGE_FILE" | dd of="$DEV_PATH" bs=1M status=progress
   sync
   # Unmap so the agent performs the mapping itself when the VM is created
   # (the application path under test; see README.md).
@@ -280,7 +295,7 @@ if grep -q '"actor_id":null' <<<"$RESPONSE"; then
   die "agent accepted the manifest but created no VM actor: $RESPONSE"
 fi
 log "VM created: $VMID"
-echo "    console: /run/odorobo/vms/$VMID/console.sock"
+echo "    console (in the odorobo container): /run/odorobo/vms/$VMID/console.sock"
 
 # --- 4. watch the boot --------------------------------------------------------
 log "waiting for the firmware boot (up to ${BOOT_TIMEOUT}s)"
@@ -320,12 +335,33 @@ echo "  (if the image locks password login, the login prompt itself still"
 echo "   proves the OS booted; a keypair via cloud-init would be needed)"
 echo "  Detach with:  Ctrl-C"
 echo
-# CH's serial socket serves one client at a time: connecting here takes the
-# console over from the agent's spool.
-if command -v socat >/dev/null 2>&1; then
-  socat -,raw,echo=0 "UNIX-CONNECT:/run/odorobo/vms/$VMID/console.sock" || true
+# The agent's runtime dir is container-local (no host bind mount), so relay
+# the serial socket through the odorobo container. CH's serial socket serves
+# one client at a time: connecting here takes the console over from the
+# agent's spool.
+CONSOLE_SOCKET="/run/odorobo/vms/$VMID/console.sock"
+if "${ENGINE[@]}" exec -i odorobo sh -c 'command -v socat' >/dev/null 2>&1; then
+  "${ENGINE[@]}" exec -i odorobo socat -,raw,echo=0 "UNIX-CONNECT:$CONSOLE_SOCKET" || true
+elif "${ENGINE[@]}" exec -i odorobo sh -c 'command -v python3' >/dev/null 2>&1; then
+  "${ENGINE[@]}" exec -i odorobo python3 -c '
+import os, select, socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(sys.argv[1])
+while True:
+    r, _, _ = select.select([0, s], [], [])
+    for src in r:
+        data = os.read(0, 4096) if src == 0 else s.recv(4096)
+        if not data:
+            os._exit(0)
+        if src == 0:
+            os.write(1, data)
+        else:
+            s.sendall(data)
+' "$CONSOLE_SOCKET" || true
 else
-  nc -U -q 1 "/run/odorobo/vms/$VMID/console.sock" || true
+  echo "[test] neither socat nor python3 is available in the container;"
+  echo "      re-attach manually once one is installed, e.g. with socat:"
+  echo "    ${ENGINE[0]} exec -it odorobo sh -c \"socat -,raw,echo=0 UNIX-CONNECT:$CONSOLE_SOCKET\""
 fi
 
 # --- 6. cleanup ----------------------------------------------------------------

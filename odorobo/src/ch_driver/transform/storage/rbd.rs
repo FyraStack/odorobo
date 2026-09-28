@@ -167,6 +167,11 @@ impl TryFrom<&Url> for RbdImage {
 
 pub struct RbdStorage;
 
+/// How long to wait for the host's udev to create the stable
+/// `/dev/rbd/<pool>/<image>` path before falling back to the kernel
+/// device name.
+const UDEV_SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 #[async_trait]
 impl StorageDriver for RbdStorage {
     fn scheme(&self) -> &'static str {
@@ -176,7 +181,36 @@ impl StorageDriver for RbdStorage {
     async fn resolve(&self, uri: &Url) -> Result<PathBuf> {
         let image = RbdImage::try_from(uri)?;
         image.map().await?;
-        Ok(image.device_path())
+        // map() uses `--options noudev`: with udev enabled, the rbd CLI waits
+        // for a udev event in its own network namespace, but rbd devices are
+        // created in the host's namespace, so that wait never completes in a
+        // container. The kernel uevent still reaches the host's udevd, so the
+        // stable path appears shortly after the map. Wait for it, and fall
+        // back to the kernel device name (e.g. /dev/rbd0) when the host has
+        // no ceph udev rule.
+        let udev_path = image.device_path();
+        let deadline = std::time::Instant::now() + UDEV_SETTLE_TIMEOUT;
+        loop {
+            if udev_path.exists() {
+                return Ok(udev_path);
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let device = rbd_map_list().await?
+            .into_iter()
+            .find(|(path, _)| path == &image.rbd_path())
+            .map(|(_, device)| device)
+            .ok_or_else(|| {
+                eyre!(
+                    "RBD image {} is mapped but no device name was found",
+                    image.rbd_path()
+                )
+            })?;
+        info!(?device, "udev path not available, using kernel device name");
+        Ok(PathBuf::from(device))
     }
 
     async fn release(&self, uri: &Url) -> Result<()> {
