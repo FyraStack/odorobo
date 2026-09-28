@@ -29,6 +29,7 @@ use odorobo::cluster_state::{ClusterStateStore, MemoryStateStore, StateStore, Tl
 
 fn main() -> Result<()> {
     let config = Config::init();
+    let _sentry_guard = init_sentry(config.sentry_dsn.as_deref());
 
     init(Some("odorobo"))?;
     let term = utils::lockfile::register_termsigs()?;
@@ -37,6 +38,17 @@ fn main() -> Result<()> {
     })?;
 
     mainloop(&term, config)
+}
+
+fn init_sentry(dsn: Option<&str>) -> Option<sentry::ClientInitGuard> {
+    let dsn = dsn?;
+    let mut options = sentry::ClientOptions::default();
+    options.release = sentry::release_name!();
+    options.send_default_pii = false;
+
+    let guard = sentry::init((dsn, options));
+    tracing::info!("Sentry error reporting enabled");
+    Some(guard)
 }
 
 fn mainloop(term: &Arc<AtomicBool>, config: Config) -> Result<()> {

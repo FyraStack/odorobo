@@ -132,6 +132,10 @@ pub struct Config {
     /// The region the agent is running in.
     #[clap(long)]
     pub region: Option<String>,
+    /// Sentry DSN used for error reporting.
+    #[clap(skip)]
+    #[serde(default)]
+    pub sentry_dsn: Option<String>,
     /// The number of VCPUs reserved for the agent. Defaults to 2.
     #[clap(long)]
     pub reserved_vcpus: Option<u32>,

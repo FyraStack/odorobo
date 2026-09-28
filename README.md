@@ -41,6 +41,12 @@ sudo ./target/release/odorobo --manager-enabled # or set ODOROBO_MANAGER_ENABLED
 sudo ./target/release/odorobo
 ```
 
+### Sentry error reporting
+
+Sentry is initialized with the project DSN from the `sentry_dsn` field in
+`odorobo/config.json`. Odorobo does not send default PII to Sentry, including
+user IPs or potentially sensitive HTTP headers.
+
 You can run multiple managers for load balancing and HA, but it is not required.
 
 Install the CLI helper
