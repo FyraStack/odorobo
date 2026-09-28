@@ -199,7 +199,8 @@ impl StorageDriver for RbdStorage {
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        let device = rbd_map_list().await?
+        let device = rbd_map_list()
+            .await?
             .into_iter()
             .find(|(path, _)| path == &image.rbd_path())
             .map(|(_, device)| device)
