@@ -112,6 +112,8 @@ impl RbdImage {
             .args(rbd_extra_args())
             .arg("device")
             .arg("map")
+            .arg("--options")
+            .arg("noudev")
             .arg(&rbd_path)
             .output()
             .await
@@ -132,6 +134,8 @@ impl RbdImage {
             .args(rbd_extra_args())
             .arg("device")
             .arg("unmap")
+            .arg("--options")
+            .arg("noudev")
             .arg(&rbd_path)
             .output()
             .await
@@ -172,7 +176,33 @@ impl StorageDriver for RbdStorage {
     async fn resolve(&self, uri: &Url) -> Result<PathBuf> {
         let image = RbdImage::try_from(uri)?;
         image.map().await?;
-        Ok(image.device_path())
+        // map() uses `--options noudev`: with udev enabled, the rbd CLI waits
+        // for a udev event in its own network namespace, but rbd devices are
+        // created in the host's namespace, so that wait never completes in a
+        // container. The kernel uevent still reaches the host's udevd, so the
+        // stable path appears shortly after the map. Wait up to 10s (100 x
+        // 100ms steps) for it, and fall back to the kernel device name (e.g.
+        // /dev/rbd0) when the host has no ceph udev rule.
+        let udev_path = image.device_path();
+        for _ in 0..100 {
+            if udev_path.exists() {
+                return Ok(udev_path);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let device = rbd_map_list()
+            .await?
+            .into_iter()
+            .find(|(path, _)| path == &image.rbd_path())
+            .map(|(_, device)| device)
+            .ok_or_else(|| {
+                eyre!(
+                    "RBD image {} is mapped but no device name was found",
+                    image.rbd_path()
+                )
+            })?;
+        info!(?device, "udev path not available, using kernel device name");
+        Ok(PathBuf::from(device))
     }
 
     async fn release(&self, uri: &Url) -> Result<()> {
