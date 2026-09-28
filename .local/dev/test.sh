@@ -54,6 +54,7 @@ SKIP_IMAGE_WRITE="${SKIP_IMAGE_WRITE:-0}"
 # --- Ceph coordinates (match compose.yml defaults) ---------------------------
 CEPH_POOL="${CEPH_POOL:-odorobo-blockpool}"
 CEPH_IMAGE_NAME="${CEPH_IMAGE_NAME:-dev-disk}"
+CEPH_CLIENT="${CEPH_CLIENT:-odorobo}"
 
 # The repo is mounted at /workspace in the odorobo container; the agent
 # requires an absolute firmware path, so point at the mounted copy.
@@ -98,12 +99,22 @@ teardown_vm() {
       "http://127.0.0.1:3000/vms/$VMID" >/dev/null 2>&1 || true
   fi
   # Defensive unmap in case the agent teardown did not release the RBD.
-  "${ENGINE[@]}" exec -i odorobo rbd device unmap \
-    "$CEPH_POOL/$CEPH_IMAGE_NAME" --options noudev >/dev/null 2>&1 || true
+  rbd device unmap "$CEPH_POOL/$CEPH_IMAGE_NAME" --options noudev >/dev/null 2>&1 || true
 }
 
-# Run a command inside the odorobo container (inheriting its CEPH_* env).
+# Run a command inside the odorobo container. Note: `exec` does NOT inherit
+# the compose environment (CEPH_CONFIG et al.), and the ceph CLI reads
+# CEPH_CONF/CEPH_KEYRING anyway, so rbd calls pass credentials explicitly.
 in_container() { "${ENGINE[@]}" exec -i odorobo "$@"; }
+
+# rbd with the generated credentials (mirrors the agent's own rbd invocations).
+rbd() {
+  in_container rbd \
+    --conf="/workspace/.local/dev/ceph/generated/ceph.conf" \
+    --id="$CEPH_CLIENT" \
+    --keyfile="/workspace/.local/dev/ceph/generated/client.$CEPH_CLIENT.key" \
+    --cluster=ceph "$@"
+}
 
 # --- 0. preflight ------------------------------------------------------------
 [[ $(id -u) -eq 0 ]] || die "run as root (sudo bash $0)"
@@ -116,7 +127,7 @@ else
   die "podman (or docker) compose is required on the host"
 fi
 
-for tool in curl xz dd; do
+for tool in curl xz dd strings; do
   command -v "$tool" >/dev/null 2>&1 || die "host tool missing: $tool"
 done
 if ! command -v socat >/dev/null 2>&1 && ! command -v nc >/dev/null 2>&1; then
@@ -184,29 +195,29 @@ if [[ "$SKIP_IMAGE_WRITE" == "1" ]]; then
   log "SKIP_IMAGE_WRITE=1; reusing the existing RBD contents"
 else
   log "preparing the RBD image"
-  current_size=$(in_container rbd info --format=json "$CEPH_POOL/$CEPH_IMAGE_NAME" \
+  current_size=$(rbd info --format=json "$CEPH_POOL/$CEPH_IMAGE_NAME" \
     | grep -o '"size":[[:space:]]*[0-9]*' | head -1 | grep -o '[0-9]*')
   [[ -n "$current_size" ]] || die "rbd info failed for $CEPH_POOL/$CEPH_IMAGE_NAME"
   if (( current_size < RAW_SIZE_BYTES )); then
     target_gib=$(( (RAW_SIZE_BYTES + 1073741824 - 1) / 1073741824 + 1 ))
     echo "[test] resizing $CEPH_POOL/$CEPH_IMAGE_NAME: $((current_size / 1024 / 1024)) MiB -> ${target_gib}G"
-    in_container rbd resize "$CEPH_POOL/$CEPH_IMAGE_NAME" --size "${target_gib}G"
+    rbd resize "$CEPH_POOL/$CEPH_IMAGE_NAME" --size "${target_gib}G"
   else
     echo "[test] RBD is $((current_size / 1024 / 1024)) MiB; no resize needed"
   fi
 
   # Clear any stale mapping (e.g. left by a previous run or a reset).
-  in_container rbd device unmap "$CEPH_POOL/$CEPH_IMAGE_NAME" --options noudev >/dev/null 2>&1 || true
+  rbd device unmap "$CEPH_POOL/$CEPH_IMAGE_NAME" --options noudev >/dev/null 2>&1 || true
 
   log "mapping the RBD and writing the image from the host"
-  in_container rbd device map "$CEPH_POOL/$CEPH_IMAGE_NAME" --options noudev
+  rbd device map "$CEPH_POOL/$CEPH_IMAGE_NAME" --options noudev
   # The mapping is a kernel object and /dev is shared with the host, so a
   # host-side dd writes straight into the pool.
   xz -d "$IMAGE_FILE" | dd of="/dev/rbd/$CEPH_POOL/$CEPH_IMAGE_NAME" bs=1M status=progress
   sync
   # Unmap so the agent performs the mapping itself when the VM is created
   # (the application path under test; see README.md).
-  in_container rbd device unmap "$CEPH_POOL/$CEPH_IMAGE_NAME" --options noudev
+  rbd device unmap "$CEPH_POOL/$CEPH_IMAGE_NAME" --options noudev
   log "image written to $CEPH_POOL/$CEPH_IMAGE_NAME"
 fi
 
@@ -259,9 +270,10 @@ EOF
 RESPONSE=$(printf '%s' "$MANIFEST" | in_container curl -s -X POST \
   -H 'Content-Type: application/json' --data-binary @- http://127.0.0.1:3000/vms)
 echo "$RESPONSE" | head -c 400; echo
-# The agent serializes the create result as {"Ok": ...} / {"Err": ...};
-# requiring "Ok" also catches opaque 500 error bodies.
-if ! grep -q '"Ok"' <<<"$RESPONSE"; then
+# The agent returns CreateVMReply {"config":..., "actor_id":...} on success
+# and {"message":...} on error; requiring "actor_id" also catches opaque
+# 500 error bodies.
+if ! grep -q '"actor_id"' <<<"$RESPONSE"; then
   die "agent create failed: $RESPONSE"
 fi
 if grep -q '"actor_id":null' <<<"$RESPONSE"; then
@@ -336,7 +348,7 @@ fi
 if [[ "${answer^^}" == "Y" ]]; then
   log "deleting the VM"
   "${ENGINE[@]}" exec -i odorobo curl -s -X DELETE "http://127.0.0.1:3000/vms/$VMID" >/dev/null
-  in_container rbd device unmap "$CEPH_POOL/$CEPH_IMAGE_NAME" --options noudev >/dev/null 2>&1 || true
+  rbd device unmap "$CEPH_POOL/$CEPH_IMAGE_NAME" --options noudev >/dev/null 2>&1 || true
   log "done. The RBD image still contains the Fedora image, so the next run can use SKIP_IMAGE_WRITE=1"
 else
   log "leaving the VM running (re-attach command above still applies)"

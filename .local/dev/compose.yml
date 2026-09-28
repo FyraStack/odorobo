@@ -39,6 +39,7 @@ services:
     build:
       context: ./odorobo
       dockerfile: Containerfile
+    container_name: odorobo
     privileged: true
     depends_on:
       ceph:
