@@ -3,6 +3,7 @@ permissions:
   contents: read
 on:
   push:
+  workflow_dispatch:
 
 jobs:
   rust:
@@ -10,12 +11,13 @@ jobs:
       security-events: write
       contents: read
       packages: read
+
     uses: FyraLabs/actions/.github/workflows/rust.yml@main
     with:
-      test-pre: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      test-pre: sudo dnf install -y protobuf-compiler
       test-cache: true
       test-riscv-rva23: true
-      test-riscv-builder-image: ghcr.io/fyralabs/rva23-builder@sha256:206d17485eb31e7b7aaad2fc8563471e71e0815574e15dd1328b97fc56696827
+      test-riscv-builder-image: ghcr.io/fyralabs/rva23-builder@sha256:807797111a49bd11b2a2b0bfcf79cc7be7ea6ab7beb1d38b8871d87961997460
 
       test-riscv-artifact-name: odorobo-riscv-rva23
       test-riscv-artifact-paths: |
