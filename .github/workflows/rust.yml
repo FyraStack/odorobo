@@ -17,7 +17,7 @@ jobs:
       test-pre: sudo dnf update && sudo dnf install -y protobuf-compiler
       test-cache: true
       test-riscv-rva23: true
-      test-riscv-builder-image: ghcr.io/fyralabs/rva23-builder@sha256:a921a5f4674abc5dd7bd2ebcfb9707b52cf2df18c6c2e7302902f5da9e563711
+      test-riscv-builder-image: ghcr.io/fyralabs/rva23-builder@sha256:807797111a49bd11b2a2b0bfcf79cc7be7ea6ab7beb1d38b8871d87961997460
 
       test-riscv-artifact-name: odorobo-riscv-rva23
       test-riscv-artifact-paths: |
