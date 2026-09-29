@@ -273,13 +273,22 @@ impl SchedulerActor {
             .vm_data_cache
             .get(&vmid)
             .is_some_and(|entries| entries.iter().any(|entry| entry.actor_ref.is_some()));
-        if !has_discovered_actor {
-            if let Some(entries) = self.vm_placements.get_mut(&vmid) {
-                entries.retain(|entry| entry.lifecycle == VmLifecycle::Pending);
-                Self::shrink_non_migrating_entries(entries);
-            }
-            self.invalidate_pending_resources();
+        if has_discovered_actor {
+            return;
         }
+        if let Some(entries) = self.vm_placements.get_mut(&vmid) {
+            // Agent status may still represent a running VM actor that has not
+            // been discovered yet, so do not remove that placement blindly.
+            entries.retain(|entry| {
+                entry.lifecycle == VmLifecycle::Pending
+                    || self
+                        .agent_vm_index
+                        .get(&entry.agent_id)
+                        .is_some_and(|vmids| vmids.contains(&vmid))
+            });
+            Self::shrink_non_migrating_entries(entries);
+        }
+        self.invalidate_pending_resources();
     }
 
     /// Incorporates additions and removals from a status delta into placement observations.
