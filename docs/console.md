@@ -19,6 +19,14 @@ For a VM with ID `01KPBBXKK0R0M09VN7G6R6R3JF`, the serial console socket will be
 
 This path is stable for the lifetime of the VM runtime directory and is derived from the VM ID.
 
+## Why a serial socket
+
+Odorobo uses Cloud Hypervisor's socket-backed serial mode rather than host TTY
+passthrough. TTY passthrough does not work reliably with systemd-managed VM
+processes and is incompatible with live migration. A graphical console is not
+an alternative because Cloud Hypervisor does not provide QXL or virtio-gpu
+support.
+
 ## Direct host access
 
 To connect directly to the guest serial console on the host, connect to the socket with `socat`:

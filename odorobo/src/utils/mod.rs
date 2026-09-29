@@ -13,10 +13,13 @@ use tracing::level_filters::LevelFilter;
 use tracing::{debug, error, info, trace, warn};
 use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
-// todo: wrap with axum-responses, return this type on request failure
+/// Application error returned by request handlers.
 #[derive(Error, Debug, ApiError, OperationIo)]
 #[aide(output)]
 pub enum OdoroboError {
+    #[error("{0}")]
+    #[api_error(status_code = 404, message = "{0}")]
+    NotFound(String),
     #[error("{0}")]
     #[api_error(status_code = 500, message = "{0}")]
     Report(#[from] Report),
@@ -45,6 +48,10 @@ mod tests {
         Err(OdoroboError::Report(Report::msg("error!")))
     }
 
+    async fn not_found_handler() -> Result<(), OdoroboError> {
+        Err(OdoroboError::NotFound("missing".to_owned()))
+    }
+
     #[tokio::test]
     async fn test_error() {
         let response = Router::new()
@@ -59,6 +66,17 @@ mod tests {
         let html = String::from_utf8(bytes.to_vec()).unwrap();
 
         assert_eq!(html, "{\"message\":\"error!\"}");
+    }
+
+    #[tokio::test]
+    async fn test_not_found_error() {
+        let response = Router::new()
+            .route("/", get(not_found_handler))
+            .oneshot(Request::get("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }
 
