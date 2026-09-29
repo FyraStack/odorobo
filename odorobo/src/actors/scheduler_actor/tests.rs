@@ -64,10 +64,10 @@ fn expires_unresolved_vm_placeholder_but_retains_vm_intent() {
             last_confirmed_at: None,
         }],
     );
-    let mut manifests = AHashMap::from([(vmid, test_manifest(1, 1))]);
+    let manifests = AHashMap::from([(vmid, test_manifest(1, 1))]);
     let mut data_cache: AHashMap<Ulid, Vec<CachedVMActor>> = AHashMap::new();
 
-    SchedulerActor::cleanup_unresolved_vm_cache(&mut manifests, &mut placements, &mut data_cache);
+    SchedulerActor::cleanup_unresolved_vm_cache(&mut placements, &mut data_cache);
 
     assert!(manifests.contains_key(&vmid));
     assert!(placements[&vmid].is_empty());

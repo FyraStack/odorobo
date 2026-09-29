@@ -379,11 +379,7 @@ impl Message<ReconcileVmPlacements> for SchedulerActor {
     type Reply = ();
 
     async fn handle(&mut self, _msg: ReconcileVmPlacements, _ctx: &mut Context<Self, Self::Reply>) {
-        Self::cleanup_unresolved_vm_cache(
-            &mut self.vm_manifests,
-            &mut self.vm_placements,
-            &mut self.vm_data_cache,
-        );
+        Self::cleanup_unresolved_vm_cache(&mut self.vm_placements, &mut self.vm_data_cache);
         self.invalidate_pending_resources();
 
         let unplaced_vms: Vec<_> = self
@@ -414,12 +410,12 @@ impl Message<ReconcileVmPlacements> for SchedulerActor {
                         .entry(vmid)
                         .or_default()
                         .push(CachedVMActor { actor_ref: None });
-                    self.invalidate_pending_resources();
-
                     if let Err(error) = agent.tell(&request).send() {
                         warn!(?error, %vmid, "failed to recreate unplaced VM");
                         self.vm_placements.insert(vmid, Vec::new());
                         self.vm_data_cache.remove(&vmid);
+                    } else {
+                        // The next iteration must account for this new pending reservation.
                         self.invalidate_pending_resources();
                     }
                 }

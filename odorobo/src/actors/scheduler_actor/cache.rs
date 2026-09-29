@@ -13,7 +13,9 @@ use crate::manifest::VmManifest;
 
 use super::{CachedVMActor, SchedulerActor, VmLifecycle, VmPlacement};
 
+// Pending creates are given time to appear in an agent status update.
 const UNRESOLVED_VM_CACHE_TIMEOUT: Duration = Duration::from_secs(120);
+// Previously observed VMs are expired promptly when repeated status updates omit them.
 const UNCONFIRMED_RUNNING_PLACEMENT_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl SchedulerActor {
@@ -56,7 +58,6 @@ impl SchedulerActor {
     /// the manifest remains scheduler intent, allowing periodic reconciliation to
     /// dispatch a replacement create request.
     pub(super) fn cleanup_unresolved_vm_cache(
-        _manifests: &mut AHashMap<Ulid, VmManifest>,
         placements: &mut AHashMap<Ulid, Vec<VmPlacement>>,
         data_cache: &mut AHashMap<Ulid, Vec<CachedVMActor>>,
     ) {
@@ -375,11 +376,13 @@ impl SchedulerActor {
             .iter_mut()
             .filter_map(|(vmid, entries)| {
                 entries.retain_mut(|entry| {
-                    if entry.agent_id != agent_id || observed.contains(vmid) {
-                        if entry.agent_id == agent_id {
-                            entry.lifecycle = VmLifecycle::Running;
-                            entry.last_confirmed_at = Some(now);
-                        }
+                    if entry.agent_id != agent_id {
+                        return true;
+                    }
+
+                    if observed.contains(vmid) {
+                        entry.lifecycle = VmLifecycle::Running;
+                        entry.last_confirmed_at = Some(now);
                         return true;
                     }
 
