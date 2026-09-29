@@ -23,10 +23,11 @@ mod scheduling;
 #[cfg(test)]
 mod tests;
 
-use std::time::Instant;
+use std::{sync::Arc, time::Instant};
 
 use ahash::{AHashMap, AHashSet};
 use kameo::prelude::*;
+use odorobo::cluster_state::{PlacementRecord, StateStore};
 use tokio::task::JoinHandle;
 use ulid::Ulid;
 
@@ -146,6 +147,8 @@ pub struct SchedulerActor {
     pub vm_manifests: AHashMap<Ulid, VmManifest>,
     /// Desired and observed VM placements; multiple entries allow migration.
     pub vm_placements: AHashMap<Ulid, Vec<VmPlacement>>,
+    /// Durable hostname assignments used to rebuild actor-specific placements.
+    pub durable_placements: AHashMap<Ulid, PlacementRecord>,
     /// VM actor references. `None` marks a placement awaiting discovery.
     pub vm_data_cache: AHashMap<Ulid, Vec<CachedVMActor>>,
     /// Polling tasks that refresh corresponding VM actor cache entries.
@@ -160,4 +163,6 @@ pub struct SchedulerActor {
     actor_kinds: AHashMap<ActorId, CachedActorKind>,
     /// Background discovery and reconciliation task.
     pub cache_actor_finder: Option<JoinHandle<()>>,
+    /// Durable cluster state shared with agents for VM placement recovery.
+    pub state_store: Arc<StateStore>,
 }

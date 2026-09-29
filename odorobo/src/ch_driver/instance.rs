@@ -335,6 +335,17 @@ impl VMInstance {
         &self.ch_socket_path
     }
 
+    /// Returns whether a Cloud Hypervisor VMM is already serving this VM's
+    /// runtime socket. This lets a restarted agent reattach instead of spawning
+    /// a second process for the same VM.
+    pub async fn is_running(id: &str) -> bool {
+        let socket = Self::runtime_dir_for(id).join(SOCKET_FILE_NAME);
+        cloud_hypervisor_client::socket_based_api_client(socket)
+            .vmm_ping_get()
+            .await
+            .is_ok()
+    }
+
     async fn stop_child_after_failed_start(&mut self) {
         if let Some(mut child) = self.child_process.take() {
             _ = child.start_kill();
@@ -392,6 +403,10 @@ impl VMInstance {
     ) -> Result<Self> {
         let ch_socket_path = Self::runtime_dir_for(id).join(SOCKET_FILE_NAME);
         info!(?ch_socket_path, "Spawning VM");
+        if Self::is_running(id).await {
+            info!(vm_id = id, "Attaching to existing Cloud Hypervisor VMM");
+            return Ok(Self::new(id, ch_socket_path, transformer, None));
+        }
         // make sure socket path parent exists
         if !ch_socket_path.parent().unwrap().exists() {
             std::fs::create_dir_all(ch_socket_path.parent().unwrap())?;
@@ -436,30 +451,40 @@ impl VMInstance {
             vm_id = self.vm_id(),
             "Destroying VM instance, shutting down VM and cleaning up runtime state"
         );
-        if let Ok(info) = self.info().await {
-            trace!(vm_id = self.vm_id(), state = ?info.state, "Checking VM state before destroy");
-            self.hook_manager.before_stop(self.vm_id(), &info).await?;
-            if matches!(
-                info.state,
-                models::VmState::Running | models::VmState::Paused
-            ) {
-                info!(vm_id = self.vm_id(), "Shutting down VM before destroy");
-                self.shutdown().await?;
+        match self.info().await {
+            Ok(info) => {
+                trace!(vm_id = self.vm_id(), state = ?info.state, "Checking VM state before destroy");
+                self.hook_manager.before_stop(self.vm_id(), &info).await?;
+                if matches!(
+                    info.state,
+                    models::VmState::Running | models::VmState::Paused
+                ) {
+                    info!(vm_id = self.vm_id(), "Shutting down VM before destroy");
+                    self.shutdown().await?;
+                }
             }
-        } else {
-            warn!(
+            Err(error) if self.child_process.is_none() && self.ch_socket_path.exists() => {
+                return Err(error.wrap_err("cannot confirm attached VMM state before deletion"));
+            }
+            Err(error) => warn!(
                 vm_id = self.vm_id(),
-                "Failed to get VM info before destroy, proceeding with shutdown and cleanup anyway"
-            );
+                ?error,
+                "VMM is already stopped; proceeding with cleanup"
+            ),
         }
 
-        if matches!(self.conn().shutdown_vmm().await, Ok(())) {
-            debug!(vm_id = self.vm_id(), "VMM shutdown successfully");
-        } else {
+        if let Err(error) = self.conn().shutdown_vmm().await {
+            if self.child_process.is_none() && self.ch_socket_path.exists() {
+                return Err(eyre!(ChApiError::from(error))
+                    .wrap_err("failed to confirm attached VMM shutdown"));
+            }
             warn!(
                 vm_id = self.vm_id(),
-                "Failed to shutdown VMM, assuming it is already stopped or unresponsive"
+                ?error,
+                "Failed to request VMM shutdown; terminating owned process"
             );
+        } else {
+            debug!(vm_id = self.vm_id(), "VMM shutdown successfully");
         }
         let vm_config = self.vm_config.clone().unwrap_or_default();
         if let Some(mut child) = self.child_process.take() {

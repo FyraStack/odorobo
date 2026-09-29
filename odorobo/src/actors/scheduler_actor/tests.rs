@@ -14,8 +14,9 @@ use crate::messages::agent::AgentStatus;
 use crate::types::ObjectMetadata;
 use ahash::{AHashMap, AHashSet};
 use bytesize::ByteSize;
-use std::collections::BTreeMap;
+use odorobo::cluster_state::{MemoryStateStore, StateStore};
 use std::time::{Duration, Instant};
+use std::{collections::BTreeMap, sync::Arc};
 use ulid::Ulid;
 
 fn test_manifest(vcpus: u32, memory_bytes: u64) -> VmManifest {
@@ -333,6 +334,7 @@ fn vm_cleanup_unplaces_vm_without_another_discovered_actor() {
         agent_keepalive_tasks: AHashMap::new(),
         vm_actorid_ulid_map: AHashMap::from([(vm_actor_id, vmid)]),
         vm_manifests: AHashMap::from([(vmid, test_manifest(1, 1))]),
+        durable_placements: AHashMap::new(),
         vm_placements: AHashMap::from([(
             vmid,
             vec![VmPlacement {
@@ -348,6 +350,7 @@ fn vm_cleanup_unplaces_vm_without_another_discovered_actor() {
         agent_vm_index: AHashMap::new(),
         actor_kinds: AHashMap::new(),
         cache_actor_finder: None,
+        state_store: Arc::new(StateStore::Memory(MemoryStateStore::default())),
     };
 
     scheduler.cleanup_vm_actor(vm_actor_id);
@@ -418,6 +421,7 @@ fn explicit_stop_removes_vm_intent_and_actor_mapping() {
         agent_keepalive_tasks: AHashMap::new(),
         vm_actorid_ulid_map: AHashMap::from([(vm_actor_id, vmid)]),
         vm_manifests: AHashMap::from([(vmid, test_manifest(1, 1))]),
+        durable_placements: AHashMap::new(),
         vm_placements: AHashMap::from([(vmid, Vec::new())]),
         vm_data_cache: AHashMap::from([(vmid, vec![CachedVMActor { actor_ref: None }])]),
         vm_keepalive_tasks: AHashMap::new(),
@@ -425,6 +429,7 @@ fn explicit_stop_removes_vm_intent_and_actor_mapping() {
         agent_vm_index: AHashMap::from([(agent_id, AHashSet::from([vmid]))]),
         actor_kinds: AHashMap::new(),
         cache_actor_finder: None,
+        state_store: Arc::new(StateStore::Memory(MemoryStateStore::default())),
     };
 
     scheduler.remove_vm_intent(vmid);
@@ -456,12 +461,14 @@ fn agent_cleanup_does_not_remove_unrelated_vm_state() {
                 last_confirmed_at: Some(Instant::now()),
             }],
         )]),
+        durable_placements: AHashMap::new(),
         vm_data_cache: AHashMap::from([(vmid, vec![CachedVMActor { actor_ref: None }])]),
         vm_keepalive_tasks: AHashMap::new(),
         pending_resources_cache: None,
         agent_vm_index: AHashMap::new(),
         actor_kinds: AHashMap::from([(agent_id, CachedActorKind::Agent)]),
         cache_actor_finder: None,
+        state_store: Arc::new(StateStore::Memory(MemoryStateStore::default())),
     };
 
     scheduler.cleanup_agent_actor(agent_id);
@@ -470,6 +477,7 @@ fn agent_cleanup_does_not_remove_unrelated_vm_state() {
     assert!(scheduler.vm_manifests.contains_key(&vmid));
     assert!(scheduler.vm_actorid_ulid_map.contains_key(&vm_actor_id));
     assert!(scheduler.vm_data_cache.contains_key(&vmid));
+    drop(scheduler);
 }
 
 #[test]
@@ -483,12 +491,14 @@ fn vm_cleanup_does_not_remove_unrelated_agent_state() {
         vm_actorid_ulid_map: AHashMap::from([(vm_actor_id, vmid)]),
         vm_manifests: AHashMap::from([(vmid, test_manifest(1, 1))]),
         vm_placements: AHashMap::new(),
+        durable_placements: AHashMap::new(),
         vm_data_cache: AHashMap::from([(vmid, vec![CachedVMActor { actor_ref: None }])]),
         vm_keepalive_tasks: AHashMap::new(),
         pending_resources_cache: None,
         agent_vm_index: AHashMap::new(),
         actor_kinds: AHashMap::from([(agent_id, CachedActorKind::Agent)]),
         cache_actor_finder: None,
+        state_store: Arc::new(StateStore::Memory(MemoryStateStore::default())),
     };
 
     scheduler.cleanup_vm_actor(vm_actor_id);
@@ -496,6 +506,7 @@ fn vm_cleanup_does_not_remove_unrelated_agent_state() {
     assert!(scheduler.actor_kinds.contains_key(&agent_id));
     assert!(scheduler.vm_manifests.contains_key(&vmid));
     assert!(scheduler.vm_data_cache.contains_key(&vmid));
+    drop(scheduler);
 }
 
 #[test]

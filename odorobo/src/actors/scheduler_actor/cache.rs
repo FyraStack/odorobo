@@ -265,7 +265,6 @@ impl SchedulerActor {
         let vmid = self.vm_actorid_ulid_map.remove(&actor_id);
         self.invalidate_pending_resources();
         Self::remove_vm_actor(actor_id, &mut self.vm_data_cache);
-
         let Some(vmid) = vmid else {
             return;
         };

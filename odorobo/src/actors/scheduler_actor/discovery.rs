@@ -10,7 +10,7 @@ use tracing::{trace, warn};
 use crate::actors::agent_actor::AgentActor;
 use crate::ch_driver::actor::VMActor;
 use crate::messages::agent::{AgentStatusUpdate, GetAgentStatus, apply_status_update};
-use crate::messages::vm::{GetVMHeartbeat, GetVMInfo};
+use crate::messages::vm::{CreateVM, GetVMHeartbeat, GetVMInfo};
 use crate::utils::actor_names::{AGENT, VM};
 
 use super::{
@@ -20,6 +20,71 @@ use super::{
 };
 
 impl SchedulerActor {
+    async fn reconcile_durable_vms_for_agent(
+        &mut self,
+        actor_id: ActorId,
+        actor_ref: RemoteActorRef<AgentActor>,
+        hostname: &str,
+        observed: &[ulid::Ulid],
+    ) {
+        let observed: ahash::AHashSet<_> = observed.iter().copied().collect();
+        let pending: Vec<_> = self
+            .durable_placements
+            .iter()
+            .filter(|(vmid, placement)| placement.node == hostname && !observed.contains(vmid))
+            .filter_map(|(vmid, _)| {
+                let config = self.vm_manifests.get(vmid)?.clone();
+                let entries = self.vm_placements.entry(*vmid).or_default();
+                if entries.iter().any(|entry| {
+                    entry.agent_id == actor_id && entry.lifecycle == super::VmLifecycle::Pending
+                }) {
+                    return None;
+                }
+                entries.retain(|entry| entry.agent_id != actor_id);
+                entries.push(super::VmPlacement {
+                    agent_id: actor_id,
+                    lifecycle: super::VmLifecycle::Pending,
+                    created_at: std::time::Instant::now(),
+                    last_confirmed_at: None,
+                });
+                self.vm_data_cache
+                    .entry(*vmid)
+                    .or_default()
+                    .push(CachedVMActor { actor_ref: None });
+                Some(CreateVM {
+                    vmid: *vmid,
+                    config,
+                })
+            })
+            .collect();
+
+        if !pending.is_empty() {
+            self.invalidate_pending_resources();
+        }
+        for create in pending {
+            match tokio::time::timeout(Duration::from_secs(10), actor_ref.ask(&create)).await {
+                Ok(Ok(reply)) => {
+                    if let Some(actor_id_bytes) = reply.actor_id
+                        && let Ok(vm_actor_id) = ActorId::from_bytes(&actor_id_bytes)
+                    {
+                        self.vm_actorid_ulid_map.insert(vm_actor_id, create.vmid);
+                    }
+                }
+                Ok(Err(error)) => warn!(
+                    ?error,
+                    vm_id = %create.vmid,
+                    %hostname,
+                    "Unable to reconcile durable VM placement"
+                ),
+                Err(_) => warn!(
+                    vm_id = %create.vmid,
+                    %hostname,
+                    "Timed out reconciling durable VM placement"
+                ),
+            }
+        }
+    }
+
     /// Enumerates currently discoverable VM actors and forwards each to the scheduler.
     async fn vm_actor_finder(parent_actor_ref: ActorRef<Self>) -> Result<(), Report> {
         trace!("running vm_actor_finder");
@@ -47,26 +112,29 @@ impl SchedulerActor {
         let mut initialized = false;
 
         loop {
-            if !initialized {
-                if let Ok(data) = actor_ref.ask(&GetVMInfo { vmid: None }).await {
-                    let send_result = scheduler
-                        .tell(VmUpdated {
-                            actor_ref: actor_ref.clone(),
-                            data,
-                        })
-                        .send()
-                        .await
-                        .map_err(|error| eyre!("failed to send VM update: {error}"));
-                    if let Err(error) = send_result {
-                        warn!(?error, "VM updater could not notify scheduler");
-                        return;
+            if initialized {
+                match actor_ref.ask(&GetVMHeartbeat).await {
+                    Ok(reply) if reply.error.is_none() => fails = 0,
+                    Ok(reply) => {
+                        warn!(?reply.error, ?actor_ref, "VM heartbeat reported a VMM failure");
+                        fails = fails.saturating_add(1);
                     }
-                    initialized = true;
-                    fails = 0;
-                } else {
-                    fails = fails.saturating_add(1);
+                    Err(_) => fails = fails.saturating_add(1),
                 }
-            } else if actor_ref.ask(&GetVMHeartbeat).await.is_ok() {
+            } else if let Ok(data) = actor_ref.ask(&GetVMInfo { vmid: None }).await {
+                let send_result = scheduler
+                    .tell(VmUpdated {
+                        actor_ref: actor_ref.clone(),
+                        data,
+                    })
+                    .send()
+                    .await
+                    .map_err(|error| eyre!("failed to send VM update: {error}"));
+                if let Err(error) = send_result {
+                    warn!(?error, "VM updater could not notify scheduler");
+                    return;
+                }
+                initialized = true;
                 fails = 0;
             } else {
                 fails = fails.saturating_add(1);
@@ -101,7 +169,10 @@ impl SchedulerActor {
 
         let mut agent_actor_stream = RemoteActorRef::<AgentActor>::lookup_all(AGENT);
 
-        while let Some(agent_actor) = agent_actor_stream.try_next().await? {
+        loop {
+            let Some(agent_actor) = agent_actor_stream.try_next().await? else {
+                break;
+            };
             parent_actor_ref
                 .tell(AgentActorDiscovered {
                     actor_ref: agent_actor,
@@ -315,6 +386,22 @@ impl Message<AgentUpdated> for SchedulerActor {
                         status_revision: revision,
                     },
                 );
+                let (actor_ref, hostname, observed) = {
+                    let cached = self.agent_data_cache.get(&msg.actor_id).unwrap();
+                    (
+                        cached.actor_ref.clone(),
+                        cached.data.hostname.clone(),
+                        cached.data.vms.clone(),
+                    )
+                };
+                self.reconcile_durable_vms_for_agent(
+                    msg.actor_id,
+                    actor_ref.clone(),
+                    &hostname,
+                    &observed,
+                )
+                .await;
+                drop(actor_ref);
             }
             return;
         };
@@ -361,6 +448,18 @@ impl Message<AgentUpdated> for SchedulerActor {
             );
             self.invalidate_pending_resources();
         }
+
+        let (actor_ref, hostname, observed) = {
+            let cached = self.agent_data_cache.get(&msg.actor_id).unwrap();
+            (
+                cached.actor_ref.clone(),
+                cached.data.hostname.clone(),
+                cached.data.vms.clone(),
+            )
+        };
+        self.reconcile_durable_vms_for_agent(msg.actor_id, actor_ref.clone(), &hostname, &observed)
+            .await;
+        drop(actor_ref);
     }
 }
 
@@ -381,6 +480,23 @@ impl Message<ReconcileVmPlacements> for SchedulerActor {
     async fn handle(&mut self, _msg: ReconcileVmPlacements, _ctx: &mut Context<Self, Self::Reply>) {
         Self::cleanup_unresolved_vm_cache(&mut self.vm_placements, &mut self.vm_data_cache);
         self.invalidate_pending_resources();
+        let agents: Vec<_> = self
+            .agent_data_cache
+            .iter()
+            .map(|(actor_id, cached)| {
+                (
+                    *actor_id,
+                    cached.actor_ref.clone(),
+                    cached.data.hostname.clone(),
+                    cached.data.vms.clone(),
+                )
+            })
+            .collect();
+        for (actor_id, actor_ref, hostname, observed) in agents {
+            self.reconcile_durable_vms_for_agent(actor_id, actor_ref.clone(), &hostname, &observed)
+                .await;
+            drop(actor_ref);
+        }
 
         let unplaced_vms: Vec<_> = self
             .vm_manifests
@@ -415,7 +531,6 @@ impl Message<ReconcileVmPlacements> for SchedulerActor {
                         self.vm_placements.insert(vmid, Vec::new());
                         self.vm_data_cache.remove(&vmid);
                     } else {
-                        // The next iteration must account for this new pending reservation.
                         self.invalidate_pending_resources();
                     }
                 }
