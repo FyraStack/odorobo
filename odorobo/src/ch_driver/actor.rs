@@ -505,7 +505,6 @@ impl Message<MigrationFinished> for VMActor {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         if self.migration_state.take().is_some() {
-            // todo: post-migration cleanup
             info!(vmid = %self.vmid, "migration finished, cleared migration state");
         } else {
             warn!(vmid = %self.vmid, "received migration finished notification with no active migration state");
@@ -575,16 +574,3 @@ impl Message<DeleteVM> for VMActor {
         crate::messages::vm::DeleteVMReply { error: None }
     }
 }
-
-// /// Provisioner backend for VM instances using an actor-based model
-// pub struct ActorProvisioner;
-
-// impl VMProvisionerBackend for ActorProvisioner {
-//     async fn start_instance(&self, vmid: &str) -> Result<i32> {
-//         todo!()
-//     }
-
-//     async fn stop_instance(&self, vmid: &str) -> Result<()> {
-//         todo!()
-//     }
-// }

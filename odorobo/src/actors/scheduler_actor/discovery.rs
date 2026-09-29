@@ -335,6 +335,13 @@ impl Message<VmUpdated> for SchedulerActor {
         self.vm_actorid_ulid_map.insert(actor_id, vmid);
         if let Some(manifest) = msg.data.config {
             self.vm_manifests.insert(vmid, manifest);
+            Self::reconcile_discovered_vm(
+                vmid,
+                &self.agent_vm_index,
+                &self.vm_manifests,
+                &mut self.vm_placements,
+            );
+            self.invalidate_pending_resources();
         }
         let cached_vm = CachedVMActor {
             actor_ref: Some(msg.actor_ref),
@@ -471,11 +478,7 @@ impl Message<ReconcileVmPlacements> for SchedulerActor {
     type Reply = ();
 
     async fn handle(&mut self, _msg: ReconcileVmPlacements, _ctx: &mut Context<Self, Self::Reply>) {
-        Self::cleanup_unresolved_vm_cache(
-            &mut self.vm_manifests,
-            &mut self.vm_placements,
-            &mut self.vm_data_cache,
-        );
+        Self::cleanup_unresolved_vm_cache(&mut self.vm_placements, &mut self.vm_data_cache);
         self.invalidate_pending_resources();
         let agents: Vec<_> = self
             .agent_data_cache
@@ -493,6 +496,46 @@ impl Message<ReconcileVmPlacements> for SchedulerActor {
             self.reconcile_durable_vms_for_agent(actor_id, actor_ref.clone(), &hostname, &observed)
                 .await;
             drop(actor_ref);
+        }
+
+        let unplaced_vms: Vec<_> = self
+            .vm_manifests
+            .iter()
+            .filter_map(|(vmid, manifest)| {
+                self.vm_placements
+                    .get(vmid)
+                    .is_none_or(Vec::is_empty)
+                    .then_some((*vmid, manifest.clone()))
+            })
+            .collect();
+
+        for (vmid, config) in unplaced_vms {
+            let request = crate::messages::vm::CreateVM { vmid, config };
+            match self.schedule_agent(&request) {
+                Ok(agent) => {
+                    self.vm_placements
+                        .entry(vmid)
+                        .or_default()
+                        .push(super::VmPlacement {
+                            agent_id: agent.id(),
+                            lifecycle: super::VmLifecycle::Pending,
+                            created_at: std::time::Instant::now(),
+                            last_confirmed_at: None,
+                        });
+                    self.vm_data_cache
+                        .entry(vmid)
+                        .or_default()
+                        .push(CachedVMActor { actor_ref: None });
+                    if let Err(error) = agent.tell(&request).send() {
+                        warn!(?error, %vmid, "failed to recreate unplaced VM");
+                        self.vm_placements.insert(vmid, Vec::new());
+                        self.vm_data_cache.remove(&vmid);
+                    } else {
+                        self.invalidate_pending_resources();
+                    }
+                }
+                Err(error) => trace!(?error, %vmid, "no eligible agent to recreate VM"),
+            }
         }
     }
 }

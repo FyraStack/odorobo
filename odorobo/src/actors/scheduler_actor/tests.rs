@@ -12,7 +12,7 @@ use crate::manifest::{
 };
 use crate::messages::agent::AgentStatus;
 use crate::types::ObjectMetadata;
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use bytesize::ByteSize;
 use odorobo::cluster_state::{MemoryStateStore, StateStore};
 use std::time::{Duration, Instant};
@@ -50,7 +50,7 @@ fn requirement(operator: Operator, values: &[&str]) -> AffinityRequirement {
 }
 
 #[test]
-fn removes_expired_unresolved_vm_placeholders() {
+fn expires_unresolved_vm_placeholder_but_retains_vm_intent() {
     let vmid = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("valid ulid");
     let agent_id = super::ActorId::new(1);
     let mut placements: AHashMap<Ulid, Vec<VmPlacement>> = AHashMap::new();
@@ -60,18 +60,18 @@ fn removes_expired_unresolved_vm_placeholders() {
             agent_id,
             lifecycle: VmLifecycle::Pending,
             created_at: Instant::now()
-                .checked_sub(Duration::from_secs(31))
+                .checked_sub(Duration::from_secs(121))
                 .expect("test timestamp should be representable"),
             last_confirmed_at: None,
         }],
     );
-    let mut manifests = AHashMap::from([(vmid, test_manifest(1, 1))]);
+    let manifests = AHashMap::from([(vmid, test_manifest(1, 1))]);
     let mut data_cache: AHashMap<Ulid, Vec<CachedVMActor>> = AHashMap::new();
 
-    SchedulerActor::cleanup_unresolved_vm_cache(&mut manifests, &mut placements, &mut data_cache);
+    SchedulerActor::cleanup_unresolved_vm_cache(&mut placements, &mut data_cache);
 
     assert!(manifests.contains_key(&vmid));
-    assert!(!placements.contains_key(&vmid));
+    assert!(placements[&vmid].is_empty());
     assert!(!data_cache.contains_key(&vmid));
 }
 
@@ -158,7 +158,7 @@ fn reconciling_source_agent_preserves_destination_migration_placement() {
 }
 
 #[test]
-fn agent_removal_preserves_desired_placement() {
+fn agent_delta_removal_unplaces_running_placement() {
     let vmid = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("valid ulid");
     let agent_id = super::ActorId::new(1);
     let manifests = AHashMap::from([(vmid, test_manifest(1, 1))]);
@@ -174,8 +174,271 @@ fn agent_removal_preserves_desired_placement() {
 
     SchedulerActor::reconcile_agent_delta(agent_id, &[], &[vmid], &manifests, &mut placements);
 
+    assert!(placements[&vmid].is_empty());
+}
+
+#[test]
+fn agent_delta_removal_retains_pending_placement() {
+    let vmid = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("valid ulid");
+    let agent_id = super::ActorId::new(1);
+    let manifests = AHashMap::from([(vmid, test_manifest(1, 1))]);
+    let mut placements = AHashMap::from([(
+        vmid,
+        vec![VmPlacement {
+            agent_id,
+            lifecycle: VmLifecycle::Pending,
+            created_at: Instant::now(),
+            last_confirmed_at: None,
+        }],
+    )]);
+
+    SchedulerActor::reconcile_agent_delta(agent_id, &[], &[vmid], &manifests, &mut placements);
+
     assert_eq!(placements[&vmid].len(), 1);
-    assert_eq!(placements[&vmid][0].agent_id, agent_id);
+    assert_eq!(placements[&vmid][0].lifecycle, VmLifecycle::Pending);
+}
+
+#[test]
+fn departed_agent_leaves_empty_placement_for_reconciliation() {
+    let vmid = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("valid ulid");
+    let agent_id = super::ActorId::new(1);
+    let mut placements = AHashMap::from([(
+        vmid,
+        vec![VmPlacement {
+            agent_id,
+            lifecycle: VmLifecycle::Running,
+            created_at: Instant::now(),
+            last_confirmed_at: Some(Instant::now()),
+        }],
+    )]);
+
+    SchedulerActor::remove_agent_placements(agent_id, &AHashSet::new(), &mut placements);
+
+    assert!(placements.contains_key(&vmid));
+    assert!(placements[&vmid].is_empty());
+}
+
+#[test]
+fn departed_agent_preserves_placement_while_vm_actor_is_reachable() {
+    let vmid = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("valid ulid");
+    let agent_id = super::ActorId::new(1);
+    let mut placements = AHashMap::from([(
+        vmid,
+        vec![VmPlacement {
+            agent_id,
+            lifecycle: VmLifecycle::Running,
+            created_at: Instant::now(),
+            last_confirmed_at: Some(Instant::now()),
+        }],
+    )]);
+
+    SchedulerActor::remove_agent_placements(agent_id, &AHashSet::from([vmid]), &mut placements);
+
+    assert_eq!(placements[&vmid].len(), 1);
+}
+
+#[test]
+fn discovered_vm_reconciles_agent_snapshot_received_first() {
+    let vmid = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("valid ulid");
+    let agent_id = super::ActorId::new(1);
+    let manifests = AHashMap::from([(vmid, test_manifest(1, 1))]);
+    let agent_vm_index = AHashMap::from([(agent_id, AHashSet::from([vmid]))]);
+    let mut placements = AHashMap::new();
+
+    SchedulerActor::reconcile_discovered_vm(vmid, &agent_vm_index, &manifests, &mut placements);
+
+    let placement = &placements[&vmid][0];
+    assert_eq!(placement.agent_id, agent_id);
+    assert_eq!(placement.lifecycle, VmLifecycle::Running);
+}
+
+#[test]
+fn pending_placement_survives_full_snapshot_until_pending_timeout() {
+    let vmid = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("valid ulid");
+    let agent_id = super::ActorId::new(1);
+    let mut placements = AHashMap::from([(
+        vmid,
+        vec![VmPlacement {
+            agent_id,
+            lifecycle: VmLifecycle::Pending,
+            created_at: Instant::now(),
+            last_confirmed_at: None,
+        }],
+    )]);
+    let manifests = AHashMap::from([(vmid, test_manifest(1, 1))]);
+    let empty_status = AgentStatus {
+        hostname: "agent".to_owned(),
+        vcpus: 1,
+        ram: ByteSize::b(1),
+        used_vcpus: 0,
+        used_ram: ByteSize::b(0),
+        vms: Vec::new(),
+        metadata: ObjectMetadata::default(),
+    };
+
+    SchedulerActor::reconcile_agent_placements(
+        agent_id,
+        &empty_status,
+        &manifests,
+        &mut placements,
+    );
+
+    assert_eq!(placements[&vmid][0].lifecycle, VmLifecycle::Pending);
+}
+
+#[test]
+fn stale_running_placement_is_expired_by_full_snapshot() {
+    let vmid = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("valid ulid");
+    let agent_id = super::ActorId::new(1);
+    let mut placements = AHashMap::from([(
+        vmid,
+        vec![VmPlacement {
+            agent_id,
+            lifecycle: VmLifecycle::Running,
+            created_at: Instant::now(),
+            last_confirmed_at: Some(
+                Instant::now()
+                    .checked_sub(Duration::from_secs(31))
+                    .expect("test timestamp should be representable"),
+            ),
+        }],
+    )]);
+    let manifests = AHashMap::from([(vmid, test_manifest(1, 1))]);
+    let empty_status = AgentStatus {
+        hostname: "agent".to_owned(),
+        vcpus: 1,
+        ram: ByteSize::b(1),
+        used_vcpus: 0,
+        used_ram: ByteSize::b(0),
+        vms: Vec::new(),
+        metadata: ObjectMetadata::default(),
+    };
+
+    SchedulerActor::reconcile_agent_placements(
+        agent_id,
+        &empty_status,
+        &manifests,
+        &mut placements,
+    );
+
+    assert!(!placements.contains_key(&vmid));
+}
+
+#[test]
+fn vm_cleanup_unplaces_vm_without_another_discovered_actor() {
+    let agent_id = super::ActorId::new(1);
+    let vm_actor_id = super::ActorId::new(2);
+    let vmid = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("valid ulid");
+    let mut scheduler = SchedulerActor {
+        agent_data_cache: AHashMap::new(),
+        agent_keepalive_tasks: AHashMap::new(),
+        vm_actorid_ulid_map: AHashMap::from([(vm_actor_id, vmid)]),
+        vm_manifests: AHashMap::from([(vmid, test_manifest(1, 1))]),
+        durable_placements: AHashMap::new(),
+        vm_placements: AHashMap::from([(
+            vmid,
+            vec![VmPlacement {
+                agent_id,
+                lifecycle: VmLifecycle::Running,
+                created_at: Instant::now(),
+                last_confirmed_at: Some(Instant::now()),
+            }],
+        )]),
+        vm_data_cache: AHashMap::from([(vmid, vec![CachedVMActor { actor_ref: None }])]),
+        vm_keepalive_tasks: AHashMap::new(),
+        pending_resources_cache: None,
+        agent_vm_index: AHashMap::new(),
+        actor_kinds: AHashMap::new(),
+        cache_actor_finder: None,
+        state_store: Arc::new(StateStore::Memory(MemoryStateStore::default())),
+    };
+
+    scheduler.cleanup_vm_actor(vm_actor_id);
+
+    assert!(scheduler.vm_manifests.contains_key(&vmid));
+    assert!(scheduler.vm_placements[&vmid].is_empty());
+}
+
+#[test]
+fn failed_create_rolls_back_state_without_an_actor() {
+    let vmid = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("valid ulid");
+    let mut manifests = AHashMap::from([(vmid, test_manifest(1, 1))]);
+    let mut actor_map = AHashMap::new();
+    let mut placements = AHashMap::from([(
+        vmid,
+        vec![VmPlacement {
+            agent_id: super::ActorId::new(1),
+            lifecycle: VmLifecycle::Pending,
+            created_at: Instant::now(),
+            last_confirmed_at: None,
+        }],
+    )]);
+    let mut data_cache = AHashMap::from([(vmid, vec![CachedVMActor { actor_ref: None }])]);
+
+    SchedulerActor::rollback_failed_create(
+        vmid,
+        false,
+        None,
+        &mut actor_map,
+        &mut manifests,
+        &mut placements,
+        &mut data_cache,
+    );
+
+    assert!(!manifests.contains_key(&vmid));
+    assert!(!placements.contains_key(&vmid));
+    assert!(!data_cache.contains_key(&vmid));
+}
+
+#[test]
+fn failed_create_keeps_state_if_actor_exists() {
+    let vmid = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("valid ulid");
+    let mut manifests = AHashMap::from([(vmid, test_manifest(1, 1))]);
+    let mut actor_map = AHashMap::new();
+    let mut placements = AHashMap::new();
+    let mut data_cache = AHashMap::new();
+
+    SchedulerActor::rollback_failed_create(
+        vmid,
+        true,
+        None,
+        &mut actor_map,
+        &mut manifests,
+        &mut placements,
+        &mut data_cache,
+    );
+
+    assert!(manifests.contains_key(&vmid));
+}
+
+#[test]
+fn explicit_stop_removes_vm_intent_and_actor_mapping() {
+    let vmid = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("valid ulid");
+    let vm_actor_id = super::ActorId::new(2);
+    let agent_id = super::ActorId::new(1);
+    let mut scheduler = SchedulerActor {
+        agent_data_cache: AHashMap::new(),
+        agent_keepalive_tasks: AHashMap::new(),
+        vm_actorid_ulid_map: AHashMap::from([(vm_actor_id, vmid)]),
+        vm_manifests: AHashMap::from([(vmid, test_manifest(1, 1))]),
+        durable_placements: AHashMap::new(),
+        vm_placements: AHashMap::from([(vmid, Vec::new())]),
+        vm_data_cache: AHashMap::from([(vmid, vec![CachedVMActor { actor_ref: None }])]),
+        vm_keepalive_tasks: AHashMap::new(),
+        pending_resources_cache: None,
+        agent_vm_index: AHashMap::from([(agent_id, AHashSet::from([vmid]))]),
+        actor_kinds: AHashMap::new(),
+        cache_actor_finder: None,
+        state_store: Arc::new(StateStore::Memory(MemoryStateStore::default())),
+    };
+
+    scheduler.remove_vm_intent(vmid);
+
+    assert!(!scheduler.vm_manifests.contains_key(&vmid));
+    assert!(!scheduler.vm_placements.contains_key(&vmid));
+    assert!(!scheduler.vm_data_cache.contains_key(&vmid));
+    assert!(!scheduler.vm_actorid_ulid_map.contains_key(&vm_actor_id));
+    assert!(!scheduler.agent_vm_index[&agent_id].contains(&vmid));
 }
 
 #[test]
@@ -242,7 +505,7 @@ fn vm_cleanup_does_not_remove_unrelated_agent_state() {
 
     assert!(scheduler.actor_kinds.contains_key(&agent_id));
     assert!(scheduler.vm_manifests.contains_key(&vmid));
-    assert!(!scheduler.vm_data_cache.contains_key(&vmid));
+    assert!(scheduler.vm_data_cache.contains_key(&vmid));
     drop(scheduler);
 }
 

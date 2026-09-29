@@ -81,6 +81,9 @@ For more advanced usage, Odorobo Agent also exposes a passthrough route for the 
 
 See `docs/ch-passthrough.md` for Cloud Hypervisor API passthrough usage.
 
+See [docs/future-work.md](docs/future-work.md) for planned scheduler,
+migration, and high-availability work that is not implemented yet.
+
 ## Note about CI Tests
 
 Because we don't have an RVA23 runner, the `test-riscv-rva23` workflow will not actually run the test suite. It will only build the tests and verify they compile successfully.

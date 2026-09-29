@@ -35,6 +35,7 @@ use kameo::error::PanicError;
 
 pub struct VMCacheData {
     actor_ref: ActorRef<VMActor>,
+    config: VmManifest,
     vcpus: u32,
     memory_bytes: u64,
 }
@@ -163,6 +164,7 @@ impl Actor for AgentActor {
                     vmid,
                     VMCacheData {
                         actor_ref: actor,
+                        config: vm_config.clone(),
                         vcpus: vm_config.desired.compute.vcpus,
                         memory_bytes: vm_config.desired.compute.memory_bytes,
                     },
@@ -191,6 +193,7 @@ impl Actor for AgentActor {
                 vmid,
                 VMCacheData {
                     actor_ref: actor,
+                    config: vm_config.clone(),
                     vcpus: vm_config.desired.compute.vcpus,
                     memory_bytes: vm_config.desired.compute.memory_bytes,
                 },
@@ -223,20 +226,16 @@ impl Actor for AgentActor {
         })
     }
 
-    // async fn on_panic(state: Self::Args, weak_actor_ref: WeakActorRef<Self>, _panic: &PanicError) {
-    //     panic!("Agent panicked: {:?}", _panic);
-    // }
-    //
     async fn on_panic(
         &mut self,
         _actor_ref: WeakActorRef<Self>,
         err: PanicError,
-    ) -> Result<std::ops::ControlFlow<ActorStopReason>> {
-        error!("Agent panicked: {:?}", err);
-
-        // todo: if we panic, we should completely regen the self struct from scratch. The assumption should be that memory corruption could have possibly happened becauew
-
-        Ok(ControlFlow::Continue(()))
+    ) -> Result<ControlFlow<ActorStopReason>> {
+        error!(
+            ?err,
+            "Agent actor panicked; stopping because its state cannot be safely rebuilt here"
+        );
+        Ok(ControlFlow::Break(ActorStopReason::Panicked(err)))
     }
 
     async fn on_link_died(
@@ -274,8 +273,13 @@ impl Message<CreateVM> for AgentActor {
                 .await
                 .is_ok_and(|reply| reply.error.is_none())
             {
+                if existing.config == msg.config {
+                    info!(?vmid, actor_id = ?actor_ref.id(), "VM already exists; treating create as idempotent");
+                } else {
+                    warn!(?vmid, actor_id = ?actor_ref.id(), "Ignoring conflicting create for existing VM");
+                }
                 return CreateVMReply {
-                    config: Some(msg.config),
+                    config: Some(existing.config.clone()),
                     actor_id: Some(actor_ref.id().to_bytes()),
                 };
             }
@@ -288,6 +292,7 @@ impl Message<CreateVM> for AgentActor {
                 vmid,
                 VMCacheData {
                     actor_ref,
+                    config: msg.config.clone(),
                     vcpus: msg.config.desired.compute.vcpus,
                     memory_bytes: msg.config.desired.compute.memory_bytes,
                 },
@@ -297,7 +302,8 @@ impl Message<CreateVM> for AgentActor {
                 actor_id: Some(actor_id),
             };
         }
-        // spawn AND link at the same time
+
+        // Spawn and link at the same time.
         let actor_ref =
             VMActor::spawn_link(ctx.actor_ref(), (vmid, Some(msg.config.clone()))).await;
         let startup = actor_ref
@@ -331,6 +337,7 @@ impl Message<CreateVM> for AgentActor {
             vmid,
             VMCacheData {
                 actor_ref: actor_ref.clone(),
+                config: msg.config.clone(),
                 vcpus: msg.config.desired.compute.vcpus,
                 memory_bytes: msg.config.desired.compute.memory_bytes,
             },
@@ -362,16 +369,32 @@ impl Message<MigrateVMReceive> for AgentActor {
             vmid,
             VMCacheData {
                 actor_ref: actor_ref.clone(),
+                config: msg.config.clone(),
                 vcpus: msg.config.desired.compute.vcpus,
                 memory_bytes: msg.config.desired.compute.memory_bytes,
             },
         );
 
-        // now ask the VM actor to handle the migration receive
-        actor_ref
-            .ask(msg)
-            .await
-            .expect("failed to start migration receiver on destination VM actor")
+        let reply = match actor_ref.ask(msg).await {
+            Ok(reply) => reply,
+            Err(error) => MigrateVMReceiveReply {
+                listening_address: String::new(),
+                error: Some(format!("failed to start migration receiver: {error}")),
+            },
+        };
+
+        if reply.error.is_some() {
+            if self
+                .vms
+                .get(&vmid)
+                .is_some_and(|cache| cache.actor_ref.id() == actor_ref.id())
+            {
+                self.remove_vm(vmid);
+            }
+            actor_ref.kill();
+        }
+
+        reply
     }
 }
 
