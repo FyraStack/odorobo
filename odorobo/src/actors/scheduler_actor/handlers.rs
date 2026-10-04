@@ -247,7 +247,11 @@ impl Message<DeleteVM> for SchedulerActor {
                     .find(|agent| agent.data.hostname == placement.node)
                     .map(|agent| agent.actor_ref.clone())
             });
-        let vm = RemoteActorRef::<VMActor>::lookup(vm_actor_id(msg.vmid)).await?;
+        let vm = if owner.is_none() {
+            RemoteActorRef::<VMActor>::lookup(vm_actor_id(msg.vmid)).await?
+        } else {
+            None
+        };
         tracing::trace!(?vm, "DeleteVM");
         let reply = if let Some(owner) = owner.as_ref() {
             tokio::time::timeout(Duration::from_secs(30), owner.ask(&msg))
@@ -270,13 +274,7 @@ impl Message<DeleteVM> for SchedulerActor {
             .delete_vm_state(msg.vmid)
             .await
             .map_err(|error| eyre!("unable to delete durable VM state: {error}"))?;
-        Self::remove_vm_state(
-            msg.vmid,
-            &mut self.vm_manifests,
-            &mut self.vm_placements,
-            &mut self.vm_data_cache,
-        );
-        self.durable_placements.remove(&msg.vmid);
+        self.remove_vm_intent(msg.vmid);
         Ok(DeleteVMReply { error: None })
     }
 }
@@ -290,15 +288,40 @@ impl Message<ShutdownVM> for SchedulerActor {
         msg: ShutdownVM,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        let vm = RemoteActorRef::<VMActor>::lookup(vm_actor_id(msg.vmid)).await?;
-        tracing::trace!(?vm, "ShutdownVM");
-        if let Some(vm) = vm {
-            vm.tell(&msg).send()?;
-            self.remove_vm_intent(msg.vmid);
-            Ok(ShutdownVMReply)
+        let owner = self
+            .durable_placements
+            .get(&msg.vmid)
+            .and_then(|placement| {
+                self.agent_data_cache
+                    .values()
+                    .find(|agent| agent.data.hostname == placement.node)
+                    .map(|agent| agent.actor_ref.clone())
+            });
+        let vm = if owner.is_none() {
+            RemoteActorRef::<VMActor>::lookup(vm_actor_id(msg.vmid)).await?
         } else {
-            Err(eyre!("VM not found"))
+            None
+        };
+        tracing::trace!(?vm, "ShutdownVM");
+        if let Some(owner) = owner.as_ref() {
+            tokio::time::timeout(Duration::from_secs(30), owner.ask(&msg))
+                .await
+                .map_err(|_| eyre!("timed out shutting down VM {}", msg.vmid))??;
+        } else if let Some(vm) = vm {
+            tokio::time::timeout(Duration::from_secs(30), vm.ask(&msg))
+                .await
+                .map_err(|_| eyre!("timed out shutting down VM {}", msg.vmid))??;
+        } else {
+            return Err(eyre!("VM not found"));
         }
+        drop(owner);
+
+        self.state_store
+            .delete_vm_state(msg.vmid)
+            .await
+            .map_err(|error| eyre!("unable to delete durable VM state: {error}"))?;
+        self.remove_vm_intent(msg.vmid);
+        Ok(ShutdownVMReply)
     }
 }
 

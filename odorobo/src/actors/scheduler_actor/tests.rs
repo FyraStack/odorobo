@@ -357,58 +357,7 @@ fn vm_cleanup_unplaces_vm_without_another_discovered_actor() {
 
     assert!(scheduler.vm_manifests.contains_key(&vmid));
     assert!(scheduler.vm_placements[&vmid].is_empty());
-}
-
-#[test]
-fn failed_create_rolls_back_state_without_an_actor() {
-    let vmid = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("valid ulid");
-    let mut manifests = AHashMap::from([(vmid, test_manifest(1, 1))]);
-    let mut actor_map = AHashMap::new();
-    let mut placements = AHashMap::from([(
-        vmid,
-        vec![VmPlacement {
-            agent_id: super::ActorId::new(1),
-            lifecycle: VmLifecycle::Pending,
-            created_at: Instant::now(),
-            last_confirmed_at: None,
-        }],
-    )]);
-    let mut data_cache = AHashMap::from([(vmid, vec![CachedVMActor { actor_ref: None }])]);
-
-    SchedulerActor::rollback_failed_create(
-        vmid,
-        false,
-        None,
-        &mut actor_map,
-        &mut manifests,
-        &mut placements,
-        &mut data_cache,
-    );
-
-    assert!(!manifests.contains_key(&vmid));
-    assert!(!placements.contains_key(&vmid));
-    assert!(!data_cache.contains_key(&vmid));
-}
-
-#[test]
-fn failed_create_keeps_state_if_actor_exists() {
-    let vmid = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("valid ulid");
-    let mut manifests = AHashMap::from([(vmid, test_manifest(1, 1))]);
-    let mut actor_map = AHashMap::new();
-    let mut placements = AHashMap::new();
-    let mut data_cache = AHashMap::new();
-
-    SchedulerActor::rollback_failed_create(
-        vmid,
-        true,
-        None,
-        &mut actor_map,
-        &mut manifests,
-        &mut placements,
-        &mut data_cache,
-    );
-
-    assert!(manifests.contains_key(&vmid));
+    drop(scheduler);
 }
 
 #[test]
@@ -421,7 +370,13 @@ fn explicit_stop_removes_vm_intent_and_actor_mapping() {
         agent_keepalive_tasks: AHashMap::new(),
         vm_actorid_ulid_map: AHashMap::from([(vm_actor_id, vmid)]),
         vm_manifests: AHashMap::from([(vmid, test_manifest(1, 1))]),
-        durable_placements: AHashMap::new(),
+        durable_placements: AHashMap::from([(
+            vmid,
+            odorobo::cluster_state::PlacementRecord {
+                vmid,
+                node: "node-a".to_owned(),
+            },
+        )]),
         vm_placements: AHashMap::from([(vmid, Vec::new())]),
         vm_data_cache: AHashMap::from([(vmid, vec![CachedVMActor { actor_ref: None }])]),
         vm_keepalive_tasks: AHashMap::new(),
@@ -437,8 +392,10 @@ fn explicit_stop_removes_vm_intent_and_actor_mapping() {
     assert!(!scheduler.vm_manifests.contains_key(&vmid));
     assert!(!scheduler.vm_placements.contains_key(&vmid));
     assert!(!scheduler.vm_data_cache.contains_key(&vmid));
+    assert!(!scheduler.durable_placements.contains_key(&vmid));
     assert!(!scheduler.vm_actorid_ulid_map.contains_key(&vm_actor_id));
     assert!(!scheduler.agent_vm_index[&agent_id].contains(&vmid));
+    drop(scheduler);
 }
 
 #[test]

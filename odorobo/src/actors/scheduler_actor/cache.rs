@@ -159,6 +159,7 @@ impl SchedulerActor {
             &mut self.vm_placements,
             &mut self.vm_data_cache,
         );
+        self.durable_placements.remove(&vmid);
         self.vm_actorid_ulid_map
             .retain(|_, mapped_vmid| *mapped_vmid != vmid);
         for index in self.agent_vm_index.values_mut() {
@@ -200,29 +201,6 @@ impl SchedulerActor {
         for (vmid, entries) in placements.iter_mut() {
             entries.retain(|entry| entry.agent_id != agent_id || reachable_vmids.contains(vmid));
             Self::shrink_non_migrating_entries(entries);
-        }
-    }
-
-    /// Rolls back optimistic create state only when no VM actor was created.
-    ///
-    /// An actor may exist even if the create request failed or its reply was lost;
-    /// retaining the state in that case lets normal discovery reconcile it.
-    pub(super) fn rollback_failed_create(
-        vmid: Ulid,
-        actor_exists: bool,
-        actor_id: Option<ActorId>,
-        actor_map: &mut AHashMap<ActorId, Ulid>,
-        manifests: &mut AHashMap<Ulid, VmManifest>,
-        placements: &mut AHashMap<Ulid, Vec<VmPlacement>>,
-        data_cache: &mut AHashMap<Ulid, Vec<CachedVMActor>>,
-    ) {
-        if !actor_exists {
-            if let Some(actor_id) = actor_id
-                && actor_map.get(&actor_id) == Some(&vmid)
-            {
-                actor_map.remove(&actor_id);
-            }
-            Self::remove_vm_state(vmid, manifests, placements, data_cache);
         }
     }
 

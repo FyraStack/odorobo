@@ -26,7 +26,7 @@ use odorobo::cluster_state::{
     ClusterStateStore, PLACEMENT_PREFIX, PlacementRecord, StateStore, VM_MANIFESTS_PREFIX,
 };
 use stable_eyre::{Report, Result, eyre::eyre};
-use std::{ops::ControlFlow, sync::Arc};
+use std::{ops::ControlFlow, sync::Arc, time::Duration};
 use sysinfo::System;
 use tracing::{error, info, trace, warn};
 use ulid::Ulid;
@@ -268,10 +268,12 @@ impl Message<CreateVM> for AgentActor {
         let vmid = msg.vmid;
         if let Some(existing) = self.vms.get(&vmid) {
             let actor_ref = existing.actor_ref.clone();
-            if actor_ref
-                .ask(crate::messages::vm::GetVMHeartbeat)
-                .await
-                .is_ok_and(|reply| reply.error.is_none())
+            if tokio::time::timeout(
+                Duration::from_secs(5),
+                actor_ref.ask(crate::messages::vm::GetVMHeartbeat),
+            )
+            .await
+            .is_ok_and(|result| result.is_ok_and(|reply| reply.error.is_none()))
             {
                 if existing.config == msg.config {
                     info!(?vmid, actor_id = ?actor_ref.id(), "VM already exists; treating create as idempotent");
@@ -283,7 +285,16 @@ impl Message<CreateVM> for AgentActor {
                     actor_id: Some(actor_ref.id().to_bytes()),
                 };
             }
-            actor_ref.wait_for_shutdown().await;
+            if tokio::time::timeout(Duration::from_secs(5), actor_ref.wait_for_shutdown())
+                .await
+                .is_err()
+            {
+                warn!(
+                    ?vmid,
+                    "VM actor did not stop after a failed heartbeat; force killing it"
+                );
+                actor_ref.kill();
+            }
             self.remove_vm(vmid);
         }
         if let Some(actor_ref) = Self::lookup_vm_actor(vmid).await {
@@ -440,18 +451,31 @@ impl Message<ShutdownVM> for AgentActor {
         msg: ShutdownVM,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        if let Some(actor_ref) = Self::lookup_vm_actor(msg.vmid).await {
-            trace!(?msg, "Telling VM to shut down");
-            let res = actor_ref.tell(msg.clone()).await;
-            if let Err(err) = res {
-                warn!(vm_id = %msg.vmid, ?err, "failed to shutdown VM actor");
-            }
+        let actor_ref = if let Some(vm) = self.vms.get(&msg.vmid) {
+            Some(vm.actor_ref.clone())
         } else {
+            Self::lookup_vm_actor(msg.vmid).await
+        };
+        let Some(actor_ref) = actor_ref else {
             warn!(vm_id = %msg.vmid, "VM actor not found for shutdown");
             return Err("VM actor not found for shutdown".to_owned());
-        }
+        };
 
-        Ok(ShutdownVMReply)
+        trace!(?msg, "Requesting VM shutdown");
+        match tokio::time::timeout(Duration::from_secs(30), actor_ref.ask(msg.clone())).await {
+            Ok(Ok(())) => {
+                self.remove_vm(msg.vmid);
+                Ok(ShutdownVMReply)
+            }
+            Ok(Err(error)) => {
+                warn!(vm_id = %msg.vmid, ?error, "failed to shutdown VM actor");
+                Err(error.to_string())
+            }
+            Err(_) => {
+                warn!(vm_id = %msg.vmid, "timed out waiting for VM actor shutdown");
+                Err("timed out waiting for VM actor shutdown".to_owned())
+            }
+        }
     }
 }
 // forward GetVMInfo to VM actor
