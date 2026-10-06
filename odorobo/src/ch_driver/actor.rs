@@ -359,6 +359,13 @@ impl Actor for VMActor {
             && let Some(rootfs) = &manifest.desired.rootfs
         {
             let runtime_dir = VMInstance::runtime_dir_for(&vmid.to_string());
+            // Resolve everything that can fail cheaply BEFORE mounting, so
+            // early errors cannot leak a mounted rootfs.
+            let program = crate::ch_driver::faas::virtiofsd_path().ok_or_else(|| {
+                eyre!(
+                    "virtiofsd not found (looked in PATH and /usr/libexec) — `dnf install virtiofsd`"
+                )
+            })?;
             let prepared = crate::ch_driver::faas::mount_rootfs(&vmid.to_string(), rootfs)
                 .await
                 .map_err(|err| {
@@ -367,15 +374,19 @@ impl Actor for VMActor {
             rootfs_mount = Some(prepared.clone());
 
             let spec = VirtiofsdSpec {
-                program: crate::ch_driver::faas::virtiofsd_path()
-                    .ok_or_else(|| eyre!(
-                        "virtiofsd not found (looked in PATH and /usr/libexec) — `dnf install virtiofsd`"
-                    ))?,
+                program,
                 socket: crate::ch_driver::faas::socket_path_for(&vmid.to_string()),
                 shared_dir: prepared.mount.clone(),
                 log: runtime_dir.join("virtiofsd.log"),
             };
-            let supervisor = VirtioFsSupervisor::start(spec)?;
+            let supervisor = match VirtioFsSupervisor::start(spec) {
+                Ok(supervisor) => supervisor,
+                // Don't orphan the mount on this path.
+                Err(err) => {
+                    crate::ch_driver::faas::unmount_rootfs(&prepared).await;
+                    return Err(err);
+                }
+            };
             if let Err(err) = supervisor
                 .wait_socket_ready(std::time::Duration::from_secs(15))
                 .await
@@ -642,15 +653,24 @@ impl Message<MigrateVMReceive> for VMActor {
         let console = self.console.clone();
         let console_socket_path = self.vm_instance.console_socket_path();
         tokio::spawn(async move {
-            loop {
+            // Bound the wait: a socket that never appears must not keep a
+            // task (and Console clone) alive forever.
+            for attempt in 1..=120 {
                 match console.attach_socket(console_socket_path.clone()).await {
-                    Ok(()) => break,
+                    Ok(()) => return,
                     Err(err) => {
-                        trace!(?err, "serial console socket not ready during migration");
+                        trace!(
+                            ?err,
+                            attempt,
+                            "serial console socket not ready during migration"
+                        );
                         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     }
                 }
             }
+            warn!(
+                "serial console socket never became ready after migration; giving up on the console spool"
+            );
         });
 
         let actor_ref = ctx.actor_ref().clone();
