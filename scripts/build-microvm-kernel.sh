@@ -16,7 +16,7 @@
 #     boots in well under a second under KVM.
 #
 # Usage: scripts/build-microvm-kernel.sh [OUTPUT_DIR]
-#   KERNEL_VERSION=6.12.x overrides the version (default: latest longterm).
+#   KERNEL_VERSION=6.12.30 overrides the version (default: latest longterm).
 #   OUTPUT_DIR defaults to /var/lib/odorobo/microvm (installs vmlinux).
 
 set -euo pipefail
@@ -31,6 +31,7 @@ if [[ -z "${KERNEL_VERSION:-}" ]]; then
 fi
 
 JOBS="$(nproc)"
+KERNEL_SERIES="v${KERNEL_VERSION%%.*}.x"
 SRC_DIR="$SRC_PARENT/linux-$KERNEL_VERSION"
 TARBALL="$SRC_PARENT/linux-$KERNEL_VERSION.tar.xz"
 
@@ -40,7 +41,7 @@ mkdir -p "$SRC_PARENT" "$OUT_DIR"
 if [[ ! -f "$SRC_DIR/Makefile" ]]; then
     echo "==> fetching linux $KERNEL_VERSION"
     rm -f "$TARBALL"
-    curl -fL -o "$TARBALL" "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$KERNEL_VERSION.tar.xz"
+    curl -fL -o "$TARBALL" "https://cdn.kernel.org/pub/linux/kernel/$KERNEL_SERIES/linux-$KERNEL_VERSION.tar.xz"
     rm -rf "$SRC_DIR"
     tar -xJf "$TARBALL" -C "$SRC_PARENT"
 fi
@@ -62,8 +63,7 @@ CFG --enable VIRTIO_CONSOLE
 CFG --enable VIRTIO_BALLOON
 # overlayfs (container root semantics for the unpacked OCI image)
 CFG --enable OVERLAY_FS
-# composefs (future rootfs backend: fs-verity verified, deduplicated roots)
-CFG --enable FS_COMPOSEFS
+# Composefs and fs-verity run on the host; the guest does not need them.
 # FUSE and virtiofs (the root filesystem)
 CFG --enable FUSE_FS
 CFG --enable VIRTIO_FS

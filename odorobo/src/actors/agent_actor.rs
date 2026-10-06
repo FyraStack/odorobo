@@ -255,21 +255,25 @@ impl Message<DeleteVM> for AgentActor {
         msg: DeleteVM,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        match self.remove_vm(msg.vmid) {
-            Some(cache_data) => {
-                let res = cache_data.actor_ref.tell(msg.clone()).await;
-                if let Err(err) = res {
-                    // probably a bad way to do this
-                    warn!(vm_id = %msg.vmid, ?err, "failed to stop VM actor gracefully, killing");
-                    cache_data.actor_ref.kill();
+        let Some(actor_ref) = self.vms.get(&msg.vmid).map(|cache| cache.actor_ref.clone()) else {
+            warn!(vm_id = %msg.vmid, "VM actor not found for delete");
+            return DeleteVMReply {
+                error: Some("VM actor not found; rootfs cleanup cannot be verified".to_owned()),
+            };
+        };
+        match actor_ref.ask(msg.clone()).await {
+            Ok(reply) if reply.error.is_none() => {
+                self.remove_vm(msg.vmid);
+                reply
+            }
+            Ok(reply) => reply,
+            Err(err) => {
+                warn!(vm_id = %msg.vmid, ?err, "failed to stop VM actor gracefully; retaining agent inventory for retry");
+                DeleteVMReply {
+                    error: Some(err.to_string()),
                 }
             }
-            None => {
-                warn!(vm_id = %msg.vmid, "VM actor not found for delete");
-            }
         }
-
-        DeleteVMReply
     }
 }
 

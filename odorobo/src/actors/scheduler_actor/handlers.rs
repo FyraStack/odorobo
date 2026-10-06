@@ -207,9 +207,15 @@ impl Message<DeleteVM> for SchedulerActor {
         let vm = RemoteActorRef::<VMActor>::lookup(vm_actor_id(msg.vmid)).await?;
         tracing::trace!(?vm, "DeleteVM");
         if let Some(vm) = vm {
-            vm.tell(&msg).send()?;
+            let reply: DeleteVMReply = vm.ask(&msg).await?;
             self.remove_vm_intent(msg.vmid);
-            Ok(DeleteVMReply)
+            if let Some(error) = &reply.error {
+                return Err(eyre!(
+                    "VM {} deletion completed with rootfs cleanup error: {error}",
+                    msg.vmid
+                ));
+            }
+            Ok(reply)
         } else {
             Err(eyre!("VM not found"))
         }
