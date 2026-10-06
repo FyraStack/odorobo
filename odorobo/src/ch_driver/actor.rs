@@ -6,13 +6,20 @@ use crate::messages::vm::{
     SendConsoleInput, SendConsoleInputReply, ShutdownVM,
 };
 use crate::{
-    ch_driver::{VMInstance, manifest::to_vm_config},
+    ch_driver::{
+        VMInstance,
+        faas::{PreparedRootfs, VirtioFsSupervisor, VirtiofsdSpec},
+        manifest::to_vm_config,
+    },
     manifest::VmManifest,
 };
 use cloud_hypervisor_client::models::VmConfig;
 use kameo::prelude::*;
 use serde::{Deserialize, Serialize};
-use stable_eyre::{Report, Result};
+use stable_eyre::{
+    Report, Result,
+    eyre::eyre,
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{UnixStream, unix::OwnedWriteHalf},
@@ -182,6 +189,130 @@ mod tests {
         assert_eq!(&history[..4], b"aaaa");
         assert_eq!(&history[CONSOLE_SPOOL_SIZE - 4..], b"tail");
     }
+
+    /// Full FaaS boot through the actor (issue #112): OCI rootfs -> composefs
+    /// mount -> supervised virtiofsd -> CH direct kernel boot -> guest mounts
+    /// its root over virtiofs. Requires nested KVM, the cloud-hypervisor
+    /// binary, virtiofsd and network access for the image pull, so it is
+    /// ignored by default:
+    /// `cargo test -p odorobo --bin odorobo faas_vm_boots -- --ignored --nocapture`
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "boots a real VM; needs /dev/kvm, cloud-hypervisor, virtiofsd and network for the OCI pull"]
+    async fn faas_vm_boots_oci_rootfs_through_the_actor() {
+        use crate::ch_driver::{
+            VMInstance,
+            faas,
+            actor::VMActor,
+        };
+        use crate::manifest::{
+            Boot, Compute, DesiredState, MANIFEST_VERSION, Metadata, Rootfs, VmManifest,
+        };
+        use crate::messages::vm::GetConsoleHistory;
+        use kameo::prelude::*;
+        use std::time::Duration;
+        use tracing::info;
+
+        _ = tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| "odorobo=debug,mk_compressfs=debug".into()),
+            )
+            .with_test_writer()
+            .try_init()
+            .map_err(|err| info!(?err, "tracing subscriber already set"));
+
+        let vmid = ulid::Ulid::generate();
+        let manifest = VmManifest {
+            api_version: MANIFEST_VERSION,
+            id: vmid,
+            desired: DesiredState {
+                metadata: Metadata {
+                    name: "faas-boot-test".to_owned(),
+                    ..Default::default()
+                },
+                compute: Compute {
+                    vcpus: 1,
+                    memory_bytes: 512 * 1024 * 1024,
+                    ..Default::default()
+                },
+                storage: vec![],
+                networks: vec![],
+                placement: Default::default(),
+                boot: Boot {
+                    start: true,
+                    // busybox has no /sbin/init; drop into its shell instead.
+                    cmdline: Some(
+                        "console=ttyS0 root=rootfs rootfstype=virtiofs rw init=/bin/sh".to_owned(),
+                    ),
+                    ..Default::default()
+                },
+                cloud_init: None,
+                vsock: None,
+                rootfs: Some(Rootfs {
+                    oci: "docker://busybox:latest".to_owned(),
+                    read_only: true,
+                }),
+            },
+            observed: None,
+        };
+
+        // prepare() gives access to the ActorRef before the actor runs.
+        let prepared = VMActor::prepare();
+        let actor_ref = prepared.actor_ref().clone();
+        let handle = prepared.spawn((vmid, Some(manifest)));
+
+        // Wait for the guest kernel to mount the virtiofs root: the console
+        // spool should show the kernel log mentioning virtiofs.
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        let mut virtiofs_seen = false;
+        while std::time::Instant::now() < deadline {
+            let reply = actor_ref
+                .ask(GetConsoleHistory { vmid })
+                .await
+                .expect("console history ask");
+            let text = String::from_utf8_lossy(&reply.history);
+            if text.contains("virtiofs") {
+                virtiofs_seen = true;
+                info!(
+                    vmid = %vmid,
+                    tail = %String::from_utf8_lossy(&reply.history
+                        [reply.history.len().saturating_sub(400)..]),
+                    "guest console shows virtiofs"
+                );
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        assert!(
+            virtiofs_seen,
+            "guest never mounted the virtiofs root within 120s"
+        );
+
+        // Graceful stop must tear down the whole tree: CH, the supervised
+        // virtiofsd and the composefs mount.
+        actor_ref
+            .stop_gracefully()
+            .await
+            .expect("graceful stop");
+        // The actor handle resolves once on_stop teardown has finished.
+        let (actor, reason) = handle
+            .await
+            .expect("actor task")
+            .expect("actor stopped cleanly");
+        let _ = actor;
+        info!(?reason, "faas boot test actor stopped");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let socket = faas::socket_path_for(&vmid.to_string());
+        let mount = VMInstance::runtime_dir_for(&vmid.to_string()).join(faas::ROOTFS_TAG);
+        assert!(!socket.exists(), "virtiofsd socket leaked after stop");
+        assert!(!mount.exists(), "rootfs mount point leaked after stop");
+        let leaked = std::process::Command::new("pgrep")
+            .arg("virtiofsd")
+            .output()
+            .expect("pgrep");
+        assert!(!leaked.status.success(), "virtiofsd process leaked after actor stop");
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -194,6 +325,11 @@ pub struct VMActor {
     pub vm_instance: VMInstance,
     pub migration_state: Option<MigrationState>,
     pub console: Console,
+    /// Supervised virtiofsd child (extra process supervised by this actor)
+    /// when the VM boots an OCI rootfs over virtiofs (FaaS, issue #112).
+    pub virtiofs: Option<VirtioFsSupervisor>,
+    /// This VM's digest-pinned composefs mount of its OCI rootfs.
+    pub rootfs_mount: Option<PreparedRootfs>,
     /// Desired provider-neutral intent retained for VM info and migration.
     /// The translated Cloud Hypervisor config lives only in `VMInstance`.
     pub manifest: Option<VmManifest>,
@@ -212,16 +348,77 @@ impl Actor for VMActor {
             .as_ref()
             .is_some_and(|manifest| manifest.desired.boot.start);
         let vm_config_for_ch = vm_config.as_ref().map(to_vm_config).transpose()?;
-        let mut vminstance =
-            VMInstance::spawn(&vmid.to_string(), vm_config_for_ch, boot, None).await?;
+
+        // FaaS rootfs (issue #112): prepare the composefs mount and start the
+        // supervised virtiofsd BEFORE spawning CH — the fs device connects to
+        // the vhost-user socket at VM create time. Everything started here is
+        // cleaned up on any later failure.
+        let mut virtiofs = None;
+        let mut rootfs_mount = None;
+        if let Some(manifest) = &vm_config
+            && let Some(rootfs) = &manifest.desired.rootfs
+        {
+            let runtime_dir = VMInstance::runtime_dir_for(&vmid.to_string());
+            let prepared = crate::ch_driver::faas::mount_rootfs(&vmid.to_string(), rootfs)
+                .await
+                .map_err(|err| {
+                    Report::msg(format!("failed to prepare OCI rootfs: {err}"))
+                })?;
+            rootfs_mount = Some(prepared.clone());
+
+            let spec = VirtiofsdSpec {
+                program: crate::ch_driver::faas::virtiofsd_path()
+                    .ok_or_else(|| eyre!(
+                        "virtiofsd not found (looked in PATH and /usr/libexec) — `dnf install virtiofsd`"
+                    ))?,
+                socket: crate::ch_driver::faas::socket_path_for(&vmid.to_string()),
+                shared_dir: prepared.mount.clone(),
+                log: runtime_dir.join("virtiofsd.log"),
+            };
+            let supervisor = VirtioFsSupervisor::start(spec)?;
+            if let Err(err) = supervisor
+                .wait_socket_ready(std::time::Duration::from_secs(15))
+                .await
+            {
+                // Don't orphan the supervisor or the mount on this path.
+                supervisor.stop().await;
+                crate::ch_driver::faas::unmount_rootfs(&prepared).await;
+                return Err(err);
+            }
+            info!(%vmid, "virtiofsd supervised child started and socket ready");
+            virtiofs = Some(supervisor);
+        }
+
+        let spawn_result =
+            VMInstance::spawn(&vmid.to_string(), vm_config_for_ch, boot, None).await;
+        if let Err(err) = spawn_result {
+            // Don't orphan virtiofsd/the mount when CH fails to start.
+            if let Some(supervisor) = virtiofs.take() {
+                supervisor.stop().await;
+            }
+            if let Some(prepared) = rootfs_mount.take() {
+                crate::ch_driver::faas::unmount_rootfs(&prepared).await;
+            }
+            return Err(err);
+        }
+        let mut vminstance = spawn_result?;
 
         let console = Console::default();
         // A migration receiver has no config yet; its serial socket is created
         // only when the migrated VM is restored.
         if vm_config.is_some() {
-            console
+            let attach_result = console
                 .attach_socket(vminstance.console_socket_path())
-                .await?;
+                .await;
+            if let Err(err) = attach_result {
+                if let Some(supervisor) = virtiofs.take() {
+                    supervisor.stop().await;
+                }
+                if let Some(prepared) = rootfs_mount.take() {
+                    crate::ch_driver::faas::unmount_rootfs(&prepared).await;
+                }
+                return Err(err);
+            }
         }
 
         // Take the child process out so we can watch for unexpected death.
@@ -255,6 +452,8 @@ impl Actor for VMActor {
             vm_instance: vminstance,
             migration_state: None,
             console,
+            virtiofs,
+            rootfs_mount,
             manifest: vm_config,
         })
     }
@@ -277,6 +476,20 @@ impl Actor for VMActor {
             _ => {
                 warn!(vmid = %self.vmid, "unknown stop reason");
             }
+        }
+
+        // Teardown order matters: stop the guest first (it stops issuing fs
+        // requests), then the supervised virtiofsd, then unmount the
+        // composefs rootfs — the mount point must be unmounted before
+        // destroy() purges the runtime directory it lives in.
+        if let Err(err) = self.vm_instance.shutdown().await {
+            warn!(vmid = %self.vmid, ?err, "graceful VM shutdown before teardown failed; destroy() will retry");
+        }
+        if let Some(supervisor) = self.virtiofs.take() {
+            supervisor.stop().await;
+        }
+        if let Some(prepared) = self.rootfs_mount.take() {
+            crate::ch_driver::faas::unmount_rootfs(&prepared).await;
         }
 
         self.vm_instance.destroy().await?;
@@ -378,6 +591,20 @@ impl Message<MigrateVMReceive> for VMActor {
             return MigrateVMReceiveReply {
                 listening_address: migration_state.listening_address.clone(),
                 error: None,
+            };
+        }
+
+        // FaaS rootfs VMs are not migratable: the virtiofs device is
+        // vhost-user, whose device state cannot be serialized by CH's
+        // migration stream (issue #112). Reschedule cold instead — the
+        // destination can mount the same digest-pinned rootfs exactly.
+        if msg.config.desired.rootfs.is_some() {
+            return MigrateVMReceiveReply {
+                listening_address: String::new(),
+                error: Some(
+                    "VM has an OCI rootfs (virtiofs/composefs); live migration is not supported for vhost-user devices — reschedule the VM cold instead"
+                        .to_owned(),
+                ),
             };
         }
 
@@ -503,6 +730,13 @@ impl Message<PrepMigration> for VMActor {
         // Preparation is best-effort here because the remote receive operation
         // has no fallible reply channel; report failures and let migration state
         // cleanup handle the failed attempt.
+        if msg.config.desired.rootfs.is_some() {
+            error!(
+                vmid = %self.vmid,
+                "refusing to prep migration: OCI rootfs (virtiofs/composefs) VMs are not migratable"
+            );
+            return;
+        }
         let config = match to_vm_config(&msg.config) {
             Ok(config) => config,
             Err(error) => {

@@ -38,6 +38,8 @@ pub enum ManifestError {
     InvalidStorageSource(String),
     #[error("storage attachment {0} has a duplicate id")]
     DuplicateStorageId(String),
+    #[error("rootfs must define a non-empty OCI image reference")]
+    EmptyRootfsOci,
 
     #[error("network {0} must define an id")]
     NetworkWithoutId(usize),
@@ -118,6 +120,13 @@ pub struct DesiredState {
     /// The order of this array determines boot device order.
     #[serde(default)]
     pub storage: Vec<Storage>,
+    /// FaaS root filesystem: an OCI image unpacked on the node and served to
+    /// the guest as its root filesystem over virtiofs. The agent runs
+    /// virtiofsd for this VM and boots the kernel directly with
+    /// `root=rootfs rootfstype=virtiofs` (issue #112). Storage-backed VMs
+    /// leave this unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rootfs: Option<Rootfs>,
     #[serde(default)]
     pub networks: Vec<Network>,
     #[serde(default)]
@@ -174,6 +183,15 @@ impl DesiredState {
             if network.id.trim().is_empty() {
                 return Err(ManifestError::NetworkWithoutId(index));
             }
+        }
+        // A virtiofs rootfs needs an image to serve; an empty reference would
+        // only fail later at pull time with a worse error.
+        if self
+            .rootfs
+            .as_ref()
+            .is_some_and(|rootfs| rootfs.oci.trim().is_empty())
+        {
+            return Err(ManifestError::EmptyRootfsOci);
         }
         for rule in &self.placement.affinity {
             for requirement in &rule.requirements {
@@ -250,6 +268,24 @@ pub struct Storage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(with = "Option<String>")]
     pub volume_id: Option<Ulid>,
+    #[serde(default)]
+    pub read_only: bool,
+}
+
+/// An OCI image used as the guest root filesystem over virtiofs (FaaS).
+///
+/// The agent materializes the image as a digest-pinned composefs mount on the
+/// node and serves it to the guest over virtiofs; the guest boots the kernel
+/// directly with `root=rootfs rootfstype=virtiofs` (issue #112).
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Rootfs {
+    /// OCI image reference understood by `skopeo copy`, e.g.
+    /// `docker://registry.fedoraproject.org/fedora:latest`.
+    pub oci: String,
+    /// Whether the guest root is writable. Read-only roots are shared by every
+    /// VM running the same image; writable roots get a per-VM overlayfs upper
+    /// directory on the node (temporary — it dies with the VM).
     #[serde(default)]
     pub read_only: bool,
 }
@@ -333,6 +369,8 @@ pub struct Boot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kernel: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initramfs: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cmdline: Option<String>,
 }
 
@@ -398,6 +436,7 @@ mod tests {
             include_str!("../../docs/fixtures/manifest/networked.json"),
             include_str!("../../docs/fixtures/manifest/cloud-init.json"),
             include_str!("../../docs/fixtures/manifest/vsock.json"),
+            include_str!("../../docs/fixtures/manifest/oci-rootfs.json"),
         ];
 
         for json in fixtures {
@@ -550,6 +589,33 @@ mod tests {
             manifest.validate(),
             Err(ManifestError::EmptyStorageId)
         ));
+    }
+
+    #[test]
+    fn accepts_and_rejects_oci_rootfs() {
+        let mut manifest = minimal_manifest();
+        manifest.desired.rootfs = Some(crate::manifest::Rootfs {
+            oci: "docker://registry.fedoraproject.org/fedora:latest".to_owned(),
+            read_only: true,
+        });
+        assert_eq!(manifest.validate(), Ok(()));
+
+        manifest.desired.rootfs = Some(crate::manifest::Rootfs {
+            oci: "   ".to_owned(),
+            read_only: false,
+        });
+        assert_eq!(manifest.validate(), Err(ManifestError::EmptyRootfsOci));
+
+        let fixture = include_str!("../../docs/fixtures/manifest/oci-rootfs.json");
+        let manifest: VmManifest =
+            serde_json::from_str(fixture).expect("oci-rootfs fixture is valid");
+        assert_eq!(manifest.validate(), Ok(()));
+        // composefs-only contract: unknown backend-style fields must reject
+        let bad = fixture.replace(
+            "\"read_only\": true",
+            "\"read_only\": true,\n      \"backend\": \"dir\"",
+        );
+        serde_json::from_str::<VmManifest>(&bad).expect_err("unknown rootfs fields must reject");
     }
 
     #[test]
