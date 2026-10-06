@@ -6,6 +6,7 @@
 pub mod actor;
 pub mod api;
 pub mod devices;
+pub mod faas;
 pub mod instance;
 pub mod manifest;
 pub mod provisioning;

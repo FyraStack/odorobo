@@ -5,11 +5,12 @@
 //! from manifest intent.
 
 use cloud_hypervisor_client::models::{
-    CpusConfig, DiskConfig, ImageType, MemoryConfig, NetConfig, PayloadConfig, PlatformConfig,
-    VmConfig, VsockConfig,
+    CpusConfig, DiskConfig, FsConfig, ImageType, MemoryConfig, NetConfig, PayloadConfig,
+    PlatformConfig, VmConfig, VsockConfig,
 };
 use stable_eyre::{Result, eyre::eyre};
 
+use crate::ch_driver::faas;
 use crate::manifest::{Storage, VmManifest};
 
 /// Convert a validated Odorobo manifest to a Cloud Hypervisor configuration.
@@ -58,6 +59,36 @@ pub fn to_vm_config(manifest: &VmManifest) -> Result<VmConfig> {
         ..Default::default()
     });
 
+    // FaaS rootfs (issue #112): the agent serves a digest-pinned composefs
+    // mount of the OCI image over virtiofs (see faas.rs). The fs device's
+    // socket lives in the VM runtime dir, where faas::mount_rootfs and the
+    // actor's virtiofsd supervisor put it. vhost-user requires shared guest
+    // memory, so rootfs VMs always boot with memory shared=on. Boot defaults
+    // to the tiny microvm kernel + virtiofs root cmdline unless the manifest
+    // overrides them.
+    let has_rootfs = desired.rootfs.is_some();
+    let fs = has_rootfs.then(|| {
+        let socket = faas::socket_path_for(&manifest.id.to_string());
+        let mut fs = FsConfig::new(
+            faas::ROOTFS_TAG.to_owned(),
+            socket.display().to_string(),
+            1,
+            1024,
+        );
+        fs.id = Some("odorobo-rootfs".to_owned());
+        vec![fs]
+    });
+    let kernel = desired
+        .boot
+        .kernel
+        .clone()
+        .or_else(|| has_rootfs.then(|| faas::MICROVM_KERNEL_PATH.to_owned()));
+    let cmdline = desired
+        .boot
+        .cmdline
+        .clone()
+        .or_else(|| has_rootfs.then(|| faas::DEFAULT_ROOTFS_CMDLINE.to_owned()));
+
     Ok(VmConfig {
         cpus: Some(CpusConfig {
             boot_vcpus: i32::try_from(desired.compute.vcpus)
@@ -69,6 +100,7 @@ pub fn to_vm_config(manifest: &VmManifest) -> Result<VmConfig> {
         memory: Some(MemoryConfig {
             size: i64::try_from(desired.compute.memory_bytes)
                 .map_err(|_| eyre!("memory size exceeds Cloud Hypervisor limits"))?,
+            shared: has_rootfs.then_some(true),
             ..Default::default()
         }),
         payload: PayloadConfig {
@@ -78,19 +110,21 @@ pub fn to_vm_config(manifest: &VmManifest) -> Result<VmConfig> {
                 // firmware, or Cloud Hypervisor rejects the config with
                 // "Specifying a kernel is not supported when a firmware is
                 // provided".
-                if desired.boot.kernel.is_some() {
+                if kernel.is_some() {
                     None
                 } else {
                     Some("/var/lib/odorobo/CLOUDHV.fd".to_owned())
                 }
             }),
-            kernel: desired.boot.kernel.clone(),
-            cmdline: desired.boot.cmdline.clone(),
+            kernel,
+            initramfs: desired.boot.initramfs.clone(),
+            cmdline,
             ..Default::default()
         },
         disks: (!disks.is_empty()).then_some(disks),
         net: (!networks.is_empty()).then_some(networks),
         vsock,
+        fs,
         platform: Some(PlatformConfig {
             serial_number: Some("ds=nocloud".to_owned()),
             ..Default::default()
@@ -195,6 +229,71 @@ mod tests {
         manifest.desired.boot.firmware = Some("/custom/fw.fd".to_owned());
         let config = to_vm_config(&manifest).expect("explicit firmware manifest converts");
         assert_eq!(config.payload.firmware.as_deref(), Some("/custom/fw.fd"));
+    }
+
+    #[test]
+    fn converts_rootfs_to_fs_shared_memory_and_direct_kernel_boot() {
+        let mut manifest = minimal();
+        manifest.desired.rootfs = Some(crate::manifest::Rootfs {
+            oci: "docker://busybox:latest".to_owned(),
+            read_only: true,
+        });
+        let config = to_vm_config(&manifest).expect("rootfs manifest converts");
+
+        // fs device: tag rootfs + runtime-dir socket where the actor's
+        // virtiofsd supervisor listens
+        let fs = config.fs.as_ref().expect("fs device for rootfs");
+        assert_eq!(fs.len(), 1);
+        assert_eq!(fs[0].tag, "rootfs");
+        assert_eq!(
+            fs[0].socket,
+            format!("/run/odorobo/vms/{}/rootfs.sock", manifest.id)
+        );
+        assert_eq!(fs[0].num_queues, 1);
+
+        // vhost-user requires shared guest memory
+        assert_eq!(config.memory.expect("memory").shared, Some(true));
+
+        // direct kernel boot defaults (tiny microvm kernel, virtiofs root)
+        assert_eq!(
+            config.payload.kernel.as_deref(),
+            Some(super::faas::MICROVM_KERNEL_PATH)
+        );
+        assert_eq!(
+            config.payload.cmdline.as_deref(),
+            Some(super::faas::DEFAULT_ROOTFS_CMDLINE)
+        );
+        assert_eq!(config.payload.firmware, None);
+    }
+
+    #[test]
+    fn rootfs_boot_overrides_win() {
+        let mut manifest = minimal();
+        manifest.desired.rootfs = Some(crate::manifest::Rootfs {
+            oci: "docker://busybox:latest".to_owned(),
+            read_only: false,
+        });
+        manifest.desired.boot.kernel = Some("/custom/vmlinux".to_owned());
+        manifest.desired.boot.initramfs = Some("/custom/initramfs.img".to_owned());
+        manifest.desired.boot.cmdline = Some("console=hvc0 quiet".to_owned());
+        let config = to_vm_config(&manifest).expect("rootfs manifest converts");
+        assert_eq!(config.payload.kernel.as_deref(), Some("/custom/vmlinux"));
+        assert_eq!(
+            config.payload.initramfs.as_deref(),
+            Some("/custom/initramfs.img")
+        );
+        assert_eq!(config.payload.cmdline.as_deref(), Some("console=hvc0 quiet"));
+    }
+
+    #[test]
+    fn non_rootfs_vms_have_no_fs_device_and_keep_firmware_default() {
+        let config = to_vm_config(&minimal()).expect("minimal converts");
+        assert!(config.fs.is_none());
+        assert_eq!(config.memory.expect("memory").shared, None);
+        assert_eq!(
+            config.payload.firmware.as_deref(),
+            Some("/var/lib/odorobo/CLOUDHV.fd")
+        );
     }
 
     #[test]
