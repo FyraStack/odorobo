@@ -1,14 +1,14 @@
 use std::{collections::VecDeque, sync::Arc};
 
 use crate::messages::vm::{
-    DeleteVM, GetConsoleHistory, GetConsoleHistoryReply, GetVMHeartbeat, GetVMHeartbeatReply,
-    GetVMInfo, GetVMInfoReply, MigrateVMReceive, MigrateVMReceiveReply, PrepMigration,
-    SendConsoleInput, SendConsoleInputReply, ShutdownVM,
+    DeleteVM, DeleteVMReply, GetConsoleHistory, GetConsoleHistoryReply, GetVMHeartbeat,
+    GetVMHeartbeatReply, GetVMInfo, GetVMInfoReply, MigrateVMReceive, MigrateVMReceiveReply,
+    PrepMigration, SendConsoleInput, SendConsoleInputReply, ShutdownVM,
 };
 use crate::{
     ch_driver::{
         VMInstance,
-        faas::{PreparedRootfs, VirtioFsSupervisor, VirtiofsdSpec},
+        containers::{PreparedRootfs, VirtioFsSupervisor, VirtiofsdSpec},
         manifest::to_vm_config,
     },
     manifest::VmManifest,
@@ -16,10 +16,7 @@ use crate::{
 use cloud_hypervisor_client::models::VmConfig;
 use kameo::prelude::*;
 use serde::{Deserialize, Serialize};
-use stable_eyre::{
-    Report, Result,
-    eyre::eyre,
-};
+use stable_eyre::{Report, Result, eyre::eyre};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{UnixStream, unix::OwnedWriteHalf},
@@ -41,6 +38,34 @@ pub struct MigrationState {
 }
 
 const CONSOLE_SPOOL_SIZE: usize = 1024 * 1024;
+
+async fn quiesce_guest_for_rootfs_teardown(instance: &VMInstance, vmid: ulid::Ulid) -> bool {
+    match instance.info().await {
+        Ok(info)
+            if matches!(
+                info.state,
+                cloud_hypervisor_client::models::VmState::Running
+                    | cloud_hypervisor_client::models::VmState::Paused
+            ) =>
+        {
+            match instance.shutdown().await {
+                Ok(()) => true,
+                Err(err) => {
+                    warn!(%vmid, ?err, "could not shut down guest before rootfs teardown");
+                    false
+                }
+            }
+        }
+        Ok(_) => true,
+        Err(info_err) => match instance.shutdown().await {
+            Ok(()) => true,
+            Err(shutdown_err) => {
+                warn!(%vmid, ?info_err, ?shutdown_err, "guest state is unknown; preserving rootfs mounts");
+                false
+            }
+        },
+    }
+}
 
 /// Bounded serial-console history shared with the task draining the CH socket.
 #[derive(Clone)]
@@ -190,25 +215,20 @@ mod tests {
         assert_eq!(&history[CONSOLE_SPOOL_SIZE - 4..], b"tail");
     }
 
-    /// Full FaaS boot through the actor (issue #112): OCI rootfs -> composefs
-    /// mount -> supervised virtiofsd -> CH direct kernel boot -> guest mounts
-    /// its root over virtiofs. Requires nested KVM, the cloud-hypervisor
-    /// binary, virtiofsd and network access for the image pull, so it is
-    /// ignored by default:
-    /// `cargo test -p odorobo --bin odorobo faas_vm_boots -- --ignored --nocapture`
+    /// Full OCI rootfs boot through the actor: OCI root -> composefs layer
+    /// mounts -> supervised virtiofsd -> CH direct kernel -> virtiofs root.
+    /// Requires nested KVM, the host tools, and Zig for a static init stub, so
+    /// it is ignored by default: `cargo test -p odorobo --bin odorobo faas_vm_boots -- --ignored --nocapture`
     #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "boots a real VM; needs /dev/kvm, cloud-hypervisor, virtiofsd and network for the OCI pull"]
+    #[ignore = "boots a real VM; needs /dev/kvm, cloud-hypervisor, virtiofsd, skopeo, composefs host support, and zig"]
     async fn faas_vm_boots_oci_rootfs_through_the_actor() {
-        use crate::ch_driver::{
-            VMInstance,
-            faas,
-            actor::VMActor,
-        };
+        use crate::ch_driver::{VMInstance, actor::VMActor, containers};
         use crate::manifest::{
             Boot, Compute, DesiredState, MANIFEST_VERSION, Metadata, Rootfs, VmManifest,
         };
-        use crate::messages::vm::GetConsoleHistory;
+        use crate::messages::vm::{DeleteVM, GetConsoleHistory};
         use kameo::prelude::*;
+        use std::path::PathBuf;
         use std::time::Duration;
         use tracing::info;
 
@@ -222,6 +242,27 @@ mod tests {
             .map_err(|err| info!(?err, "tracing subscriber already set"));
 
         let vmid = ulid::Ulid::generate();
+        let fixture_dir = PathBuf::from("/var/lib/odorobo/vm-boot-fixtures").join(vmid.to_string());
+        std::fs::create_dir_all(&fixture_dir).unwrap();
+        let init_source = fixture_dir.join("init.c");
+        let init_binary = fixture_dir.join("root-init");
+        std::fs::write(&init_source, "#include <unistd.h>\nint main(void) { static const char s[] = \"odorobo-test-init\\n\"; write(1, s, sizeof(s)-1); for (;;) pause(); }\n").unwrap();
+        let compiled = std::process::Command::new("zig")
+            .args(["cc", "-target", "x86_64-linux-musl", "-static", "-O2", "-o"])
+            .arg(&init_binary)
+            .arg(&init_source)
+            .output()
+            .expect("zig is required for a static guest init fixture");
+        assert!(
+            compiled.status.success(),
+            "zig init compile failed: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let oci_layout = crate::ch_driver::containers::tests::fixture_oci_layout_with_init(
+            &fixture_dir,
+            &init_binary,
+        );
+        let image_ref = format!("oci:{}:latest", oci_layout.display());
         let manifest = VmManifest {
             api_version: MANIFEST_VERSION,
             id: vmid,
@@ -240,7 +281,7 @@ mod tests {
                 placement: Default::default(),
                 boot: Boot {
                     start: true,
-                    // busybox has no /sbin/init; drop into its shell instead.
+                    // The test layer includes static BusyBox at /bin/sh.
                     cmdline: Some(
                         "console=ttyS0 root=rootfs rootfstype=virtiofs rw init=/bin/sh".to_owned(),
                     ),
@@ -249,8 +290,8 @@ mod tests {
                 cloud_init: None,
                 vsock: None,
                 rootfs: Some(Rootfs {
-                    oci: "docker://busybox:latest".to_owned(),
-                    read_only: true,
+                    oci: image_ref,
+                    mode: crate::manifest::RootfsMode::ReadOnly,
                 }),
             },
             observed: None,
@@ -266,10 +307,17 @@ mod tests {
         let deadline = std::time::Instant::now() + Duration::from_secs(120);
         let mut virtiofs_seen = false;
         while std::time::Instant::now() < deadline {
-            let reply = actor_ref
-                .ask(GetConsoleHistory { vmid })
-                .await
-                .expect("console history ask");
+            let reply = match actor_ref.ask(GetConsoleHistory { vmid }).await {
+                Ok(reply) => reply,
+                Err(err) => {
+                    let termination = match handle.await {
+                        Ok(Ok((_actor, reason))) => format!("actor stopped: {reason:?}"),
+                        Ok(Err(start_error)) => format!("actor start failed: {start_error:?}"),
+                        Err(join_error) => format!("actor task failed: {join_error}"),
+                    };
+                    panic!("console history ask failed: {err}; {termination}");
+                }
+            };
             let text = String::from_utf8_lossy(&reply.history);
             if text.contains("virtiofs") {
                 virtiofs_seen = true;
@@ -290,10 +338,14 @@ mod tests {
 
         // Graceful stop must tear down the whole tree: CH, the supervised
         // virtiofsd and the composefs mount.
-        actor_ref
-            .stop_gracefully()
+        let deleted = actor_ref
+            .ask(DeleteVM { vmid })
             .await
-            .expect("graceful stop");
+            .expect("DeleteVM reply");
+        assert_eq!(
+            deleted.error, None,
+            "actor rootfs teardown must report clean deletion"
+        );
         // The actor handle resolves once on_stop teardown has finished.
         let (actor, reason) = handle
             .await
@@ -303,15 +355,19 @@ mod tests {
         info!(?reason, "faas boot test actor stopped");
         tokio::time::sleep(Duration::from_secs(1)).await;
 
-        let socket = faas::socket_path_for(&vmid.to_string());
-        let mount = VMInstance::runtime_dir_for(&vmid.to_string()).join(faas::ROOTFS_TAG);
+        let socket = containers::socket_path_for(&vmid.to_string());
+        let mount = VMInstance::runtime_dir_for(&vmid.to_string()).join(containers::ROOTFS_TAG);
         assert!(!socket.exists(), "virtiofsd socket leaked after stop");
         assert!(!mount.exists(), "rootfs mount point leaked after stop");
         let leaked = std::process::Command::new("pgrep")
             .arg("virtiofsd")
             .output()
             .expect("pgrep");
-        assert!(!leaked.status.success(), "virtiofsd process leaked after actor stop");
+        assert!(
+            !leaked.status.success(),
+            "virtiofsd process leaked after actor stop"
+        );
+        std::fs::remove_dir_all(fixture_dir).unwrap();
     }
 }
 
@@ -361,21 +417,19 @@ impl Actor for VMActor {
             let runtime_dir = VMInstance::runtime_dir_for(&vmid.to_string());
             // Resolve everything that can fail cheaply BEFORE mounting, so
             // early errors cannot leak a mounted rootfs.
-            let program = crate::ch_driver::faas::virtiofsd_path().ok_or_else(|| {
+            let program = crate::ch_driver::containers::virtiofsd_path().ok_or_else(|| {
                 eyre!(
                     "virtiofsd not found (looked in PATH and /usr/libexec) — `dnf install virtiofsd`"
                 )
             })?;
-            let prepared = crate::ch_driver::faas::mount_rootfs(&vmid.to_string(), rootfs)
+            let prepared = crate::ch_driver::containers::mount_rootfs(&vmid.to_string(), rootfs)
                 .await
-                .map_err(|err| {
-                    Report::msg(format!("failed to prepare OCI rootfs: {err}"))
-                })?;
+                .map_err(|err| Report::msg(format!("failed to prepare OCI rootfs: {err}")))?;
             rootfs_mount = Some(prepared.clone());
 
             let spec = VirtiofsdSpec {
                 program,
-                socket: crate::ch_driver::faas::socket_path_for(&vmid.to_string()),
+                socket: crate::ch_driver::containers::socket_path_for(&vmid.to_string()),
                 shared_dir: prepared.mount.clone(),
                 log: runtime_dir.join("virtiofsd.log"),
             };
@@ -383,7 +437,11 @@ impl Actor for VMActor {
                 Ok(supervisor) => supervisor,
                 // Don't orphan the mount on this path.
                 Err(err) => {
-                    crate::ch_driver::faas::unmount_rootfs(&prepared).await;
+                    if let Err(cleanup_err) =
+                        crate::ch_driver::containers::unmount_rootfs(&prepared).await
+                    {
+                        warn!(%vmid, ?cleanup_err, "rootfs cleanup after virtiofsd start failure incomplete");
+                    }
                     return Err(err);
                 }
             };
@@ -393,22 +451,29 @@ impl Actor for VMActor {
             {
                 // Don't orphan the supervisor or the mount on this path.
                 supervisor.stop().await;
-                crate::ch_driver::faas::unmount_rootfs(&prepared).await;
+                if let Err(cleanup_err) =
+                    crate::ch_driver::containers::unmount_rootfs(&prepared).await
+                {
+                    warn!(%vmid, ?cleanup_err, "rootfs cleanup after virtiofs socket failure incomplete");
+                }
                 return Err(err);
             }
             info!(%vmid, "virtiofsd supervised child started and socket ready");
             virtiofs = Some(supervisor);
         }
 
-        let spawn_result =
-            VMInstance::spawn(&vmid.to_string(), vm_config_for_ch, boot, None).await;
+        let spawn_result = VMInstance::spawn(&vmid.to_string(), vm_config_for_ch, boot, None).await;
         if let Err(err) = spawn_result {
             // Don't orphan virtiofsd/the mount when CH fails to start.
             if let Some(supervisor) = virtiofs.take() {
                 supervisor.stop().await;
             }
             if let Some(prepared) = rootfs_mount.take() {
-                crate::ch_driver::faas::unmount_rootfs(&prepared).await;
+                if let Err(cleanup_err) =
+                    crate::ch_driver::containers::unmount_rootfs(&prepared).await
+                {
+                    warn!(%vmid, ?cleanup_err, "rootfs cleanup after hypervisor spawn failure incomplete");
+                }
             }
             return Err(err);
         }
@@ -426,7 +491,11 @@ impl Actor for VMActor {
                     supervisor.stop().await;
                 }
                 if let Some(prepared) = rootfs_mount.take() {
-                    crate::ch_driver::faas::unmount_rootfs(&prepared).await;
+                    if let Err(cleanup_err) =
+                        crate::ch_driver::containers::unmount_rootfs(&prepared).await
+                    {
+                        warn!(%vmid, ?cleanup_err, "rootfs cleanup after console attach failure incomplete");
+                    }
                 }
                 return Err(err);
             }
@@ -493,14 +562,24 @@ impl Actor for VMActor {
         // requests), then the supervised virtiofsd, then unmount the
         // composefs rootfs — the mount point must be unmounted before
         // destroy() purges the runtime directory it lives in.
-        if let Err(err) = self.vm_instance.shutdown().await {
-            warn!(vmid = %self.vmid, ?err, "graceful VM shutdown before teardown failed; destroy() will retry");
+        let guest_stopped = quiesce_guest_for_rootfs_teardown(&self.vm_instance, self.vmid).await;
+        if !guest_stopped {
+            warn!(vmid = %self.vmid, "VM teardown will preserve rootfs mounts because guest shutdown is unconfirmed");
         }
         if let Some(supervisor) = self.virtiofs.take() {
             supervisor.stop().await;
         }
-        if let Some(prepared) = self.rootfs_mount.take() {
-            crate::ch_driver::faas::unmount_rootfs(&prepared).await;
+        if guest_stopped {
+            if let Some(prepared) = self.rootfs_mount.take() {
+                if let Err(err) = crate::ch_driver::containers::unmount_rootfs(&prepared).await {
+                    self.rootfs_mount = Some(prepared);
+                    warn!(vmid = %self.vmid, ?err, "rootfs teardown incomplete; preserving persistent state");
+                }
+            }
+        } else {
+            // Do not tear a root out from under a potentially live guest. The
+            // failed mount stays visible and prevents a second writer.
+            warn!(vmid = %self.vmid, "guest shutdown was not confirmed; leaving rootfs mounts in place for recovery");
         }
 
         self.vm_instance.destroy().await?;
@@ -661,8 +740,7 @@ impl Message<MigrateVMReceive> for VMActor {
                     Err(err) => {
                         trace!(
                             ?err,
-                            attempt,
-                            "serial console socket not ready during migration"
+                            attempt, "serial console socket not ready during migration"
                         );
                         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     }
@@ -785,13 +863,51 @@ impl Message<ShutdownVM> for VMActor {
 }
 #[remote_message]
 impl Message<DeleteVM> for VMActor {
-    type Reply = ();
+    type Reply = DeleteVMReply;
     async fn handle(
         &mut self,
         _msg: DeleteVM,
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        trace!(vmid = %self.vmid, "Shutting down VM actor");
+        trace!(vmid = %self.vmid, "Deleting VM actor and persistent rootfs state");
+        if !quiesce_guest_for_rootfs_teardown(&self.vm_instance, self.vmid).await {
+            return DeleteVMReply {
+                error: Some("guest shutdown did not complete; actor and rootfs mounts were retained for retry".to_owned()),
+            };
+        }
+        if let Some(supervisor) = self.virtiofs.take() {
+            supervisor.stop().await;
+        }
+        let mut persistent = self.manifest.as_ref().is_some_and(|manifest| {
+            manifest
+                .desired
+                .rootfs
+                .as_ref()
+                .is_some_and(|rootfs| rootfs.mode == crate::manifest::RootfsMode::Persistent)
+        });
+        if let Some(prepared) = self.rootfs_mount.take() {
+            persistent = prepared.mode == crate::manifest::RootfsMode::Persistent;
+            if let Err(err) = crate::ch_driver::containers::unmount_rootfs(&prepared).await {
+                self.rootfs_mount = Some(prepared);
+                return DeleteVMReply {
+                    error: Some(format!(
+                        "rootfs unmount failed; actor and state retained for retry: {err}"
+                    )),
+                };
+            }
+        }
+        if persistent {
+            if let Err(err) =
+                crate::ch_driver::containers::delete_persistent_rootfs(&self.vmid.to_string()).await
+            {
+                return DeleteVMReply {
+                    error: Some(format!(
+                        "persistent rootfs deletion failed; actor retained for retry: {err}"
+                    )),
+                };
+            }
+        }
         ctx.actor_ref().stop_gracefully().await.unwrap();
+        DeleteVMReply { error: None }
     }
 }

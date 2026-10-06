@@ -3,7 +3,7 @@
 This directory runs the local development stack in containers:
 
 - `ceph` provides a single-node Ceph cluster and a file-backed OSD.
-- `odorobo` runs the agent, sharing Ceph's network and PID namespaces and the host's `/dev`.
+- `odorobo` runs the agent, sharing Ceph's network and PID namespaces and the host's `/dev`. Its image includes the host-side OCI/composefs/fs-verity and virtiofsd tools needed to exercise container roots.
 
 Odorobo must run in the container for the `rbd://` storage path. It invokes `rbd device map` using the generated Ceph credentials, which creates a kernel block device, and then passes that device to Cloud Hypervisor. The container provides the credential files, the privileged device access, and the shared namespaces that a host-side process would have to replicate.
 
@@ -68,7 +68,7 @@ Because `odorobo` uses Ceph's network namespace, the generated Ceph config inten
 
 ## Application development
 
-The repository is mounted at `/workspace` in the Odorobo container. Rebuild and restart the application after source changes:
+The repository is mounted at `/workspace` in the Odorobo container. The app container also shares `/var/lib/odorobo` (persistent OCI/layer caches and the built microVM kernel) and `/run/odorobo` (VM runtime/mount paths) with the host so the kernel and composefs-capable filesystem are available to the test agent. Rebuild and restart the application after source changes:
 
 ```bash
 podman compose -f .local/dev/compose.yml build odorobo
@@ -84,7 +84,24 @@ The agent runs as:
 cargo run --release -p odorobo -- --manager-enabled true
 ```
 
-Its runtime directory is container-local (`/run/odorobo` in the `odorobo` container); Cloud Hypervisor processes and RBD devices are visible in the same namespaces as the agent.
+Its runtime directory is `/run/odorobo/vms` (shared with the host for privileged mount tests); Cloud Hypervisor processes and RBD devices are visible in the same namespaces as the agent. The app image installs `composefs`, `fsverity-utils`, `skopeo`, `virtiofsd`, `e2fsprogs`, `util-linux`, and Zig for the ignored kernel fixture test.
+
+Privileged rootfs end-to-end checks run from one-off containers; they use Cargo's existing host cache and only disposable fixture/RBD paths:
+
+```bash
+podman compose -f .local/dev/compose.yml run --rm --no-deps \
+  -v /root/.cargo:/root/.cargo -e CARGO_NET_OFFLINE=true odorobo \
+  cargo test --offline -p odorobo --bin odorobo oci_rootfs_modes_share_verified_layers_and_keep_writes_isolated -- --ignored --nocapture
+
+podman compose -f .local/dev/compose.yml run --rm --no-deps \
+  -v /root/.cargo:/root/.cargo -e CARGO_NET_OFFLINE=true \
+  -e ODOROBO_ROOTFS_BACKEND=rbd -e ODOROBO_ROOTFS_RBD_SIZE=128M odorobo \
+  cargo test --offline -p odorobo --bin odorobo rbd_persistent_upper_cold_reattach_and_delete -- --ignored --nocapture
+```
+
+The RBD test creates a unique `odorobo-rootfs-<vmid>` image and deletes it; never substitute the persistent `dev-disk`. Persistent rootfs backend selection defaults to `local`; use `ODOROBO_ROOTFS_BACKEND=rbd` and `ODOROBO_ROOTFS_RBD_SIZE=128M` for the ignored lifecycle test. That test creates and deletes a uniquely named `odorobo-rootfs-<vmid>` image; never repurpose `dev-disk` for rootfs tests.
+
+The app image installs `composefs`, `fsverity-utils`, `skopeo`, `virtiofsd`, `e2fsprogs`, and `util-linux` in addition to the build/runtime dependencies.
 
 ## Verify the image
 
@@ -113,6 +130,9 @@ CEPH_CLIENT=odorobo
 CEPH_IMAGE_NAME=dev-disk
 CEPH_IMAGE_SIZE=1G
 CEPH_OSD_SIZE=10G
+ODOROBO_ROOTFS_BACKEND=local
+ODOROBO_ROOTFS_RBD_POOL=odorobo-blockpool
+ODOROBO_ROOTFS_RBD_SIZE=1G
 ```
 
 `CEPH_MON_IP` should remain `127.0.0.1` with the provided Compose topology. If you change the network topology, it must be an address reachable from both services.

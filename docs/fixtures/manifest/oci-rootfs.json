@@ -10,7 +10,7 @@
     "boot": { "start": true },
     "rootfs": {
       "oci": "docker://registry.fedoraproject.org/fedora:latest",
-      "read_only": true
+      "mode": "read_only"
     }
   }
 }

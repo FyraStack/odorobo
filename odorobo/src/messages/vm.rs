@@ -69,7 +69,10 @@ pub struct DeleteVM {
 }
 
 #[derive(Serialize, Deserialize, Reply, Debug, Clone)]
-pub struct DeleteVMReply;
+pub struct DeleteVMReply {
+    /// Persistent rootfs teardown or deletion error, if actor cleanup failed.
+    pub error: Option<String>,
+}
 
 /// Shuts down a VM temporarily
 #[derive(Serialize, Deserialize, Debug, Clone)]

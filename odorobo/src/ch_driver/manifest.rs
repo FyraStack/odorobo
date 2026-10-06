@@ -10,7 +10,7 @@ use cloud_hypervisor_client::models::{
 };
 use stable_eyre::{Result, eyre::eyre};
 
-use crate::ch_driver::faas;
+use crate::ch_driver::containers;
 use crate::manifest::{Storage, VmManifest};
 
 /// Convert a validated Odorobo manifest to a Cloud Hypervisor configuration.
@@ -59,18 +59,18 @@ pub fn to_vm_config(manifest: &VmManifest) -> Result<VmConfig> {
         ..Default::default()
     });
 
-    // FaaS rootfs (issue #112): the agent serves a digest-pinned composefs
-    // mount of the OCI image over virtiofs (see faas.rs). The fs device's
-    // socket lives in the VM runtime dir, where faas::mount_rootfs and the
+    // Container rootfs: the agent serves a digest-pinned composefs layer
+    // stack of the OCI image over virtiofs (see containers.rs). The fs device's
+    // socket lives in the VM runtime dir, where containers::mount_rootfs and the
     // actor's virtiofsd supervisor put it. vhost-user requires shared guest
     // memory, so rootfs VMs always boot with memory shared=on. Boot defaults
     // to the tiny microvm kernel + virtiofs root cmdline unless the manifest
     // overrides them.
     let has_rootfs = desired.rootfs.is_some();
     let fs = has_rootfs.then(|| {
-        let socket = faas::socket_path_for(&manifest.id.to_string());
+        let socket = containers::socket_path_for(&manifest.id.to_string());
         let mut fs = FsConfig::new(
-            faas::ROOTFS_TAG.to_owned(),
+            containers::ROOTFS_TAG.to_owned(),
             socket.display().to_string(),
             1,
             1024,
@@ -82,12 +82,12 @@ pub fn to_vm_config(manifest: &VmManifest) -> Result<VmConfig> {
         .boot
         .kernel
         .clone()
-        .or_else(|| has_rootfs.then(|| faas::MICROVM_KERNEL_PATH.to_owned()));
+        .or_else(|| has_rootfs.then(|| containers::MICROVM_KERNEL_PATH.to_owned()));
     let cmdline = desired
         .boot
         .cmdline
         .clone()
-        .or_else(|| has_rootfs.then(|| faas::DEFAULT_ROOTFS_CMDLINE.to_owned()));
+        .or_else(|| has_rootfs.then(|| containers::DEFAULT_ROOTFS_CMDLINE.to_owned()));
 
     Ok(VmConfig {
         cpus: Some(CpusConfig {
@@ -236,7 +236,7 @@ mod tests {
         let mut manifest = minimal();
         manifest.desired.rootfs = Some(crate::manifest::Rootfs {
             oci: "docker://busybox:latest".to_owned(),
-            read_only: true,
+            mode: crate::manifest::RootfsMode::ReadOnly,
         });
         let config = to_vm_config(&manifest).expect("rootfs manifest converts");
 
@@ -257,11 +257,11 @@ mod tests {
         // direct kernel boot defaults (tiny microvm kernel, virtiofs root)
         assert_eq!(
             config.payload.kernel.as_deref(),
-            Some(super::faas::MICROVM_KERNEL_PATH)
+            Some(super::containers::MICROVM_KERNEL_PATH)
         );
         assert_eq!(
             config.payload.cmdline.as_deref(),
-            Some(super::faas::DEFAULT_ROOTFS_CMDLINE)
+            Some(super::containers::DEFAULT_ROOTFS_CMDLINE)
         );
         assert_eq!(config.payload.firmware, None);
     }
@@ -271,7 +271,7 @@ mod tests {
         let mut manifest = minimal();
         manifest.desired.rootfs = Some(crate::manifest::Rootfs {
             oci: "docker://busybox:latest".to_owned(),
-            read_only: false,
+            mode: crate::manifest::RootfsMode::Ephemeral,
         });
         manifest.desired.boot.kernel = Some("/custom/vmlinux".to_owned());
         manifest.desired.boot.initramfs = Some("/custom/initramfs.img".to_owned());
@@ -282,7 +282,10 @@ mod tests {
             config.payload.initramfs.as_deref(),
             Some("/custom/initramfs.img")
         );
-        assert_eq!(config.payload.cmdline.as_deref(), Some("console=hvc0 quiet"));
+        assert_eq!(
+            config.payload.cmdline.as_deref(),
+            Some("console=hvc0 quiet")
+        );
     }
 
     #[test]
