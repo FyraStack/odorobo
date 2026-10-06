@@ -22,10 +22,11 @@
 //!    upper directory when the manifest asks for a writable root), then run
 //!    virtiofsd serving that mount.
 //!
-//! Security notes: layers are unpacked by this process as root; symlink
-//! targets inside images are taken as-is (they resolve inside the guest
-//! view). The store must live on an fs-verity-capable filesystem (ext4,
-//! btrfs) for digest-pinned mounts.
+//! Security notes: layers are unpacked by this process as root; tar paths
+//! are validated (`..` rejected) and every unpack/whiteout operation refuses
+//! to traverse symlinks planted by earlier layers, so a hostile image cannot
+//! write through or remove host paths. The store must live on an
+//! fs-verity-capable filesystem (ext4, btrfs) for digest-pinned mounts.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -81,8 +82,9 @@ pub struct PreparedRootfs {
 // ---------------------------------------------------------------------------
 
 /// Filesystem-safe slug for an image reference (cache dir / cache key).
+/// Always a single, non-traversing path component.
 fn sanitize_image_ref(image_ref: &str) -> String {
-    image_ref
+    let slug: String = image_ref
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
@@ -91,7 +93,11 @@ fn sanitize_image_ref(image_ref: &str) -> String {
                 '_'
             }
         })
-        .collect()
+        .collect();
+    match slug.as_str() {
+        "" | "." | ".." => "_".to_owned(),
+        _ => slug,
+    }
 }
 
 /// Accepts bare docker refs and explicit transports alike.
@@ -167,6 +173,11 @@ fn digest_blob_path(layout: &Path, digest: &str) -> Result<PathBuf> {
     if algorithm != "sha256" {
         bail!("unsupported digest algorithm {algorithm:?}");
     }
+    // The hex comes from manifests (possibly registry-controlled); never let
+    // it traverse out of the blobs dir.
+    if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)) {
+        bail!("malformed sha256 digest hex in {digest:?}");
+    }
     Ok(layout.join("blobs").join(algorithm).join(hex))
 }
 
@@ -187,15 +198,21 @@ async fn pull_oci(image_ref: &str) -> Result<PathBuf> {
     let tag_ref = format!("oci:{}:rootfs", tmp.display());
 
     info!(image_ref, dir = %dir.display(), "pulling OCI image with skopeo");
-    let output = tokio::time::timeout(
-        SKOPEO_TIMEOUT,
-        Command::new("skopeo")
-            .args(["copy", "--remove-signatures", &normalized, &tag_ref])
-            .output(),
-    )
-    .await
-    .map_err(|_| eyre!("skopeo pull of {normalized} timed out after 600s"))?
-    .wrap_err("failed to run skopeo (is it installed? `dnf install skopeo`)")?;
+    let pull = Command::new("skopeo")
+        .args(["copy", "--remove-signatures", &normalized, &tag_ref])
+        // A timed-out pull must not keep running against the (already
+        // removed) tmp dir.
+        .kill_on_drop(true)
+        .output();
+    let output = match tokio::time::timeout(SKOPEO_TIMEOUT, pull).await {
+        Ok(output) => {
+            output.wrap_err("failed to run skopeo (is it installed? `dnf install skopeo`)")?
+        }
+        Err(_elapsed) => {
+            _ = tokio::fs::remove_dir_all(&tmp).await;
+            bail!("skopeo pull of {normalized} timed out after 600s");
+        }
+    };
 
     if !output.status.success() {
         _ = tokio::fs::remove_dir_all(&tmp).await;
@@ -244,15 +261,39 @@ fn remove_path(path: &Path) {
     }
 }
 
+/// Every prefix of `rel` under `tree` must exist and not be a symlink. Tar
+/// layers can plant symlinks (`etc -> /etc`); without this guard, directory
+/// creation, opaque-whiteout scans and unpacking would resolve through them
+/// on the HOST and a hostile image could touch host paths.
+fn ensure_no_symlink_ancestors(tree: &Path, rel: &Path) -> Result<()> {
+    let mut cur = tree.to_path_buf();
+    for component in rel.components() {
+        cur.push(component);
+        match std::fs::symlink_metadata(&cur) {
+            Ok(meta) if meta.is_symlink() => {
+                bail!(
+                    "tar path {rel:?} traverses symlink {} — refusing (hostile layer?)",
+                    cur.display()
+                );
+            }
+            Ok(_) => {}
+            // Missing ancestor: nothing below it can be a symlink.
+            Err(_) => return Ok(()),
+        }
+    }
+    Ok(())
+}
+
 /// Apply an OCI whiteout entry (`.wh.<name>` / `.wh..wh..opk`) relative to
 /// the layer's parent directory in the unpacked tree.
-fn apply_whiteout(tree: &Path, parent_rel: &Path, file_name: &str) {
+fn apply_whiteout(tree: &Path, parent_rel: &Path, file_name: &str) -> Result<()> {
+    ensure_no_symlink_ancestors(tree, parent_rel)?;
     if file_name == ".wh..wh..opk" {
         // Opaque whiteout: the parent directory becomes empty relative to
         // lower layers.
         let parent = tree.join(parent_rel);
         let Ok(entries) = std::fs::read_dir(&parent) else {
-            return;
+            return Ok(());
         };
         for entry in entries.flatten() {
             remove_path(&entry.path());
@@ -263,6 +304,7 @@ fn apply_whiteout(tree: &Path, parent_rel: &Path, file_name: &str) {
         remove_path(&tree.join(parent_rel.join(target)));
         debug!(target, "applied whiteout");
     }
+    Ok(())
 }
 
 /// Unpack one tar entry into the tree, handling OCI whiteouts. Device and
@@ -279,18 +321,31 @@ fn unpack_entry<R: Read>(tree: &Path, mut entry: tar::Entry<'_, R>) -> Result<()
 
     if file_name.starts_with(".wh.") {
         let parent = rel.parent().unwrap_or(Path::new("")).to_path_buf();
-        apply_whiteout(tree, &parent, &file_name);
+        apply_whiteout(tree, &parent, &file_name)?;
         return Ok(());
+    }
+
+    // All ancestors of the entry must be real directories: earlier layers
+    // may have planted symlinks that would otherwise resolve on the host.
+    if let Some(parent) = rel.parent() {
+        ensure_no_symlink_ancestors(tree, parent)?;
+    }
+    // A symlink at the entry's own path is replaced, never written through
+    // (GNU tar replace semantics: unlink the link first).
+    let target = tree.join(&rel);
+    if let Ok(meta) = std::fs::symlink_metadata(&target)
+        && meta.is_symlink()
+    {
+        remove_path(&target);
     }
 
     match entry.header().entry_type() {
         tar::EntryType::Directory => {
-            let target = tree.join(&rel);
             std::fs::create_dir_all(&target)
                 .wrap_err_with(|| format!("mkdir {}", target.display()))?;
         }
         tar::EntryType::Regular | tar::EntryType::Symlink | tar::EntryType::Link => {
-            if let Some(parent) = tree.join(&rel).parent() {
+            if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent)?;
             }
             // unpack_in() extracts at the entry's (already validated) path
@@ -430,54 +485,64 @@ async fn build_composefs_entry(
     let store = tmp.join("store");
     let image = tmp.join("root.cfs");
 
-    debug!(tree = %tree.display(), "building composefs image");
-    run_checked(
-        "mkcomposefs",
-        [
-            "--digest-store".to_owned(),
-            store.display().to_string(),
-            tree.display().to_string(),
-            image.display().to_string(),
-        ],
-        &[],
-    )
-    .await
-    .wrap_err("mkcomposefs failed")?;
+    let built: Result<(PathBuf, PathBuf, String)> = async {
+        debug!(tree = %tree.display(), "building composefs image");
+        run_checked(
+            "mkcomposefs",
+            [
+                "--digest-store".to_owned(),
+                store.display().to_string(),
+                tree.display().to_string(),
+                image.display().to_string(),
+            ],
+            &[],
+        )
+        .await
+        .wrap_err("mkcomposefs failed")?;
 
-    run_checked(
-        "fsverity",
-        ["enable".to_owned()],
-        &[image.as_path()],
-    )
-    .await
-    .wrap_err("fsverity enable on composefs image failed (backing fs must support fs-verity)")?;
+        run_checked("fsverity", ["enable".to_owned()], &[image.as_path()])
+            .await
+            .wrap_err(
+                "fsverity enable on composefs image failed (backing fs must support fs-verity)",
+            )?;
 
-    let digest = run_checked(
-        "composefs-info",
-        ["measure-file".to_owned()],
-        &[image.as_path()],
-    )
-    .await
-    .wrap_err("measuring composefs image digest failed")?;
-    let digest = digest.trim().to_owned();
+        let digest = run_checked(
+            "composefs-info",
+            ["measure-file".to_owned()],
+            &[image.as_path()],
+        )
+        .await
+        .wrap_err("measuring composefs image digest failed")?;
+        Ok((image, store, digest.trim().to_owned()))
+    }
+    .await;
+    let (_, _, digest) = match built {
+        Ok(built) => built,
+        // Never leave a potentially multi-GB scratch store behind.
+        Err(err) => {
+            _ = tokio::fs::remove_dir_all(&tmp).await;
+            return Err(err);
+        }
+    };
 
     let entry = roots.join(&digest);
     if entry.exists() {
         // Another VM already published this exact root; drop our duplicate.
-        tokio::fs::remove_dir_all(&tmp).await.ok();
+        _ = tokio::fs::remove_dir_all(&tmp).await;
     } else {
         // Persist the source ref for cache reuse across VMs.
         let marker = tmp.join("ref");
-        tokio::fs::write(&marker, format!("{image_ref_slug}\n"))
-            .await
-            .ok();
+        _ = tokio::fs::write(&marker, format!("{image_ref_slug}\n")).await;
         match tokio::fs::rename(&tmp, &entry).await {
             Ok(()) => {}
             Err(err) if entry.exists() => {
                 debug!(?err, "losing composefs publish race, reusing winner");
-                tokio::fs::remove_dir_all(&tmp).await.ok();
+                _ = tokio::fs::remove_dir_all(&tmp).await;
             }
-            Err(err) => bail!("publish composefs entry {}: {err}", entry.display()),
+            Err(err) => {
+                _ = tokio::fs::remove_dir_all(&tmp).await;
+                bail!("publish composefs entry {}: {err}", entry.display());
+            }
         }
     }
 
@@ -585,24 +650,39 @@ pub async fn mount_rootfs(vmid: &str, rootfs: &Rootfs) -> Result<PreparedRootfs>
     Ok(PreparedRootfs { digest, image, store, mount, upper, work })
 }
 
-/// Unmount a VM's rootfs and drop its per-VM overlay dirs. Best effort:
-/// failures are logged and do not block teardown.
+/// Unmount a VM's rootfs and drop its per-VM overlay dirs. The overlay dirs
+/// are only removed after a confirmed successful umount — deleting them
+/// under a still-mounted rootfs would orphan the mount.
 pub async fn unmount_rootfs(prepared: &PreparedRootfs) {
+    let mut unmounted = false;
     for attempt in 1..=3 {
-        let output = Command::new("umount").arg(&prepared.mount).output().await;
-        match output {
-            Ok(out) if out.status.success() => break,
+        match Command::new("umount").arg(&prepared.mount).output().await {
+            Ok(out) if out.status.success() => {
+                unmounted = true;
+                break;
+            }
             other => {
                 debug!(attempt, ?other, "umount retrying");
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                if attempt < 3 {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
             }
         }
     }
-    if let Some(upper) = &prepared.upper {
-        tokio::fs::remove_dir_all(upper).await.ok();
-    }
-    if let Some(work) = &prepared.work {
-        tokio::fs::remove_dir_all(work).await.ok();
+    if unmounted {
+        if let Some(upper) = &prepared.upper {
+            _ = tokio::fs::remove_dir_all(upper).await;
+        }
+        if let Some(work) = &prepared.work {
+            _ = tokio::fs::remove_dir_all(work).await;
+        }
+    } else {
+        // Leave upper/work in place so the failure stays diagnosable; the
+        // runtime dir purge will reclaim them once the mount is gone.
+        warn!(
+            mount = %prepared.mount.display(),
+            "umount of rootfs failed after 3 attempts; leaving overlay dirs in place"
+        );
     }
     // The mount point dir itself lives in the VM runtime dir, which
     // purge_instance_data removes.
@@ -817,7 +897,7 @@ impl VirtioFsSupervisor {
 mod tests {
     use super::{
         Compression, VirtioFsSupervisor, VirtiofsdSpec, apply_whiteout, compression_of_media_type,
-        safe_rel_path, sanitize_image_ref,
+        digest_blob_path, ensure_no_symlink_ancestors, safe_rel_path, sanitize_image_ref,
     };
     use std::path::Path;
     use std::time::Duration;
@@ -834,6 +914,46 @@ mod tests {
         let slug = sanitize_image_ref("../../etc/shadow");
         assert!(!slug.contains('/') && !slug.contains(':'));
         assert_ne!(slug, "..");
+        // Pure traversal names must not survive as-is.
+        assert_eq!(sanitize_image_ref(".."), "_");
+        assert_eq!(sanitize_image_ref("."), "_");
+        assert_eq!(sanitize_image_ref(""), "_");
+    }
+
+    #[test]
+    fn validates_digest_hex_before_path_use() {
+        let layout = Path::new("/cache");
+        let good = "a".repeat(64);
+        assert_eq!(
+            digest_blob_path(layout, &format!("sha256:{good}"))
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_string_lossy(),
+            good
+        );
+        assert!(digest_blob_path(layout, "sha256:../../etc/shadow").is_err());
+        assert!(digest_blob_path(layout, "sha256:deadbeef").is_err());
+        assert!(digest_blob_path(layout, "md5:aaaa").is_err());
+        assert!(digest_blob_path(layout, "garbage").is_err());
+    }
+
+    #[test]
+    fn unpacking_through_a_planted_symlink_is_refused() {
+        let base = std::env::temp_dir().join(format!("odorobo-symlink-{}", ulid::Ulid::generate()));
+        let tree = base.join("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        // Layer 1 plants a symlink; layer 2 must not resolve through it.
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("/etc", tree.join("etc")).unwrap();
+
+        assert!(ensure_no_symlink_ancestors(&tree, Path::new("etc/passwd")).is_err());
+        assert!(ensure_no_symlink_ancestors(&tree, Path::new("etc")).is_err());
+        assert!(ensure_no_symlink_ancestors(&tree, Path::new("usr/bin")).is_ok());
+        // Whiteouts through the planted symlink are refused too.
+        assert!(apply_whiteout(&tree, Path::new("etc"), ".wh..wh..opk").is_err());
+
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]
@@ -876,12 +996,12 @@ mod tests {
         std::fs::write(tree.join("keep"), b"keep").unwrap();
 
         // plain whiteout removes bin/ls
-        apply_whiteout(&tree, Path::new("bin"), ".wh.ls");
+        apply_whiteout(&tree, Path::new("bin"), ".wh.ls").unwrap();
         assert!(!tree.join("bin/ls").exists());
 
         // opaque whiteout empties the whole bin dir
         std::fs::write(tree.join("bin/cat"), b"x").unwrap();
-        apply_whiteout(&tree, Path::new("bin"), ".wh..wh..opk");
+        apply_whiteout(&tree, Path::new("bin"), ".wh..wh..opk").unwrap();
         assert!(tree.join("bin").read_dir().unwrap().next().is_none());
         assert!(tree.join("keep").exists());
 
