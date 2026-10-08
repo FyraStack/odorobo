@@ -387,7 +387,10 @@ impl Message<DeleteVM> for AgentActor {
                 })
                 .await;
             if let Err(error) = shutdown_result {
-                let proof = Arc::clone(&self.vms[&msg.vmid].process_exit_confirmed);
+                let proof = self.vms.get(&msg.vmid).map_or_else(
+                    || Arc::new(AtomicBool::new(false)),
+                    |vm| Arc::clone(&vm.process_exit_confirmed),
+                );
                 self.blocked_vm_ids.insert(msg.vmid, proof);
                 self.remove_vm(msg.vmid);
                 return DeleteVMReply {
@@ -407,6 +410,9 @@ impl Message<DeleteVM> for AgentActor {
             .get(&msg.vmid)
             .is_some_and(|proof| !proof.load(Ordering::SeqCst));
         if self.blocked_vm_ids.contains_key(&msg.vmid) && !exit_unconfirmed {
+            if let Err(error) = VsockCidAllocator::from_environment().mark_process_exited(msg.vmid) {
+                return DeleteVMReply { error: Some(format!("failed to persist confirmed VM process exit: {error}")) };
+            }
             // The old process exited but runtime cleanup failed. Retry that
             // cleanup before acknowledging deletion and allowing path reuse.
             let runtime_dir = crate::ch_driver::VMInstance::runtime_dir_for(&msg.vmid.to_string());

@@ -533,12 +533,7 @@ impl VMInstance {
             // start_kill can fail when the process has already exited; wait is
             // authoritative and must succeed before callers can release leases.
             _ = child.start_kill();
-            child.wait().await.wrap_err_with(|| {
-                format!(
-                    "failed to confirm Cloud Hypervisor process exit for {}",
-                    self.vm_id()
-                )
-            })?;
+            child.wait().await.map_err(UnconfirmedProcessExit)?;
         }
 
         let cleanup_result = self.cleanup_after_stop().await;
