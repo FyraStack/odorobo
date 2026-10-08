@@ -333,6 +333,8 @@ fn vm_cleanup_unplaces_vm_without_another_discovered_actor() {
         agent_keepalive_tasks: AHashMap::new(),
         vm_actorid_ulid_map: AHashMap::from([(vm_actor_id, vmid)]),
         vm_manifests: AHashMap::from([(vmid, test_manifest(1, 1))]),
+        stopped_vms: Default::default(),
+        retired_vm_actors: Default::default(),
         vm_placements: AHashMap::from([(
             vmid,
             vec![VmPlacement {
@@ -418,6 +420,8 @@ fn explicit_stop_removes_vm_intent_and_actor_mapping() {
         agent_keepalive_tasks: AHashMap::new(),
         vm_actorid_ulid_map: AHashMap::from([(vm_actor_id, vmid)]),
         vm_manifests: AHashMap::from([(vmid, test_manifest(1, 1))]),
+        stopped_vms: Default::default(),
+        retired_vm_actors: Default::default(),
         vm_placements: AHashMap::from([(vmid, Vec::new())]),
         vm_data_cache: AHashMap::from([(vmid, vec![CachedVMActor { actor_ref: None }])]),
         vm_keepalive_tasks: AHashMap::new(),
@@ -427,13 +431,23 @@ fn explicit_stop_removes_vm_intent_and_actor_mapping() {
         cache_actor_finder: None,
     };
 
-    scheduler.remove_vm_intent(vmid);
+    scheduler.suppress_vm_intent(vmid);
+    // Late discovery must not restore runnable intent for an explicitly
+    // stopped owner, including a response already queued before shutdown.
+    scheduler.observe_vm_manifest(vmid, test_manifest(1, 1));
+    assert!(!scheduler.should_resolve_unplaced_owner(vmid));
+    // Actor-departure cleanup after deletion must not erase the tombstone.
+    scheduler.cleanup_vm_actor(vm_actor_id);
+    scheduler.observe_vm_manifest(vmid, test_manifest(1, 1));
+    assert!(!scheduler.should_resolve_unplaced_owner(vmid));
 
     assert!(!scheduler.vm_manifests.contains_key(&vmid));
     assert!(!scheduler.vm_placements.contains_key(&vmid));
     assert!(!scheduler.vm_data_cache.contains_key(&vmid));
     assert!(!scheduler.vm_actorid_ulid_map.contains_key(&vm_actor_id));
-    assert!(!scheduler.agent_vm_index[&agent_id].contains(&vmid));
+    // Removing intent must not falsify observed agent inventory: OCI cold
+    // shutdown can retain an owner on that agent for restart/delete.
+    assert!(scheduler.agent_vm_index[&agent_id].contains(&vmid));
 }
 
 #[test]
@@ -447,6 +461,8 @@ fn agent_cleanup_does_not_remove_unrelated_vm_state() {
         agent_keepalive_tasks: AHashMap::new(),
         vm_actorid_ulid_map: AHashMap::from([(vm_actor_id, vmid)]),
         vm_manifests: AHashMap::from([(vmid, test_manifest(1, 1))]),
+        stopped_vms: Default::default(),
+        retired_vm_actors: Default::default(),
         vm_placements: AHashMap::from([(
             vmid,
             vec![VmPlacement {
@@ -482,6 +498,8 @@ fn vm_cleanup_does_not_remove_unrelated_agent_state() {
         agent_keepalive_tasks: AHashMap::new(),
         vm_actorid_ulid_map: AHashMap::from([(vm_actor_id, vmid)]),
         vm_manifests: AHashMap::from([(vmid, test_manifest(1, 1))]),
+        stopped_vms: Default::default(),
+        retired_vm_actors: Default::default(),
         vm_placements: AHashMap::new(),
         vm_data_cache: AHashMap::from([(vmid, vec![CachedVMActor { actor_ref: None }])]),
         vm_keepalive_tasks: AHashMap::new(),

@@ -36,7 +36,8 @@ pub trait StorageDriver: Send + Sync {
     /// Resolves a URI to a local block device or file path for use in a VM disk config.
     async fn resolve(&self, uri: &Url) -> Result<PathBuf>;
 
-    /// Releases resources associated with a previously resolved URI.
+    /// Releases resources associated with an attempted URI resolution.
+    /// Must succeed as a no-op if the failed attempt left no attachment.
     async fn release(&self, uri: &Url) -> Result<()>;
 }
 
@@ -46,11 +47,16 @@ pub trait StorageDriver: Send + Sync {
 /// Disk paths that are not URIs or whose scheme has no registered backend are left unchanged.
 pub struct StorageDriverTransformer {
     backends: Vec<Box<dyn StorageDriver>>,
+    /// Acquisition attempts are separate from untouched desired disk URIs.
+    attempts: std::sync::Mutex<std::collections::HashMap<String, Vec<Url>>>,
 }
 
 impl StorageDriverTransformer {
     pub fn new() -> Self {
-        Self { backends: vec![] }
+        Self {
+            backends: vec![],
+            attempts: Default::default(),
+        }
     }
 
     pub fn with_backend<B: StorageDriver + 'static>(mut self, backend: B) -> Self {
@@ -65,26 +71,25 @@ impl StorageDriverTransformer {
             .map(std::convert::AsRef::as_ref)
     }
 
-    /// Releases storage resources for all URI-backed disks in a VM config.
-    /// Checks both `path` and `id` fields for a URI, since after transforms `path` is the
-    /// resolved device path while `id` holds the original URI.
-    /// Errors are logged as warnings and do not abort the remaining releases.
-    pub async fn release_config(&self, config: &VmConfig) {
-        let Some(disks) = config.disks.as_ref() else {
-            return;
-        };
-        for disk in disks {
-            let candidates = [disk.path.as_deref(), disk.id.as_deref()];
-            let Some((uri, backend)) = candidates.into_iter().flatten().find_map(|s| {
-                let uri = Url::parse(s).ok()?;
-                let backend = self.find_backend(&uri)?;
-                Some((uri, backend))
-            }) else {
-                continue;
+    /// Releases only recorded acquisition attempts, in reverse order. Failed
+    /// releases remain recorded for retry; untouched desired disks are excluded.
+    pub async fn release_config(&self, vmid: &str) -> Result<()> {
+        loop {
+            let uri = self
+                .attempts
+                .lock()
+                .unwrap()
+                .get(vmid)
+                .and_then(|uris| uris.last())
+                .cloned();
+            let Some(uri) = uri else {
+                return Ok(());
             };
-            if let Err(e) = backend.release(&uri).await {
-                warn!(path = uri.as_str(), error = ?e, "Failed to release storage for disk");
-            }
+            self.find_backend(&uri)
+                .expect("recorded backend")
+                .release(&uri)
+                .await?;
+            self.attempts.lock().unwrap().get_mut(vmid).unwrap().pop();
         }
     }
 }
@@ -93,20 +98,19 @@ impl Default for StorageDriverTransformer {
     fn default() -> Self {
         Self::new()
             .with_backend(file::FileStorage)
-            .with_backend(rbd::RbdStorage)
-            .with_backend(iscsi::ISCSIStorage)
+            .with_backend(rbd::RbdStorage::default())
+            .with_backend(iscsi::ISCSIStorage::default())
     }
 }
 
 impl ConfigTransform for StorageDriverTransformer {
-    fn teardown(&self, _vmid: &str, config: &mut VmConfig) -> Result<()> {
+    fn teardown(&self, vmid: &str, _config: &mut VmConfig) -> Result<()> {
         tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(self.release_config(config));
-        });
-        Ok(())
+            tokio::runtime::Handle::current().block_on(self.release_config(vmid))
+        })
     }
 
-    fn transform(&self, _vmid: &str, config: &mut VmConfig) -> Result<()> {
+    fn transform(&self, vmid: &str, config: &mut VmConfig) -> Result<()> {
         let Some(disks) = config.disks.as_mut() else {
             return Ok(());
         };
@@ -138,6 +142,14 @@ impl ConfigTransform for StorageDriverTransformer {
 
             disk.id = Some(new_disk_id);
 
+            // Record before resolve: a failed attempt may have acquired some
+            // resources. Backends must reconcile absence as successful cleanup.
+            self.attempts
+                .lock()
+                .unwrap()
+                .entry(vmid.to_owned())
+                .or_default()
+                .push(uri.clone());
             let resolved = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(backend.resolve(&uri))
             })?;
@@ -146,5 +158,67 @@ impl ConfigTransform for StorageDriverTransformer {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    struct RecordingStorage(Arc<Mutex<Vec<String>>>);
+    #[async_trait]
+    impl StorageDriver for RecordingStorage {
+        fn scheme(&self) -> &'static str {
+            "recording"
+        }
+        async fn resolve(&self, uri: &Url) -> Result<PathBuf> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("resolve:{}", uri.host_str().unwrap()));
+            if uri.host_str() == Some("failed") {
+                return Err(stable_eyre::eyre::eyre!("no resource acquired"));
+            }
+            Ok("/dev/recording".into())
+        }
+        async fn release(&self, uri: &Url) -> Result<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("release:{}", uri.host_str().unwrap()));
+            Ok(()) // already absent is a no-op
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn partial_resolution_never_releases_untouched_desired_disks() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let transformer =
+            StorageDriverTransformer::new().with_backend(RecordingStorage(calls.clone()));
+        let mut config = VmConfig {
+            disks: Some(
+                ["acquired", "failed", "untouched"]
+                    .iter()
+                    .map(|name| cloud_hypervisor_client::models::DiskConfig {
+                        path: Some(format!("recording://{name}/disk")),
+                        ..Default::default()
+                    })
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+        assert!(transformer.transform("fixture", &mut config).is_err());
+        transformer.teardown("fixture", &mut config).unwrap();
+        transformer.teardown("fixture", &mut config).unwrap();
+        assert_eq!(
+            *calls.lock().unwrap(),
+            [
+                "resolve:acquired",
+                "resolve:failed",
+                "release:failed",
+                "release:acquired"
+            ]
+        );
     }
 }

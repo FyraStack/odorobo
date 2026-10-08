@@ -83,7 +83,7 @@ impl Drop for RemovePathOnDrop {
 }
 
 /// A rootfs made ready for a specific VM.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct PreparedRootfs {
     /// OCI manifest digest identifying the immutable base.
     pub digest: String,
@@ -97,8 +97,6 @@ pub struct PreparedRootfs {
     layer_mounts: Vec<PathBuf>,
     /// Persistent backend mount directory; populated only for RBD state.
     persistent_state_mount: Option<PathBuf>,
-    /// Mapped RBD block device to unmap after the state filesystem is unmounted.
-    rbd_device: Option<PathBuf>,
     /// RBD image identity for explicit deletion.
     rbd_image: Option<String>,
     /// Node-local flock prevents duplicate actor instances for this VM id.
@@ -189,6 +187,10 @@ impl OciUnpackLimits {
 
 fn parse_size_limit(env: &str, default: &str, maximum: u64) -> Result<u64> {
     let value = std::env::var(env).unwrap_or_else(|_| default.to_owned());
+    parse_size_bytes(env, &value, maximum, true)
+}
+
+fn parse_size_bytes(env: &str, value: &str, maximum: u64, allow_terabytes: bool) -> Result<u64> {
     let value = value.trim();
     let split = value
         .find(|c: char| !c.is_ascii_digit())
@@ -200,8 +202,8 @@ fn parse_size_limit(env: &str, default: &str, maximum: u64) -> Result<u64> {
     let multiplier = match unit.to_ascii_uppercase().as_str() {
         "M" | "MB" => 1024_u64.pow(2),
         "G" | "GB" => 1024_u64.pow(3),
-        "T" | "TB" => 1024_u64.pow(4),
-        _ => bail!("{env} must use M, G, or T units"),
+        "T" | "TB" if allow_terabytes => 1024_u64.pow(4),
+        _ => bail!("unsupported size unit for {env}: {unit:?}"),
     };
     let bytes = count
         .checked_mul(multiplier)
@@ -599,6 +601,15 @@ async fn preflight_compressed_size(
 /// layout dir. A metadata preflight, serial layer copy and writer file-size
 /// limit constrain the temporary pull before it is accepted; tags remain cached until cleared.
 async fn pull_oci(image_ref: &str, max_compressed_bytes: u64) -> Result<PathBuf> {
+    let image_ref = image_ref.to_owned();
+    // Cancellation of an actor must not concurrently remove skopeo's staging
+    // tree. The pull owns its child and cleanup until termination is reaped.
+    tokio::spawn(async move { pull_oci_inner(&image_ref, max_compressed_bytes).await })
+        .await
+        .map_err(|err| eyre!("OCI pull task failed: {err}"))?
+}
+
+async fn pull_oci_inner(image_ref: &str, max_compressed_bytes: u64) -> Result<PathBuf> {
     let normalized = normalize_image_ref(image_ref);
     // Keep human-readable names but include the full ref hash so sanitization
     // cannot alias distinct registry names into the same cached OCI layout.
@@ -884,7 +895,70 @@ fn set_overlay_xattr(path: &Path, attribute: &str, value: &[u8]) -> Result<()> {
 
 /// Unpack one non-whiteout tar entry. Whiteouts are returned for deferred
 /// application after all files from this same OCI layer have been extracted.
-fn unpack_entry<R: Read>(tree: &Path, mut entry: tar::Entry<'_, R>) -> Result<Option<Whiteout>> {
+struct DirectoryMetadata {
+    relative: PathBuf,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+    mtime: u64,
+    xattrs: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+fn apply_xattrs(target: &Path, xattrs: &[(Vec<u8>, Vec<u8>)]) -> Result<()> {
+    let path = std::ffi::CString::new(target.as_os_str().as_encoded_bytes())?;
+    for (name, value) in xattrs {
+        let name = std::ffi::CString::new(name.as_slice())?;
+        // SAFETY: valid C strings and buffer; lsetxattr does not follow links.
+        if unsafe {
+            libc::lsetxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                value.as_ptr().cast(),
+                value.len(),
+                0,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error()).wrap_err("preserve OCI xattr");
+        }
+    }
+    Ok(())
+}
+
+fn restore_directory_metadata(tree: &Path, directories: &mut [DirectoryMetadata]) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    // Descendants first: default ACLs must not affect extraction, and final
+    // directory modes/times must not be disturbed by children or whiteouts.
+    directories.sort_by_key(|directory| std::cmp::Reverse(directory.relative.components().count()));
+    for directory in directories {
+        ensure_no_symlink_ancestors(tree, &directory.relative)?;
+        let path = tree.join(&directory.relative);
+        if !std::fs::symlink_metadata(&path)?.is_dir() {
+            bail!(
+                "OCI directory replaced by non-directory: {}",
+                path.display()
+            );
+        }
+        let file = std::fs::File::open(&path)?;
+        // SAFETY: live fd and checked numeric ownership; no path following.
+        if unsafe { libc::fchown(file.as_raw_fd(), directory.uid, directory.gid) } != 0 {
+            return Err(std::io::Error::last_os_error()).wrap_err("preserve directory ownership");
+        }
+        file.set_permissions(std::fs::Permissions::from_mode(directory.mode))?;
+        file.set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(directory.mtime)),
+        )?;
+        apply_xattrs(&path, &directory.xattrs)?;
+    }
+    Ok(())
+}
+
+fn unpack_entry<R: Read>(
+    tree: &Path,
+    mut entry: tar::Entry<'_, R>,
+    directories: &mut Vec<DirectoryMetadata>,
+) -> Result<Option<Whiteout>> {
     let raw_path = entry.path()?.to_path_buf();
     let Some(rel) = safe_rel_path(&raw_path) else {
         bail!("refusing to extract suspicious tar path {raw_path:?}");
@@ -916,13 +990,61 @@ fn unpack_entry<R: Read>(tree: &Path, mut entry: tar::Entry<'_, R>) -> Result<Op
         remove_path(&target);
     }
 
+    // Do not let an image inject host OverlayFS control attributes (redirect,
+    // metacopy, whiteout, etc.). Only OCI whiteouts may create those markers.
+    let mut xattrs = Vec::new();
+    if let Some(extensions) = entry.pax_extensions()? {
+        for extension in extensions {
+            let extension = extension?;
+            if let Some(name) = extension.key_bytes().strip_prefix(b"SCHILY.xattr.") {
+                if name.starts_with(b"user.overlay.")
+                    || !(name.starts_with(b"user.")
+                        || name == b"security.capability"
+                        || name == b"security.selinux"
+                        || name == b"system.posix_acl_access"
+                        || name == b"system.posix_acl_default")
+                {
+                    bail!("unsupported OCI xattr {:?}", String::from_utf8_lossy(name));
+                }
+                xattrs.push((name.to_vec(), extension.value_bytes().to_vec()));
+            }
+        }
+    }
     match entry.header().entry_type() {
         tar::EntryType::Directory => {
-            entry
-                .unpack_in(tree)
-                .wrap_err_with(|| format!("extract directory metadata {}", rel.display()))?;
+            // tar::unpack_in intentionally ignores headers for '.'; explicit
+            // restoration also avoids host ACL inheritance depending on order.
+            let metadata = DirectoryMetadata {
+                relative: rel.clone(),
+                uid: entry.header().uid()?.try_into()?,
+                gid: entry.header().gid()?.try_into()?,
+                mode: entry.header().mode()?,
+                mtime: entry.header().mtime()?,
+                xattrs,
+            };
+            std::fs::create_dir_all(&target)?;
+            if let Some(previous) = directories.iter_mut().find(|d| d.relative == rel) {
+                *previous = metadata;
+            } else {
+                directories.push(metadata);
+            }
+            return Ok(None);
         }
         tar::EntryType::Regular | tar::EntryType::Symlink | tar::EntryType::Link => {
+            if entry.header().entry_type() == tar::EntryType::Link {
+                let link = entry
+                    .link_name()?
+                    .ok_or_else(|| eyre!("hard link has no target"))?;
+                let relative_target = safe_rel_path(&link)
+                    .ok_or_else(|| eyre!("unsafe OCI hard-link target {link:?}"))?;
+                ensure_no_symlink_ancestors(tree, &relative_target)?;
+                if !tree.join(&relative_target).exists() {
+                    bail!(
+                        "OCI hard-link target {} is absent from this layer; cross-layer and forward hard links are not supported by digest-only layer materialization",
+                        relative_target.display()
+                    );
+                }
+            }
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -948,6 +1070,7 @@ fn unpack_entry<R: Read>(tree: &Path, mut entry: tar::Entry<'_, R>) -> Result<Op
             rel.display()
         ),
     }
+    apply_xattrs(&target, &xattrs)?;
     Ok(None)
 }
 
@@ -955,8 +1078,9 @@ fn extract_entries<R: Read>(
     mut archive: tar::Archive<R>,
     tree: &Path,
     max_entries: u64,
-) -> Result<u64> {
+) -> Result<(u64, Vec<PathBuf>, Vec<DirectoryReset>)> {
     let mut whiteouts = Vec::new();
+    let mut directories = Vec::new();
     let mut count = 0_u64;
     for entry in archive.entries().wrap_err("iterate tar entries")? {
         count = count
@@ -965,7 +1089,8 @@ fn extract_entries<R: Read>(
         if count > max_entries {
             bail!("OCI layer exceeds the configured {max_entries} entry limit");
         }
-        if let Some(whiteout) = unpack_entry(tree, entry.wrap_err("tar entry")?)? {
+        if let Some(whiteout) = unpack_entry(tree, entry.wrap_err("tar entry")?, &mut directories)?
+        {
             whiteouts.push(whiteout);
         }
     }
@@ -974,6 +1099,22 @@ fn extract_entries<R: Read>(
         .filter(|w| w.file_name == ".wh..wh..opq")
         .map(|w| w.parent.clone())
         .collect::<std::collections::HashSet<_>>();
+    let resets = whiteouts
+        .iter()
+        .map(|w| {
+            if w.file_name == ".wh..wh..opq" {
+                DirectoryReset {
+                    path: w.parent.clone(),
+                    descendants_only: true,
+                }
+            } else {
+                DirectoryReset {
+                    path: w.parent.join(w.file_name.strip_prefix(".wh.").unwrap()),
+                    descendants_only: false,
+                }
+            }
+        })
+        .collect();
     for whiteout in whiteouts {
         if whiteout.file_name != ".wh..wh..opq" {
             if opaque_dirs.contains(&whiteout.parent) {
@@ -992,7 +1133,18 @@ fn extract_entries<R: Read>(
         }
         apply_whiteout(tree, &whiteout.parent, &whiteout.file_name)?;
     }
-    Ok(count)
+    restore_directory_metadata(tree, &mut directories)?;
+    Ok((
+        count,
+        directories.into_iter().map(|d| d.relative).collect(),
+        resets,
+    ))
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+struct DirectoryReset {
+    path: PathBuf,
+    descendants_only: bool,
 }
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
@@ -1002,6 +1154,9 @@ struct LayerStats {
     diff_id: String,
     composefs_image_bytes: u64,
     object_store_bytes: u64,
+    /// Only these directories were changed explicitly by the OCI changeset.
+    explicit_directories: Vec<PathBuf>,
+    directory_resets: Vec<DirectoryReset>,
 }
 
 struct LimitedReader<R> {
@@ -1057,7 +1212,11 @@ fn unpack_tar<R: Read>(
     max_entries: u64,
 ) -> Result<LayerStats> {
     let mut limited = LimitedReader::new(reader, max_bytes);
-    let entry_count = extract_entries(tar::Archive::new(&mut limited), tree, max_entries)?;
+    let mut archive = tar::Archive::new(&mut limited);
+    archive.set_preserve_ownerships(true);
+    archive.set_preserve_permissions(true);
+    let (entry_count, explicit_directories, directory_resets) =
+        extract_entries(archive, tree, max_entries)?;
     // Drain trailing tar padding and any bytes after the end marker so DiffID
     // and the byte bound cover the entire decompressed stream, not only entries.
     let mut buffer = [0_u8; 16 * 1024];
@@ -1072,6 +1231,8 @@ fn unpack_tar<R: Read>(
         diff_id: format!("sha256:{}", to_hex(&limited.hasher.finalize())),
         composefs_image_bytes: 0,
         object_store_bytes: 0,
+        explicit_directories,
+        directory_resets,
     })
 }
 
@@ -1233,10 +1394,13 @@ fn read_oci_manifest(layout: &Path) -> Result<(String, Vec<OciLayerDescriptor>)>
     Ok((manifest_digest, layers))
 }
 
-// Cache format v3 stores validated compressed size/unpacked DiffID and
+// Cache format v6 records explicit directory changes for composition, and
+// preserves root directory metadata and restores ACLs
+// after extraction to prevent order-dependent child inheritance.
+// Older entries lost this metadata and must not be reused. The cache stores
 // composefs storage-usage statistics alongside each immutable layer. Versioned
 // paths avoid replacing older entries while they may still be mounted.
-const LAYERS_ROOT: &str = "/var/lib/odorobo/layers/sha256/v3";
+const LAYERS_ROOT: &str = "/var/lib/odorobo/layers/sha256/v8";
 
 async fn ensure_fsverity(path: &Path) -> Result<()> {
     match run_checked("fsverity", ["enable".to_owned()], &[path]).await {
@@ -1267,6 +1431,7 @@ async fn materialize_layer(
     materialize_layer_at_limited(layout, desc, Path::new(LAYERS_ROOT), max_bytes, max_entries).await
 }
 
+#[cfg(test)]
 async fn materialize_layer_at(
     layout: &Path,
     desc: &OciLayerDescriptor,
@@ -1335,6 +1500,25 @@ async fn materialize_layer_at_limited(
     max_bytes: u64,
     max_entries: u64,
 ) -> Result<(PathBuf, LayerStats)> {
+    let layout = layout.to_owned();
+    let desc = desc.clone();
+    let cache_root = cache_root.to_owned();
+    // Builder and external writers share one lifetime, including staging
+    // cleanup, even when the actor's awaiting future is cancelled.
+    tokio::spawn(async move {
+        materialize_layer_inner(&layout, &desc, &cache_root, max_bytes, max_entries).await
+    })
+    .await
+    .map_err(|err| eyre!("layer builder task failed: {err}"))?
+}
+
+async fn materialize_layer_inner(
+    layout: &Path,
+    desc: &OciLayerDescriptor,
+    cache_root: &Path,
+    max_bytes: u64,
+    max_entries: u64,
+) -> Result<(PathBuf, LayerStats)> {
     let compression = compression_of_media_type(&desc.media_type)
         .ok_or_else(|| eyre!("unsupported OCI layer media type {:?}", desc.media_type))?;
     let blob = digest_blob_path(layout, &desc.digest)?;
@@ -1367,31 +1551,38 @@ async fn materialize_layer_at_limited(
     tokio::fs::create_dir_all(cache_root).await?;
     let tmp = cache_root.join(format!(".layer-{}", ulid::Ulid::generate()));
     let tree = tmp.join("tree");
-    tokio::fs::create_dir_all(&tree).await?;
+    // Create staging privately from the outset; the blocking writer owns
+    // cleanup until it explicitly hands the finished tree back to the builder.
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new().mode(0o700).create(&tmp)?;
+    std::fs::create_dir(&tree)?;
+    let cleanup = RemovePathOnDrop::new(tmp.clone());
     let blob_for_unpack = blob.clone();
     let tree_clone = tree.clone();
     let diff_id = desc.diff_id.clone();
-    let extraction = tokio::task::spawn_blocking(move || -> Result<LayerStats> {
-        let f = std::fs::File::open(&blob_for_unpack)?;
-        let stats = unpack_layer(
-            std::io::BufReader::new(f),
-            compression,
-            &tree_clone,
-            max_bytes,
-            max_entries,
-        )?;
-        if stats.diff_id != diff_id {
-            bail!(
-                "layer DiffID mismatch: expected {diff_id}, uncompressed content is {}",
-                stats.diff_id
-            );
-        }
-        Ok(stats)
-    })
-    .await
-    .map_err(|e| eyre!("layer extraction task failed: {e}"))?;
-    let mut stats = match extraction {
-        Ok(stats) => stats,
+    let extraction =
+        tokio::task::spawn_blocking(move || -> Result<(LayerStats, RemovePathOnDrop)> {
+            let cleanup = cleanup;
+            let f = std::fs::File::open(&blob_for_unpack)?;
+            let stats = unpack_layer(
+                std::io::BufReader::new(f),
+                compression,
+                &tree_clone,
+                max_bytes,
+                max_entries,
+            )?;
+            if stats.diff_id != diff_id {
+                bail!(
+                    "layer DiffID mismatch: expected {diff_id}, uncompressed content is {}",
+                    stats.diff_id
+                );
+            }
+            Ok((stats, cleanup))
+        })
+        .await
+        .map_err(|e| eyre!("layer extraction task failed: {e}"))?;
+    let (mut stats, _cleanup) = match extraction {
+        Ok(result) => result,
         Err(err) => {
             _ = tokio::fs::remove_dir_all(&tmp).await;
             return Err(err.wrap_err("extract bounded OCI layer"));
@@ -1515,6 +1706,11 @@ fn rbd_pool() -> String {
 }
 
 async fn is_mountpoint(path: &Path) -> Result<bool> {
+    match tokio::fs::symlink_metadata(path).await {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err.into()),
+        Ok(_) => {}
+    }
     let output = Command::new("mountpoint")
         .arg("-q")
         .arg(path)
@@ -1548,6 +1744,10 @@ async fn rbd_lookup_device(image: &str) -> Result<Option<PathBuf>> {
     }
     let devices: serde_json::Value =
         serde_json::from_slice(&output.stdout).wrap_err("parse RBD device list")?;
+    match_rbd_head_device(image, &devices)
+}
+
+fn match_rbd_head_device(image: &str, devices: &serde_json::Value) -> Result<Option<PathBuf>> {
     let pool = image.split('/').next().unwrap_or_default();
     let name = image.split('/').nth(1).unwrap_or_default();
     for mapping in devices
@@ -1555,6 +1755,9 @@ async fn rbd_lookup_device(image: &str) -> Result<Option<PathBuf>> {
         .ok_or_else(|| eyre!("RBD device list is not an array"))?
     {
         if mapping["pool"].as_str() == Some(pool)
+            && mapping["namespace"].as_str().unwrap_or_default().is_empty()
+            && matches!(mapping["snap"].as_str().unwrap_or_default(), "" | "-")
+            && matches!(mapping["snapshot"].as_str().unwrap_or_default(), "" | "-")
             && (mapping["name"].as_str() == Some(name) || mapping["image"].as_str() == Some(name))
         {
             let device = mapping["device"]
@@ -1627,16 +1830,49 @@ async fn acquire_rootfs_lock(vmid: &str) -> Result<Arc<std::fs::File>> {
     Ok(Arc::new(file))
 }
 
+static TOOL_OPERATIONS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Keep command ownership outside the caller's cancellable future. Cleanup
+/// takes the same operation lock, so it cannot inspect/unmap before a cancelled
+/// acquisition has completed (or timed out, been killed and reaped).
 async fn rbd_output(args: &[String]) -> Result<std::process::Output> {
-    let out = Command::new("rbd")
-        .args(rbd_prefix_args())
-        .args(args)
-        .output()
-        .await
-        .wrap_err(
-            "failed to execute rbd (Ceph client configuration required for RBD rootfs backend)",
-        )?;
-    Ok(out)
+    let mut command = Command::new("rbd");
+    command.args(rbd_prefix_args()).args(args);
+    run_owned_command(command).await
+}
+
+async fn run_owned_command(mut command: Command) -> Result<std::process::Output> {
+    let guard = TOOL_OPERATIONS.lock().await;
+    command
+        .kill_on_drop(true)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    command.as_std_mut().process_group(0);
+    let child = command
+        .spawn()
+        .wrap_err("failed to execute external tool")?;
+    let task = tokio::spawn(async move {
+        let _guard = guard;
+        let pid = child
+            .id()
+            .ok_or_else(|| eyre!("external tool child has no PID"))?;
+        let output = child.wait_with_output();
+        tokio::pin!(output);
+        match tokio::time::timeout(Duration::from_secs(120), &mut output).await {
+            Ok(result) => result.wrap_err("external tool operation failed"),
+            Err(_) => {
+                // SAFETY: child is still owned by the pinned wait future and
+                // unreaped; its PID cannot be reused before that future ends.
+                unsafe {
+                    libc::kill(-i32::try_from(pid)?, libc::SIGKILL);
+                }
+                _ = output.await;
+                bail!("external tool timed out; process group killed and child reaped");
+            }
+        }
+    });
+    task.await
+        .map_err(|err| eyre!("external tool task failed: {err}"))?
 }
 
 async fn rbd_image_exists(image: &str) -> Result<bool> {
@@ -1658,7 +1894,58 @@ async fn rbd_image_exists(image: &str) -> Result<bool> {
     }
 }
 
-async fn mount_persistent_state(vmid: &str) -> Result<(PathBuf, Option<String>, Option<PathBuf>)> {
+pub(crate) static PERSISTENT_OPERATIONS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+pub(crate) static RBD_RESERVATIONS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::LazyLock::new(Default::default);
+// None = command started but device not yet established; absence of a key =
+// never acquired (including explicit preflight rejection).
+static RBD_STAGING_IMAGES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, Vec<String>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+async fn cleanup_staging_images(image: &str) -> Result<()> {
+    loop {
+        let staging = RBD_STAGING_IMAGES
+            .lock()
+            .unwrap()
+            .get(image)
+            .and_then(|images| images.last())
+            .cloned();
+        let Some(staging) = staging else {
+            return Ok(());
+        };
+        if rbd_image_exists(&staging).await? {
+            let removed = rbd_output(&["rm".into(), staging.clone()]).await?;
+            if !removed.status.success() {
+                bail!("remove retained staging RBD image {staging} failed");
+            }
+        }
+        RBD_STAGING_IMAGES
+            .lock()
+            .unwrap()
+            .get_mut(image)
+            .unwrap()
+            .pop();
+    }
+}
+
+static PERSISTENT_RBD_OWNERS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, Option<PathBuf>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+async fn mount_persistent_state(vmid: &str) -> Result<(PathBuf, Option<String>)> {
+    let guard = PERSISTENT_OPERATIONS.lock().await;
+    let vmid = vmid.to_owned();
+    tokio::spawn(async move {
+        let _guard = guard;
+        mount_persistent_state_inner(&vmid).await
+    })
+    .await
+    .map_err(|err| eyre!("persistent attachment task failed: {err}"))?
+}
+
+async fn mount_persistent_state_inner(vmid: &str) -> Result<(PathBuf, Option<String>)> {
     let path = PathBuf::from(PERSISTENT_ROOTFS_ROOT).join(vmid);
     tokio::fs::create_dir_all(&path).await?;
     if is_mountpoint(&path).await? {
@@ -1668,7 +1955,7 @@ async fn mount_persistent_state(vmid: &str) -> Result<(PathBuf, Option<String>, 
         );
     }
     if persistent_backend()? == PersistentBackend::Local {
-        return Ok((path, None, None));
+        return Ok((path, None));
     }
     let pool = rbd_pool();
     if pool.is_empty()
@@ -1679,16 +1966,29 @@ async fn mount_persistent_state(vmid: &str) -> Result<(PathBuf, Option<String>, 
         bail!("invalid RBD pool name {pool:?}");
     }
     let image = rbd_identity(vmid)?;
+    cleanup_staging_images(&image).await?;
     let created = if rbd_image_exists(&image).await? {
         false
     } else {
+        // Publish the final VM identity only after its provisioning phase is
+        // durable in RBD metadata. A crash before publication cannot turn a
+        // blank image into an apparently established VM volume.
+        let staging_image = format!("{image}-initializing-{}", ulid::Ulid::generate());
+        // Record before the command: timeout/transport failure can still leave
+        // the created volume. Reconciliation checks existence before removal.
+        RBD_STAGING_IMAGES
+            .lock()
+            .unwrap()
+            .entry(image.clone())
+            .or_default()
+            .push(staging_image.clone());
         let create = rbd_output(&[
             "create".into(),
             "--size".into(),
             rbd_size()?,
             "--image-feature".into(),
             "exclusive-lock".into(),
-            image.clone(),
+            staging_image.clone(),
         ])
         .await?;
         if !create.status.success() {
@@ -1697,6 +1997,32 @@ async fn mount_persistent_state(vmid: &str) -> Result<(PathBuf, Option<String>, 
                 String::from_utf8_lossy(&create.stderr).trim()
             );
         }
+        // A volume may exist before its first mapping/formatting succeeds.
+        // Keep this provisioning phase on the volume, not node-local state.
+        let phase = rbd_output(&[
+            "image-meta".into(),
+            "set".into(),
+            staging_image.clone(),
+            "odorobo.rootfs.phase".into(),
+            "uninitialized".into(),
+        ])
+        .await?;
+        if !phase.status.success() {
+            let removed = rbd_output(&["rm".into(), staging_image.clone()]).await;
+            bail!("record new RBD provisioning phase failed; rollback: {removed:?}");
+        }
+        let published =
+            rbd_output(&["rename".into(), staging_image.clone(), image.clone()]).await?;
+        if !published.status.success() {
+            let removed = cleanup_staging_images(&image).await;
+            bail!("publish RBD image failed; staging cleanup: {removed:?}");
+        }
+        RBD_STAGING_IMAGES
+            .lock()
+            .unwrap()
+            .get_mut(&image)
+            .unwrap()
+            .pop();
         true
     };
     let info_args = vec![
@@ -1727,14 +2053,26 @@ async fn mount_persistent_state(vmid: &str) -> Result<(PathBuf, Option<String>, 
             "RBD rootfs image {image} lacks exclusive-lock; refusing unsafe multi-writer attachment"
         );
     }
-    let device = if let Some(existing) = rbd_lookup_device(&image).await? {
-        existing
-    } else {
+    // Never adopt a mapping whose ownership/lock mode we cannot establish.
+    if RBD_RESERVATIONS.lock().unwrap().contains(&image)
+        || rbd_lookup_device(&image).await?.is_some()
+    {
+        bail!(
+            "RBD image {image} is mapped or has unresolved ownership; detach it before restarting"
+        );
+    }
+    RBD_RESERVATIONS.lock().unwrap().insert(image.clone());
+    PERSISTENT_RBD_OWNERS
+        .lock()
+        .unwrap()
+        .insert(image.clone(), None);
+    let device = {
         let map = rbd_output(&[
             "device".into(),
             "map".into(),
+            "--exclusive".into(),
             "--options".into(),
-            "noudev".into(),
+            "noudev,lock_timeout=30".into(),
             image.clone(),
         ])
         .await?;
@@ -1755,76 +2093,83 @@ async fn mount_persistent_state(vmid: &str) -> Result<(PathBuf, Option<String>, 
         }
         PathBuf::from(device)
     };
-    let device_str = device
-        .to_str()
-        .ok_or_else(|| eyre!("non-UTF8 RBD device path"))?;
-    if is_device_mounted(&device).await? {
-        bail!(
-            "RBD device {} is mounted elsewhere on this node",
-            device.display()
-        );
-    }
-    if created {
-        let mkfs = Command::new("mkfs.ext4")
-            .args(["-F", device_str])
-            .output()
-            .await?;
-        if !mkfs.status.success() {
-            _ = rbd_output(&[
-                "device".into(),
-                "unmap".into(),
-                "--options".into(),
-                "noudev".into(),
-                image.clone(),
-            ])
-            .await;
+    PERSISTENT_RBD_OWNERS
+        .lock()
+        .unwrap()
+        .insert(image.clone(), Some(device.clone()));
+    let attach = async {
+        if is_device_mounted(&device).await? {
             bail!(
-                "format RBD rootfs filesystem: {}",
-                String::from_utf8_lossy(&mkfs.stderr).trim()
+                "RBD device {} is mounted elsewhere on this node",
+                device.display()
             );
         }
-    } else {
-        let check = Command::new("e2fsck")
-            .args(["-p", device_str])
-            .output()
-            .await?;
-        if !matches!(check.status.code(), Some(0 | 1)) {
-            _ = rbd_output(&[
-                "device".into(),
-                "unmap".into(),
-                "--options".into(),
-                "noudev".into(),
-                image.clone(),
-            ])
-            .await;
-            bail!(
-                "RBD rootfs filesystem check failed (status {:?}): {}",
-                check.status.code(),
-                String::from_utf8_lossy(&check.stderr).trim()
-            );
-        }
-    }
-    let mount = Command::new("mount")
-        .args(["-t", "ext4", "-o", "noatime,nosuid,nodev"])
-        .arg(&device)
-        .arg(&path)
-        .output()
-        .await?;
-    if !mount.status.success() {
-        _ = rbd_output(&[
-            "device".into(),
-            "unmap".into(),
-            "--options".into(),
-            "noudev".into(),
+        let phase = rbd_output(&[
+            "image-meta".into(),
+            "get".into(),
             image.clone(),
+            "odorobo.rootfs.phase".into(),
         ])
-        .await;
-        bail!(
-            "mount RBD persistent rootfs filesystem: {}",
-            String::from_utf8_lossy(&mount.stderr).trim()
-        );
+        .await?;
+        let phase_text = String::from_utf8_lossy(&phase.stdout);
+        let initialize = if phase.status.success() {
+            match phase_text.trim() {
+                "uninitialized" => true,
+                "formatted" => false,
+                other => bail!("unknown RBD provisioning phase {other:?}"),
+            }
+        } else if created {
+            bail!("new RBD image lost its provisioning phase");
+        } else {
+            // Legacy established volumes lack this key. Never format them.
+            false
+        };
+        if initialize {
+            run_checked("mkfs.ext4", ["-F".into()], &[&device]).await?;
+            let formatted = rbd_output(&[
+                "image-meta".into(),
+                "set".into(),
+                image.clone(),
+                "odorobo.rootfs.phase".into(),
+                "formatted".into(),
+            ])
+            .await?;
+            if !formatted.status.success() {
+                bail!("record formatted RBD phase failed");
+            }
+        } else {
+            let check = Command::new("e2fsck")
+                .arg("-p")
+                .arg(&device)
+                .output()
+                .await?;
+            if !matches!(check.status.code(), Some(0 | 1)) {
+                bail!(
+                    "RBD filesystem check failed ({}): {}",
+                    check.status,
+                    String::from_utf8_lossy(&check.stderr).trim()
+                );
+            }
+        }
+        run_checked(
+            "mount",
+            [
+                "-t".into(),
+                "ext4".into(),
+                "-o".into(),
+                "noatime,nosuid,nodev".into(),
+            ],
+            &[&device, &path],
+        )
+        .await?;
+        Ok::<_, stable_eyre::Report>(())
     }
-    Ok((path, Some(image), Some(device)))
+    .await;
+    if let Err(err) = attach {
+        let cleanup = release_persistent_backend_inner(None, Some(&image)).await;
+        return Err(err.wrap_err(format!("RBD attachment rollback: {cleanup:?}")));
+    }
+    Ok((path, Some(image)))
 }
 
 async fn is_device_mounted(device: &Path) -> Result<bool> {
@@ -1847,7 +2192,6 @@ struct UpperState {
     work: Option<PathBuf>,
     state_mount: Option<PathBuf>,
     rbd_image: Option<String>,
-    rbd_device: Option<PathBuf>,
 }
 
 async fn prepare_upper(
@@ -1862,15 +2206,12 @@ async fn prepare_upper(
             work: None,
             state_mount: None,
             rbd_image: None,
-            rbd_device: None,
         });
     }
     let mut rbd_image = None;
-    let mut rbd_device = None;
     let state_dir = if mode == RootfsMode::Persistent {
-        let (path, image, device) = mount_persistent_state(vmid).await?;
+        let (path, image) = mount_persistent_state(vmid).await?;
         rbd_image = image;
-        rbd_device = device;
         path
     } else {
         runtime_dir.to_path_buf()
@@ -1906,7 +2247,7 @@ async fn prepare_upper(
     let (upper, work) = match result {
         Ok(paths) => paths,
         Err(err) => {
-            if let (Some(image), Some(_device)) = (&rbd_image, &rbd_device) {
+            if let Some(image) = &rbd_image {
                 if let Err(cleanup) =
                     release_persistent_backend(Some(&state_dir), Some(image)).await
                 {
@@ -1923,7 +2264,6 @@ async fn prepare_upper(
         work: Some(work),
         state_mount: rbd_image.as_ref().map(|_| state_dir),
         rbd_image,
-        rbd_device,
     })
 }
 
@@ -1931,17 +2271,37 @@ async fn release_persistent_backend(
     state_mount: Option<&Path>,
     rbd_image: Option<&str>,
 ) -> Result<()> {
+    let _guard = PERSISTENT_OPERATIONS.lock().await;
+    release_persistent_backend_inner(state_mount, rbd_image).await
+}
+
+async fn release_persistent_backend_inner(
+    state_mount: Option<&Path>,
+    rbd_image: Option<&str>,
+) -> Result<()> {
     if let Some(path) = state_mount {
-        let output = Command::new("umount").arg(path).output().await?;
-        if !output.status.success() {
-            bail!(
-                "unmount persistent state {}: {}",
-                path.display(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
+        unmount_path(path).await?;
     }
     if let Some(image) = rbd_image {
+        cleanup_staging_images(image).await?;
+        let ownership = PERSISTENT_RBD_OWNERS.lock().unwrap().get(image).cloned();
+        let Some(expected) = ownership else {
+            return Ok(());
+        };
+        let Some(device) = rbd_lookup_device(image).await? else {
+            PERSISTENT_RBD_OWNERS.lock().unwrap().remove(image);
+            RBD_RESERVATIONS.lock().unwrap().remove(image);
+            return Ok(());
+        };
+        if expected
+            .as_ref()
+            .is_some_and(|expected| *expected != device)
+        {
+            bail!("persistent RBD mapping identity changed; refusing release");
+        }
+        if is_device_mounted(&device).await? {
+            bail!("refusing to unmap mounted RBD device {}", device.display());
+        }
         let output = rbd_output(&[
             "device".into(),
             "unmap".into(),
@@ -1956,34 +2316,57 @@ async fn release_persistent_backend(
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
+        PERSISTENT_RBD_OWNERS.lock().unwrap().remove(image);
+        RBD_RESERVATIONS.lock().unwrap().remove(image);
+    }
+    Ok(())
+}
+
+/// Idempotence is essential: teardown may have succeeded only partially on
+/// its previous attempt. Never treat an already-detached mount as a failure.
+async fn unmount_path(path: &Path) -> Result<()> {
+    // An acquisition may outlive a cancelled caller; observe its completion
+    // before checking whether the target needs detaching.
+    {
+        let _barrier = TOOL_OPERATIONS.lock().await;
+    }
+    if is_mountpoint(path).await? {
+        run_checked("umount", [], &[path]).await?;
     }
     Ok(())
 }
 
 async fn unmount_layer_mounts(mounts: &[PathBuf]) -> Result<()> {
-    let mut errors = Vec::new();
     for path in mounts.iter().rev() {
-        match Command::new("umount").arg(path).output().await {
-            Ok(out) if out.status.success() => {}
-            Ok(out) => errors.push(format!(
-                "{}: {}",
-                path.display(),
-                String::from_utf8_lossy(&out.stderr).trim()
-            )),
-            Err(err) => errors.push(format!("{}: {err}", path.display())),
-        }
+        unmount_path(path).await?;
     }
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(eyre!("unmount layer stack failed: {}", errors.join("; ")))
-    }
+    Ok(())
 }
 
 /// Prepare a digest-addressed composefs mount for each OCI layer, then expose
 /// their OCI-ordered OverlayFS stack as the VM root. No flattened image copy is
 /// retained; only per-layer stores and per-reference OCI layouts are cached.
-pub async fn mount_rootfs(vmid: &str, rootfs: &Rootfs) -> Result<PreparedRootfs> {
+#[cfg(test)]
+async fn mount_rootfs(vmid: &str, rootfs: &Rootfs) -> Result<PreparedRootfs> {
+    let mut owner = None;
+    match mount_rootfs_owned(vmid, rootfs, &mut owner).await {
+        Ok(()) => Ok(owner.unwrap()),
+        Err(err) => {
+            if let Some(prepared) = owner.as_ref() {
+                unmount_rootfs(prepared).await.wrap_err("rootfs rollback")?;
+            }
+            Err(err)
+        }
+    }
+}
+
+/// Publish acquired resources to a lifecycle owner before the first mount.
+/// A failed startup retains this inventory for an explicit teardown retry.
+pub async fn mount_rootfs_owned(
+    vmid: &str,
+    rootfs: &Rootfs,
+    owner: &mut Option<PreparedRootfs>,
+) -> Result<()> {
     validate_vmid(vmid)?;
     let limits = OciUnpackLimits::from_env()?;
     let state_lock = acquire_rootfs_lock(vmid).await?;
@@ -2019,6 +2402,8 @@ pub async fn mount_rootfs(vmid: &str, rootfs: &Rootfs) -> Result<PreparedRootfs>
 
     let runtime_dir = crate::ch_driver::VMInstance::runtime_dir_for(vmid);
     tokio::fs::create_dir_all(&runtime_dir).await?;
+    use std::os::unix::fs::PermissionsExt;
+    tokio::fs::set_permissions(&runtime_dir, std::fs::Permissions::from_mode(0o700)).await?;
     let root_mount = runtime_dir.join(ROOTFS_TAG);
     tokio::fs::create_dir_all(&root_mount).await?;
     if is_mountpoint(&root_mount).await? {
@@ -2030,6 +2415,8 @@ pub async fn mount_rootfs(vmid: &str, rootfs: &Rootfs) -> Result<PreparedRootfs>
     // Materialize every cache entry before mounting anything, so extraction or
     // integrity failures cannot strand a partial stack.
     let mut caches = Vec::with_capacity(descriptors.len());
+    let mut directory_changes = Vec::with_capacity(descriptors.len());
+    let mut directory_resets = Vec::with_capacity(descriptors.len());
     let mut unpacked_bytes = 0_u64;
     let mut unpacked_entries = 0_u64;
     let mut composefs_image_bytes = 0_u64;
@@ -2058,11 +2445,12 @@ pub async fn mount_rootfs(vmid: &str, rootfs: &Rootfs) -> Result<PreparedRootfs>
                 .checked_add(stats.object_store_bytes)
                 .ok_or_else(|| eyre!("composefs object cache size overflows"))?;
         }
+        directory_changes.push(stats.explicit_directories);
+        directory_resets.push(stats.directory_resets);
         caches.push(cache);
     }
     let layer_root = runtime_dir.join("rootfs-layers");
     tokio::fs::create_dir_all(&layer_root).await?;
-    let mut layer_mounts = Vec::with_capacity(descriptors.len());
     let mut mount_specs = Vec::with_capacity(descriptors.len());
     for (index, (desc, cache)) in descriptors.iter().zip(&caches).enumerate() {
         let (_, hex) = desc.digest.split_once(':').expect("validated layer digest");
@@ -2082,53 +2470,98 @@ pub async fn mount_rootfs(vmid: &str, rootfs: &Rootfs) -> Result<PreparedRootfs>
             layer_mount,
         ));
     }
+    *owner = Some(PreparedRootfs {
+        digest: manifest_digest.clone(),
+        mount: root_mount.clone(),
+        upper: None,
+        work: None,
+        layer_mounts: mount_specs
+            .iter()
+            .map(|(_, _, _, path)| path.clone())
+            .collect(),
+        persistent_state_mount: None,
+        rbd_image: None,
+        _state_lock: state_lock,
+        mode: rootfs.mode,
+        scratch_mounts: Vec::new(),
+    });
     let mut lowerdirs = Vec::with_capacity(mount_specs.len());
-    for (layer_digest, cache, verity_digest, layer_mount) in &mount_specs {
+    for (_layer_digest, cache, verity_digest, layer_mount) in &mount_specs {
         let opts = format!(
             "basedir={},digest={},verity,ro",
             cache.join("store").display(),
             verity_digest
         );
-        if let Err(err) = run_checked(
+        run_checked(
             "mount.composefs",
             ["-o".to_owned(), opts],
             &[cache.join("layer.cfs").as_path(), layer_mount.as_path()],
         )
-        .await
-        {
-            let cleanup = unmount_layer_mounts(&layer_mounts).await;
-            return Err(err.wrap_err(format!(
-                "mount OCI layer {layer_digest}; cleanup: {cleanup:?}"
-            )));
-        }
-        if let Err(err) = run_checked(
+        .await?;
+        run_checked(
             "mount",
             ["--make-rprivate".to_owned()],
             &[layer_mount.as_path()],
         )
-        .await
-        {
-            _ = Command::new("umount").arg(layer_mount).output().await;
-            let cleanup = unmount_layer_mounts(&layer_mounts).await;
-            return Err(err.wrap_err(format!(
-                "make composefs layer mount private; cleanup: {cleanup:?}"
-            )));
-        }
-        layer_mounts.push(layer_mount.clone());
+        .await?;
+        // mount.composefs does not accept standard nosuid/nodev options;
+        // apply these host-side restrictions to the resulting mount instead.
+        run_checked(
+            "mount",
+            ["-o".into(), "remount,bind,ro,nosuid,nodev".into()],
+            &[layer_mount],
+        )
+        .await?;
         lowerdirs.push(layer_mount.clone());
     }
+    // Correct directory-only metadata in a VM-private composefs layer. OCI
+    // omitted ancestors inherit prior metadata, unlike OverlayFS's highest
+    // directory rule. Payload caches remain immutable and fully reusable.
+    let correction = runtime_dir.join("rootfs-directory-metadata");
+    owner
+        .as_mut()
+        .unwrap()
+        .layer_mounts
+        .push(correction.clone());
+    let corrected = compose_directory_metadata(
+        &runtime_dir,
+        &root_mount,
+        &lowerdirs,
+        &directory_changes,
+        &directory_resets,
+    )
+    .await?;
     // OCI order is base to top; OverlayFS expects its highest-priority lower first.
     lowerdirs.reverse();
+    lowerdirs.insert(0, corrected);
 
-    let upper_state = match prepare_upper(vmid, rootfs.mode, &manifest_digest, &runtime_dir).await {
-        Ok(state) => state,
-        Err(err) => {
-            let cleanup = unmount_layer_mounts(&layer_mounts).await;
-            return Err(err.wrap_err(format!("prepare rootfs upper; layer cleanup: {cleanup:?}")));
+    // Include persistence in inventory before attaching; failed formatting,
+    // metadata validation or unmapping must remain reachable for cleanup.
+    if rootfs.mode == RootfsMode::Persistent && persistent_backend()? == PersistentBackend::Rbd {
+        let image = rbd_identity(vmid)?;
+        let state_path = Path::new(PERSISTENT_ROOTFS_ROOT).join(vmid);
+        if rbd_lookup_device(&image).await?.is_some() || is_mountpoint(&state_path).await? {
+            bail!("persistent RBD state already attached; refusing ownership adoption");
         }
-    };
+        let prepared = owner.as_mut().unwrap();
+        prepared.persistent_state_mount = Some(state_path);
+        prepared.rbd_image = Some(image);
+    }
+    let upper_state = prepare_upper(vmid, rootfs.mode, &manifest_digest, &runtime_dir).await?;
+    {
+        let prepared = owner.as_mut().unwrap();
+        prepared.upper = upper_state.upper.clone();
+        prepared.work = upper_state.work.clone();
+    }
+    if rootfs.mode == RootfsMode::ReadOnly && lowerdirs.len() == 1 {
+        // A second, controlled empty lower preserves OverlayFS interpretation
+        // of OCI whiteouts. A direct bind export would expose marker files.
+        let empty = runtime_dir.join("rootfs-empty-lower");
+        tokio::fs::create_dir_all(&empty).await?;
+        lowerdirs.push(empty);
+    }
     let mut options = format!(
-        "lowerdir={}",
+        "nosuid,nodev,lowerdir={}",
         lowerdirs
             .iter()
             .map(|p| p.display().to_string())
@@ -2145,184 +2578,297 @@ pub async fn mount_rootfs(vmid: &str, rootfs: &Rootfs) -> Result<PreparedRootfs>
         options.push_str(",ro");
     }
     if options.len() >= 4096 {
-        _ = release_persistent_backend(
-            upper_state.state_mount.as_deref(),
-            upper_state.rbd_image.as_deref(),
-        )
-        .await;
-        _ = unmount_layer_mounts(&layer_mounts).await;
         bail!("OCI OverlayFS mount options exceed the kernel page-size limit");
     }
-    let root_mount_result = if rootfs.mode == RootfsMode::ReadOnly && lowerdirs.len() == 1 {
-        // Linux rejects a lower-only OverlayFS mount with just one lowerdir.
-        // The sole composefs lower is already immutable, so a private bind
-        // mount is the equivalent read-only merged view for this special case.
-        run_checked(
-            "mount",
-            ["--bind".into()],
-            &[lowerdirs[0].as_path(), root_mount.as_path()],
-        )
-        .await
-    } else {
-        run_checked(
-            "mount",
-            [
-                "-t".into(),
-                "overlay".into(),
-                "overlay".into(),
-                "-o".into(),
-                options,
-            ],
-            &[root_mount.as_path()],
-        )
-        .await
-    };
-    if let Err(err) = root_mount_result {
-        let state_cleanup = release_persistent_backend(
-            upper_state.state_mount.as_deref(),
-            upper_state.rbd_image.as_deref(),
-        )
-        .await;
-        let layer_cleanup = unmount_layer_mounts(&layer_mounts).await;
-        return Err(err.wrap_err(format!("mount OCI OverlayFS root; state cleanup: {state_cleanup:?}; layer cleanup: {layer_cleanup:?}")));
-    }
-    if let Err(err) = run_checked(
+    run_checked(
+        "mount",
+        [
+            "-t".into(),
+            "overlay".into(),
+            "overlay".into(),
+            "-o".into(),
+            options,
+        ],
+        &[root_mount.as_path()],
+    )
+    .await?;
+    run_checked(
         "mount",
         ["--make-rprivate".to_owned()],
         &[root_mount.as_path()],
     )
-    .await
-    {
-        _ = Command::new("umount").arg(&root_mount).output().await;
-        let state_cleanup = release_persistent_backend(
-            upper_state.state_mount.as_deref(),
-            upper_state.rbd_image.as_deref(),
-        )
-        .await;
-        let layer_cleanup = unmount_layer_mounts(&layer_mounts).await;
-        return Err(err.wrap_err(format!("make VM root mount private; state cleanup: {state_cleanup:?}; layer cleanup: {layer_cleanup:?}")));
+    .await?;
+    // Record scratch targets before mounting so even failed scratch rollback
+    // can be retried through the owner.
+    if rootfs.mode == RootfsMode::ReadOnly {
+        owner.as_mut().unwrap().scratch_mounts = validate_scratch_targets(&root_mount)?
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect();
     }
     let scratch_mounts = if rootfs.mode == RootfsMode::ReadOnly {
-        match mount_readonly_scratch(&root_mount).await {
-            Ok(paths) => paths,
-            Err(err) => {
-                let root_umount = Command::new("umount").arg(&root_mount).output().await;
-                if root_umount.as_ref().is_ok_and(|out| out.status.success()) {
-                    _ = unmount_layer_mounts(&layer_mounts).await;
-                }
-                return Err(err.wrap_err(format!(
-                    "scratch setup failed; root rollback: {root_umount:?}"
-                )));
-            }
-        }
+        mount_readonly_scratch(&root_mount).await?
     } else {
         Vec::new()
     };
     info!(vmid, %manifest_digest, layers=descriptors.len(), unique_layer_blob_bytes=compressed_bytes, composefs_image_bytes, composefs_object_bytes, mount=%root_mount.display(), "OCI rootfs mounted; referenced cache usage (compressed blobs / composefs metadata / composefs objects)");
-    Ok(PreparedRootfs {
-        digest: manifest_digest,
-        mount: root_mount,
-        upper: upper_state.upper,
-        work: upper_state.work,
-        layer_mounts,
-        persistent_state_mount: upper_state.state_mount,
-        rbd_device: upper_state.rbd_device,
-        rbd_image: upper_state.rbd_image,
-        _state_lock: state_lock,
-        mode: rootfs.mode,
-        scratch_mounts,
+    owner.as_mut().unwrap().scratch_mounts = scratch_mounts;
+    Ok(())
+}
+
+fn copy_directory_attributes(source: &Path, destination: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let metadata = std::fs::symlink_metadata(source)?;
+    if !metadata.is_dir() {
+        bail!("directory metadata source is not a directory");
+    }
+    let file = std::fs::File::open(destination)?;
+    // SAFETY: live fd and numeric metadata from verified layer.
+    if unsafe { libc::fchown(file.as_raw_fd(), metadata.uid(), metadata.gid()) } != 0 {
+        return Err(std::io::Error::last_os_error()).wrap_err("copy directory owner");
+    }
+    file.set_permissions(std::fs::Permissions::from_mode(metadata.mode()))?;
+    file.set_times(std::fs::FileTimes::new().set_modified(metadata.modified()?))?;
+    let path = std::ffi::CString::new(source.as_os_str().as_encoded_bytes())?;
+    // SAFETY: valid path; null buffer queries length.
+    let length = unsafe { libc::llistxattr(path.as_ptr(), std::ptr::null_mut(), 0) };
+    if length < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let mut names = vec![0_u8; length as usize];
+    // SAFETY: valid allocated buffer and path.
+    let length = unsafe { libc::llistxattr(path.as_ptr(), names.as_mut_ptr().cast(), names.len()) };
+    if length < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let mut attributes = Vec::new();
+    for name in names[..length as usize]
+        .split(|byte| *byte == 0)
+        .filter(|name| !name.is_empty())
+    {
+        if name.starts_with(b"trusted.overlay.") || name.starts_with(b"user.overlay.") {
+            continue;
+        }
+        let cname = std::ffi::CString::new(name)?;
+        // SAFETY: valid strings, null buffer for length query.
+        let size =
+            unsafe { libc::lgetxattr(path.as_ptr(), cname.as_ptr(), std::ptr::null_mut(), 0) };
+        if size < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let mut value = vec![0_u8; size as usize];
+        // SAFETY: valid output buffer sized by preceding query.
+        if unsafe {
+            libc::lgetxattr(
+                path.as_ptr(),
+                cname.as_ptr(),
+                value.as_mut_ptr().cast(),
+                value.len(),
+            )
+        } < 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        attributes.push((name.to_vec(), value));
+    }
+    apply_xattrs(destination, &attributes)
+}
+
+fn directory_metadata_source(
+    relative: &Path,
+    layers: &[PathBuf],
+    changes: &[Vec<PathBuf>],
+    resets: &[Vec<DirectoryReset>],
+) -> Result<usize> {
+    let mut source = None;
+    for (index, layer) in layers.iter().enumerate() {
+        if resets[index].iter().any(|reset| {
+            relative.starts_with(&reset.path) && (!reset.descendants_only || relative != reset.path)
+        }) {
+            source = None;
+        }
+        // Examine every component with lstat; never traverse image symlinks.
+        let mut prefix = layer.clone();
+        let mut blocked = false;
+        for component in relative.components() {
+            prefix.push(component);
+            match std::fs::symlink_metadata(&prefix) {
+                Ok(metadata) if !metadata.is_dir() => {
+                    blocked = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    break;
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+        if blocked {
+            source = None;
+            continue;
+        }
+        if std::fs::symlink_metadata(layer.join(relative)).is_ok_and(|m| m.is_dir())
+            && (source.is_none() || changes[index].iter().any(|path| path == relative))
+        {
+            source = Some(index);
+        }
+    }
+    source.ok_or_else(|| {
+        eyre!(
+            "no current-generation metadata source for {}",
+            relative.display()
+        )
     })
+}
+
+static DIRECTORY_OPERATIONS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn compose_directory_metadata(
+    runtime: &Path,
+    temporary_mount: &Path,
+    layers: &[PathBuf],
+    changes: &[Vec<PathBuf>],
+    resets: &[Vec<DirectoryReset>],
+) -> Result<PathBuf> {
+    let guard = DIRECTORY_OPERATIONS.lock().await;
+    let runtime = runtime.to_owned();
+    let temporary_mount = temporary_mount.to_owned();
+    let layers = layers.to_vec();
+    let changes = changes.to_vec();
+    let resets = resets.to_vec();
+    tokio::spawn(async move {
+        let _guard = guard;
+        compose_directory_metadata_inner(&runtime, &temporary_mount, &layers, &changes, &resets)
+            .await
+    })
+    .await
+    .map_err(|err| eyre!("directory composition task failed: {err}"))?
+}
+
+async fn compose_directory_metadata_inner(
+    runtime: &Path,
+    temporary_mount: &Path,
+    layers: &[PathBuf],
+    changes: &[Vec<PathBuf>],
+    resets: &[Vec<DirectoryReset>],
+) -> Result<PathBuf> {
+    let metadata_dir = Path::new("/var/lib/odorobo/directory-metadata").join(
+        runtime
+            .file_name()
+            .ok_or_else(|| eyre!("VM runtime has no identity"))?,
+    );
+    use std::os::unix::fs::PermissionsExt;
+    tokio::fs::create_dir_all(&metadata_dir).await?;
+    tokio::fs::set_permissions(&metadata_dir, std::fs::Permissions::from_mode(0o700)).await?;
+    let tree = metadata_dir.join("tree");
+    tokio::fs::create_dir_all(&tree).await?;
+    let empty = runtime.join("rootfs-empty-lower");
+    tokio::fs::create_dir_all(&empty).await?;
+    let mut lowers = layers
+        .iter()
+        .rev()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>();
+    lowers.push(empty.display().to_string());
+    run_checked(
+        "mount",
+        [
+            "-t".into(),
+            "overlay".into(),
+            "overlay".into(),
+            "-o".into(),
+            format!("ro,nosuid,nodev,lowerdir={}", lowers.join(":")),
+        ],
+        &[temporary_mount],
+    )
+    .await?;
+    let mut pending = vec![PathBuf::new()];
+    let mut directories = Vec::new();
+    while let Some(relative) = pending.pop() {
+        let path = temporary_mount.join(&relative);
+        tokio::fs::create_dir_all(tree.join(&relative)).await?;
+        let mut entries = tokio::fs::read_dir(&path).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            if entry.file_type().await?.is_dir() {
+                pending.push(relative.join(entry.file_name()));
+            }
+        }
+        // The newest explicit directory header wins. If none exists, use
+        // the first layer introducing it, never a later synthetic ancestor.
+        let selected = directory_metadata_source(&relative, layers, changes, resets)?;
+        directories.push((relative, selected));
+    }
+    directories.sort_by_key(|(path, _)| std::cmp::Reverse(path.components().count()));
+    for (relative, selected) in directories {
+        copy_directory_attributes(&layers[selected].join(&relative), &tree.join(&relative))?;
+    }
+    unmount_path(temporary_mount).await?;
+    let image = metadata_dir.join("directories.cfs");
+    run_checked(
+        "mkcomposefs",
+        [tree.display().to_string(), image.display().to_string()],
+        &[],
+    )
+    .await?;
+    ensure_fsverity(&image).await?;
+    let digest = run_checked("composefs-info", ["measure-file".into()], &[&image]).await?;
+    let target = runtime.join("rootfs-directory-metadata");
+    tokio::fs::create_dir_all(&target).await?;
+    run_checked(
+        "mount.composefs",
+        [
+            "-o".into(),
+            format!(
+                "basedir={},digest={},verity,ro",
+                empty.display(),
+                digest.trim()
+            ),
+        ],
+        &[&image, &target],
+    )
+    .await?;
+    run_checked(
+        "mount",
+        ["-o".into(), "remount,bind,ro,nosuid,nodev".into()],
+        &[&target],
+    )
+    .await?;
+    run_checked("mount", ["--make-rprivate".into()], &[&target]).await?;
+    tokio::fs::remove_dir_all(tree).await?;
+    Ok(target)
 }
 
 /// Tear down mounts in dependency order. Persistent upper data is never removed
 /// here; RBD is unmounted and unmapped only after the overlay and layers stop.
 pub async fn unmount_rootfs(prepared: &PreparedRootfs) -> Result<()> {
-    let mut failures = Vec::new();
-    if let Err(err) = unmount_scratch_mounts(&prepared.scratch_mounts).await {
-        failures.push(err.to_string());
+    let _directory_barrier = DIRECTORY_OPERATIONS.lock().await;
+    unmount_scratch_mounts(&prepared.scratch_mounts).await?;
+    unmount_path(&prepared.mount).await?;
+    unmount_layer_mounts(&prepared.layer_mounts).await?;
+    release_persistent_backend(
+        prepared.persistent_state_mount.as_deref(),
+        prepared.rbd_image.as_deref(),
+    )
+    .await?;
+    if let Some(runtime) = prepared.mount.parent().and_then(Path::file_name) {
+        let directory = Path::new("/var/lib/odorobo/directory-metadata").join(runtime);
+        match tokio::fs::remove_dir_all(directory).await {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
     }
-    let mut unmounted = false;
-    for attempt in 1..=3 {
-        match Command::new("umount").arg(&prepared.mount).output().await {
-            Ok(out) if out.status.success() => {
-                unmounted = true;
-                break;
-            }
-            other => {
-                debug!(attempt, ?other, "rootfs umount retry");
-                if attempt < 3 {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                }
+    if prepared.mode == RootfsMode::Ephemeral {
+        for path in [&prepared.upper, &prepared.work].into_iter().flatten() {
+            match tokio::fs::remove_dir_all(path).await {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err.into()),
             }
         }
     }
-    if !unmounted {
-        failures.push(format!(
-            "failed to unmount rootfs {}",
-            prepared.mount.display()
-        ));
-    }
-    let mut layers_unmounted = unmounted && failures.is_empty();
-    if layers_unmounted {
-        for path in prepared.layer_mounts.iter().rev() {
-            match Command::new("umount").arg(path).output().await {
-                Ok(out) if out.status.success() => {}
-                Ok(out) => {
-                    failures.push(format!(
-                        "unmount composefs layer {}: {}",
-                        path.display(),
-                        String::from_utf8_lossy(&out.stderr).trim()
-                    ));
-                    layers_unmounted = false;
-                }
-                Err(err) => {
-                    failures.push(format!("unmount composefs layer {}: {err}", path.display()));
-                    layers_unmounted = false;
-                }
-            }
-        }
-    }
-    if unmounted && layers_unmounted && failures.is_empty() {
-        if let Some(state_mount) = &prepared.persistent_state_mount {
-            let out = Command::new("umount").arg(state_mount).output().await?;
-            if !out.status.success() {
-                failures.push(format!(
-                    "unmount persistent state {}: {}",
-                    state_mount.display(),
-                    String::from_utf8_lossy(&out.stderr).trim()
-                ));
-            } else if let (Some(image), Some(_device)) = (&prepared.rbd_image, &prepared.rbd_device)
-            {
-                let out = rbd_output(&[
-                    "device".into(),
-                    "unmap".into(),
-                    "--options".into(),
-                    "noudev".into(),
-                    image.clone(),
-                ])
-                .await?;
-                if !out.status.success() {
-                    failures.push(format!(
-                        "unmap RBD {image}: {}",
-                        String::from_utf8_lossy(&out.stderr).trim()
-                    ));
-                }
-            }
-        }
-        if prepared.mode == RootfsMode::Ephemeral {
-            if let Some(upper) = &prepared.upper {
-                tokio::fs::remove_dir_all(upper).await.ok();
-            }
-            if let Some(work) = &prepared.work {
-                tokio::fs::remove_dir_all(work).await.ok();
-            }
-        }
-    }
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        Err(eyre!("rootfs teardown incomplete: {}", failures.join("; ")))
-    }
+    Ok(())
 }
 
 async fn run_checked(
@@ -2337,8 +2883,7 @@ async fn run_checked(
     for path in extra {
         cmd.arg(path);
     }
-    let output = cmd
-        .output()
+    let output = run_owned_command(cmd)
         .await
         .wrap_err_with(|| format!("failed to run {program}"))?;
     if !output.status.success() {
@@ -2357,26 +2902,7 @@ fn scratch_size_mb(env: &str, default_mb: u64) -> Result<u64> {
 }
 
 fn parse_scratch_size_mb(env: &str, value: &str) -> Result<u64> {
-    let value = value.trim();
-    let split = value
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(value.len());
-    let (number, unit) = value.split_at(split);
-    let number: u64 = number
-        .parse()
-        .map_err(|_| eyre!("invalid scratch size {env}={value:?}"))?;
-    let multiplier = match unit.to_ascii_uppercase().as_str() {
-        "M" | "MB" => 1,
-        "G" | "GB" => 1024,
-        _ => bail!("{env} must use M or G units"),
-    };
-    let mb = number
-        .checked_mul(multiplier)
-        .ok_or_else(|| eyre!("scratch size overflows"))?;
-    if !(1..=2048).contains(&mb) {
-        bail!("{env} must be between 1M and 2G");
-    }
-    Ok(mb)
+    parse_size_bytes(env, value, 2 * 1024_u64.pow(3), false).map(|bytes| bytes / 1024_u64.pow(2))
 }
 
 /// Resolve the three scratch locations completely before mounting any tmpfs.
@@ -2387,21 +2913,21 @@ fn validate_scratch_targets(root: &Path) -> Result<Vec<(PathBuf, String)>> {
         (
             "tmp",
             format!(
-                "size={}m,mode=1777",
+                "size={}m,mode=1777,nosuid,nodev",
                 scratch_size_mb("ODOROBO_ROOTFS_TMP_SIZE", 64)?
             ),
         ),
         (
             "run",
             format!(
-                "size={}m,mode=755",
+                "size={}m,mode=755,nosuid,nodev",
                 scratch_size_mb("ODOROBO_ROOTFS_RUN_SIZE", 32)?
             ),
         ),
         (
             "var/tmp",
             format!(
-                "size={}m,mode=1777",
+                "size={}m,mode=1777,nosuid,nodev",
                 scratch_size_mb("ODOROBO_ROOTFS_VARTMP_SIZE", 32)?
             ),
         ),
@@ -2434,23 +2960,9 @@ fn validate_scratch_targets(root: &Path) -> Result<Vec<(PathBuf, String)>> {
 }
 
 async fn unmount_scratch_mounts(mounts: &[PathBuf]) -> Result<()> {
-    let mut errors = Vec::new();
-    for path in mounts.iter().rev() {
-        match Command::new("umount").arg(path).output().await {
-            Ok(out) if out.status.success() => {}
-            Ok(out) => errors.push(format!(
-                "{}: {}",
-                path.display(),
-                String::from_utf8_lossy(&out.stderr).trim()
-            )),
-            Err(err) => errors.push(format!("{}: {err}", path.display())),
-        }
-    }
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(eyre!("scratch unmount failed: {}", errors.join("; ")))
-    }
+    unmount_layer_mounts(mounts)
+        .await
+        .wrap_err("scratch unmount failed")
 }
 
 /// Read-only root supports only bounded volatile scratch: /tmp, /run, /var/tmp.
@@ -2488,6 +3000,9 @@ async fn mount_readonly_scratch(root: &Path) -> Result<Vec<PathBuf>> {
 
 /// Remove persistent upper state only from the explicit DeleteVM path.
 pub async fn delete_persistent_rootfs(vmid: &str) -> Result<()> {
+    let _operations = PERSISTENT_OPERATIONS.lock().await;
+    validate_vmid(vmid)?;
+    let _lock = acquire_rootfs_lock(vmid).await?;
     let path = PathBuf::from(PERSISTENT_ROOTFS_ROOT).join(vmid);
     if is_mountpoint(&path).await? {
         bail!(
@@ -2506,25 +3021,13 @@ pub async fn delete_persistent_rootfs(vmid: &str) -> Result<()> {
         },
         PersistentBackend::Rbd => {
             let image = rbd_identity(vmid)?;
+            cleanup_staging_images(&image).await?;
             if !rbd_image_exists(&image).await? {
                 tokio::fs::remove_dir_all(&path).await.ok();
                 return Ok(());
             }
             if rbd_lookup_device(&image).await?.is_some() {
-                let unmap = rbd_output(&[
-                    "device".into(),
-                    "unmap".into(),
-                    "--options".into(),
-                    "noudev".into(),
-                    image.clone(),
-                ])
-                .await?;
-                if !unmap.status.success() {
-                    bail!(
-                        "unmap RBD rootfs {image} before deletion: {}",
-                        String::from_utf8_lossy(&unmap.stderr).trim()
-                    );
-                }
+                bail!("refusing to delete mapped RBD image {image}; detach it first");
             }
             let remove = rbd_output(&["rm".into(), image.clone()]).await?;
             if !remove.status.success() {
@@ -2577,17 +3080,27 @@ struct SupState {
     shutdown: AtomicBool,
     notify: Notify,
     restarts: AtomicU32,
+    ready: AtomicBool,
 }
 
 /// Runs virtiofsd as a supervised child of the VM actor for the VM's
 /// lifetime: restarts with capped backoff on unexpected exit, stopped with
 /// the actor. Children are `kill_on_drop`, so even an abrupt actor kill does
 /// not leak the process.
-#[derive(Clone)]
 pub struct VirtioFsSupervisor {
     spec: VirtiofsdSpec,
     state: Arc<SupState>,
-    task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    abort: tokio::task::AbortHandle,
+}
+
+impl Drop for VirtioFsSupervisor {
+    fn drop(&mut self) {
+        // Dropping a JoinHandle alone detaches it. Abort the task so its
+        // kill_on_drop child cannot outlive a cancelled startup or actor.
+        self.state.shutdown.store(true, Ordering::Relaxed);
+        self.abort.abort();
+    }
 }
 
 impl VirtioFsSupervisor {
@@ -2601,6 +3114,7 @@ impl VirtioFsSupervisor {
             shutdown: AtomicBool::new(false),
             notify: Notify::new(),
             restarts: AtomicU32::new(0),
+            ready: AtomicBool::new(false),
         });
         let task_state = Arc::clone(&state);
         let task_spec = spec.clone();
@@ -2611,6 +3125,10 @@ impl VirtioFsSupervisor {
                 if task_state.shutdown.load(Ordering::Relaxed) {
                     break;
                 }
+                task_state.ready.store(false, Ordering::Relaxed);
+                // Only the previous child has owned this private VM socket.
+                // Remove it after exit, before each replacement generation.
+                std::fs::remove_file(&task_spec.socket).ok();
                 let log = match std::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
@@ -2632,6 +3150,8 @@ impl VirtioFsSupervisor {
                     format!("--shared-dir={}", task_spec.shared_dir.display()),
                     "--sandbox=chroot".to_owned(),
                     "--cache=auto".to_owned(),
+                    "--xattr".to_owned(),
+                    "--posix-acl".to_owned(),
                 ])
                 .stdin(std::process::Stdio::null())
                 .stdout(log.try_clone().expect("log handle clone"))
@@ -2641,16 +3161,27 @@ impl VirtioFsSupervisor {
                 debug!(program = %task_spec.program.display(), "spawning virtiofsd");
                 match cmd.spawn() {
                     Ok(mut child) => {
-                        let exit = tokio::select! {
-                            status = child.wait() => status,
-                            _ = task_state.notify.notified() => {
-                                // stop() asked us to go down; make sure the
-                                // child is gone before exiting the loop.
-                                _ = child.start_kill();
-                                _ = child.wait().await;
-                                break;
+                        let exit = loop {
+                            match child.try_wait() {
+                                Ok(Some(status)) => break Ok(status),
+                                Err(err) => break Err(err),
+                                Ok(None) => {}
+                            }
+                            // A pathname from an exited generation is never
+                            // readiness. Only the current live child publishes it.
+                            task_state
+                                .ready
+                                .store(task_spec.socket.exists(), Ordering::Relaxed);
+                            tokio::select! {
+                                () = tokio::time::sleep(Duration::from_millis(50)) => {}
+                                _ = task_state.notify.notified() => {
+                                    _ = child.start_kill();
+                                    break child.wait().await;
+                                }
                             }
                         };
+                        task_state.ready.store(false, Ordering::Relaxed);
+                        std::fs::remove_file(&task_spec.socket).ok();
                         if task_state.shutdown.load(Ordering::Relaxed) {
                             break;
                         }
@@ -2681,7 +3212,8 @@ impl VirtioFsSupervisor {
         Ok(Self {
             spec,
             state,
-            task: Arc::new(Mutex::new(Some(handle))),
+            abort: handle.abort_handle(),
+            task: Mutex::new(Some(handle)),
         })
     }
 
@@ -2696,7 +3228,7 @@ impl VirtioFsSupervisor {
     pub async fn wait_socket_ready(&self, timeout: Duration) -> Result<()> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            if self.spec.socket.exists() {
+            if self.state.ready.load(Ordering::Relaxed) {
                 return Ok(());
             }
             if tokio::time::Instant::now() >= deadline {
@@ -2712,17 +3244,23 @@ impl VirtioFsSupervisor {
 
     /// Stop supervising and kill the running child, if any.
     pub async fn stop(&self) {
+        self.stop_with_timeout(Duration::from_secs(5)).await;
+    }
+
+    async fn stop_with_timeout(&self, timeout: Duration) {
         self.state.shutdown.store(true, Ordering::Relaxed);
         self.state.notify.notify_one();
-        if let Some(task) = self.task.lock().await.take() {
+        // Serialize concurrent stop calls until the child has been reaped.
+        let mut slot = self.task.lock().await;
+        if let Some(task) = slot.as_mut() {
             // Give the loop a moment to observe the shutdown flag and reap
             // the child; abort (kill_on_drop) as a backstop.
-            if tokio::time::timeout(Duration::from_secs(5), task)
-                .await
-                .is_err()
-            {
+            if tokio::time::timeout(timeout, &mut *task).await.is_err() {
                 warn!("virtiofsd supervisor task did not exit in time; aborting");
+                task.abort();
+                _ = task.await;
             }
+            *slot = None;
         }
     }
 }
@@ -2738,6 +3276,385 @@ pub(crate) mod tests {
     use std::os::unix::fs::MetadataExt;
     use std::path::{Path, PathBuf};
     use std::time::Duration;
+
+    #[test]
+    fn unpack_preserves_oci_metadata_and_rejects_overlay_xattrs() {
+        let base =
+            std::env::temp_dir().join(format!("odorobo-metadata-{}", ulid::Ulid::generate()));
+        std::fs::create_dir_all(&base).unwrap();
+        let mut bytes = Vec::new();
+        let mut archive = tar::Builder::new(&mut bytes);
+        // A valid v2 Linux capability xattr (CAP_NET_BIND_SERVICE).
+        let capability = [1, 0, 0, 2, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        archive
+            .append_pax_extensions([("SCHILY.xattr.security.capability", capability.as_slice())])
+            .unwrap();
+        let mut header = tar::Header::new_gnu();
+        header.set_uid(1234);
+        header.set_gid(2345);
+        header.set_mode(0o4755);
+        header.set_size(4);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, "app", &b"data"[..])
+            .unwrap();
+        header.set_entry_type(tar::EntryType::Directory);
+        header.set_size(0);
+        header.set_mode(0o1777);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, "tmp", std::io::empty())
+            .unwrap();
+        archive.finish().unwrap();
+        drop(archive);
+        super::unpack_layer(bytes.as_slice(), Compression::None, &base, 1024 * 1024, 10).unwrap();
+        let meta = std::fs::metadata(base.join("app")).unwrap();
+        assert_eq!(
+            (meta.uid(), meta.gid(), meta.mode() & 0o7777),
+            (1234, 2345, 0o4755)
+        );
+        assert_eq!(
+            std::fs::metadata(base.join("tmp")).unwrap().mode() & 0o7777,
+            0o1777
+        );
+        let path = std::ffi::CString::new(base.join("app").as_os_str().as_encoded_bytes()).unwrap();
+        let name = c"security.capability";
+        let mut actual = [0; 20];
+        // SAFETY: valid path/name and output buffer.
+        let len = unsafe {
+            libc::lgetxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                actual.as_mut_ptr().cast(),
+                actual.len(),
+            )
+        };
+        assert_eq!(len, 20);
+        assert_eq!(actual, capability);
+
+        let mut bytes = Vec::new();
+        let mut archive = tar::Builder::new(&mut bytes);
+        archive
+            .append_pax_extensions([("SCHILY.xattr.trusted.overlay.redirect", b"/etc".as_slice())])
+            .unwrap();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, "hostile", std::io::empty())
+            .unwrap();
+        archive.finish().unwrap();
+        drop(archive);
+        assert!(
+            super::unpack_layer(bytes.as_slice(), Compression::None, &base, 1024 * 1024, 10)
+                .is_err()
+        );
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn root_metadata_and_default_acls_are_order_independent() {
+        // Linux ACL xattr v2: owner rwx, named uid 1234 rwx, group r-x,
+        // mask rwx, other r-x. Children without an ACL must not inherit it.
+        let mut acl = 2_u32.to_le_bytes().to_vec();
+        for (tag, permission, id) in [
+            (1_u16, 7_u16, u32::MAX),
+            (2, 7, 1234),
+            (4, 5, u32::MAX),
+            (16, 7, u32::MAX),
+            (32, 5, u32::MAX),
+        ] {
+            acl.extend(tag.to_le_bytes());
+            acl.extend(permission.to_le_bytes());
+            acl.extend(id.to_le_bytes());
+        }
+        for reversed in [false, true] {
+            let base =
+                std::env::temp_dir().join(format!("odorobo-root-acl-{}", ulid::Ulid::generate()));
+            std::fs::create_dir_all(&base).unwrap();
+            let mut bytes = Vec::new();
+            let mut archive = tar::Builder::new(&mut bytes);
+            let mut header = tar::Header::new_gnu();
+            header.set_uid(1234);
+            header.set_gid(2345);
+            header.set_mode(0o755);
+            header.set_size(0);
+            if reversed {
+                header.set_cksum();
+                archive
+                    .append_data(&mut header, "child", std::io::empty())
+                    .unwrap();
+            }
+            archive
+                .append_pax_extensions([("SCHILY.xattr.system.posix_acl_default", acl.as_slice())])
+                .unwrap();
+            header.set_entry_type(tar::EntryType::Directory);
+            header.set_mode(0o1775);
+            header.set_mtime(42);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, "./", std::io::empty())
+                .unwrap();
+            if !reversed {
+                header.set_entry_type(tar::EntryType::Regular);
+                header.set_mode(0o755);
+                header.set_cksum();
+                archive
+                    .append_data(&mut header, "child", std::io::empty())
+                    .unwrap();
+            }
+            archive.finish().unwrap();
+            drop(archive);
+            super::unpack_layer(bytes.as_slice(), Compression::None, &base, 1024 * 1024, 10)
+                .unwrap();
+            let meta = std::fs::metadata(&base).unwrap();
+            assert_eq!(
+                (meta.uid(), meta.gid(), meta.mode() & 0o7777, meta.mtime()),
+                (1234, 2345, 0o1775, 42)
+            );
+            let child =
+                std::ffi::CString::new(base.join("child").as_os_str().as_encoded_bytes()).unwrap();
+            assert_eq!(
+                // SAFETY: valid C strings; null buffer queries xattr existence.
+                unsafe {
+                    libc::lgetxattr(
+                        child.as_ptr(),
+                        c"system.posix_acl_access".as_ptr(),
+                        std::ptr::null_mut(),
+                        0,
+                    )
+                },
+                -1
+            );
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ENODATA)
+            );
+            std::fs::remove_dir_all(base).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_rbd_caller_cannot_overtake_its_command() {
+        let base =
+            std::env::temp_dir().join(format!("odorobo-rbd-cancel-{}", ulid::Ulid::generate()));
+        std::fs::create_dir_all(&base).unwrap();
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg("echo $$ > \"$1/pid\"; sleep 0.2; echo mapped > \"$1/mapped\"")
+            .arg("sh")
+            .arg(&base);
+        let caller = tokio::spawn(super::run_owned_command(command));
+        for _ in 0..100 {
+            if base.join("pid").exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(base.join("pid").exists());
+        caller.abort();
+        _ = caller.await;
+        // Reconciliation must wait for the detached owned command, then sees
+        // its effects; no mapping can appear after cleanup has inspected them.
+        let guard = super::TOOL_OPERATIONS.lock().await;
+        assert!(base.join("mapped").exists());
+        let pid: u32 = std::fs::read_to_string(base.join("pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(!Path::new(&format!("/proc/{pid}")).exists());
+        std::fs::remove_file(base.join("mapped")).unwrap();
+        drop(guard);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(!base.join("mapped").exists());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_mount_helper_descendant_cannot_overtake_teardown() {
+        let base =
+            std::env::temp_dir().join(format!("odorobo-mount-cancel-{}", ulid::Ulid::generate()));
+        std::fs::create_dir_all(&base).unwrap();
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg("(echo ready > \"$1/ready\"; sleep 0.2; echo acquired > \"$1/acquired\") & exit 0")
+            .arg("sh")
+            .arg(&base);
+        let caller = tokio::spawn(super::run_owned_command(command));
+        for _ in 0..100 {
+            if base.join("ready").exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(base.join("ready").exists());
+        caller.abort();
+        _ = caller.await;
+        super::unmount_path(&base).await.unwrap();
+        assert!(
+            base.join("acquired").exists(),
+            "teardown must wait for helper descendants"
+        );
+        std::fs::remove_file(base.join("acquired")).unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(!base.join("acquired").exists());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[tokio::test]
+    async fn supervisor_replaces_stale_socket_generation() {
+        let base =
+            std::env::temp_dir().join(format!("odorobo-socket-restart-{}", ulid::Ulid::generate()));
+        std::fs::create_dir_all(&base).unwrap();
+        let script = base.join("stub");
+        std::fs::write(&script, "#!/usr/bin/python3\nimport socket,sys,time,pathlib\np=pathlib.Path(__file__).parent\ns=socket.socket(socket.AF_UNIX)\ns.bind(str(p/'sock'))\nf=p/'generation'\nn=int(f.read_text())+1 if f.exists() else 1\nf.write_text(str(n))\ntime.sleep(0.15 if n==1 else 100)\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let supervisor = VirtioFsSupervisor::start(VirtiofsdSpec {
+            program: script,
+            socket: base.join("sock"),
+            shared_dir: base.clone(),
+            log: base.join("log"),
+        })
+        .unwrap();
+        supervisor
+            .wait_socket_ready(Duration::from_secs(2))
+            .await
+            .unwrap();
+        for _ in 0..100 {
+            if supervisor.restarts() > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(supervisor.restarts() > 0);
+        assert!(
+            !supervisor
+                .state
+                .ready
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+        supervisor
+            .wait_socket_ready(Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(base.join("generation")).unwrap(),
+            "2"
+        );
+        supervisor.stop().await;
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[tokio::test]
+    async fn teardown_accepts_already_unmounted_paths() {
+        let base =
+            std::env::temp_dir().join(format!("odorobo-teardown-{}", ulid::Ulid::generate()));
+        std::fs::create_dir_all(&base).unwrap();
+        super::unmount_layer_mounts(&[base.clone(), base.join("missing")])
+            .await
+            .unwrap();
+        super::release_persistent_backend(Some(&base), None)
+            .await
+            .unwrap();
+        super::release_persistent_backend(Some(&base), None)
+            .await
+            .unwrap();
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires privileged tmpfs mounts; tests busy-layer rollback and purge protection"]
+    async fn partial_teardown_retries_without_purging_live_mounts() {
+        let vmid = ulid::Ulid::generate().to_string();
+        let mut instance =
+            crate::ch_driver::VMInstance::new(&vmid, PathBuf::from("/unused"), None, None);
+        let runtime = instance.runtime_dir();
+        let mount = runtime.join("rootfs");
+        let layer = runtime.join("rootfs-layers/0");
+        let upper = runtime.join("rootfs.upper");
+        for path in [&mount, &layer, &upper] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::write(upper.join("keep"), b"persistent until detached").unwrap();
+        for path in [&mount, &layer] {
+            super::run_checked(
+                "mount",
+                ["-t".into(), "tmpfs".into(), "tmpfs".into()],
+                &[path],
+            )
+            .await
+            .unwrap();
+        }
+        std::fs::write(layer.join("keep"), b"never purge through a mount").unwrap();
+        let mut busy = tokio::process::Command::new("sleep")
+            .arg("100")
+            .current_dir(&layer)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let prepared = super::PreparedRootfs {
+            digest: "fixture".into(),
+            mount: mount.clone(),
+            upper: Some(upper.clone()),
+            work: None,
+            layer_mounts: vec![layer.clone()],
+            persistent_state_mount: None,
+            rbd_image: None,
+            _state_lock: super::acquire_rootfs_lock(&vmid).await.unwrap(),
+            mode: crate::manifest::RootfsMode::Ephemeral,
+            scratch_mounts: vec![],
+        };
+        let result = async {
+            assert!(super::unmount_rootfs(&prepared).await.is_err());
+            assert!(!super::is_mountpoint(&mount).await.unwrap());
+            assert!(super::is_mountpoint(&layer).await.unwrap());
+            assert!(instance.purge_instance_data().is_err());
+            assert!(layer.join("keep").exists());
+            assert!(upper.join("keep").exists());
+            busy.kill().await.unwrap();
+            super::unmount_rootfs(&prepared).await.unwrap();
+            super::unmount_rootfs(&prepared).await.unwrap();
+            assert!(!upper.exists());
+            instance.purge_instance_data().unwrap();
+        }
+        .await;
+        _ = busy.kill().await;
+        _ = super::unmount_rootfs(&prepared).await;
+        _ = instance.purge_instance_data();
+        result
+    }
+
+    #[tokio::test]
+    async fn supervisor_timeout_aborts_and_joins_task() {
+        let state = std::sync::Arc::new(super::SupState {
+            shutdown: std::sync::atomic::AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+            restarts: std::sync::atomic::AtomicU32::new(0),
+            ready: std::sync::atomic::AtomicBool::new(false),
+        });
+        let task = tokio::spawn(std::future::pending::<()>());
+        let abort = task.abort_handle();
+        let supervisor = VirtioFsSupervisor {
+            spec: VirtiofsdSpec {
+                program: "/bin/false".into(),
+                socket: "unused".into(),
+                shared_dir: "unused".into(),
+                log: "unused".into(),
+            },
+            state,
+            task: tokio::sync::Mutex::new(Some(task)),
+            abort: abort.clone(),
+        };
+        supervisor.stop_with_timeout(Duration::from_millis(1)).await;
+        assert!(
+            abort.is_finished(),
+            "timeout must not detach the supervisor"
+        );
+        supervisor.stop().await;
+    }
 
     #[test]
     fn sanitizes_image_refs_for_the_cache() {
@@ -2910,6 +3827,8 @@ pub(crate) mod tests {
                 (include_run || *path != "run/") && (init_binary.is_some() || *path != "bin/")
             }) {
                 let mut directory = tar::Header::new_gnu();
+                directory.set_uid(0);
+                directory.set_gid(0);
                 directory.set_entry_type(tar::EntryType::Directory);
                 directory.set_size(0);
                 directory.set_mode(mode);
@@ -2919,6 +3838,8 @@ pub(crate) mod tests {
             }
             let payload = vec![fill; 16 * 1024];
             let mut header = tar::Header::new_gnu();
+            header.set_uid(0);
+            header.set_gid(0);
             header.set_size(payload.len() as u64);
             header.set_mode(0o644);
             header.set_cksum();
@@ -2927,12 +3848,22 @@ pub(crate) mod tests {
             if let Some(init_binary) = init_binary {
                 let binary = std::fs::read(init_binary).unwrap();
                 let mut init = tar::Header::new_gnu();
+                init.set_uid(0);
+                init.set_gid(0);
                 init.set_size(binary.len() as u64);
                 init.set_mode(0o755);
                 init.set_cksum();
                 tar.append_data(&mut init, "bin/sh", binary.as_slice())
                     .unwrap();
             }
+            let mut whiteout = tar::Header::new_gnu();
+            whiteout.set_uid(0);
+            whiteout.set_gid(0);
+            whiteout.set_size(0);
+            whiteout.set_mode(0o000);
+            whiteout.set_cksum();
+            tar.append_data(&mut whiteout, "etc/.wh.deleted", std::io::empty())
+                .unwrap();
             tar.finish().unwrap();
         }
         let layer_digest = put_blob(&layout, &tar_bytes);
@@ -3005,6 +3936,55 @@ pub(crate) mod tests {
             std::fs::remove_dir_all(alias).unwrap();
         }
         std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_builder_does_not_remove_a_live_staging_writer() {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        let path = std::env::temp_dir().join(format!(
+            "odorobo-extraction-cancel-{}",
+            ulid::Ulid::generate()
+        ));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .unwrap();
+        let cleanup = super::RemovePathOnDrop::new(path.clone());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let writer_path = path.clone();
+        let builder = tokio::spawn(async move {
+            tokio::task::spawn_blocking(move || {
+                let cleanup = cleanup;
+                started_tx.send(()).unwrap();
+                resume_rx.recv().unwrap();
+                std::fs::create_dir_all(writer_path.join("tree/children")).unwrap();
+                std::fs::write(
+                    writer_path.join("tree/children/payload"),
+                    b"privileged payload",
+                )
+                .unwrap();
+                ((), cleanup)
+            })
+            .await
+            .unwrap()
+        });
+        started_rx.await.unwrap();
+        builder.abort();
+        _ = builder.await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        resume_tx.send(()).unwrap();
+        for _ in 0..100 {
+            if !path.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!path.exists(), "last writer must remove abandoned staging");
     }
 
     #[test]
@@ -3334,6 +4314,8 @@ pub(crate) mod tests {
             let mut tar = tar::Builder::new(&mut bytes);
             for (path, mode) in [("restricted/", 0o700), ("restricted/opaque/", 0o755)] {
                 let mut dir = tar::Header::new_gnu();
+                dir.set_uid(0);
+                dir.set_gid(0);
                 dir.set_entry_type(tar::EntryType::Directory);
                 dir.set_size(0);
                 dir.set_mode(mode);
@@ -3353,6 +4335,8 @@ pub(crate) mod tests {
                     .unwrap();
             }
             let mut file = tar::Header::new_gnu();
+            file.set_uid(0);
+            file.set_gid(0);
             file.set_size(4);
             file.set_mode(0o644);
             file.set_cksum();
@@ -3562,6 +4546,20 @@ pub(crate) mod tests {
             std::fs::write(ro_a.mount.join("etc/denied"), b"no").is_err(),
             "read-only root writes outside scratch must fail"
         );
+        let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
+        for path in &ro_a.scratch_mounts {
+            let record = mountinfo
+                .lines()
+                .find(|line| line.split_whitespace().nth(4) == path.to_str())
+                .unwrap();
+            let flags = record.split_whitespace().nth(5).unwrap();
+            assert!(flags.split(',').any(|flag| flag == "nosuid"));
+            assert!(flags.split(',').any(|flag| flag == "nodev"));
+        }
+        assert!(
+            !ro_a.mount.join("etc/deleted").exists(),
+            "single-layer read-only root must interpret whiteouts"
+        );
         super::unmount_rootfs(&ro_a).await.unwrap();
         super::unmount_rootfs(&ro_b).await.unwrap();
         drop(ro_a);
@@ -3645,6 +4643,45 @@ pub(crate) mod tests {
         ] {
             _ = std::fs::remove_dir_all(crate::ch_driver::VMInstance::runtime_dir_for(&vmid));
         }
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires privileged composefs mounts; failed scratch setup retains resource owner"]
+    async fn failed_rootfs_start_retains_mount_inventory_for_retry() {
+        let base = Path::new("/var/lib/odorobo/startup-owner-tests")
+            .join(ulid::Ulid::generate().to_string());
+        let (layout, _) = fixture_oci_layout_with_options(&base, b'x', false);
+        let vmid = ulid::Ulid::generate().to_string();
+        let mut owner = None;
+        let rootfs = crate::manifest::Rootfs {
+            oci: format!("oci:{}:latest", layout.display()),
+            mode: crate::manifest::RootfsMode::ReadOnly,
+        };
+        assert!(
+            super::mount_rootfs_owned(&vmid, &rootfs, &mut owner)
+                .await
+                .is_err()
+        );
+        let prepared = owner
+            .as_ref()
+            .expect("failed acquisition must retain ownership");
+        assert!(super::is_mountpoint(&prepared.mount).await.unwrap());
+        assert!(super::acquire_rootfs_lock(&vmid).await.is_err());
+        let layer = &prepared.layer_mounts[0];
+        let mut busy = tokio::process::Command::new("sleep")
+            .arg("100")
+            .current_dir(layer)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        assert!(super::unmount_rootfs(prepared).await.is_err());
+        assert!(super::acquire_rootfs_lock(&vmid).await.is_err());
+        busy.kill().await.unwrap();
+        super::unmount_rootfs(prepared).await.unwrap();
+        drop(owner);
+        assert!(super::acquire_rootfs_lock(&vmid).await.is_ok());
+        std::fs::remove_dir_all(crate::ch_driver::VMInstance::runtime_dir_for(&vmid)).unwrap();
         std::fs::remove_dir_all(base).unwrap();
     }
 
@@ -3743,6 +4780,217 @@ pub(crate) mod tests {
         result.unwrap();
     }
 
+    #[test]
+    fn persistent_rbd_lookup_matches_only_default_namespace_head() {
+        let mappings = serde_json::json!([
+            {"pool":"pool", "namespace":"foo", "name":"volume", "device":"/dev/rbd0"},
+            {"pool":"pool", "namespace":"", "name":"volume", "snap":"snapshot", "device":"/dev/rbd1"},
+            {"pool":"pool", "namespace":"", "name":"volume", "snap":"-", "device":"/dev/rbd2"}
+        ]);
+        assert_eq!(
+            super::match_rbd_head_device("pool/volume", &mappings).unwrap(),
+            Some("/dev/rbd2".into())
+        );
+        assert!(
+            super::match_rbd_head_device("pool/volume", &serde_json::json!([mappings[0].clone()]))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn hard_links_preserve_same_layer_content_and_reject_missing_or_escaping_targets() {
+        for target in ["file", "base-only", "../escape"] {
+            let base =
+                std::env::temp_dir().join(format!("odorobo-hardlink-{}", ulid::Ulid::generate()));
+            std::fs::create_dir_all(&base).unwrap();
+            let mut bytes = Vec::new();
+            let mut tar = tar::Builder::new(&mut bytes);
+            let mut header = tar::Header::new_gnu();
+            header.set_uid(1234);
+            header.set_gid(2345);
+            header.set_mode(0o640);
+            header.set_size(4);
+            header.set_cksum();
+            tar.append_data(&mut header, "file", &b"data"[..]).unwrap();
+            header.set_entry_type(tar::EntryType::Link);
+            header.set_size(0);
+            header.set_link_name(target).unwrap();
+            header.set_cksum();
+            tar.append_data(&mut header, "alias", std::io::empty())
+                .unwrap();
+            tar.finish().unwrap();
+            drop(tar);
+            let result =
+                super::unpack_layer(bytes.as_slice(), Compression::None, &base, 1024 * 1024, 10);
+            if target == "file" {
+                result.unwrap();
+                assert_eq!(std::fs::read(base.join("alias")).unwrap(), b"data");
+                assert_eq!(
+                    std::fs::metadata(base.join("file")).unwrap().ino(),
+                    std::fs::metadata(base.join("alias")).unwrap().ino()
+                );
+            } else {
+                assert!(result.is_err());
+            }
+            std::fs::remove_dir_all(base).unwrap();
+        }
+    }
+
+    #[test]
+    fn directory_metadata_does_not_cross_replacement_generations_or_symlinks() {
+        let base =
+            std::env::temp_dir().join(format!("odorobo-generation-{}", ulid::Ulid::generate()));
+        let layers = [base.join("a"), base.join("b"), base.join("c")];
+        for layer in &layers {
+            std::fs::create_dir_all(layer).unwrap();
+        }
+        std::fs::create_dir_all(layers[0].join("app/private")).unwrap();
+        std::fs::create_dir_all(layers[2].join("app/private")).unwrap();
+        let changes = [vec!["app/private".into()], vec![], vec!["app".into()]];
+        let path = Path::new("app/private");
+        assert_eq!(
+            super::directory_metadata_source(
+                path,
+                &layers,
+                &changes,
+                &[
+                    vec![],
+                    vec![super::DirectoryReset {
+                        path: "app".into(),
+                        descendants_only: false
+                    }],
+                    vec![]
+                ]
+            )
+            .unwrap(),
+            2
+        );
+        std::fs::write(layers[1].join("app"), b"replacement").unwrap();
+        assert_eq!(
+            super::directory_metadata_source(path, &layers, &changes, &[vec![], vec![], vec![]])
+                .unwrap(),
+            2
+        );
+        std::fs::remove_file(layers[1].join("app")).unwrap();
+        std::os::unix::fs::symlink("/etc", layers[1].join("app")).unwrap();
+        assert_eq!(
+            super::directory_metadata_source(path, &layers, &changes, &[vec![], vec![], vec![]])
+                .unwrap(),
+            2
+        );
+        std::fs::remove_file(layers[1].join("app")).unwrap();
+        std::fs::create_dir_all(layers[1].join("app/private")).unwrap();
+        assert_eq!(
+            super::directory_metadata_source(
+                path,
+                &layers,
+                &changes,
+                &[
+                    vec![],
+                    vec![super::DirectoryReset {
+                        path: "app".into(),
+                        descendants_only: false
+                    }],
+                    vec![]
+                ]
+            )
+            .unwrap(),
+            1
+        );
+        let opaque = [
+            vec![],
+            vec![super::DirectoryReset {
+                path: "app".into(),
+                descendants_only: true,
+            }],
+            vec![],
+        ];
+        assert_eq!(
+            super::directory_metadata_source(
+                Path::new("app"),
+                &layers,
+                &[vec!["app".into()], vec![], vec![]],
+                &opaque
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            super::directory_metadata_source(path, &layers, &changes, &opaque).unwrap(),
+            1
+        );
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires composefs/OverlayFS mounts and fs-verity"]
+    async fn synthetic_layer_parents_preserve_inherited_directory_metadata() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::PermissionsExt;
+        let vmid = ulid::Ulid::generate().to_string();
+        let runtime = crate::ch_driver::VMInstance::runtime_dir_for(&vmid);
+        let base = runtime.join("base");
+        let top = runtime.join("top");
+        let merged = runtime.join("merged");
+        for path in [&base, &top, &merged] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::create_dir(base.join("app")).unwrap();
+        std::fs::create_dir(top.join("app")).unwrap();
+        std::fs::write(base.join("app/old"), b"old").unwrap();
+        std::fs::write(top.join("app/new"), b"new").unwrap();
+        for path in [&base, &base.join("app")] {
+            let file = std::fs::File::open(path).unwrap();
+            // SAFETY: live fd; disposable test metadata.
+            assert_eq!(unsafe { libc::fchown(file.as_raw_fd(), 1000, 1000) }, 0);
+            file.set_permissions(std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+        let correction = super::compose_directory_metadata(
+            &runtime,
+            &merged,
+            &[base.clone(), top.clone()],
+            &[vec![PathBuf::new(), "app".into()], vec![]],
+            &[vec![], vec![]],
+        )
+        .await
+        .unwrap();
+        let options = format!(
+            "ro,lowerdir={}:{}:{}",
+            correction.display(),
+            top.display(),
+            base.display()
+        );
+        super::run_checked(
+            "mount",
+            [
+                "-t".into(),
+                "overlay".into(),
+                "overlay".into(),
+                "-o".into(),
+                options,
+            ],
+            &[&merged],
+        )
+        .await
+        .unwrap();
+        for path in [&merged, &merged.join("app")] {
+            let metadata = std::fs::metadata(path).unwrap();
+            assert_eq!(
+                (metadata.uid(), metadata.gid(), metadata.mode() & 0o7777),
+                (1000, 1000, 0o700)
+            );
+        }
+        assert_eq!(std::fs::read(merged.join("app/new")).unwrap(), b"new");
+        assert_eq!(std::fs::read(merged.join("app/old")).unwrap(), b"old");
+        super::unmount_path(&merged).await.unwrap();
+        super::unmount_path(&correction).await.unwrap();
+        std::fs::remove_dir_all(&runtime).unwrap();
+        std::fs::remove_dir_all(Path::new("/var/lib/odorobo/directory-metadata").join(vmid))
+            .unwrap();
+    }
+
     /// Exercises the product's Ceph RBD persistence helpers against a unique
     /// disposable image. Run only in the privileged `.local/dev` Odorobo
     /// container with ODOROBO_ROOTFS_BACKEND=rbd and a small test size.
@@ -3832,11 +5080,20 @@ pub(crate) mod tests {
             "no restarts after stop"
         );
 
-        // A long-running child must be killed by stop(), not leaked.
+        // Use a script that accepts virtiofsd's arguments and execs a real
+        // long-running child. /bin/sleep rejects those arguments immediately.
         let base2 = std::env::temp_dir().join(format!("odorobo-sup2-{}", ulid::Ulid::generate()));
         std::fs::create_dir_all(&base2).unwrap();
+        let script = base2.join("virtiofsd-stub");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho $$ > \"$(dirname \"$0\")/pid\"\nexec sleep 100\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
         let supervisor = VirtioFsSupervisor::start(VirtiofsdSpec {
-            program: "/bin/sleep".into(),
+            program: script.clone(),
             socket: base2.join("sock"),
             shared_dir: base2.clone(),
             log: base2.join("log"),
@@ -3844,22 +5101,42 @@ pub(crate) mod tests {
         .expect("supervisor starts");
         tokio::time::sleep(Duration::from_millis(300)).await;
         supervisor.stop().await;
-        // /bin/sleep should be gone: no process owns "sleep 100" anymore.
+        let pid: u32 = std::fs::read_to_string(base2.join("pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
         assert!(
-            !check_sleeping_children(),
-            "supervised child leaked after stop"
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "child leaked after stop"
+        );
+        let supervisor = VirtioFsSupervisor::start(VirtiofsdSpec {
+            program: script,
+            socket: base2.join("sock"),
+            shared_dir: base2.clone(),
+            log: base2.join("log"),
+        })
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let pid: u32 = std::fs::read_to_string(base2.join("pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(Path::new(&format!("/proc/{pid}")).exists());
+        drop(supervisor);
+        for _ in 0..100 {
+            if !Path::new(&format!("/proc/{pid}")).exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "child leaked after drop"
         );
 
         std::fs::remove_dir_all(&base).ok();
         std::fs::remove_dir_all(&base2).ok();
-    }
-
-    fn check_sleeping_children() -> bool {
-        // look for a `sleep 100` process (our second supervisor's child)
-        let output = std::process::Command::new("pgrep")
-            .args(["-f", "sleep 100"])
-            .output()
-            .expect("pgrep");
-        output.status.success()
     }
 }
