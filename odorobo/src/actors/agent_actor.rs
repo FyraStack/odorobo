@@ -62,6 +62,15 @@ pub struct AgentActor {
     pub metadata: ObjectMetadata,
 }
 
+fn startup_cleanup_failed(result: Result<(), kameo::error::HookError<&Report>>) -> bool {
+    match result {
+        Err(kameo::error::HookError::Error(error)) => error
+            .downcast_ref::<crate::ch_driver::actor::FailedStartupCleanup>()
+            .is_some(),
+        _ => false,
+    }
+}
+
 impl AgentActor {
     fn record_membership_change(&mut self, vmid: Ulid, added: bool) {
         self.membership_revision = self.membership_revision.saturating_add(1);
@@ -251,7 +260,11 @@ impl Message<CreateVM> for AgentActor {
                         result.map(|_| ()).map_err(|error| error.to_string())
                     })
                     .await;
-                if !process_exit_confirmed.load(Ordering::SeqCst)
+                let startup_cleanup_failed = actor_ref
+                    .with_startup_result(startup_cleanup_failed)
+                    .unwrap_or(false);
+                if startup_cleanup_failed
+                    || !process_exit_confirmed.load(Ordering::SeqCst)
                     || shutdown_result.is_err()
                         && actor_ref
                             .with_startup_result(|result| result.is_ok())
@@ -614,5 +627,28 @@ impl Message<GetAgentStatus> for AgentActor {
             used_vcpus,
             used_ram,
         }
+    }
+}
+
+#[cfg(test)]
+mod startup_cleanup_tests {
+    use super::startup_cleanup_failed;
+    use crate::ch_driver::actor::FailedStartupCleanup;
+    use kameo::error::HookError;
+    use stable_eyre::Report;
+
+    #[test]
+    fn failed_console_cleanup_preserves_quarantine_even_when_startup_failed() {
+        let cleanup_error = Report::new(FailedStartupCleanup(
+            "cleanup after confirmed reap failed".to_owned(),
+        ));
+        assert!(startup_cleanup_failed(Err(HookError::Error(
+            &cleanup_error
+        ))));
+        let validation_error = Report::msg("invalid manifest before VMM spawn");
+        assert!(!startup_cleanup_failed(Err(HookError::Error(
+            &validation_error
+        ))));
+        assert!(!startup_cleanup_failed(Ok(())));
     }
 }

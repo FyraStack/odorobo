@@ -39,6 +39,10 @@ pub struct MigrationState {
     previous_manifest: Option<VmManifest>,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("VM startup cleanup failed: {0}")]
+pub struct FailedStartupCleanup(pub String);
+
 const CONSOLE_SPOOL_SIZE: usize = 1024 * 1024;
 
 /// Bounded serial-console history shared with the task draining the CH socket.
@@ -378,8 +382,16 @@ impl Actor for VMActor {
                         .is_none()
                     {
                         process_exit_confirmed.store(true, Ordering::SeqCst);
+                        if let Err(record_error) =
+                            VsockCidAllocator::from_environment().mark_process_exited(vmid)
+                        {
+                            warn!(%vmid, ?record_error, "failed to record process exit after console attachment failure");
+                        }
                     }
                     warn!(%vmid, ?cleanup_error, "failed to clean VM after console attach failure; retaining vsock CID reservation");
+                    return Err(Report::new(FailedStartupCleanup(format!(
+                        "{error}; {cleanup_error}"
+                    ))));
                 }
             }
             return Err(error);
