@@ -373,6 +373,9 @@ impl Actor for VMActor {
                     rollback_vsock_cid(vmid, cid_reservation);
                 }
                 Err(cleanup_error) => {
+                    if cleanup_error.downcast_ref::<super::instance::UnconfirmedProcessExit>().is_none() {
+                        process_exit_confirmed.store(true, Ordering::SeqCst);
+                    }
                     warn!(%vmid, ?cleanup_error, "failed to clean VM after console attach failure; retaining vsock CID reservation");
                 }
             }
