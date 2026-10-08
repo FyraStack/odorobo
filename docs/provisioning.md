@@ -48,7 +48,10 @@ the assignment in a locked, atomically updated node-local registry. The
 default registry is `/var/lib/odorobo/vsock-cids.json`; set
 `ODOROBO_VSOCK_CID_REGISTRY` to change it. Successful assignments survive
 agent/VM shutdown and restart, and are released on explicit VM deletion;
-reservations from failed startup attempts are rolled back. A requested CID is
+reservations from failed startup attempts are rolled back only after confirmed
+process exit. An active lease cannot be reused—even for the same VM ID—until
+exit is confirmed. After an unclean agent/host failure, stale active leases may
+need manual recovery rather than assuming the old VMM is gone. A requested CID is
 reserved if free; a conflict fails VM creation rather than silently assigning
 a different CID. `GetVMInfo` returns the effective VM manifest, including the
 allocated CID in `observed.vsock_guest_cid` and the desired socket path;
