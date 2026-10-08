@@ -261,9 +261,23 @@ impl Message<VmUpdated> for SchedulerActor {
     async fn handle(&mut self, msg: VmUpdated, _ctx: &mut Context<Self, Self::Reply>) {
         let vmid = msg.data.vmid;
         let actor_id = msg.actor_ref.id();
+        if self.retired_vm_actors.contains(&actor_id) {
+            return;
+        }
+        if msg.data.config.as_ref().is_some_and(|observed| {
+            self.vm_manifests
+                .get(&vmid)
+                .is_some_and(|desired| desired != observed)
+        }) {
+            return;
+        }
         self.vm_actorid_ulid_map.insert(actor_id, vmid);
-        if let Some(manifest) = msg.data.config {
-            self.vm_manifests.insert(vmid, manifest);
+        if let Some(manifest) = msg
+            .data
+            .config
+            .filter(|_| !self.stopped_vms.contains(&vmid))
+        {
+            self.observe_vm_manifest(vmid, manifest);
             Self::reconcile_discovered_vm(
                 vmid,
                 &self.agent_vm_index,
@@ -394,6 +408,21 @@ impl Message<ReconcileVmPlacements> for SchedulerActor {
             .collect();
 
         for (vmid, config) in unplaced_vms {
+            // Discovery can precede agent inventory. Known/discoverable owners
+            // must never be replaced just for lacking placement observations.
+            if !self.should_resolve_unplaced_owner(vmid) {
+                continue;
+            }
+            match RemoteActorRef::<VMActor>::lookup(crate::utils::actor_names::vm_actor_id(vmid))
+                .await
+            {
+                Ok(Some(_)) => continue,
+                Err(error) => {
+                    warn!(%vmid, ?error, "ownership lookup failed; refusing recreation");
+                    continue;
+                }
+                Ok(None) => {}
+            }
             let request = crate::messages::vm::CreateVM { vmid, config };
             match self.schedule_agent(&request) {
                 Ok(agent) => {

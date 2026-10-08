@@ -163,8 +163,25 @@ impl Message<CreateVM> for AgentActor {
 
     async fn handle(&mut self, msg: CreateVM, ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
         let vmid = msg.vmid;
+        if msg.config.id != vmid {
+            return CreateVMReply {
+                config: None,
+                actor_id: None,
+            };
+        }
         if let Some(existing) = self.vms.get(&vmid) {
             if existing.config == msg.config {
+                if let Err(err) = existing
+                    .actor_ref
+                    .ask(crate::ch_driver::actor::StartVM)
+                    .await
+                {
+                    warn!(%vmid, ?err, "VM startup failed; lifecycle owner retained");
+                    return CreateVMReply {
+                        config: None,
+                        actor_id: Some(existing.actor_ref.id().to_bytes()),
+                    };
+                }
                 info!(?vmid, actor_id = ?existing.actor_ref.id(), "VM already exists; treating create as idempotent");
             } else {
                 warn!(?vmid, actor_id = ?existing.actor_ref.id(), "Ignoring conflicting create for existing VM");
@@ -191,6 +208,13 @@ impl Message<CreateVM> for AgentActor {
             },
         );
 
+        if let Err(err) = actor_ref.ask(crate::ch_driver::actor::StartVM).await {
+            warn!(%vmid, ?err, "VM startup failed; lifecycle owner retained for cleanup");
+            return CreateVMReply {
+                config: None,
+                actor_id: Some(actor_ref.id().to_bytes()),
+            };
+        }
         info!(?vmid, "VM Spawned successfully");
         CreateVMReply {
             config: Some(msg.config),
@@ -209,6 +233,19 @@ impl Message<MigrateVMReceive> for AgentActor {
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         let vmid = msg.vmid;
+        // Reject unsupported OCI receive and occupied identities before any
+        // spawning, registry changes or inventory mutation.
+        if msg.config.desired.rootfs.is_some()
+            || self.vms.contains_key(&vmid)
+            || Self::lookup_vm_actor(vmid).await.is_some()
+        {
+            return MigrateVMReceiveReply {
+                listening_address: String::new(),
+                error: Some(
+                    "OCI migration is unsupported or destination VM ID already owned".into(),
+                ),
+            };
+        }
         let actor_ref = VMActor::spawn_link(ctx.actor_ref(), (vmid, None)).await;
 
         _ = actor_ref.register(vm_actor_id(vmid)).await;
@@ -288,10 +325,10 @@ impl Message<ShutdownVM> for AgentActor {
     ) -> Self::Reply {
         if let Some(actor_ref) = Self::lookup_vm_actor(msg.vmid).await {
             trace!(?msg, "Telling VM to shut down");
-            let res = actor_ref.tell(msg.clone()).await;
-            if let Err(err) = res {
-                warn!(vm_id = %msg.vmid, ?err, "failed to shutdown VM actor");
-            }
+            actor_ref
+                .ask(msg.clone())
+                .await
+                .map_err(|err| err.to_string())?;
         } else {
             warn!(vm_id = %msg.vmid, "VM actor not found for shutdown");
             return Err("VM actor not found for shutdown".to_owned());

@@ -69,10 +69,26 @@ fn rbd_lines_list(input: &str) -> Result<Vec<(String, String)>> {
         // id  pool               namespace  image    snap  device
         // 0   pool               foo        testimg    -   /dev/rbd0
         if let Some(device) = parts.next() {
-            mappings.push((format!("{pool}/{next}"), device.to_owned()));
+            let identity = format!("{pool}/{field}/{next}");
+            mappings.push((
+                if fifth == "-" {
+                    identity
+                } else {
+                    format!("{identity}@{fifth}")
+                },
+                device.to_owned(),
+            ));
         } else if fifth.starts_with("/dev/") {
             // If namespace is empty, it may be omitted from the output.
-            mappings.push((format!("{pool}/{field}"), fifth.to_owned()));
+            let identity = format!("{pool}/{field}");
+            mappings.push((
+                if next == "-" {
+                    identity
+                } else {
+                    format!("{identity}@{next}")
+                },
+                fifth.to_owned(),
+            ));
         }
     }
 
@@ -96,17 +112,10 @@ impl RbdImage {
         PathBuf::from(format!("/dev/rbd/{}/{}", self.pool, self.image))
     }
 
-    /// Maps the RBD image to a kernel block device. If already mapped, this is a no-op.
+    /// Acquire a new mapping. Never adopt another consumer's mapping.
     #[tracing::instrument(skip(self))]
-    pub async fn map(&self) -> Result<()> {
+    pub async fn map(&self) -> Result<PathBuf> {
         let rbd_path = self.rbd_path();
-        let mappings = rbd_map_list().await?;
-
-        if mappings.iter().any(|(path, _)| path == &rbd_path) {
-            info!(?rbd_path, "RBD image already mapped, reusing");
-            return Ok(());
-        }
-
         info!(?rbd_path, "Mapping RBD image to device");
         let output = Command::new("rbd")
             .args(rbd_extra_args())
@@ -122,13 +131,24 @@ impl RbdImage {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(eyre!("rbd map failed: {stderr}"));
         }
-        Ok(())
+        let device = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        if !device.starts_with("/dev/rbd") {
+            return Err(eyre!("invalid RBD mapping device {device:?}"));
+        }
+        Ok(PathBuf::from(device))
     }
 
     /// Unmaps the RBD image from the kernel block device.
     #[tracing::instrument(skip(self))]
     pub async fn unmap(&self) -> Result<()> {
         let rbd_path = self.rbd_path();
+        if !rbd_map_list()
+            .await?
+            .iter()
+            .any(|(path, _)| path == &rbd_path)
+        {
+            return Ok(());
+        }
         info!(?rbd_path, "Unmapping RBD image");
         let output = Command::new("rbd")
             .args(rbd_extra_args())
@@ -165,7 +185,24 @@ impl TryFrom<&Url> for RbdImage {
     }
 }
 
-pub struct RbdStorage;
+fn owned_mapping_device<'a>(
+    identity: &str,
+    expected: &std::path::Path,
+    mappings: &'a [(String, String)],
+) -> Result<Option<&'a str>> {
+    let Some((_, device)) = mappings.iter().find(|(image, _)| image == identity) else {
+        return Ok(None);
+    };
+    if std::path::Path::new(device) != expected {
+        return Err(eyre!("RBD mapping identity changed; refusing release"));
+    }
+    Ok(Some(device))
+}
+
+#[derive(Default)]
+pub struct RbdStorage {
+    owned: tokio::sync::Mutex<std::collections::HashMap<String, Option<PathBuf>>>,
+}
 
 #[async_trait]
 impl StorageDriver for RbdStorage {
@@ -174,8 +211,34 @@ impl StorageDriver for RbdStorage {
     }
 
     async fn resolve(&self, uri: &Url) -> Result<PathBuf> {
+        let _operation = crate::ch_driver::containers::PERSISTENT_OPERATIONS
+            .lock()
+            .await;
         let image = RbdImage::try_from(uri)?;
-        image.map().await?;
+        let mappings = rbd_map_list().await?;
+        if crate::ch_driver::containers::RBD_RESERVATIONS
+            .lock()
+            .unwrap()
+            .contains(&image.rbd_path())
+            || mappings
+                .iter()
+                .any(|(identity, _)| identity == &image.rbd_path())
+        {
+            return Err(eyre!("RBD image already mapped; refusing adoption"));
+        }
+        crate::ch_driver::containers::RBD_RESERVATIONS
+            .lock()
+            .unwrap()
+            .insert(image.rbd_path());
+        self.owned
+            .lock()
+            .await
+            .insert(uri.as_str().to_owned(), None);
+        let device = image.map().await?;
+        self.owned
+            .lock()
+            .await
+            .insert(uri.as_str().to_owned(), Some(device.clone()));
         // map() uses `--options noudev`: with udev enabled, the rbd CLI waits
         // for a udev event in its own network namespace, but rbd devices are
         // created in the host's namespace, so that wait never completes in a
@@ -190,30 +253,98 @@ impl StorageDriver for RbdStorage {
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        let device = rbd_map_list()
-            .await?
-            .into_iter()
-            .find(|(path, _)| path == &image.rbd_path())
-            .map(|(_, device)| device)
-            .ok_or_else(|| {
-                eyre!(
-                    "RBD image {} is mapped but no device name was found",
-                    image.rbd_path()
-                )
-            })?;
-        info!(?device, "udev path not available, using kernel device name");
-        Ok(PathBuf::from(device))
+        info!(
+            ?device,
+            "udev path not available, using owned kernel device name"
+        );
+        Ok(device)
     }
 
     async fn release(&self, uri: &Url) -> Result<()> {
+        let _operation = crate::ch_driver::containers::PERSISTENT_OPERATIONS
+            .lock()
+            .await;
+        let mut owned = self.owned.lock().await;
+        let Some(expected) = owned.get(uri.as_str()) else {
+            return Ok(());
+        };
         let image = RbdImage::try_from(uri)?;
-        image.unmap().await
+        let mappings = rbd_map_list().await?;
+        let current_device = if let Some(device) = expected {
+            owned_mapping_device(&image.rbd_path(), device, &mappings)?
+        } else {
+            mappings
+                .iter()
+                .find(|(identity, _)| identity == &image.rbd_path())
+                .map(|(_, device)| device.as_str())
+        };
+        let Some(current_device) = current_device else {
+            // Original image detached; the saved device may now be another
+            // consumer's mapping. Never unmap by stale pathname existence.
+            owned.remove(uri.as_str());
+            crate::ch_driver::containers::RBD_RESERVATIONS
+                .lock()
+                .unwrap()
+                .remove(&image.rbd_path());
+            return Ok(());
+        };
+        let output = Command::new("rbd")
+            .args(rbd_extra_args())
+            .args(["device", "unmap", "--options", "noudev"])
+            .arg(current_device)
+            .output()
+            .await?;
+        if !output.status.success() {
+            return Err(eyre!(
+                "unmap owned RBD device failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        owned.remove(uri.as_str());
+        crate::ch_driver::containers::RBD_RESERVATIONS
+            .lock()
+            .unwrap()
+            .remove(&image.rbd_path());
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_device_reuse_is_not_attachment_ownership() {
+        let mappings = vec![("pool/other-image".into(), "/dev/rbd0".into())];
+        assert!(
+            owned_mapping_device(
+                "pool/original",
+                std::path::Path::new("/dev/rbd0"),
+                &mappings
+            )
+            .unwrap()
+            .is_none()
+        );
+        let mappings = vec![("pool/original".into(), "/dev/rbd1".into())];
+        assert!(
+            owned_mapping_device(
+                "pool/original",
+                std::path::Path::new("/dev/rbd0"),
+                &mappings
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn unowned_failed_attempt_release_never_queries_or_unmaps_other_resources() {
+        // No RBD executable/cluster is needed: absence of an ownership token
+        // must return before any lookup, even if another mapping exists.
+        RbdStorage::default()
+            .release(&Url::parse("rbd://pool/existing-other-owner").unwrap())
+            .await
+            .unwrap();
+    }
 
     #[test]
     fn test_rbd_image_from_uri() {
@@ -237,5 +368,21 @@ id  pool               namespace  image    snap  device
         assert_eq!(mappings.len(), 1);
         assert_eq!(mappings[0].0, "kessoku-blockpool/testimg");
         assert_eq!(mappings[0].1, "/dev/rbd0");
+        let mappings =
+            rbd_lines_list("id pool namespace image snap device\n0 pool foo testimg - /dev/rbd0")
+                .unwrap();
+        assert_eq!(mappings[0].0, "pool/foo/testimg");
+        let snapshots = rbd_lines_list("id pool namespace image snap device\n0 pool image snap /dev/rbd1\n1 pool foo image snap /dev/rbd2").unwrap();
+        assert_eq!(snapshots[0].0, "pool/image@snap");
+        assert_eq!(snapshots[1].0, "pool/foo/image@snap");
+        assert_eq!(
+            owned_mapping_device(
+                "pool/foo/testimg",
+                std::path::Path::new("/dev/rbd0"),
+                &mappings
+            )
+            .unwrap(),
+            Some("/dev/rbd0")
+        );
     }
 }
