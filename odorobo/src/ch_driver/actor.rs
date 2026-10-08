@@ -1,15 +1,22 @@
-use std::{collections::VecDeque, sync::Arc};
+use std::{
+    collections::VecDeque,
+    process::ExitStatus,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use crate::messages::vm::{
     DeleteVM, GetConsoleHistory, GetConsoleHistoryReply, GetVMHeartbeat, GetVMHeartbeatReply,
-    GetVMInfo, GetVMInfoReply, MigrateVMReceive, MigrateVMReceiveReply, PrepMigration,
-    SendConsoleInput, SendConsoleInputReply, ShutdownVM,
+    GetVMInfo, GetVMInfoReply, MigrateVMReceive, MigrateVMReceiveReply, SendConsoleInput,
+    SendConsoleInputReply, ShutdownVM,
 };
 use crate::{
     ch_driver::{VMInstance, manifest::to_vm_config},
     manifest::VmManifest,
+    vsock_cid::{VsockCidAllocator, VsockCidReservation},
 };
-use cloud_hypervisor_client::models::VmConfig;
 use kameo::prelude::*;
 use serde::{Deserialize, Serialize};
 use stable_eyre::{Report, Result};
@@ -22,15 +29,14 @@ use tokio::{
 use tracing::{debug, error, info, trace, warn};
 
 /// Cloud Hypervisor-specific state for an in-progress receive migration.
-///
-/// The public migration messages carry `VmManifest`; the translated `VmConfig`
-/// stays private to the CH actor because another backend could use different
-/// migration metadata.
 pub struct MigrationState {
     pub listening_address: String,
-    pub config: VmConfig,
     /// The task handle for the migration process.
-    pub migration_task: Option<JoinHandle<()>>,
+    pub migration_task: Option<JoinHandle<Result<()>>>,
+    console_attach_task: Option<JoinHandle<()>>,
+    /// Reservation is committed only after the incoming migration completes.
+    cid_reservation: Option<VsockCidReservation>,
+    previous_manifest: Option<VmManifest>,
 }
 
 const CONSOLE_SPOOL_SIZE: usize = 1024 * 1024;
@@ -185,7 +191,9 @@ mod tests {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct MigrationFinished;
+pub struct MigrationFinished {
+    pub succeeded: bool,
+}
 
 #[derive(RemoteActor)]
 pub struct VMActor {
@@ -197,58 +205,224 @@ pub struct VMActor {
     /// Desired provider-neutral intent retained for VM info and migration.
     /// The translated Cloud Hypervisor config lives only in `VMInstance`.
     pub manifest: Option<VmManifest>,
+    /// Explicit VM deletion releases any persistent vsock CID; shutdown keeps it.
+    release_vsock_cid: bool,
+    /// Shared with the owning agent; independent of whether a CID was present.
+    process_exit_confirmed: Arc<AtomicBool>,
+    /// Owns and supervises the child after it is transferred out of `VMInstance`.
+    process_watcher: Option<(
+        tokio::sync::oneshot::Sender<()>,
+        JoinHandle<std::io::Result<ExitStatus>>,
+    )>,
+}
+
+fn allocate_vsock_cid(
+    vmid: ulid::Ulid,
+    manifest: &mut VmManifest,
+    use_observed_cid: bool,
+) -> Result<Option<VsockCidReservation>> {
+    manifest.validate()?;
+    let observed_cid = use_observed_cid
+        .then(|| {
+            manifest
+                .observed
+                .as_ref()
+                .and_then(|observed| observed.vsock_guest_cid)
+        })
+        .flatten();
+    if let Some(vsock) = manifest.desired.vsock.as_ref() {
+        let requested_cid = migration_vsock_cid(vsock.guest_cid, observed_cid, use_observed_cid)?;
+        let allocator = VsockCidAllocator::from_environment();
+        let reservation = allocator.reserve_with_previous(vmid, requested_cid)?;
+        manifest
+            .observed
+            .get_or_insert_with(Default::default)
+            .vsock_guest_cid = Some(reservation.cid);
+        return Ok(Some(reservation));
+    }
+    Ok(None)
+}
+
+fn validate_migration_manifest(manifest: &VmManifest) -> Result<()> {
+    if manifest.desired.cloud_init.is_some() {
+        return Err(Report::msg(
+            "live migration of cloud-init VMs is unsupported: destination seed paths cannot be overridden",
+        ));
+    }
+    Ok(())
+}
+
+fn migration_vsock_cid(
+    desired: Option<u32>,
+    observed: Option<u32>,
+    migrating: bool,
+) -> Result<Option<u32>> {
+    if !migrating {
+        return Ok(desired);
+    }
+    if let (Some(desired), Some(observed)) = (desired, observed)
+        && desired != observed
+    {
+        return Err(Report::msg(
+            "migration desired and observed vsock CIDs disagree",
+        ));
+    }
+    desired.or(observed).map(Some).ok_or_else(|| {
+        Report::msg("vsock migration requires the source guest CID; automatic allocation is unsafe")
+    })
+}
+
+/// Produce a temporary manifest for the provider converter without turning an
+/// automatically allocated CID into desired intent stored by the scheduler.
+fn manifest_with_resolved_vsock_cid(manifest: &VmManifest) -> VmManifest {
+    let mut resolved = manifest.clone();
+    if let Some(vsock) = resolved.desired.vsock.as_mut()
+        && vsock.guest_cid.is_none()
+    {
+        vsock.guest_cid = resolved
+            .observed
+            .as_ref()
+            .and_then(|observed| observed.vsock_guest_cid);
+    }
+    resolved
+}
+
+fn rollback_vsock_cid(vmid: ulid::Ulid, reservation: Option<VsockCidReservation>) {
+    if let Some(reservation) = reservation
+        && let Err(error) = VsockCidAllocator::from_environment().rollback(vmid, reservation)
+    {
+        warn!(%vmid, ?error, "failed to roll back vsock CID reservation");
+    }
 }
 
 impl Actor for VMActor {
     // The actor accepts intent; CH conversion happens inside on_start.
-    type Args = (ulid::Ulid, Option<VmManifest>);
+    type Args = (ulid::Ulid, Option<VmManifest>, Arc<AtomicBool>);
     type Error = Report;
 
     #[tracing::instrument(skip_all)]
-    async fn on_start((vmid, vm_config): Self::Args, actor_ref: ActorRef<Self>) -> Result<Self> {
+    #[allow(clippy::too_many_lines)]
+    async fn on_start(
+        (vmid, mut vm_config, process_exit_confirmed): Self::Args,
+        actor_ref: ActorRef<Self>,
+    ) -> Result<Self> {
+        let cid_reservation = vm_config
+            .as_mut()
+            .map(|manifest| allocate_vsock_cid(vmid, manifest, false))
+            .transpose()?
+            .flatten();
         // Boot is manifest intent, not a Cloud Hypervisor default. Preserve it
         // separately because VMInstance also supports create-without-boot paths.
         let boot = vm_config
             .as_ref()
             .is_some_and(|manifest| manifest.desired.boot.start);
-        let vm_config_for_ch = vm_config.as_ref().map(to_vm_config).transpose()?;
-        let mut vminstance =
-            VMInstance::spawn(&vmid.to_string(), vm_config_for_ch, boot, None).await?;
+        let runtime_dir = VMInstance::runtime_dir_for(&vmid.to_string());
+        let vm_config_for_ch = match vm_config
+            .as_ref()
+            .map(manifest_with_resolved_vsock_cid)
+            .as_ref()
+            .map(|manifest| to_vm_config(manifest, &runtime_dir))
+            .transpose()
+        {
+            Ok(config) => config,
+            Err(error) => {
+                rollback_vsock_cid(vmid, cid_reservation);
+                return Err(error);
+            }
+        };
+        process_exit_confirmed.store(false, Ordering::SeqCst);
+        let mut vminstance = match VMInstance::spawn(
+            &vmid.to_string(),
+            vm_config_for_ch,
+            boot,
+            None,
+        )
+        .await
+        {
+            Ok(instance) => instance,
+            Err(error) => {
+                if error
+                    .downcast_ref::<super::instance::UnconfirmedProcessExit>()
+                    .is_some()
+                {
+                    warn!(%vmid, ?error, "retaining runtime files and vsock lease because VMM exit was not confirmed");
+                    return Err(error);
+                }
+                process_exit_confirmed.store(true, Ordering::SeqCst);
+                if let Err(cleanup_error) = std::fs::remove_dir_all(&runtime_dir)
+                    && cleanup_error.kind() != std::io::ErrorKind::NotFound
+                {
+                    warn!(%vmid, ?cleanup_error, "failed to clean VM runtime directory after startup failure");
+                }
+                rollback_vsock_cid(vmid, cid_reservation);
+                return Err(error);
+            }
+        };
 
         let console = Console::default();
         // A migration receiver has no config yet; its serial socket is created
         // only when the migrated VM is restored.
-        if vm_config.is_some() {
-            console
+        if vm_config.is_some()
+            && let Err(error) = console
                 .attach_socket(vminstance.console_socket_path())
-                .await?;
+                .await
+        {
+            match vminstance.destroy().await {
+                Ok(()) => {
+                    process_exit_confirmed.store(true, Ordering::SeqCst);
+                    rollback_vsock_cid(vmid, cid_reservation);
+                }
+                Err(cleanup_error) => {
+                    warn!(%vmid, ?cleanup_error, "failed to clean VM after console attach failure; retaining vsock CID reservation");
+                }
+            }
+            return Err(error);
         }
 
         // Take the child process out so we can watch for unexpected death.
         // destroy() handles a missing child_process gracefully.
-        if let Some(mut child_process) = vminstance.take_child_process() {
+        let process_watcher = if let Some(mut child_process) = vminstance.take_child_process() {
+            let (kill_sender, kill_receiver) = tokio::sync::oneshot::channel();
             let actor_ref = actor_ref.clone();
-            tokio::spawn(async move {
+            let watcher = tokio::spawn(async move {
                 debug!(%vmid, "watching child process to handle actor cleanup");
-                match child_process.wait().await {
-                    Ok(status) => {
-                        if status.success() {
+                let (result, teardown_requested) = tokio::select! {
+                    result = child_process.wait() => (result, false),
+                    _ = kill_receiver => {
+                        // The process may already have exited. wait() reaps it
+                        // either way; its result is the proof needed to release CID.
+                        drop(child_process.start_kill());
+                        (child_process.wait().await, true)
+                    }
+                };
+                if !teardown_requested {
+                    match &result {
+                        Ok(status) if status.success() => {
                             warn!(%vmid, "child process exited outside of actor teardown");
-                            _ = actor_ref.stop_gracefully().await;
-                        } else {
+                            let actor_ref = actor_ref.clone();
+                            tokio::spawn(async move {
+                                if let Err(error) = actor_ref.stop_gracefully().await {
+                                    error!(%vmid, ?error, "failed to stop actor after VMM exit");
+                                }
+                            });
+                        }
+                        Ok(status) => {
                             error!(%vmid, ?status, "child process exited unexpectedly, killing actor");
                             actor_ref.kill();
                         }
-                    }
-                    Err(err) => {
-                        error!(%vmid, ?err, "failed to wait on child process, killing actor");
-                        actor_ref.kill();
+                        Err(err) => {
+                            error!(%vmid, ?err, "failed to wait on child process, killing actor");
+                            actor_ref.kill();
+                        }
                     }
                 }
+                result
             });
+            Some((kill_sender, watcher))
         } else {
             warn!(%vmid, "VMInstance has no child process to watch");
-        }
+            None
+        };
 
         Ok(Self {
             vmid,
@@ -256,6 +430,9 @@ impl Actor for VMActor {
             migration_state: None,
             console,
             manifest: vm_config,
+            release_vsock_cid: false,
+            process_exit_confirmed,
+            process_watcher,
         })
     }
 
@@ -279,11 +456,48 @@ impl Actor for VMActor {
             }
         }
 
-        self.vm_instance.destroy().await?;
+        if let Some(state) = self.migration_state.as_mut()
+            && let Some(task) = state.console_attach_task.take()
+        {
+            task.abort();
+        }
+        let stop_result = self.vm_instance.stop().await;
+        let process_exited = if let Some((kill_sender, watcher)) = self.process_watcher.take() {
+            let _send_result: std::result::Result<(), ()> = kill_sender.send(());
+            watcher
+                .await
+                .map_err(|error| Report::msg(format!("VM process watcher failed: {error}")))?
+                .map_err(|error| {
+                    Report::msg(format!("failed to confirm VM process exit: {error}"))
+                })?;
+            true
+        } else {
+            // Without a watcher there is no proof that the VMM process exited;
+            // retain reservations rather than risk reassigning a live guest CID.
+            false
+        };
 
-        // info!(vmid = %self.vmid, ?res, "VM process exited");
+        let cleanup_result = if process_exited {
+            self.process_exit_confirmed.store(true, Ordering::SeqCst);
+            self.vm_instance.cleanup_after_stop().await
+        } else {
+            Ok(())
+        };
 
-        Ok(())
+        if process_exited {
+            if let Some(mut migration_state) = self.migration_state.take() {
+                rollback_vsock_cid(self.vmid, migration_state.cid_reservation.take());
+            }
+            let allocator = VsockCidAllocator::from_environment();
+            if self.release_vsock_cid {
+                allocator.release(self.vmid)?;
+            } else {
+                allocator.mark_process_exited(self.vmid)?;
+            }
+        }
+
+        stop_result?;
+        cleanup_result
     }
 }
 
@@ -368,6 +582,10 @@ impl Message<GetVMHeartbeat> for VMActor {
 impl Message<MigrateVMReceive> for VMActor {
     type Reply = MigrateVMReceiveReply;
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "keeps migration reservation and receiver setup ordered"
+    )]
     async fn handle(
         &mut self,
         msg: MigrateVMReceive,
@@ -381,12 +599,15 @@ impl Message<MigrateVMReceive> for VMActor {
             };
         }
 
-        let prep_config = msg.config.clone();
-
-        // Translate before opening a receive socket so invalid intent cannot
-        // leave behind a migration listener that can never complete.
-        let config = match to_vm_config(&msg.config) {
-            Ok(config) => config,
+        if let Err(error) = validate_migration_manifest(&msg.config) {
+            return MigrateVMReceiveReply {
+                listening_address: String::new(),
+                error: Some(error.to_string()),
+            };
+        }
+        let mut prep_manifest = msg.config.clone();
+        let cid_reservation = match allocate_vsock_cid(self.vmid, &mut prep_manifest, true) {
+            Ok(reservation) => reservation,
             Err(error) => {
                 return MigrateVMReceiveReply {
                     listening_address: String::new(),
@@ -394,11 +615,48 @@ impl Message<MigrateVMReceive> for VMActor {
                 };
             }
         };
+
+        // Keep ownership of this reservation in the actor until the process
+        // exits. Any failure below tears down the receiver and rolls back from
+        // on_stop, after the process watcher confirms exit.
+        self.migration_state = Some(MigrationState {
+            migration_task: None,
+            console_attach_task: None,
+            listening_address: String::new(),
+            cid_reservation,
+            previous_manifest: self.manifest.clone(),
+        });
+
+        // Translate before opening a receive socket so invalid intent cannot
+        // leave behind a migration listener that can never complete.
+        let runtime_dir = VMInstance::runtime_dir_for(&self.vmid.to_string());
+        let resolved_manifest = manifest_with_resolved_vsock_cid(&prep_manifest);
+        let config = match to_vm_config(&resolved_manifest, &runtime_dir) {
+            Ok(config) => config,
+            Err(error) => {
+                ctx.actor_ref().stop_gracefully().await.unwrap();
+                return MigrateVMReceiveReply {
+                    listening_address: String::new(),
+                    error: Some(error.to_string()),
+                };
+            }
+        };
+
+        // Perform every fallible preparation step before opening the receiver.
+        // On failure, stop the actor so on_stop rolls back after process exit.
+        if let Err(error) = self.vm_instance.prep_config(config.clone()).await {
+            ctx.actor_ref().stop_gracefully().await.unwrap();
+            return MigrateVMReceiveReply {
+                listening_address: String::new(),
+                error: Some(error.to_string()),
+            };
+        }
 
         // Start receiving migration on the destination VM (this actor).
         let (listening_address, migration_task) = match self.vm_instance.receive_migration().await {
             Ok(result) => result,
             Err(error) => {
+                ctx.actor_ref().stop_gracefully().await.unwrap();
                 return MigrateVMReceiveReply {
                     listening_address: String::new(),
                     error: Some(error.to_string()),
@@ -406,15 +664,15 @@ impl Message<MigrateVMReceive> for VMActor {
             }
         };
 
-        self.migration_state = Some(MigrationState {
-            migration_task: Some(migration_task),
-            listening_address: listening_address.clone(),
-            config,
-        });
+        self.manifest = Some(prep_manifest);
+        if let Some(state) = self.migration_state.as_mut() {
+            state.listening_address.clone_from(&listening_address);
+            state.migration_task = Some(migration_task);
+        }
 
         let console = self.console.clone();
         let console_socket_path = self.vm_instance.console_socket_path();
-        tokio::spawn(async move {
+        let console_attach_task = tokio::spawn(async move {
             loop {
                 match console.attach_socket(console_socket_path.clone()).await {
                     Ok(()) => break,
@@ -426,43 +684,32 @@ impl Message<MigrateVMReceive> for VMActor {
             }
         });
 
-        let actor_ref = ctx.actor_ref().clone();
+        if let Some(state) = self.migration_state.as_mut() {
+            state.console_attach_task = Some(console_attach_task);
+        }
 
-        let vmid = self.vmid;
-
-        // now spawn a task for itself
-        // to actually prep the migration while we're receiving the migration stream
-        tokio::spawn(async move {
-            if let Err(err) = actor_ref
-                .tell(PrepMigration {
-                    vmid,
-                    config: prep_config,
-                })
-                .await
-            {
-                error!(
-                    ?err,
-                    "failed to start migration prep on destination VM actor"
-                );
-            }
-        });
-
-        // send migration finished notification in a separate task, after the prep is done
-        if let Some(migration_state) = self.migration_state.as_mut() {
-            // take the task value out and await that
-            if let Some(migration_task) = migration_state.migration_task.take() {
-                // NOTE: this is kinda scuffed
-                let actor_ref = ctx.actor_ref().clone();
-                tokio::spawn(async move {
-                    if let Err(err) = migration_task.await {
-                        error!(?err, "migration task join failed");
+        // Notify the VM actor after receive finishes so it can commit the CID
+        // reservation or stop and roll it back after process exit.
+        if let Some(migration_state) = self.migration_state.as_mut()
+            && let Some(migration_task) = migration_state.migration_task.take()
+        {
+            let actor_ref = ctx.actor_ref().clone();
+            tokio::spawn(async move {
+                let succeeded = match migration_task.await {
+                    Ok(Ok(())) => true,
+                    Ok(Err(error)) => {
+                        error!(?error, "migration receiver failed");
+                        false
                     }
-
-                    if let Err(err) = actor_ref.tell(MigrationFinished).await {
-                        error!(?err, "failed to notify actor that migration finished");
+                    Err(error) => {
+                        error!(?error, "migration receiver task failed");
+                        false
                     }
-                });
-            }
+                };
+                if let Err(error) = actor_ref.tell(MigrationFinished { succeeded }).await {
+                    error!(?error, "failed to notify actor that migration finished");
+                }
+            });
         }
 
         MigrateVMReceiveReply {
@@ -479,40 +726,76 @@ impl Message<MigrationFinished> for VMActor {
 
     async fn handle(
         &mut self,
-        _msg: MigrationFinished,
-        _ctx: &mut Context<Self, Self::Reply>,
+        msg: MigrationFinished,
+        ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        if self.migration_state.take().is_some() {
-            info!(vmid = %self.vmid, "migration finished, cleared migration state");
+        if msg.succeeded {
+            if let Some(mut state) = self.migration_state.take() {
+                if let Some(task) = state.console_attach_task.take() {
+                    task.abort();
+                }
+                if let Err(error) = self
+                    .console
+                    .attach_socket(self.vm_instance.console_socket_path())
+                    .await
+                {
+                    warn!(vmid = %self.vmid, ?error, "failed to attach console after migration");
+                }
+                info!(vmid = %self.vmid, "migration finished successfully");
+            } else {
+                warn!(vmid = %self.vmid, "received migration finished notification with no active migration state");
+            }
+        } else if let Some(state) = self.migration_state.as_ref() {
+            self.manifest.clone_from(&state.previous_manifest);
+            warn!(vmid = %self.vmid, "migration failed; stopping receiver before rolling back CID reservation");
+            ctx.actor_ref().stop_gracefully().await.unwrap();
         } else {
-            warn!(vmid = %self.vmid, "received migration finished notification with no active migration state");
+            warn!(vmid = %self.vmid, "received migration failed notification with no active migration state");
         }
     }
 }
 
-#[remote_message]
-impl Message<PrepMigration> for VMActor {
-    type Reply = ();
+#[cfg(test)]
+mod vsock_manifest_tests {
+    use super::{
+        manifest_with_resolved_vsock_cid, migration_vsock_cid, validate_migration_manifest,
+    };
+    use crate::manifest::{ObservedState, ObservedStatus, VmManifest};
 
-    async fn handle(
-        &mut self,
-        msg: PrepMigration,
-        _ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
-        info!(vmid = %self.vmid, "PrepMigration handler invoked");
-        // Preparation is best-effort here because the remote receive operation
-        // has no fallible reply channel; report failures and let migration state
-        // cleanup handle the failed attempt.
-        let config = match to_vm_config(&msg.config) {
-            Ok(config) => config,
-            Err(error) => {
-                error!(?error, "failed to convert migration manifest");
-                return;
-            }
-        };
-        if let Err(error) = self.vm_instance.prep_config(config).await {
-            error!(?error, "failed to prepare migrated VM configuration");
-        }
+    #[test]
+    fn cloud_init_migration_is_rejected_before_creating_artifacts() {
+        let manifest: VmManifest = serde_json::from_str(include_str!(
+            "../../../docs/fixtures/manifest/cloud-init.json"
+        ))
+        .unwrap();
+        drop(validate_migration_manifest(&manifest).unwrap_err());
+    }
+
+    #[test]
+    fn migration_requires_and_preserves_the_source_vsock_cid() {
+        drop(migration_vsock_cid(None, None, true).unwrap_err());
+        drop(migration_vsock_cid(Some(42), Some(43), true).unwrap_err());
+        assert_eq!(migration_vsock_cid(None, Some(42), true).unwrap(), Some(42));
+        assert_eq!(migration_vsock_cid(Some(42), None, true).unwrap(), Some(42));
+        assert_eq!(migration_vsock_cid(None, Some(42), false).unwrap(), None);
+    }
+
+    #[test]
+    fn resolved_automatic_cid_does_not_become_desired_intent() {
+        let mut manifest: VmManifest =
+            serde_json::from_str(include_str!("../../../docs/fixtures/manifest/vsock.json"))
+                .expect("vsock fixture parses");
+        manifest.desired.vsock.as_mut().unwrap().guest_cid = None;
+        manifest.observed = Some(ObservedState {
+            status: ObservedStatus::Running,
+            vsock_guest_cid: Some(47),
+            ..Default::default()
+        });
+
+        let resolved = manifest_with_resolved_vsock_cid(&manifest);
+
+        assert_eq!(manifest.desired.vsock.unwrap().guest_cid, None);
+        assert_eq!(resolved.desired.vsock.unwrap().guest_cid, Some(47));
     }
 }
 
@@ -538,6 +821,9 @@ impl Message<DeleteVM> for VMActor {
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         trace!(vmid = %self.vmid, "Shutting down VM actor");
+        // Explicit deletion also releases a lease retained by an earlier
+        // incarnation, even if this incarnation no longer has a vsock device.
+        self.release_vsock_cid = true;
         ctx.actor_ref().stop_gracefully().await.unwrap();
     }
 }

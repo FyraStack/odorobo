@@ -9,6 +9,7 @@ use stable_eyre::{Report, eyre::eyre};
 use tracing::{info, warn};
 
 use crate::ch_driver::actor::VMActor;
+use crate::manifest::same_create_intent;
 use crate::messages::vm::{
     AgentListVMs, AgentListVMsReply, CreateVM, CreateVMReply, DeleteVM, DeleteVMReply,
     GetConsoleHistory, GetConsoleHistoryReply, GetVMInfo, GetVMInfoReply, SendConsoleInput,
@@ -37,6 +38,9 @@ impl Actor for SchedulerActor {
             agent_keepalive_tasks: AHashMap::new(),
             vm_actorid_ulid_map: AHashMap::new(),
             vm_manifests: AHashMap::new(),
+            vm_effective_manifests: AHashMap::new(),
+            vm_tombstones: AHashMap::new(),
+            vm_delete_targets: AHashMap::new(),
             vm_placements: AHashMap::new(),
             vm_data_cache: AHashMap::new(),
             vm_keepalive_tasks: AHashMap::new(),
@@ -81,13 +85,27 @@ impl Actor for SchedulerActor {
 impl Message<CreateVM> for SchedulerActor {
     type Reply = Result<CreateVMReply, Report>;
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "keeps correlated create caches and uncertainty handling together"
+    )]
     async fn handle(
         &mut self,
         msg: CreateVM,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
+        if self.vm_tombstones.get(&msg.vmid) == Some(&true) {
+            return Err(eyre!(
+                "VM deletion cleanup is pending; retry deletion before recreating it"
+            ));
+        }
         if let Some(existing) = self.vm_manifests.get(&msg.vmid) {
-            if existing != &msg.config {
+            let matches_intent = same_create_intent(existing, &msg.config)
+                || self
+                    .vm_effective_manifests
+                    .get(&msg.vmid)
+                    .is_some_and(|effective| same_create_intent(effective, &msg.config));
+            if !matches_intent {
                 return Err(eyre!("conflicting create request for existing VM ID"));
             }
 
@@ -96,13 +114,20 @@ impl Message<CreateVM> for SchedulerActor {
                 .iter()
                 .find_map(|(actor_id, vmid)| (*vmid == msg.vmid).then(|| actor_id.to_bytes()));
             return Ok(CreateVMReply {
-                config: Some(existing.clone()),
+                config: Some(
+                    self.vm_effective_manifests
+                        .get(&msg.vmid)
+                        .unwrap_or(existing)
+                        .clone(),
+                ),
                 actor_id,
+                error: None,
             });
         }
 
         let target_agent = self.schedule_agent(&msg)?;
 
+        self.vm_tombstones.remove(&msg.vmid);
         self.vm_manifests.insert(msg.vmid, msg.config.clone());
         self.invalidate_pending_resources();
         self.vm_placements
@@ -119,7 +144,27 @@ impl Message<CreateVM> for SchedulerActor {
             .or_default()
             .push(CachedVMActor { actor_ref: None });
 
-        let reply = target_agent.ask(&msg).await;
+        let mut startup_outcome_unknown = false;
+        let reply: Result<CreateVMReply, Report> = match target_agent.ask(&msg).await {
+            Ok(CreateVMReply {
+                config,
+                actor_id,
+                error,
+            }) => error.map_or_else(
+                || {
+                    Ok(CreateVMReply {
+                        config,
+                        actor_id,
+                        error: None,
+                    })
+                },
+                |error| Err(eyre!("agent failed to create VM: {error}")),
+            ),
+            Err(error) => {
+                startup_outcome_unknown = true;
+                Err(eyre!(error.to_string()))
+            }
+        };
 
         if let Ok(reply) = &reply
             && let Some(actor_id_bytes) = &reply.actor_id
@@ -128,7 +173,9 @@ impl Message<CreateVM> for SchedulerActor {
             self.vm_actorid_ulid_map.insert(actor_id, msg.vmid);
         }
 
-        if reply.is_err() {
+        // A transport failure is not proof that startup failed. Keep the
+        // pending placement while discovery has a chance to confirm it.
+        if reply.is_err() && !startup_outcome_unknown {
             let actor_exists = RemoteActorRef::<VMActor>::lookup(vm_actor_id(msg.vmid))
                 .await
                 .ok()
@@ -145,12 +192,20 @@ impl Message<CreateVM> for SchedulerActor {
                 }),
                 &mut self.vm_actorid_ulid_map,
                 &mut self.vm_manifests,
+                &mut self.vm_effective_manifests,
                 &mut self.vm_placements,
                 &mut self.vm_data_cache,
             );
         }
 
-        Ok(reply?)
+        if let Ok(reply) = &reply
+            && let Some(effective_config) = &reply.config
+        {
+            self.vm_effective_manifests
+                .insert(msg.vmid, effective_config.clone());
+        }
+
+        reply
     }
 }
 
@@ -195,7 +250,8 @@ impl Message<SendConsoleInput> for SchedulerActor {
     }
 }
 
-/// Looks up a VM actor, forwards deletion, and removes desired intent.
+/// Deletes through agents so process exit and all node-local CID releases are
+/// confirmed before acknowledging deletion and removing desired intent.
 impl Message<DeleteVM> for SchedulerActor {
     type Reply = Result<DeleteVMReply, Report>;
 
@@ -204,14 +260,43 @@ impl Message<DeleteVM> for SchedulerActor {
         msg: DeleteVM,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        let vm = RemoteActorRef::<VMActor>::lookup(vm_actor_id(msg.vmid)).await?;
-        tracing::trace!(?vm, "DeleteVM");
-        if let Some(vm) = vm {
-            vm.tell(&msg).send()?;
-            self.remove_vm_intent(msg.vmid);
-            Ok(DeleteVMReply)
+        self.remove_vm_intent(msg.vmid);
+        self.vm_tombstones.insert(msg.vmid, true);
+        // Always contact agents, including when a VM actor is discoverable.
+        // Direct tells acknowledge only enqueueing and leave a race with CID
+        // release during teardown. Other nodes may also retain stopped leases.
+        let targets = self.vm_delete_targets.entry(msg.vmid).or_default();
+        for agent in self.agent_data_cache.values() {
+            targets.insert(agent.actor_ref.id(), agent.actor_ref.clone());
+        }
+        let agents: Vec<_> = targets.values().cloned().collect();
+        if agents.is_empty() {
+            return Err(eyre!(
+                "no reachable agents can delete the VM and release its CID"
+            ));
+        }
+
+        let mut failures = Vec::new();
+        for agent in agents {
+            match agent.ask(&msg).await {
+                Ok(reply) if reply.error.is_none() => {
+                    if let Some(targets) = self.vm_delete_targets.get_mut(&msg.vmid) {
+                        targets.remove(&agent.id());
+                    }
+                }
+                Ok(reply) => failures.push(reply.error.unwrap_or_default()),
+                Err(error) => failures.push(error.to_string()),
+            }
+        }
+        if failures.is_empty() {
+            self.vm_delete_targets.remove(&msg.vmid);
+            self.vm_tombstones.insert(msg.vmid, false);
+            Ok(DeleteVMReply { error: None })
         } else {
-            Err(eyre!("VM not found"))
+            Err(eyre!(
+                "failed to release VM CID on one or more agents: {}",
+                failures.join("; ")
+            ))
         }
     }
 }
@@ -290,5 +375,52 @@ impl Message<Ping> for SchedulerActor {
 
     async fn handle(&mut self, _msg: Ping, _ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
         Pong
+    }
+}
+
+#[cfg(test)]
+mod create_intent_tests {
+    use crate::manifest::{VmManifest, same_create_intent};
+
+    fn vsock_manifest() -> VmManifest {
+        serde_json::from_str(include_str!(
+            "../../../../docs/fixtures/manifest/vsock.json"
+        ))
+        .expect("vsock fixture parses")
+    }
+
+    #[test]
+    fn automatic_and_explicit_cids_are_different_create_intents() {
+        let mut automatic = vsock_manifest();
+        automatic.desired.vsock.as_mut().unwrap().guest_cid = None;
+        let explicit = vsock_manifest();
+        assert!(!same_create_intent(&explicit, &automatic));
+        assert!(!same_create_intent(&automatic, &explicit));
+    }
+
+    #[test]
+    fn automatically_assigned_observed_cid_does_not_change_create_intent() {
+        let mut effective = vsock_manifest();
+        effective.desired.vsock.as_mut().unwrap().guest_cid = None;
+        effective.observed = Some(crate::manifest::ObservedState {
+            vsock_guest_cid: Some(42),
+            ..Default::default()
+        });
+        let mut requested = effective.clone();
+        requested.observed = None;
+
+        assert!(same_create_intent(&effective, &requested));
+    }
+
+    #[test]
+    fn requested_cid_or_other_manifest_changes_still_conflict() {
+        let existing = vsock_manifest();
+        let mut different_cid = vsock_manifest();
+        different_cid.desired.vsock.as_mut().unwrap().guest_cid = Some(43);
+        assert!(!same_create_intent(&existing, &different_cid));
+
+        let mut different_socket = vsock_manifest();
+        different_socket.desired.vsock.as_mut().unwrap().socket = "/run/other.sock".to_owned();
+        assert!(!same_create_intent(&existing, &different_socket));
     }
 }
