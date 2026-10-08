@@ -144,6 +144,13 @@ pub struct SchedulerActor {
     pub vm_actorid_ulid_map: AHashMap<ActorId, Ulid>,
     /// Canonical VM intent retained while a VM is reconciled or migrated.
     pub vm_manifests: AHashMap<Ulid, VmManifest>,
+    /// Last effective manifest reported by a VM actor, including node-local values.
+    pub vm_effective_manifests: AHashMap<Ulid, VmManifest>,
+    /// Suppresses late discovery after explicit stop/delete. True means delete
+    /// cleanup is still pending, so recreation must wait for a successful retry.
+    vm_tombstones: AHashMap<Ulid, bool>,
+    /// Failed deletion targets retained even after discovery evicts an agent.
+    vm_delete_targets: AHashMap<Ulid, AHashMap<ActorId, RemoteActorRef<AgentActor>>>,
     /// Desired and observed VM placements; multiple entries allow migration.
     pub vm_placements: AHashMap<Ulid, Vec<VmPlacement>>,
     /// VM actor references. `None` marks a placement awaiting discovery.

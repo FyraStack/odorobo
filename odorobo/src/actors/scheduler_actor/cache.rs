@@ -142,10 +142,12 @@ impl SchedulerActor {
     pub(super) fn remove_vm_state(
         vmid: Ulid,
         manifests: &mut AHashMap<Ulid, VmManifest>,
+        effective_manifests: &mut AHashMap<Ulid, VmManifest>,
         placements: &mut AHashMap<Ulid, Vec<VmPlacement>>,
         data_cache: &mut AHashMap<Ulid, Vec<CachedVMActor>>,
     ) {
         manifests.remove(&vmid);
+        effective_manifests.remove(&vmid);
         placements.remove(&vmid);
         data_cache.remove(&vmid);
     }
@@ -153,9 +155,11 @@ impl SchedulerActor {
     /// Removes VM intent and every actor-ID association so reconciliation cannot
     /// recreate a VM after an explicit stop or delete request.
     pub(super) fn remove_vm_intent(&mut self, vmid: Ulid) {
+        self.vm_tombstones.entry(vmid).or_insert(false);
         Self::remove_vm_state(
             vmid,
             &mut self.vm_manifests,
+            &mut self.vm_effective_manifests,
             &mut self.vm_placements,
             &mut self.vm_data_cache,
         );
@@ -207,12 +211,17 @@ impl SchedulerActor {
     ///
     /// An actor may exist even if the create request failed or its reply was lost;
     /// retaining the state in that case lets normal discovery reconcile it.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "updates correlated scheduler caches atomically"
+    )]
     pub(super) fn rollback_failed_create(
         vmid: Ulid,
         actor_exists: bool,
         actor_id: Option<ActorId>,
         actor_map: &mut AHashMap<ActorId, Ulid>,
         manifests: &mut AHashMap<Ulid, VmManifest>,
+        effective_manifests: &mut AHashMap<Ulid, VmManifest>,
         placements: &mut AHashMap<Ulid, Vec<VmPlacement>>,
         data_cache: &mut AHashMap<Ulid, Vec<CachedVMActor>>,
     ) {
@@ -222,7 +231,7 @@ impl SchedulerActor {
             {
                 actor_map.remove(&actor_id);
             }
-            Self::remove_vm_state(vmid, manifests, placements, data_cache);
+            Self::remove_vm_state(vmid, manifests, effective_manifests, placements, data_cache);
         }
     }
 

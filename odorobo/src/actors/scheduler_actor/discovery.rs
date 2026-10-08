@@ -260,10 +260,18 @@ impl Message<VmUpdated> for SchedulerActor {
 
     async fn handle(&mut self, msg: VmUpdated, _ctx: &mut Context<Self, Self::Reply>) {
         let vmid = msg.data.vmid;
+        if self.vm_tombstones.contains_key(&vmid) {
+            return;
+        }
         let actor_id = msg.actor_ref.id();
         self.vm_actorid_ulid_map.insert(actor_id, vmid);
         if let Some(manifest) = msg.data.config {
-            self.vm_manifests.insert(vmid, manifest);
+            self.vm_effective_manifests.insert(vmid, manifest.clone());
+            // A manifest discovered after scheduler startup is the only intent
+            // available. Otherwise preserve the original request: effective
+            // values such as an agent-assigned vsock CID are node-local and
+            // must not become hard requirements during failover.
+            self.vm_manifests.entry(vmid).or_insert(manifest);
             Self::reconcile_discovered_vm(
                 vmid,
                 &self.agent_vm_index,

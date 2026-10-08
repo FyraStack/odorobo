@@ -151,7 +151,11 @@ pub fn connect_to_swarm() -> Result<PeerId> {
         .with_behaviour(|key| {
             let local_peer_id = key.public().to_peer_id();
 
-            let kameo = remote::Behaviour::new(local_peer_id, remote::messaging::Config::default());
+            let kameo = remote::Behaviour::new(
+                local_peer_id,
+                remote::messaging::Config::default()
+                    .with_request_timeout(std::time::Duration::from_secs(120)),
+            );
             let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id)?;
             Ok(ProductionBehaviour { kameo, mdns })
         })?

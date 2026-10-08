@@ -17,7 +17,7 @@ use std::{
 };
 use thiserror::Error;
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::ch_driver::{
     provisioning::hooks::HookManager,
@@ -53,6 +53,10 @@ impl std::fmt::Debug for VMInstance {
             .finish_non_exhaustive()
     }
 }
+
+#[derive(Debug, Error)]
+#[error("failed to confirm VMM process exit after startup failure: {0}")]
+pub struct UnconfirmedProcessExit(std::io::Error);
 
 #[derive(Debug, Error)]
 pub enum ChApiError {
@@ -199,7 +203,7 @@ impl VMInstance {
     /// so it's currently up to the caller to make sure that the receiver is ready before the sender tries to connect.
     /// Future improvement: add some kind of global tracker for active migrations and their states.
     #[tracing::instrument]
-    pub async fn receive_migration(&self) -> Result<(String, JoinHandle<()>)> {
+    pub async fn receive_migration(&self) -> Result<(String, JoinHandle<Result<()>>)> {
         let conn = self.conn();
         trace!("Preparing VM for migration");
 
@@ -223,21 +227,14 @@ impl VMInstance {
         );
 
         let migration_task = tokio::spawn(async move {
-            match conn
-                .vm_receive_migration_put(receive_migration_data)
+            conn.vm_receive_migration_put(receive_migration_data)
                 .await
                 .map_err(ChApiError::from)
-                .wrap_err(eyre!("Failed to prepare VM for migration {}", vm_id))
-            {
-                Ok(()) => {
-                    info!(vm_id, "Migration receiver completed successfully");
-                    // shut down vm
-                    if let Err(e) = conn.shutdown_vmm().await {
-                        error!(vm_id, error = ?e, "Failed to shut down VM after migration");
-                    }
-                }
-                Err(e) => error!(vm_id, error = ?e, "Migration receiver failed"),
-            }
+                .wrap_err(eyre!("Failed to prepare VM for migration {}", vm_id))?;
+            info!(vm_id, "Migration receiver completed successfully");
+            // This is the destination VMM: it now owns the running guest and
+            // must remain alive after a successful receive.
+            Ok(())
         });
 
         Ok((receiver_uri, migration_task))
@@ -335,11 +332,12 @@ impl VMInstance {
         &self.ch_socket_path
     }
 
-    async fn stop_child_after_failed_start(&mut self) {
+    async fn cleanup_failed_start(&mut self) -> Result<()> {
         if let Some(mut child) = self.child_process.take() {
             _ = child.start_kill();
-            _ = child.wait().await;
+            child.wait().await.map_err(UnconfirmedProcessExit)?;
         }
+        self.cleanup_after_stop().await
     }
 
     pub async fn info(&self) -> Result<VmInfo> {
@@ -399,18 +397,44 @@ impl VMInstance {
         let ch_process = tokio::process::Command::new("cloud-hypervisor")
             .arg("--api-socket")
             .arg(&ch_socket_path)
+            .kill_on_drop(true)
             .spawn()?;
         let mut instance = Self::new(id, ch_socket_path, transformer, Some(ch_process));
 
         const MAX_ATTEMPTS: u32 = 31;
         for attempt in 0..MAX_ATTEMPTS {
             info!(vm_id = id, attempt, "Checking if CH socket is available");
-            if instance.conn().vmm_ping_get().await.is_ok() {
+            if matches!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(500),
+                    instance.conn().vmm_ping_get()
+                )
+                .await,
+                Ok(Ok(_))
+            ) {
                 info!(vm_id = id, "CH socket available");
                 if let Some(vm_config) = vm_config {
                     info!(boot, ?vm_config, "Creating VM config");
-                    if let Err(error) = instance.create_config(vm_config, boot).await {
-                        instance.stop_child_after_failed_start().await;
+                    let create_result = tokio::time::timeout(
+                        std::time::Duration::from_secs(60),
+                        instance.create_config(vm_config, boot),
+                    )
+                    .await
+                    .unwrap_or_else(|_| Err(eyre!("VM creation timed out")));
+                    if let Err(error) = create_result {
+                        if let Err(cleanup_error) = instance.cleanup_failed_start().await {
+                            warn!(
+                                vm_id = id,
+                                ?cleanup_error,
+                                "failed to clean up unsuccessful VM startup"
+                            );
+                            if cleanup_error
+                                .downcast_ref::<UnconfirmedProcessExit>()
+                                .is_some()
+                            {
+                                return Err(cleanup_error.wrap_err(error.to_string()));
+                            }
+                        }
                         return Err(error);
                     }
                 }
@@ -422,7 +446,19 @@ impl VMInstance {
             }
         }
 
-        instance.stop_child_after_failed_start().await;
+        if let Err(cleanup_error) = instance.cleanup_failed_start().await {
+            warn!(
+                vm_id = id,
+                ?cleanup_error,
+                "failed to clean up VMM socket timeout"
+            );
+            if cleanup_error
+                .downcast_ref::<UnconfirmedProcessExit>()
+                .is_some()
+            {
+                return Err(cleanup_error);
+            }
+        }
         Err(eyre!(
             "CH socket not available after {} attempts for VM {}",
             MAX_ATTEMPTS,
@@ -430,30 +466,55 @@ impl VMInstance {
         ))
     }
 
-    /// Gracefully shutdown the VM and VMM, then clean up runtime state.
-    pub async fn destroy(&mut self) -> Result<()> {
+    /// Request shutdown without removing resources still used by the VMM.
+    pub async fn stop(&self) -> Result<()> {
+        self.stop_with_timeouts(
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+    }
+
+    async fn stop_with_timeouts(
+        &self,
+        guest_timeout: std::time::Duration,
+        vmm_timeout: std::time::Duration,
+    ) -> Result<()> {
         info!(
             vm_id = self.vm_id(),
             "Destroying VM instance, shutting down VM and cleaning up runtime state"
         );
-        if let Ok(info) = self.info().await {
-            trace!(vm_id = self.vm_id(), state = ?info.state, "Checking VM state before destroy");
-            self.hook_manager.before_stop(self.vm_id(), &info).await?;
-            if matches!(
-                info.state,
-                models::VmState::Running | models::VmState::Paused
-            ) {
-                info!(vm_id = self.vm_id(), "Shutting down VM before destroy");
-                self.shutdown().await?;
+        let stop_result = tokio::time::timeout(guest_timeout, async {
+            if let Ok(info) = self.info().await {
+                trace!(vm_id = self.vm_id(), state = ?info.state, "Checking VM state before destroy");
+                self.hook_manager.before_stop(self.vm_id(), &info).await?;
+                if matches!(
+                    info.state,
+                    models::VmState::Running | models::VmState::Paused
+                ) {
+                    info!(vm_id = self.vm_id(), "Shutting down VM before destroy");
+                    self.shutdown().await?;
+                }
+            } else {
+                warn!(
+                    vm_id = self.vm_id(),
+                    "Failed to get VM info before destroy, proceeding with shutdown and cleanup anyway"
+                );
             }
-        } else {
-            warn!(
-                vm_id = self.vm_id(),
-                "Failed to get VM info before destroy, proceeding with shutdown and cleanup anyway"
-            );
-        }
+            Ok(())
+        })
+        .await
+        .unwrap_or_else(|_| {
+            warn!(vm_id = self.vm_id(), "graceful VM shutdown timed out; forcing process exit");
+            Ok(())
+        });
 
-        if matches!(self.conn().shutdown_vmm().await, Ok(())) {
+        // Attempt VMM shutdown even if a hook or guest shutdown failed, but
+        // never let an unresponsive API prevent the caller from killing it.
+        if matches!(
+            tokio::time::timeout(vmm_timeout, self.conn().shutdown_vmm()).await,
+            Ok(Ok(()))
+        ) {
             debug!(vm_id = self.vm_id(), "VMM shutdown successfully");
         } else {
             warn!(
@@ -461,32 +522,37 @@ impl VMInstance {
                 "Failed to shutdown VMM, assuming it is already stopped or unresponsive"
             );
         }
-        let vm_config = self.vm_config.clone().unwrap_or_default();
+        stop_result
+    }
+
+    /// Gracefully shutdown the VM and VMM, confirm exit, then clean up runtime state.
+    pub async fn destroy(&mut self) -> Result<()> {
+        let stop_result = self.stop().await;
         if let Some(mut child) = self.child_process.take() {
             trace!("VMM stopped... checking child process");
+            // start_kill can fail when the process has already exited; wait is
+            // authoritative and must succeed before callers can release leases.
             _ = child.start_kill();
-            if let Err(err) = child.wait().await {
-                warn!(
-                    vm_id = self.vm_id(),
-                    ?err,
-                    "Failed to wait for child process, manual cleanup may be required"
-                );
-            }
+            child.wait().await.wrap_err_with(|| {
+                format!(
+                    "failed to confirm Cloud Hypervisor process exit for {}",
+                    self.vm_id()
+                )
+            })?;
         }
 
-        self.hook_manager
-            .after_stop(self.vm_id(), &vm_config)
-            .await?;
+        let cleanup_result = self.cleanup_after_stop().await;
+        stop_result?;
+        cleanup_result
+    }
 
-        if let Err(err) = self.purge_instance_data() {
-            warn!(
-                vm_id = self.vm_id(),
-                ?err,
-                "Failed to purge runtime data, manual cleanup may be required"
-            );
-        }
-
-        Ok(())
+    /// Remove resources only after the owner has confirmed VMM process exit.
+    pub async fn cleanup_after_stop(&mut self) -> Result<()> {
+        let vm_config = self.vm_config.clone().unwrap_or_default();
+        let hook_result = self.hook_manager.after_stop(self.vm_id(), &vm_config).await;
+        let cleanup_result = self.purge_instance_data();
+        hook_result?;
+        cleanup_result
     }
 
     /// Purge the runtime data for this VM instance.
@@ -494,15 +560,11 @@ impl VMInstance {
     /// This removes the runtime directory and all its contents if it exists.
     pub fn purge_instance_data(&mut self) -> Result<()> {
         let mut vm_config = self.vm_config.take().unwrap_or_default();
-        self.transformer.teardown(self.vm_id(), &mut vm_config)?;
         let runtime_dir = self.runtime_dir();
-        if runtime_dir.exists() {
-            fs::remove_dir_all(runtime_dir).wrap_err(eyre!(
-                "Failed to remove runtime directory for {}",
-                self.vm_id()
-            ))?;
-        }
-        Ok(())
+        let teardown_result = self.transformer.teardown(self.vm_id(), &mut vm_config);
+        let cleanup_result = remove_runtime_directory(&runtime_dir, self.vm_id());
+        teardown_result?;
+        cleanup_result
     }
 
     /// Load desired VM config from disk.
@@ -532,14 +594,14 @@ impl VMInstance {
 
         trace!(vm_id = self.vm_id(), "Applying config transforms");
         let mut transformed_config = config;
-        self.transformer
-            .transform(self.vm_id(), &mut transformed_config)
-            .wrap_err(eyre!(
-                "Failed to apply config transforms for VM {}",
-                self.vm_id()
-            ))?;
-
+        let transform_result = self
+            .transformer
+            .transform(self.vm_id(), &mut transformed_config);
         self.vm_config = Some(transformed_config.clone());
+        transform_result.wrap_err(eyre!(
+            "Failed to apply config transforms for VM {}",
+            self.vm_id()
+        ))?;
 
         trace!(vm_id = self.vm_id(), "Creating VM via CH API");
         self.conn()
@@ -560,19 +622,16 @@ impl VMInstance {
 
     /// Dry-apply a VM config without actually setting it in Cloud Hypervisor,
     /// allowing for live migration of the VM.
-    pub async fn prep_config(&mut self, config: models::VmConfig) -> Result<()> {
-        self.vm_config = Some(config.clone());
-
+    pub async fn prep_config(&mut self, mut config: models::VmConfig) -> Result<()> {
         info!(vm_id = self.vm_id(), "Preparing VM config for migration");
-        // simply "transform" the config here without actually setting it in CH, the migrator will do that for us
-
-        let mut transformed_config = config.clone();
-        self.transformer
-            .transform(self.vm_id(), &mut transformed_config)
-            .wrap_err(eyre!(
-                "Failed to apply config transforms for VM {}",
-                self.vm_id()
-            ))?;
+        // Preserve even partial transforms so teardown can release everything
+        // provisioned before an error.
+        let transform_result = self.transformer.transform(self.vm_id(), &mut config);
+        self.vm_config = Some(config.clone());
+        transform_result.wrap_err(eyre!(
+            "Failed to apply config transforms for VM {}",
+            self.vm_id()
+        ))?;
 
         self.hook_manager.before_boot(self.vm_id(), &config).await?;
 
@@ -622,5 +681,112 @@ impl VMInstance {
                 })
             })
             .collect())
+    }
+}
+
+fn remove_runtime_directory(runtime_dir: &Path, vmid: &str) -> Result<()> {
+    if runtime_dir.exists() {
+        fs::remove_dir_all(runtime_dir)
+            .wrap_err(eyre!("Failed to remove runtime directory for {vmid}"))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{VMInstance, remove_runtime_directory};
+    use crate::ch_driver::cloud_init::create_seed_image;
+    use crate::ch_driver::transform::{ConfigTransform, TransformChain};
+    use crate::manifest::CloudInit;
+    use cloud_hypervisor_client::models::VmConfig;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    use tokio::net::UnixListener;
+    use ulid::Ulid;
+
+    struct RecordTeardown(Arc<AtomicBool>);
+
+    impl ConfigTransform for RecordTeardown {
+        fn transform(&self, _vmid: &str, _config: &mut VmConfig) -> stable_eyre::Result<()> {
+            Ok(())
+        }
+
+        fn teardown(&self, _vmid: &str, _config: &mut VmConfig) -> stable_eyre::Result<()> {
+            self.0.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_start_reaps_child_and_tears_down_provisioned_resources() {
+        let directory =
+            std::env::temp_dir().join(format!("odorobo-failed-start-{}", Ulid::generate()));
+        let child = tokio::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let teardown = Arc::new(AtomicBool::new(false));
+        let transformer = TransformChain::new().add(RecordTeardown(Arc::clone(&teardown)));
+        let mut instance = VMInstance::new(
+            &Ulid::generate().to_string(),
+            directory.join("ch.sock"),
+            Some(transformer),
+            Some(child),
+        );
+        instance.vm_config = Some(VmConfig::default());
+        instance.cleanup_failed_start().await.unwrap();
+        assert!(instance.child_process.is_none());
+        assert!(teardown.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn unresponsive_api_cannot_block_force_kill_fallback() {
+        let directory =
+            std::env::temp_dir().join(format!("odorobo-stop-timeout-{}", Ulid::generate()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let socket = directory.join("ch.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let first = listener.accept().await.unwrap().0;
+            let second = listener.accept().await.unwrap().0;
+            std::future::pending::<()>().await;
+            drop((first, second));
+        });
+        let instance = VMInstance::new(
+            &Ulid::generate().to_string(),
+            socket,
+            Some(TransformChain::new()),
+            None,
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            instance.stop_with_timeouts(
+                std::time::Duration::from_millis(20),
+                std::time::Duration::from_millis(20),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        server.abort();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn runtime_cleanup_removes_cloud_init_seed_artifacts() {
+        let runtime_dir =
+            std::env::temp_dir().join(format!("odorobo-runtime-cleanup-{}", Ulid::generate()));
+        let cloud_init = CloudInit {
+            user_data: Some("#cloud-config\n".to_owned()),
+            meta_data: Some("instance-id: cleanup-test\n".to_owned()),
+            vendor_data: None,
+        };
+        let seed_path = create_seed_image(&runtime_dir, &cloud_init).expect("seed image created");
+        assert!(seed_path.exists());
+
+        remove_runtime_directory(&runtime_dir, "cleanup-test").expect("runtime data removed");
+        assert!(!runtime_dir.exists());
     }
 }
