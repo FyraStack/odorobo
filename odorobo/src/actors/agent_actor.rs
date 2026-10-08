@@ -410,8 +410,13 @@ impl Message<DeleteVM> for AgentActor {
             .get(&msg.vmid)
             .is_some_and(|proof| !proof.load(Ordering::SeqCst));
         if self.blocked_vm_ids.contains_key(&msg.vmid) && !exit_unconfirmed {
-            if let Err(error) = VsockCidAllocator::from_environment().mark_process_exited(msg.vmid) {
-                return DeleteVMReply { error: Some(format!("failed to persist confirmed VM process exit: {error}")) };
+            if let Err(error) = VsockCidAllocator::from_environment().mark_process_exited(msg.vmid)
+            {
+                return DeleteVMReply {
+                    error: Some(format!(
+                        "failed to persist confirmed VM process exit: {error}"
+                    )),
+                };
             }
             // The old process exited but runtime cleanup failed. Retry that
             // cleanup before acknowledging deletion and allowing path reuse.
