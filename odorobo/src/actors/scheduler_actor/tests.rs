@@ -333,6 +333,9 @@ fn vm_cleanup_unplaces_vm_without_another_discovered_actor() {
         agent_keepalive_tasks: AHashMap::new(),
         vm_actorid_ulid_map: AHashMap::from([(vm_actor_id, vmid)]),
         vm_manifests: AHashMap::from([(vmid, test_manifest(1, 1))]),
+        vm_effective_manifests: AHashMap::new(),
+        vm_tombstones: AHashMap::new(),
+        vm_delete_targets: AHashMap::new(),
         vm_placements: AHashMap::from([(
             vmid,
             vec![VmPlacement {
@@ -360,6 +363,7 @@ fn vm_cleanup_unplaces_vm_without_another_discovered_actor() {
 fn failed_create_rolls_back_state_without_an_actor() {
     let vmid = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("valid ulid");
     let mut manifests = AHashMap::from([(vmid, test_manifest(1, 1))]);
+    let mut effective_manifests = AHashMap::new();
     let mut actor_map = AHashMap::new();
     let mut placements = AHashMap::from([(
         vmid,
@@ -378,11 +382,13 @@ fn failed_create_rolls_back_state_without_an_actor() {
         None,
         &mut actor_map,
         &mut manifests,
+        &mut effective_manifests,
         &mut placements,
         &mut data_cache,
     );
 
     assert!(!manifests.contains_key(&vmid));
+    assert!(!effective_manifests.contains_key(&vmid));
     assert!(!placements.contains_key(&vmid));
     assert!(!data_cache.contains_key(&vmid));
 }
@@ -391,6 +397,7 @@ fn failed_create_rolls_back_state_without_an_actor() {
 fn failed_create_keeps_state_if_actor_exists() {
     let vmid = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("valid ulid");
     let mut manifests = AHashMap::from([(vmid, test_manifest(1, 1))]);
+    let mut effective_manifests = AHashMap::new();
     let mut actor_map = AHashMap::new();
     let mut placements = AHashMap::new();
     let mut data_cache = AHashMap::new();
@@ -401,6 +408,7 @@ fn failed_create_keeps_state_if_actor_exists() {
         None,
         &mut actor_map,
         &mut manifests,
+        &mut effective_manifests,
         &mut placements,
         &mut data_cache,
     );
@@ -418,6 +426,9 @@ fn explicit_stop_removes_vm_intent_and_actor_mapping() {
         agent_keepalive_tasks: AHashMap::new(),
         vm_actorid_ulid_map: AHashMap::from([(vm_actor_id, vmid)]),
         vm_manifests: AHashMap::from([(vmid, test_manifest(1, 1))]),
+        vm_effective_manifests: AHashMap::new(),
+        vm_tombstones: AHashMap::new(),
+        vm_delete_targets: AHashMap::new(),
         vm_placements: AHashMap::from([(vmid, Vec::new())]),
         vm_data_cache: AHashMap::from([(vmid, vec![CachedVMActor { actor_ref: None }])]),
         vm_keepalive_tasks: AHashMap::new(),
@@ -429,6 +440,7 @@ fn explicit_stop_removes_vm_intent_and_actor_mapping() {
 
     scheduler.remove_vm_intent(vmid);
 
+    assert!(scheduler.vm_tombstones.contains_key(&vmid));
     assert!(!scheduler.vm_manifests.contains_key(&vmid));
     assert!(!scheduler.vm_placements.contains_key(&vmid));
     assert!(!scheduler.vm_data_cache.contains_key(&vmid));
@@ -447,6 +459,9 @@ fn agent_cleanup_does_not_remove_unrelated_vm_state() {
         agent_keepalive_tasks: AHashMap::new(),
         vm_actorid_ulid_map: AHashMap::from([(vm_actor_id, vmid)]),
         vm_manifests: AHashMap::from([(vmid, test_manifest(1, 1))]),
+        vm_effective_manifests: AHashMap::new(),
+        vm_tombstones: AHashMap::new(),
+        vm_delete_targets: AHashMap::new(),
         vm_placements: AHashMap::from([(
             vmid,
             vec![VmPlacement {
@@ -482,6 +497,9 @@ fn vm_cleanup_does_not_remove_unrelated_agent_state() {
         agent_keepalive_tasks: AHashMap::new(),
         vm_actorid_ulid_map: AHashMap::from([(vm_actor_id, vmid)]),
         vm_manifests: AHashMap::from([(vmid, test_manifest(1, 1))]),
+        vm_effective_manifests: AHashMap::new(),
+        vm_tombstones: AHashMap::new(),
+        vm_delete_targets: AHashMap::new(),
         vm_placements: AHashMap::new(),
         vm_data_cache: AHashMap::from([(vmid, vec![CachedVMActor { actor_ref: None }])]),
         vm_keepalive_tasks: AHashMap::new(),

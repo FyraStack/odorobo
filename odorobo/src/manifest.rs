@@ -45,10 +45,12 @@ pub enum ManifestError {
     IncompleteCloudInit,
     #[error("cloud-init user-data and meta-data must both be non-empty")]
     EmptyCloudInitData,
-    #[error("vsock requires a non-zero guest CID")]
+    #[error("vsock guest CID must be between 3 and 4294967294 when explicitly provided")]
     InvalidVsockCid,
     #[error("vsock requires a non-empty absolute socket path")]
     InvalidVsockSocket,
+    #[error("cloud-init vendor-data must not be empty")]
+    EmptyCloudInitVendorData,
     #[error("affinity comparison for key {0} requires exactly one finite numeric value")]
     InvalidAffinityComparison(String),
 }
@@ -108,6 +110,19 @@ impl VmManifest {
         }
         self.desired.validate()
     }
+}
+
+/// Compare create intent without node-local observations. An omitted desired
+/// CID means automatic allocation and is distinct from an explicit CID.
+#[must_use]
+pub fn same_create_intent(existing: &VmManifest, requested: &VmManifest) -> bool {
+    let mut existing = existing.clone();
+    let mut requested = requested.clone();
+    // Observed state contains node-assigned values (including an automatically
+    // allocated vsock CID) and must not make a retry look like a new request.
+    existing.observed = None;
+    requested.observed = None;
+    existing == requested
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
@@ -209,9 +224,19 @@ impl DesiredState {
             {
                 return Err(ManifestError::EmptyCloudInitData);
             }
+            if cloud
+                .vendor_data
+                .as_deref()
+                .is_some_and(|data| data.trim().is_empty())
+            {
+                return Err(ManifestError::EmptyCloudInitVendorData);
+            }
         }
         if let Some(vsock) = &self.vsock {
-            if vsock.guest_cid == 0 {
+            if vsock
+                .guest_cid
+                .is_some_and(|cid| !(3..u32::MAX).contains(&cid))
+            {
                 return Err(ManifestError::InvalidVsockCid);
             }
             if vsock.socket.trim().is_empty() || !Path::new(&vsock.socket).is_absolute() {
@@ -338,17 +363,26 @@ pub struct Boot {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[allow(
+    clippy::struct_field_names,
+    reason = "field names follow cloud-init's standard file names"
+)]
 pub struct CloudInit {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_data: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub meta_data: Option<String>,
+    /// Optional `NoCloud` vendor-data interpreted by cloud-init.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vendor_data: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Vsock {
-    pub guest_cid: u32,
+    /// Optional guest CID. The agent allocates and persists one when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest_cid: Option<u32>,
     pub socket: String,
 }
 
@@ -368,6 +402,10 @@ pub struct ObservedState {
     /// Actionable failure detail when the observed status is `error`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Effective node-local guest CID for vsock. This is reported for runtime
+    /// inspection and migration, but is not a hard placement requirement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vsock_guest_cid: Option<u32>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
@@ -556,7 +594,7 @@ mod tests {
     fn rejects_invalid_vsock_and_metadata() {
         let mut manifest = minimal_manifest();
         manifest.desired.vsock = Some(Vsock {
-            guest_cid: 42,
+            guest_cid: Some(42),
             socket: "/run/odorobo/vsock.sock".to_owned(),
         });
         assert_eq!(manifest.validate(), Ok(()));
@@ -566,11 +604,19 @@ mod tests {
             .vsock
             .as_mut()
             .expect("vsock exists")
-            .guest_cid = 0;
+            .guest_cid = Some(2);
+        assert_eq!(manifest.validate(), Err(ManifestError::InvalidVsockCid));
+
+        manifest
+            .desired
+            .vsock
+            .as_mut()
+            .expect("vsock exists")
+            .guest_cid = Some(u32::MAX);
         assert_eq!(manifest.validate(), Err(ManifestError::InvalidVsockCid));
 
         let vsock = manifest.desired.vsock.as_mut().expect("vsock exists");
-        vsock.guest_cid = 42;
+        vsock.guest_cid = Some(42);
         vsock.socket = "  ".to_owned();
         assert_eq!(manifest.validate(), Err(ManifestError::InvalidVsockSocket));
 
@@ -608,10 +654,12 @@ mod tests {
             CloudInit {
                 user_data: Some("#cloud-config".to_owned()),
                 meta_data: None,
+                vendor_data: None,
             },
             CloudInit {
                 user_data: None,
                 meta_data: Some("instance-id: vm".to_owned()),
+                vendor_data: None,
             },
         ] {
             manifest.desired.cloud_init = Some(cloud_init);
@@ -622,15 +670,27 @@ mod tests {
             CloudInit {
                 user_data: Some("  ".to_owned()),
                 meta_data: Some("instance-id: vm".to_owned()),
+                vendor_data: None,
             },
             CloudInit {
                 user_data: Some("#cloud-config".to_owned()),
                 meta_data: Some("  ".to_owned()),
+                vendor_data: None,
             },
         ] {
             manifest.desired.cloud_init = Some(cloud_init);
             assert_eq!(manifest.validate(), Err(ManifestError::EmptyCloudInitData));
         }
+
+        manifest.desired.cloud_init = Some(CloudInit {
+            user_data: Some("#cloud-config".to_owned()),
+            meta_data: Some("instance-id: vm".to_owned()),
+            vendor_data: Some("  ".to_owned()),
+        });
+        assert_eq!(
+            manifest.validate(),
+            Err(ManifestError::EmptyCloudInitVendorData)
+        );
     }
 
     #[test]

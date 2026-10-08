@@ -25,6 +25,9 @@ pub struct CreateVMReply {
     pub config: Option<VmManifest>,
     /// Serialized ID of the VM actor created by the agent.
     pub actor_id: Option<Vec<u8>>,
+    /// VM startup failure reported by the destination agent, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// Message to delete a VM's config from the agent, shutting it down
@@ -69,7 +72,10 @@ pub struct DeleteVM {
 }
 
 #[derive(Serialize, Deserialize, Reply, Debug, Clone)]
-pub struct DeleteVMReply;
+pub struct DeleteVMReply {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
 
 /// Shuts down a VM temporarily
 #[derive(Serialize, Deserialize, Debug, Clone)]
