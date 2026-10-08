@@ -41,7 +41,14 @@ Odorobo should provision. It contains:
   VM/agent matching; `inverse` selects anti-affinity, with OR-ed
   label/annotation requirements.
 - `boot`: whether to start after provisioning and optional firmware/kernel/
-  command-line intent.
+  initramfs/command-line intent.
+- `rootfs`: optional OCI image used as the guest root filesystem for container
+  workloads (issues #112/#113). Its `mode` selects read-only with bounded
+  scratch, ephemeral writable (default), or persistent writable behavior; an
+  omitted `mode` defaults to `ephemeral`. For compatibility, `read_only: true`
+  or `false` is accepted only when `mode` is absent and maps to `read_only` or
+  `ephemeral`; the boolean is never serialized. Rootfs VMs cannot be
+  live-migrated; see [`containers.md`](containers.md) for storage details.
 - `cloud_init`: paired NoCloud user-data and meta-data.
 - `vsock`: guest CID and the desired host-side socket location.
 
@@ -69,6 +76,10 @@ non-zero vCPUs and memory, and satisfy these relationships:
 - Cloud-init must provide non-empty configuration with user-data and meta-data
   supplied together.
 - A vsock guest CID must be non-zero and its socket must be an absolute path.
+- A `rootfs` must reference a non-empty OCI image reference. The guest boots
+  the agent's microVM kernel with `root=rootfs rootfstype=virtiofs`; supported
+  write modes and the host preparation pipeline are documented in
+  [`containers.md`](containers.md).
 
 Invalid field combinations are rejected during deserialization, as are unknown
 fields, rather than silently interpreted. New fields should be added in a future manifest version when they

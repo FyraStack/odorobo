@@ -144,6 +144,11 @@ pub struct SchedulerActor {
     pub vm_actorid_ulid_map: AHashMap<ActorId, Ulid>,
     /// Canonical VM intent retained while a VM is reconciled or migrated.
     pub vm_manifests: AHashMap<Ulid, VmManifest>,
+    /// Process-local explicit-stop suppression; ownership discovery must not
+    /// turn retained stopped actors back into runnable intent.
+    stopped_vms: AHashSet<Ulid>,
+    /// Deleted actor generations remain retired across explicit ID recreation.
+    retired_vm_actors: AHashSet<ActorId>,
     /// Desired and observed VM placements; multiple entries allow migration.
     pub vm_placements: AHashMap<Ulid, Vec<VmPlacement>>,
     /// VM actor references. `None` marks a placement awaiting discovery.

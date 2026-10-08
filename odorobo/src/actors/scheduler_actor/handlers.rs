@@ -37,6 +37,8 @@ impl Actor for SchedulerActor {
             agent_keepalive_tasks: AHashMap::new(),
             vm_actorid_ulid_map: AHashMap::new(),
             vm_manifests: AHashMap::new(),
+            stopped_vms: Default::default(),
+            retired_vm_actors: Default::default(),
             vm_placements: AHashMap::new(),
             vm_data_cache: AHashMap::new(),
             vm_keepalive_tasks: AHashMap::new(),
@@ -86,23 +88,57 @@ impl Message<CreateVM> for SchedulerActor {
         msg: CreateVM,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        if let Some(existing) = self.vm_manifests.get(&msg.vmid) {
-            if existing != &msg.config {
-                return Err(eyre!("conflicting create request for existing VM ID"));
+        if self
+            .vm_manifests
+            .get(&msg.vmid)
+            .is_some_and(|existing| existing != &msg.config)
+        {
+            return Err(eyre!("conflicting create request for existing VM ID"));
+        }
+        // Cold stop can remove scheduler intent while retaining the OCI owner.
+        // Discover ownership before scheduling: local persistent state must not
+        // silently move to a second agent with a fresh upper.
+        if let Some(owner) = RemoteActorRef::<VMActor>::lookup(vm_actor_id(msg.vmid)).await? {
+            let info = owner
+                .ask(&GetVMInfo {
+                    vmid: Some(msg.vmid),
+                })
+                .await?;
+            if info.config.as_ref() != Some(&msg.config) {
+                return Err(eyre!("conflicting create request for retained VM owner"));
             }
-
-            let actor_id = self
-                .vm_actorid_ulid_map
-                .iter()
-                .find_map(|(actor_id, vmid)| (*vmid == msg.vmid).then(|| actor_id.to_bytes()));
+            owner.ask(&crate::ch_driver::actor::StartVM).await?;
+            self.stopped_vms.remove(&msg.vmid);
+            self.vm_manifests.insert(msg.vmid, msg.config.clone());
+            self.vm_actorid_ulid_map.insert(owner.id(), msg.vmid);
+            Self::reconcile_discovered_vm(
+                msg.vmid,
+                &self.agent_vm_index,
+                &self.vm_manifests,
+                &mut self.vm_placements,
+            );
+            Self::update_cached_vm_entry(
+                self.vm_data_cache.entry(msg.vmid).or_default(),
+                owner.id(),
+                CachedVMActor {
+                    actor_ref: Some(owner.clone()),
+                },
+            );
+            self.invalidate_pending_resources();
             return Ok(CreateVMReply {
-                config: Some(existing.clone()),
-                actor_id,
+                config: Some(msg.config),
+                actor_id: Some(owner.id().to_bytes()),
             });
+        }
+        if self.vm_manifests.contains_key(&msg.vmid) {
+            return Err(eyre!(
+                "VM intent exists but owner is unavailable; retry discovery"
+            ));
         }
 
         let target_agent = self.schedule_agent(&msg)?;
 
+        self.stopped_vms.remove(&msg.vmid);
         self.vm_manifests.insert(msg.vmid, msg.config.clone());
         self.invalidate_pending_resources();
         self.vm_placements
@@ -207,9 +243,15 @@ impl Message<DeleteVM> for SchedulerActor {
         let vm = RemoteActorRef::<VMActor>::lookup(vm_actor_id(msg.vmid)).await?;
         tracing::trace!(?vm, "DeleteVM");
         if let Some(vm) = vm {
-            vm.tell(&msg).send()?;
-            self.remove_vm_intent(msg.vmid);
-            Ok(DeleteVMReply)
+            let reply: DeleteVMReply = vm.ask(&msg).await?;
+            if let Some(error) = &reply.error {
+                return Err(eyre!("VM {} deletion failed: {error}", msg.vmid));
+            }
+            // Tombstone successful deletion just like shutdown: queued
+            // pre-delete discovery must not recreate removed persistent state.
+            self.retired_vm_actors.insert(vm.id());
+            self.suppress_vm_intent(msg.vmid);
+            Ok(reply)
         } else {
             Err(eyre!("VM not found"))
         }
@@ -228,8 +270,8 @@ impl Message<ShutdownVM> for SchedulerActor {
         let vm = RemoteActorRef::<VMActor>::lookup(vm_actor_id(msg.vmid)).await?;
         tracing::trace!(?vm, "ShutdownVM");
         if let Some(vm) = vm {
-            vm.tell(&msg).send()?;
-            self.remove_vm_intent(msg.vmid);
+            vm.ask(&msg).await?;
+            self.suppress_vm_intent(msg.vmid);
             Ok(ShutdownVMReply)
         } else {
             Err(eyre!("VM not found"))

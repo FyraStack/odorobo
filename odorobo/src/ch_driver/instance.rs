@@ -34,12 +34,66 @@ pub type ConsoleStream = std::fs::File;
 const DEFAULT_RUNTIME_ROOT_DIR: &str = "/run/odorobo";
 const RUNTIME_ROOT_ENV_VAR: &str = "ODOROBO_RUNTIME_DIR";
 
+/// mountinfo escapes whitespace and backslashes with octal sequences.
+fn decode_mount_path(value: &str) -> PathBuf {
+    use std::os::unix::ffi::OsStringExt;
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\\'
+            && index + 3 < bytes.len()
+            && bytes[index + 1..index + 4]
+                .iter()
+                .all(|b| (b'0'..=b'7').contains(b))
+        {
+            decoded.push(
+                (bytes[index + 1] - b'0') * 64 + (bytes[index + 2] - b'0') * 8 + bytes[index + 3]
+                    - b'0',
+            );
+            index += 4;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    std::ffi::OsString::from_vec(decoded).into()
+}
+
+fn check_runtime_mounts(runtime: &Path, mountinfo: &str) -> Result<()> {
+    for line in mountinfo.lines() {
+        let mount = line
+            .split_whitespace()
+            .nth(4)
+            .ok_or_else(|| eyre!("invalid mountinfo record"))?;
+        if decode_mount_path(mount).starts_with(runtime) {
+            return Err(eyre!(
+                "refusing to purge runtime {} while mounts remain",
+                runtime.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn ensure_runtime_unmounted(runtime: &Path) -> Result<()> {
+    if runtime.exists() {
+        check_runtime_mounts(
+            &fs::canonicalize(runtime)?,
+            &fs::read_to_string("/proc/self/mountinfo")?,
+        )?;
+    }
+    Ok(())
+}
+
 pub struct VMInstance {
     pub id: String,
     pub ch_socket_path: PathBuf,
     transformer: TransformChain,
     hook_manager: HookManager,
-    child_process: Option<tokio::process::Child>,
+    child_process: std::sync::Arc<tokio::sync::Mutex<Option<tokio::process::Child>>>,
+    stopping: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    stopped: bool,
     /// Pre-transformed VM config, if available
     pub vm_config: Option<models::VmConfig>,
 }
@@ -79,7 +133,7 @@ impl From<ChClientError> for ChApiError {
 }
 
 impl VMInstance {
-    fn new(
+    pub(super) fn new(
         id: &str,
         ch_socket_path: PathBuf,
         transformer: Option<TransformChain>,
@@ -90,16 +144,63 @@ impl VMInstance {
             ch_socket_path,
             transformer: transformer.unwrap_or_default(),
             hook_manager: HookManager::default(),
-            child_process,
+            child_process: std::sync::Arc::new(tokio::sync::Mutex::new(child_process)),
+            stopping: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            stopped: false,
             vm_config: None,
         }
     }
 
-    /// Takes the child process out of this instance, transferring ownership to the caller.
-    /// Useful for watching the process lifecycle externally (e.g. in an actor watcher task).
-    /// After calling this, `destroy()` will skip the child-kill step.
-    pub const fn take_child_process(&mut self) -> Option<tokio::process::Child> {
-        self.child_process.take()
+    #[cfg(test)]
+    pub(super) async fn kill_hypervisor_for_test(&self) {
+        self.child_process
+            .lock()
+            .await
+            .as_mut()
+            .expect("running child")
+            .start_kill()
+            .unwrap();
+    }
+
+    /// Lifecycle placeholder before a hypervisor has been acquired.
+    pub(super) fn stopped(id: &str) -> Self {
+        let mut instance = Self::new(
+            id,
+            Self::runtime_dir_for(id).join(SOCKET_FILE_NAME),
+            None,
+            None,
+        );
+        instance.stopped = true;
+        instance
+    }
+
+    /// Watch exit without transferring child ownership away from teardown.
+    pub fn watch_child(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Option<std::process::ExitStatus>>> + Send + 'static
+    {
+        let child = self.child_process.clone();
+        let stopping = self.stopping.clone();
+        async move {
+            loop {
+                {
+                    let mut slot = child.lock().await;
+                    if stopping.load(std::sync::atomic::Ordering::Relaxed) {
+                        return Ok(None);
+                    }
+                    let Some(process) = slot.as_mut() else {
+                        return Ok(None);
+                    };
+                    if let Some(status) = process.try_wait()? {
+                        if stopping.load(std::sync::atomic::Ordering::Relaxed) {
+                            return Ok(None);
+                        }
+                        return Ok(Some(status));
+                    }
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            }
+        }
     }
 
     /// Get a VM instance by its ID through the filesystem database
@@ -335,8 +436,8 @@ impl VMInstance {
         &self.ch_socket_path
     }
 
-    async fn stop_child_after_failed_start(&mut self) {
-        if let Some(mut child) = self.child_process.take() {
+    async fn stop_child_after_failed_start(&self) {
+        if let Some(mut child) = self.child_process.lock().await.take() {
             _ = child.start_kill();
             _ = child.wait().await;
         }
@@ -384,12 +485,13 @@ impl VMInstance {
     /// callers can create a stopped VM without changing its provider config.
     /// The socket is polled for up to roughly 30 seconds before failing.
     #[tracing::instrument(skip_all)]
-    pub async fn spawn(
+    pub async fn spawn_into(
+        owner: &mut Self,
         id: &str,
         vm_config: Option<VmConfig>,
         boot: bool,
         transformer: Option<TransformChain>,
-    ) -> Result<Self> {
+    ) -> Result<()> {
         let ch_socket_path = Self::runtime_dir_for(id).join(SOCKET_FILE_NAME);
         info!(?ch_socket_path, "Spawning VM");
         // make sure socket path parent exists
@@ -399,8 +501,10 @@ impl VMInstance {
         let ch_process = tokio::process::Command::new("cloud-hypervisor")
             .arg("--api-socket")
             .arg(&ch_socket_path)
+            .kill_on_drop(true)
             .spawn()?;
-        let mut instance = Self::new(id, ch_socket_path, transformer, Some(ch_process));
+        *owner = Self::new(id, ch_socket_path, transformer, Some(ch_process));
+        let instance = owner;
 
         const MAX_ATTEMPTS: u32 = 31;
         for attempt in 0..MAX_ATTEMPTS {
@@ -410,11 +514,10 @@ impl VMInstance {
                 if let Some(vm_config) = vm_config {
                     info!(boot, ?vm_config, "Creating VM config");
                     if let Err(error) = instance.create_config(vm_config, boot).await {
-                        instance.stop_child_after_failed_start().await;
                         return Err(error);
                     }
                 }
-                return Ok(instance);
+                return Ok(());
             }
 
             if attempt < MAX_ATTEMPTS - 1 {
@@ -422,7 +525,6 @@ impl VMInstance {
             }
         }
 
-        instance.stop_child_after_failed_start().await;
         Err(eyre!(
             "CH socket not available after {} attempts for VM {}",
             MAX_ATTEMPTS,
@@ -430,30 +532,44 @@ impl VMInstance {
         ))
     }
 
-    /// Gracefully shutdown the VM and VMM, then clean up runtime state.
-    pub async fn destroy(&mut self) -> Result<()> {
+    /// Stop the VM/VMM without deleting runtime paths. Rootfs teardown must
+    /// finish before the separate purge step may traverse those paths.
+    pub async fn stop(&mut self) -> Result<()> {
+        if self.stopped {
+            return Ok(());
+        }
         info!(
             vm_id = self.vm_id(),
-            "Destroying VM instance, shutting down VM and cleaning up runtime state"
+            "Stopping VM and VMM without purging runtime state"
         );
         if let Ok(info) = self.info().await {
-            trace!(vm_id = self.vm_id(), state = ?info.state, "Checking VM state before destroy");
+            trace!(vm_id = self.vm_id(), state = ?info.state, "Checking VM state before stop");
             self.hook_manager.before_stop(self.vm_id(), &info).await?;
             if matches!(
                 info.state,
                 models::VmState::Running | models::VmState::Paused
             ) {
-                info!(vm_id = self.vm_id(), "Shutting down VM before destroy");
+                info!(vm_id = self.vm_id(), "Shutting down VM before stop");
                 self.shutdown().await?;
             }
         } else {
             warn!(
                 vm_id = self.vm_id(),
-                "Failed to get VM info before destroy, proceeding with shutdown and cleanup anyway"
+                "Failed to get VM info before stop; stopping the VMM directly"
             );
         }
 
-        if matches!(self.conn().shutdown_vmm().await, Ok(())) {
+        // The exit watcher must not stop this actor in the middle of a
+        // retryable DeleteVM request. Teardown now owns the child lifecycle.
+        self.stopping
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let vmm_shutdown = self.conn().shutdown_vmm().await;
+        if vmm_shutdown.is_err() && self.child_process.lock().await.is_none() {
+            return Err(eyre!(
+                "VMM shutdown is unconfirmed; preserving runtime and rootfs"
+            ));
+        }
+        if vmm_shutdown.is_ok() {
             debug!(vm_id = self.vm_id(), "VMM shutdown successfully");
         } else {
             warn!(
@@ -462,30 +578,22 @@ impl VMInstance {
             );
         }
         let vm_config = self.vm_config.clone().unwrap_or_default();
-        if let Some(mut child) = self.child_process.take() {
-            trace!("VMM stopped... checking child process");
-            _ = child.start_kill();
-            if let Err(err) = child.wait().await {
-                warn!(
-                    vm_id = self.vm_id(),
-                    ?err,
-                    "Failed to wait for child process, manual cleanup may be required"
-                );
+        {
+            let mut slot = self.child_process.lock().await;
+            if let Some(child) = slot.as_mut() {
+                // Preserve the handle if killing/reaping fails, allowing retry.
+                if child.try_wait()?.is_none() {
+                    child.start_kill()?;
+                    child.wait().await?;
+                }
             }
+            *slot = None;
         }
 
         self.hook_manager
             .after_stop(self.vm_id(), &vm_config)
             .await?;
-
-        if let Err(err) = self.purge_instance_data() {
-            warn!(
-                vm_id = self.vm_id(),
-                ?err,
-                "Failed to purge runtime data, manual cleanup may be required"
-            );
-        }
-
+        self.stopped = true;
         Ok(())
     }
 
@@ -493,8 +601,12 @@ impl VMInstance {
     ///
     /// This removes the runtime directory and all its contents if it exists.
     pub fn purge_instance_data(&mut self) -> Result<()> {
-        let mut vm_config = self.vm_config.take().unwrap_or_default();
-        self.transformer.teardown(self.vm_id(), &mut vm_config)?;
+        ensure_runtime_unmounted(&self.runtime_dir())?;
+        let mut vm_config = self.vm_config.clone().unwrap_or_default();
+        let release = self.transformer.teardown(self.vm_id(), &mut vm_config);
+        self.vm_config = Some(vm_config);
+        release?;
+        self.vm_config = None;
         let runtime_dir = self.runtime_dir();
         if runtime_dir.exists() {
             fs::remove_dir_all(runtime_dir).wrap_err(eyre!(
@@ -532,14 +644,15 @@ impl VMInstance {
 
         trace!(vm_id = self.vm_id(), "Applying config transforms");
         let mut transformed_config = config;
-        self.transformer
-            .transform(self.vm_id(), &mut transformed_config)
-            .wrap_err(eyre!(
-                "Failed to apply config transforms for VM {}",
-                self.vm_id()
-            ))?;
-
+        let transform = self
+            .transformer
+            .transform(self.vm_id(), &mut transformed_config);
+        // Preserve partial acquisition even when a subsequent transform fails.
         self.vm_config = Some(transformed_config.clone());
+        transform.wrap_err(eyre!(
+            "Failed to apply config transforms for VM {}",
+            self.vm_id()
+        ))?;
 
         trace!(vm_id = self.vm_id(), "Creating VM via CH API");
         self.conn()
@@ -622,5 +735,99 @@ impl VMInstance {
                 })
             })
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_purge_checks_nested_mounts_and_escaped_paths() {
+        let runtime = Path::new("/run/odorobo/vms/a b");
+        assert!(
+            check_runtime_mounts(
+                runtime,
+                "1 0 0:1 / /run/odorobo/vms/a\\040b/rootfs rw - tmpfs tmpfs rw"
+            )
+            .is_err()
+        );
+        assert!(
+            check_runtime_mounts(
+                runtime,
+                "1 0 0:1 / /run/odorobo/vms/a\\040b-other rw - tmpfs tmpfs rw"
+            )
+            .is_ok()
+        );
+        assert!(check_runtime_mounts(runtime, "malformed").is_err());
+        assert_eq!(decode_mount_path("/a\\134b"), Path::new("/a\\b"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn partial_transform_failure_retains_release_inventory_for_retry() {
+        use crate::ch_driver::transform::ConfigTransform;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        struct RecordingTransform(Arc<AtomicUsize>);
+        impl ConfigTransform for RecordingTransform {
+            fn transform(&self, _vmid: &str, config: &mut VmConfig) -> Result<()> {
+                config.disks = Some(vec![models::DiskConfig {
+                    path: Some("/dev/recorded".into()),
+                    id: Some("recording://volume".into()),
+                    ..Default::default()
+                }]);
+                Err(eyre!("later transform failed"))
+            }
+            fn teardown(&self, _vmid: &str, config: &mut VmConfig) -> Result<()> {
+                if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err(eyre!("release failed"));
+                }
+                config.disks = None;
+                Ok(())
+            }
+        }
+        let releases = Arc::new(AtomicUsize::new(0));
+        let mut instance = VMInstance::new(
+            "transform-fixture",
+            PathBuf::from("/unused"),
+            Some(TransformChain::new().add(RecordingTransform(releases.clone()))),
+            None,
+        );
+        assert!(
+            instance
+                .create_config(VmConfig::default(), false)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            instance.vm_config.as_ref().unwrap().disks.as_ref().unwrap()[0]
+                .id
+                .as_deref(),
+            Some("recording://volume")
+        );
+        assert!(instance.purge_instance_data().is_err());
+        assert!(instance.vm_config.as_ref().unwrap().disks.is_some());
+        instance.purge_instance_data().unwrap();
+        assert_eq!(releases.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn child_watcher_leaves_owned_child_for_teardown() {
+        let child = tokio::process::Command::new("sleep")
+            .arg("100")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        let instance = VMInstance::new("fixture", PathBuf::from("/unused"), None, Some(child));
+        let watcher = tokio::spawn(instance.watch_child());
+        instance
+            .stopping
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(watcher.await.unwrap().unwrap().is_none());
+        instance.stop_child_after_failed_start().await;
+        assert!(!Path::new(&format!("/proc/{pid}")).exists());
     }
 }

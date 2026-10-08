@@ -53,7 +53,9 @@ impl ISCSITarget {
             .output()
             .await
             .map_err(|e| eyre!("Failed to execute iscsiadm command: {e}"))?;
-        if !output.status.success() {
+        // open-iscsi exit 21 means no matching session: failed login may
+        // legitimately leave nothing to detach.
+        if !output.status.success() && output.status.code() != Some(21) {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(eyre!("iscsiadm logout failed: {stderr}"));
         }
@@ -134,7 +136,73 @@ impl TryFrom<PathBuf> for ISCSITarget {
     }
 }
 
-pub struct ISCSIStorage;
+fn target_sessions(output: &str, target: &ISCSITarget) -> Vec<u32> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            if fields.get(2)?.split(',').next() != Some(target.host.as_str())
+                || *fields.get(3)? != target.iqn
+            {
+                return None;
+            }
+            fields.get(1)?.trim_matches(['[', ']']).parse().ok()
+        })
+        .collect()
+}
+
+#[cfg(test)]
+fn session_matches(output: &str, target: &ISCSITarget) -> bool {
+    !target_sessions(output, target).is_empty()
+}
+
+static SESSION_OPERATIONS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static SESSION_RESERVATIONS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<(String, String)>>,
+> = std::sync::LazyLock::new(Default::default);
+
+async fn sessions(target: &ISCSITarget) -> Result<Vec<u32>> {
+    let output = Command::new("iscsiadm")
+        .args(["-m", "session"])
+        .output()
+        .await?;
+    if output.status.code() == Some(21) {
+        return Ok(vec![]);
+    }
+    if !output.status.success() {
+        return Err(eyre!("cannot establish iSCSI session ownership"));
+    }
+    Ok(target_sessions(
+        &String::from_utf8_lossy(&output.stdout),
+        target,
+    ))
+}
+
+struct SessionOwnership {
+    target: ISCSITarget,
+    ids: Option<Vec<u32>>,
+}
+
+async fn canonical_target(uri: &Url) -> Result<ISCSITarget> {
+    let mut target = ISCSITarget::from(uri);
+    let port = uri.port().unwrap_or(3260);
+    let addresses = match uri.host().ok_or_else(|| eyre!("missing iSCSI host"))? {
+        url::Host::Ipv4(ip) => vec![std::net::SocketAddr::new(ip.into(), port)],
+        url::Host::Ipv6(ip) => vec![std::net::SocketAddr::new(ip.into(), port)],
+        url::Host::Domain(host) => tokio::net::lookup_host((host, port)).await?.collect(),
+    };
+    let address = addresses
+        .first()
+        .ok_or_else(|| eyre!("iSCSI host resolved no addresses"))?;
+    // Use the same numeric portal for login and session identity queries.
+    target.host = address.to_string();
+    Ok(target)
+}
+
+#[derive(Default)]
+pub struct ISCSIStorage {
+    owned: tokio::sync::Mutex<std::collections::HashMap<String, SessionOwnership>>,
+}
 
 #[async_trait]
 impl StorageDriver for ISCSIStorage {
@@ -142,19 +210,112 @@ impl StorageDriver for ISCSIStorage {
         "iscsi"
     }
     async fn resolve(&self, uri: &Url) -> Result<PathBuf> {
-        let target = ISCSITarget::from(uri);
-        target.attach().await
+        let _operation = SESSION_OPERATIONS.lock().await;
+        let target = canonical_target(uri).await?;
+        let identity = (target.host.clone(), target.iqn.clone());
+        if SESSION_RESERVATIONS.lock().unwrap().contains(&identity)
+            || !sessions(&target).await?.is_empty()
+        {
+            return Err(eyre!(
+                "iSCSI target already has a session; refusing adoption"
+            ));
+        }
+        SESSION_RESERVATIONS.lock().unwrap().insert(identity);
+        self.owned.lock().await.insert(
+            uri.as_str().to_owned(),
+            SessionOwnership {
+                target: target.clone(),
+                ids: None,
+            },
+        );
+        let result = target.attach().await;
+        // Discover sessions even on partial login failure while the global
+        // acquisition/release lock excludes competing VM backend instances.
+        let ids = sessions(&target).await?;
+        self.owned.lock().await.get_mut(uri.as_str()).unwrap().ids = Some(ids);
+        result
     }
-
     async fn release(&self, uri: &Url) -> Result<()> {
-        let target = ISCSITarget::from(uri);
-        target.detach().await
+        let _operation = SESSION_OPERATIONS.lock().await;
+        let mut owned = self.owned.lock().await;
+        let Some(ownership) = owned.get_mut(uri.as_str()) else {
+            return Ok(());
+        };
+        let current = sessions(&ownership.target).await?;
+        // Pending discovery must be reconciled, never mistaken for no owned
+        // session. A failed query preserves this pending token for retry.
+        let ids = ownership.ids.get_or_insert_with(|| current.clone());
+        while let Some(id) = ids.last().copied() {
+            if current.contains(&id) {
+                let output = Command::new("iscsiadm")
+                    .args(["-m", "session", "-r", &id.to_string(), "--logout"])
+                    .output()
+                    .await?;
+                if !output.status.success() && output.status.code() != Some(21) {
+                    return Err(eyre!("owned iSCSI session logout failed"));
+                }
+            }
+            ids.pop();
+        }
+        SESSION_RESERVATIONS
+            .lock()
+            .unwrap()
+            .remove(&(ownership.target.host.clone(), ownership.target.iqn.clone()));
+        owned.remove(uri.as_str());
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn numeric_portals_canonicalize_without_dns() {
+        assert_eq!(
+            canonical_target(&Url::parse("iscsi://127.0.0.1/iqn/0").unwrap())
+                .await
+                .unwrap()
+                .host,
+            "127.0.0.1:3260"
+        );
+        assert_eq!(
+            canonical_target(&Url::parse("iscsi://[::1]/iqn/0").unwrap())
+                .await
+                .unwrap()
+                .host,
+            "[::1]:3260"
+        );
+    }
+
+    #[test]
+    fn session_identity_is_not_a_substring_match() {
+        let target = ISCSITarget {
+            host: "127.0.0.1:3260".into(),
+            iqn: "iqn.fixture".into(),
+            lun: 0,
+        };
+        assert!(!session_matches(
+            "tcp: [1] 127.0.0.1:3260,1 iqn.fixture-extra",
+            &target
+        ));
+        assert!(session_matches(
+            "tcp: [1] 127.0.0.1:3260,1 iqn.fixture",
+            &target
+        ));
+        assert!(!session_matches(
+            "tcp: [1] 127.0.0.11:3260,1 iqn.fixture",
+            &target
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_unowned_login_cleanup_is_a_noop() {
+        ISCSIStorage::default()
+            .release(&Url::parse("iscsi://unreachable.example/iqn.fixture/0").unwrap())
+            .await
+            .unwrap();
+    }
 
     #[test]
     fn test_iscsi_target_parsing_from_path() {
