@@ -5,7 +5,7 @@ use cloud_hypervisor_client::{
 };
 use hyper::{Request, Response, body::Bytes};
 use stable_eyre::{
-    Result,
+    Report, Result,
     eyre::{Context, eyre},
 };
 use std::{
@@ -14,6 +14,10 @@ use std::{
     io::BufWriter,
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use thiserror::Error;
 use tokio::task::JoinHandle;
@@ -24,7 +28,7 @@ use crate::ch_driver::{
     transform::{ConfigTransform, TransformChain},
 };
 
-use super::api::call_request;
+use super::{actor::FailedStartupCleanup, api::call_request};
 
 pub const CONFIG_FILE_NAME: &str = "config.json";
 const SOCKET_FILE_NAME: &str = "ch.sock";
@@ -203,7 +207,10 @@ impl VMInstance {
     /// so it's currently up to the caller to make sure that the receiver is ready before the sender tries to connect.
     /// Future improvement: add some kind of global tracker for active migrations and their states.
     #[tracing::instrument]
-    pub async fn receive_migration(&self) -> Result<(String, JoinHandle<Result<()>>)> {
+    pub async fn receive_migration(
+        &self,
+        succeeded: Arc<AtomicBool>,
+    ) -> Result<(String, JoinHandle<Result<()>>)> {
         let conn = self.conn();
         trace!("Preparing VM for migration");
 
@@ -231,6 +238,9 @@ impl VMInstance {
                 .await
                 .map_err(ChApiError::from)
                 .wrap_err(eyre!("Failed to prepare VM for migration {}", vm_id))?;
+            // Publish success before returning: actor shutdown can race with
+            // the completion notification and must not roll back this guest's CID.
+            succeeded.store(true, Ordering::SeqCst);
             info!(vm_id, "Migration receiver completed successfully");
             // This is the destination VMM: it now owns the running guest and
             // must remain alive after a successful receive.
@@ -422,20 +432,10 @@ impl VMInstance {
                     .await
                     .unwrap_or_else(|_| Err(eyre!("VM creation timed out")));
                     if let Err(error) = create_result {
-                        if let Err(cleanup_error) = instance.cleanup_failed_start().await {
-                            warn!(
-                                vm_id = id,
-                                ?cleanup_error,
-                                "failed to clean up unsuccessful VM startup"
-                            );
-                            if cleanup_error
-                                .downcast_ref::<UnconfirmedProcessExit>()
-                                .is_some()
-                            {
-                                return Err(cleanup_error.wrap_err(error.to_string()));
-                            }
-                        }
-                        return Err(error);
+                        return Err(startup_failure_error(
+                            error,
+                            instance.cleanup_failed_start().await,
+                        ));
                     }
                 }
                 return Ok(instance);
@@ -446,23 +446,13 @@ impl VMInstance {
             }
         }
 
-        if let Err(cleanup_error) = instance.cleanup_failed_start().await {
-            warn!(
-                vm_id = id,
-                ?cleanup_error,
-                "failed to clean up VMM socket timeout"
-            );
-            if cleanup_error
-                .downcast_ref::<UnconfirmedProcessExit>()
-                .is_some()
-            {
-                return Err(cleanup_error);
-            }
-        }
-        Err(eyre!(
-            "CH socket not available after {} attempts for VM {}",
-            MAX_ATTEMPTS,
-            id
+        Err(startup_failure_error(
+            eyre!(
+                "CH socket not available after {} attempts for VM {}",
+                MAX_ATTEMPTS,
+                id
+            ),
+            instance.cleanup_failed_start().await,
         ))
     }
 
@@ -544,22 +534,27 @@ impl VMInstance {
     /// Remove resources only after the owner has confirmed VMM process exit.
     pub async fn cleanup_after_stop(&mut self) -> Result<()> {
         let vm_config = self.vm_config.clone().unwrap_or_default();
-        let hook_result = self.hook_manager.after_stop(self.vm_id(), &vm_config).await;
-        let cleanup_result = self.purge_instance_data();
-        hook_result?;
-        cleanup_result
+        self.hook_manager
+            .after_stop(self.vm_id(), &vm_config)
+            .await?;
+        self.purge_instance_data()
     }
 
     /// Purge the runtime data for this VM instance.
     ///
     /// This removes the runtime directory and all its contents if it exists.
     pub fn purge_instance_data(&mut self) -> Result<()> {
-        let mut vm_config = self.vm_config.take().unwrap_or_default();
-        let runtime_dir = self.runtime_dir();
-        let teardown_result = self.transformer.teardown(self.vm_id(), &mut vm_config);
-        let cleanup_result = remove_runtime_directory(&runtime_dir, self.vm_id());
-        teardown_result?;
-        cleanup_result
+        self.purge_instance_data_at(&self.runtime_dir())
+    }
+
+    fn purge_instance_data_at(&mut self, runtime_dir: &Path) -> Result<()> {
+        // Keep the original config and runtime files until all cleanup succeeds.
+        // A failed teardown may still need its disk IDs/paths on a later retry.
+        let mut vm_config = self.vm_config.clone().unwrap_or_default();
+        self.transformer.teardown(self.vm_id(), &mut vm_config)?;
+        remove_runtime_directory(runtime_dir, self.vm_id())?;
+        self.vm_config = None;
+        Ok(())
     }
 
     /// Load desired VM config from disk.
@@ -679,17 +674,43 @@ impl VMInstance {
     }
 }
 
-fn remove_runtime_directory(runtime_dir: &Path, vmid: &str) -> Result<()> {
-    if runtime_dir.exists() {
-        fs::remove_dir_all(runtime_dir)
-            .wrap_err(eyre!("Failed to remove runtime directory for {vmid}"))?;
+fn startup_failure_error(startup_error: Report, cleanup_result: Result<()>) -> Report {
+    match cleanup_result {
+        Ok(()) => startup_error,
+        Err(cleanup_error) => {
+            // Keep the original report in the chain so an unconfirmed process
+            // exit remains downcastable and callers cannot release its lease.
+            if cleanup_error
+                .downcast_ref::<UnconfirmedProcessExit>()
+                .is_some()
+            {
+                cleanup_error.wrap_err(format!("VM startup failed: {startup_error:#}"))
+            } else {
+                let marker = FailedStartupCleanup(format!(
+                    "startup failed: {startup_error:#}; cleanup failed: {cleanup_error:#}"
+                ));
+                cleanup_error.wrap_err(marker)
+            }
+        }
     }
-    Ok(())
+}
+
+fn remove_runtime_directory(runtime_dir: &Path, vmid: &str) -> Result<()> {
+    // Avoid exists(): metadata access errors must not turn failed credential
+    // cleanup into success. Only an already-absent directory is harmless.
+    match fs::remove_dir_all(runtime_dir) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).wrap_err(eyre!("Failed to remove runtime directory for {vmid}")),
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{VMInstance, remove_runtime_directory};
+    use super::{
+        FailedStartupCleanup, UnconfirmedProcessExit, VMInstance, remove_runtime_directory,
+        startup_failure_error,
+    };
     use crate::ch_driver::cloud_init::create_seed_image;
     use crate::ch_driver::transform::{ConfigTransform, TransformChain};
     use crate::manifest::CloudInit;
@@ -698,7 +719,10 @@ mod tests {
         Arc,
         atomic::{AtomicBool, Ordering},
     };
-    use tokio::net::UnixListener;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::UnixListener,
+    };
     use ulid::Ulid;
 
     struct RecordTeardown(Arc<AtomicBool>);
@@ -711,6 +735,163 @@ mod tests {
         fn teardown(&self, _vmid: &str, _config: &mut VmConfig) -> stable_eyre::Result<()> {
             self.0.store(true, Ordering::SeqCst);
             Ok(())
+        }
+    }
+
+    struct FailTeardownOnce(Arc<AtomicBool>);
+
+    impl ConfigTransform for FailTeardownOnce {
+        fn transform(&self, _vmid: &str, _config: &mut VmConfig) -> stable_eyre::Result<()> {
+            Ok(())
+        }
+
+        fn teardown(&self, _vmid: &str, config: &mut VmConfig) -> stable_eyre::Result<()> {
+            if self.0.swap(false, Ordering::SeqCst) {
+                config.disks = None;
+                return Err(stable_eyre::eyre::eyre!(
+                    "injected transform cleanup failure"
+                ));
+            }
+            assert!(
+                config.disks.is_some(),
+                "retry must retain disk cleanup metadata"
+            );
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn startup_and_runtime_cleanup_failure_preserves_error_marker_and_config() {
+        let runtime_path =
+            std::env::temp_dir().join(format!("odorobo-cleanup-failure-{}", Ulid::generate()));
+        // A file in place of the runtime directory reliably makes remove_dir_all
+        // fail without relying on permissions (tests may run as root).
+        std::fs::write(&runtime_path, "cloud-init credentials").unwrap();
+        let mut instance = VMInstance::new(
+            &Ulid::generate().to_string(),
+            runtime_path.join("ch.sock"),
+            Some(TransformChain::new()),
+            None,
+        );
+        instance.vm_config = Some(VmConfig::default());
+        let cleanup_result = instance.purge_instance_data_at(&runtime_path);
+        let error = startup_failure_error(
+            stable_eyre::eyre::eyre!("VM creation timed out"),
+            cleanup_result,
+        );
+        assert!(error.downcast_ref::<FailedStartupCleanup>().is_some());
+        assert!(error.downcast_ref::<std::io::Error>().is_some());
+        let details = format!("{error:#}");
+        assert!(details.contains("VM creation timed out"));
+        assert!(details.contains("Failed to remove runtime directory"));
+        assert!(instance.vm_config.is_some());
+        assert!(runtime_path.exists());
+
+        std::fs::remove_file(&runtime_path).unwrap();
+        instance.purge_instance_data_at(&runtime_path).unwrap();
+        assert!(instance.vm_config.is_none());
+    }
+
+    #[test]
+    fn transform_cleanup_failure_retains_runtime_files_and_config_for_retry() {
+        let runtime_dir =
+            std::env::temp_dir().join(format!("odorobo-teardown-retry-{}", Ulid::generate()));
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        let config_path = runtime_dir.join(super::CONFIG_FILE_NAME);
+        std::fs::write(&config_path, "retained cleanup metadata").unwrap();
+        let transformer =
+            TransformChain::new().add(FailTeardownOnce(Arc::new(AtomicBool::new(true))));
+        let mut instance = VMInstance::new(
+            &Ulid::generate().to_string(),
+            runtime_dir.join("ch.sock"),
+            Some(transformer),
+            None,
+        );
+        instance.vm_config = Some(VmConfig {
+            disks: Some(vec![cloud_hypervisor_client::models::DiskConfig {
+                id: Some("file:///retained-disk".to_owned()),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        });
+        let error = startup_failure_error(
+            stable_eyre::eyre::eyre!("failed to create VM"),
+            instance.purge_instance_data_at(&runtime_dir),
+        );
+        assert!(error.downcast_ref::<FailedStartupCleanup>().is_some());
+        assert!(format!("{error:#}").contains("injected transform cleanup failure"));
+        assert!(instance.vm_config.as_ref().unwrap().disks.is_some());
+        assert!(config_path.exists());
+
+        instance.purge_instance_data_at(&runtime_dir).unwrap();
+        assert!(instance.vm_config.is_none());
+        assert!(!runtime_dir.exists());
+    }
+
+    #[test]
+    fn startup_cleanup_keeps_unconfirmed_process_exit_downcastable() {
+        let error = startup_failure_error(
+            stable_eyre::eyre::eyre!("CH socket not available"),
+            Err(stable_eyre::Report::new(UnconfirmedProcessExit(
+                std::io::Error::other("injected wait failure"),
+            ))),
+        );
+        assert!(error.downcast_ref::<UnconfirmedProcessExit>().is_some());
+        assert!(error.downcast_ref::<FailedStartupCleanup>().is_none());
+        let details = format!("{error:#}");
+        assert!(details.contains("CH socket not available"));
+        assert!(details.contains("injected wait failure"));
+    }
+
+    #[test]
+    fn successful_startup_cleanup_returns_original_startup_error() {
+        let error = startup_failure_error(
+            stable_eyre::Report::new(std::io::Error::other("injected startup failure")),
+            Ok(()),
+        );
+        assert!(error.downcast_ref::<std::io::Error>().is_some());
+        assert!(error.downcast_ref::<FailedStartupCleanup>().is_none());
+    }
+
+    #[tokio::test]
+    async fn migration_receive_publishes_success_only_after_successful_api_response() {
+        for success in [true, false] {
+            let directory =
+                std::env::temp_dir().join(format!("odorobo-migration-result-{}", Ulid::generate()));
+            std::fs::create_dir_all(&directory).unwrap();
+            let socket = directory.join("ch.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let succeeded = Arc::new(AtomicBool::new(false));
+            let server = tokio::spawn(async move {
+                let (mut connection, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                let read = connection.read(&mut request).await.unwrap();
+                assert!(read > 0);
+                let response = if success {
+                    "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                } else {
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                };
+                connection.write_all(response.as_bytes()).await.unwrap();
+            });
+            let instance = VMInstance::new(
+                &Ulid::generate().to_string(),
+                socket,
+                Some(TransformChain::new()),
+                None,
+            );
+            let (_, task) = instance
+                .receive_migration(Arc::clone(&succeeded))
+                .await
+                .unwrap();
+            let result = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(result.is_ok(), success);
+            assert_eq!(succeeded.load(Ordering::SeqCst), success);
+            server.await.unwrap();
+            std::fs::remove_dir_all(directory).unwrap();
         }
     }
 

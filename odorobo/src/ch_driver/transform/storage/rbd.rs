@@ -1,4 +1,4 @@
-use super::StorageDriver;
+use super::{StorageAcquisition, StorageDriver, iscsi::command};
 use async_trait::async_trait;
 use stable_eyre::{Result, eyre::eyre};
 use std::path::PathBuf;
@@ -31,13 +31,15 @@ fn rbd_extra_args() -> Vec<String> {
 #[tracing::instrument]
 async fn rbd_map_list() -> Result<Vec<(String, String)>> {
     // returns a list of (rbd_path, device_path) for all currently mapped rbd devices
-    let output = Command::new("rbd")
-        .args(rbd_extra_args())
-        .arg("device")
-        .arg("list")
-        .output()
-        .await
-        .map_err(|e| eyre!("Failed to execute rbd command: {e}"))?;
+    let output = command::run(
+        Command::new("rbd")
+            .args(rbd_extra_args())
+            .arg("device")
+            .arg("list"),
+        "rbd device list",
+    )
+    .await
+    .map_err(command::CommandFailure::into_report)?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(eyre!("rbd command failed: {stderr}"));
@@ -69,10 +71,25 @@ fn rbd_lines_list(input: &str) -> Result<Vec<(String, String)>> {
         // id  pool               namespace  image    snap  device
         // 0   pool               foo        testimg    -   /dev/rbd0
         if let Some(device) = parts.next() {
-            mappings.push((format!("{pool}/{next}"), device.to_owned()));
+            let image_path = if field == "-" {
+                format!("{pool}/{next}")
+            } else {
+                format!("{pool}/{field}/{next}")
+            };
+            let image_path = if fifth == "-" {
+                image_path
+            } else {
+                format!("{image_path}@{fifth}")
+            };
+            mappings.push((image_path, device.to_owned()));
         } else if fifth.starts_with("/dev/") {
             // If namespace is empty, it may be omitted from the output.
-            mappings.push((format!("{pool}/{field}"), fifth.to_owned()));
+            let image_path = if next == "-" {
+                format!("{pool}/{field}")
+            } else {
+                format!("{pool}/{field}@{next}")
+            };
+            mappings.push((image_path, fifth.to_owned()));
         }
     }
 
@@ -96,53 +113,81 @@ impl RbdImage {
         PathBuf::from(format!("/dev/rbd/{}/{}", self.pool, self.image))
     }
 
-    /// Maps the RBD image to a kernel block device. If already mapped, this is a no-op.
+    /// Maps the RBD image, borrowing existing mappings rather than owning them.
     #[tracing::instrument(skip(self))]
-    pub async fn map(&self) -> Result<()> {
+    pub async fn map(&self) -> Result<StorageAcquisition> {
         let rbd_path = self.rbd_path();
         let mappings = rbd_map_list().await?;
 
         if mappings.iter().any(|(path, _)| path == &rbd_path) {
             info!(?rbd_path, "RBD image already mapped, reusing");
-            return Ok(());
+            return Ok(StorageAcquisition::borrowed());
         }
 
         info!(?rbd_path, "Mapping RBD image to device");
-        let output = Command::new("rbd")
-            .args(rbd_extra_args())
-            .arg("device")
-            .arg("map")
-            .arg("--options")
-            .arg("noudev")
-            .arg(&rbd_path)
-            .output()
-            .await
-            .map_err(|e| eyre!("Failed to execute rbd command: {e}"))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(eyre!("rbd map failed: {stderr}"));
+        let output = match command::run(
+            Command::new("rbd")
+                .args(rbd_extra_args())
+                .arg("device")
+                .arg("map")
+                .arg("--options")
+                .arg("noudev")
+                .arg(&rbd_path),
+            "rbd device map",
+        )
+        .await
+        {
+            Ok(output) => output,
+            Err(error) => return error.into_acquisition(),
+        };
+        if output.status.success() {
+            return Ok(StorageAcquisition::owned());
         }
-        Ok(())
+        let error = eyre!(
+            "rbd map failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // Absence before the command does not attribute a later mapping to us:
+        // another process may have mapped it while our command failed.
+        let exists = rbd_map_list()
+            .await
+            .map(|mappings| mappings.iter().any(|(path, _)| path == &rbd_path));
+        StorageAcquisition::after_failed_command(error, exists)
     }
 
     /// Unmaps the RBD image from the kernel block device.
     #[tracing::instrument(skip(self))]
     pub async fn unmap(&self) -> Result<()> {
         let rbd_path = self.rbd_path();
+        if !rbd_map_list()
+            .await?
+            .iter()
+            .any(|(path, _)| path == &rbd_path)
+        {
+            return Ok(());
+        }
         info!(?rbd_path, "Unmapping RBD image");
-        let output = Command::new("rbd")
-            .args(rbd_extra_args())
-            .arg("device")
-            .arg("unmap")
-            .arg("--options")
-            .arg("noudev")
-            .arg(&rbd_path)
-            .output()
-            .await
-            .map_err(|e| eyre!("Failed to execute rbd command: {e}"))?;
+        let output = command::run(
+            Command::new("rbd")
+                .args(rbd_extra_args())
+                .arg("device")
+                .arg("unmap")
+                .arg("--options")
+                .arg("noudev")
+                .arg(&rbd_path),
+            "rbd device unmap",
+        )
+        .await
+        .map_err(command::CommandFailure::into_release_report)?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(eyre!("rbd unmap failed: {stderr}"));
+            if rbd_map_list()
+                .await?
+                .iter()
+                .any(|(path, _)| path == &rbd_path)
+            {
+                return Err(eyre!("rbd unmap failed: {stderr}"));
+            }
         }
         Ok(())
     }
@@ -173,9 +218,16 @@ impl StorageDriver for RbdStorage {
         "rbd"
     }
 
+    fn resource_key(&self, uri: &Url) -> Result<String> {
+        Ok(format!("rbd://{}", RbdImage::try_from(uri)?.rbd_path()))
+    }
+
+    async fn acquire(&self, uri: &Url) -> Result<StorageAcquisition> {
+        RbdImage::try_from(uri)?.map().await
+    }
+
     async fn resolve(&self, uri: &Url) -> Result<PathBuf> {
         let image = RbdImage::try_from(uri)?;
-        image.map().await?;
         // map() uses `--options noudev`: with udev enabled, the rbd CLI waits
         // for a udev event in its own network namespace, but rbd devices are
         // created in the host's namespace, so that wait never completes in a
@@ -225,6 +277,27 @@ mod tests {
         assert_eq!(
             image.device_path(),
             std::path::PathBuf::from("/dev/rbd/my-pool/my-image")
+        );
+    }
+
+    #[test]
+    fn mapping_identity_includes_namespace_and_snapshot() {
+        let mappings = rbd_lines_list(
+            "id pool namespace image snap device\n\
+            0 pool - image - /dev/rbd0\n\
+            1 pool ns image - /dev/rbd1\n\
+            2 pool ns image snap /dev/rbd2\n\
+            3 pool image snap /dev/rbd3",
+        )
+        .unwrap();
+        assert_eq!(
+            mappings,
+            [
+                ("pool/image".to_owned(), "/dev/rbd0".to_owned()),
+                ("pool/ns/image".to_owned(), "/dev/rbd1".to_owned()),
+                ("pool/ns/image@snap".to_owned(), "/dev/rbd2".to_owned()),
+                ("pool/image@snap".to_owned(), "/dev/rbd3".to_owned()),
+            ]
         );
     }
 

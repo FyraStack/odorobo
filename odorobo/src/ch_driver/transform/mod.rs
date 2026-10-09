@@ -1,5 +1,5 @@
 use cloud_hypervisor_client::models::VmConfig;
-use stable_eyre::Result;
+use stable_eyre::{Result, eyre::eyre};
 
 pub trait ConfigTransform: Send + Sync {
     fn transform(&self, vmid: &str, config: &mut VmConfig) -> Result<()>;
@@ -48,10 +48,20 @@ impl ConfigTransform for TransformChain {
 
     fn teardown(&self, vmid: &str, config: &mut VmConfig) -> Result<()> {
         trace!("Teardown transform chain with {} transforms", self.0.len());
+        let mut errors = Vec::new();
         for t in self.0.iter().rev() {
-            t.teardown(vmid, config)?;
+            if let Err(error) = t.teardown(vmid, config) {
+                errors.push(format!("{error:#}"));
+            }
         }
-        Ok(())
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(eyre!(
+                "Failed to tear down transforms: {}",
+                errors.join("; ")
+            ))
+        }
     }
 }
 
@@ -62,5 +72,48 @@ impl Default for TransformChain {
             .add(ConsoleTransform)
             .add(NetworkTransform)
             .add(PathVerify)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    struct FailingTeardown {
+        calls: Arc<Mutex<Vec<usize>>>,
+        index: usize,
+    }
+
+    impl ConfigTransform for FailingTeardown {
+        fn transform(&self, _vmid: &str, _config: &mut VmConfig) -> Result<()> {
+            Ok(())
+        }
+
+        fn teardown(&self, _vmid: &str, _config: &mut VmConfig) -> Result<()> {
+            self.calls
+                .lock()
+                .map_err(|error| eyre!("{error}"))?
+                .push(self.index);
+            Err(eyre!("failure {}", self.index))
+        }
+    }
+
+    #[test]
+    fn teardown_continues_in_reverse_order_and_reports_all_errors() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let chain = TransformChain::new()
+            .add(FailingTeardown {
+                calls: Arc::clone(&calls),
+                index: 0,
+            })
+            .add(FailingTeardown {
+                calls: Arc::clone(&calls),
+                index: 1,
+            });
+        let error = chain.teardown("vm", &mut VmConfig::default()).unwrap_err();
+        assert_eq!(*calls.lock().unwrap(), [1, 0]);
+        assert!(error.to_string().contains("failure 0"));
+        assert!(error.to_string().contains("failure 1"));
     }
 }
