@@ -7,7 +7,9 @@ an RBD image onto each compute node.
 
 The initial storage contract supports local files and kernel-mapped Ceph RBD
 images. iSCSI remains available through the existing transform, but is outside
-the Ceph lifecycle contract described here. A manifest attachment has a stable
+the Ceph lifecycle contract described here. This defines behavior for new
+manifest attachments; it does not migrate existing Odorobo deployments or
+rewrite existing local images. A manifest attachment has a stable
 attachment ID, one source (`uri` or `volume_id`), and an optional `read_only`
 flag. `volume_id` resolution is not yet defined; use a supported URI.
 
@@ -40,7 +42,8 @@ Specify an existing RBD image as `rbd://<pool>/<image>`:
 
 The pool and image are part of the VM attachment URI, not a local cache path.
 For the initial contract, pool and image names use ASCII letters, digits, `.`,
-`_`, or `-`; names cannot be empty or start with `-`. The URI must have exactly
+`_`, or `-`; names cannot be empty or start with `-`. Pool names must be
+lowercase because URI parsing normalizes the authority's case. The URI must have exactly
 one image path segment. Credentials, ports, query parameters, fragments,
 namespaces, and snapshot selectors are not accepted. In particular,
 `rbd://pool/ns/image` and `rbd://pool/image@snapshot` are not supported by this

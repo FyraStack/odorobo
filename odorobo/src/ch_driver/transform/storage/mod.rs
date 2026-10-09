@@ -587,6 +587,25 @@ impl Default for StorageDriverTransformer {
     }
 }
 
+fn parse_storage_uri(path: &str) -> Result<Option<Url>> {
+    if path.starts_with("rbd://") {
+        // Preserve the raw syntax check so URL normalization cannot turn a
+        // nested/dot-segment path into a different, apparently valid image.
+        rbd::RbdImage::parse_uri(path)?;
+    }
+    match Url::parse(path) {
+        Ok(uri) => Ok(Some(uri)),
+        Err(error)
+            if ["file://", "rbd://", "iscsi://"]
+                .iter()
+                .any(|prefix| path.starts_with(prefix)) =>
+        {
+            Err(eyre!("Invalid supported storage URI: {error}"))
+        }
+        Err(_) => Ok(None),
+    }
+}
+
 impl ConfigTransform for StorageDriverTransformer {
     fn teardown(&self, vmid: &str, _config: &mut VmConfig) -> Result<()> {
         tokio::task::block_in_place(|| {
@@ -603,7 +622,7 @@ impl ConfigTransform for StorageDriverTransformer {
             let Some(path) = disk.path.as_deref() else {
                 continue;
             };
-            let Ok(uri) = Url::parse(path) else {
+            let Some(uri) = parse_storage_uri(path)? else {
                 continue;
             };
             let Some(backend) = self.find_backend(&uri) else {
@@ -831,6 +850,39 @@ mod tests {
         transform
             .resolve_disk(vmid, &uri, transform.find_backend(&uri).unwrap())
             .await
+    }
+
+    #[test]
+    fn malformed_supported_storage_uri_syntax_is_not_passed_through() {
+        for path in ["rbd://[", "file://[", "rbd://pool/../other-image"] {
+            assert!(parse_storage_uri(path).is_err(), "accepted {path}");
+        }
+        assert!(
+            parse_storage_uri("/var/lib/odorobo/disk.raw")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            parse_storage_uri("custom://storage/disk")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            parse_storage_uri("rbd://UPPER/image")
+                .unwrap_err()
+                .to_string()
+                .contains("must be lowercase")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn malformed_rbd_uri_is_rejected_before_cloud_hypervisor() {
+        let transformer = StorageDriverTransformer::default();
+        let mut config = config(&["rbd://"]);
+        let error = transformer
+            .transform("malformed-rbd", &mut config)
+            .expect_err("an invalid RBD source must not reach Cloud Hypervisor");
+        assert!(error.to_string().contains("RBD URI"));
     }
 
     fn config(paths: &[&str]) -> VmConfig {
