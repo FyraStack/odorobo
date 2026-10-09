@@ -28,6 +28,8 @@ use super::api::call_request;
 
 pub const CONFIG_FILE_NAME: &str = "config.json";
 const SOCKET_FILE_NAME: &str = "ch.sock";
+const CONSOLE_SOCKET_FILE_NAME: &str = "console.sock";
+const SOCKET_LOCK_FILE_NAME: &str = "ch.sock.lock";
 pub const VMS_DIR_NAME: &str = "vms";
 pub type ConsoleStream = std::fs::File;
 
@@ -346,6 +348,29 @@ impl VMInstance {
             .is_ok()
     }
 
+    fn purge_stale_runtime_sockets(runtime_dir: &Path) -> Result<()> {
+        for name in [
+            SOCKET_FILE_NAME,
+            CONSOLE_SOCKET_FILE_NAME,
+            SOCKET_LOCK_FILE_NAME,
+        ] {
+            let path = runtime_dir.join(name);
+            match fs::remove_file(&path) {
+                Ok(()) => debug!(?path, "Removed stale VM runtime socket"),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).wrap_err_with(|| {
+                        eyre!(
+                            "Failed to remove stale VM runtime artifact {}",
+                            path.display()
+                        )
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn stop_child_after_failed_start(&mut self) {
         if let Some(mut child) = self.child_process.take() {
             _ = child.start_kill();
@@ -407,10 +432,13 @@ impl VMInstance {
             info!(vm_id = id, "Attaching to existing Cloud Hypervisor VMM");
             return Ok(Self::new(id, ch_socket_path, transformer, None));
         }
-        // make sure socket path parent exists
-        if !ch_socket_path.parent().unwrap().exists() {
-            std::fs::create_dir_all(ch_socket_path.parent().unwrap())?;
-        }
+        // Ensure the runtime directory exists, then remove socket files left by
+        // a VMM that died without running its normal cleanup path. In particular,
+        // Cloud Hypervisor does not remove a stale console socket before binding it.
+        let runtime_dir = ch_socket_path.parent().unwrap();
+        fs::create_dir_all(runtime_dir)?;
+        Self::purge_stale_runtime_sockets(runtime_dir)?;
+
         let ch_process = tokio::process::Command::new("cloud-hypervisor")
             .arg("--api-socket")
             .arg(&ch_socket_path)
@@ -647,5 +675,42 @@ impl VMInstance {
                 })
             })
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CONFIG_FILE_NAME, CONSOLE_SOCKET_FILE_NAME, SOCKET_FILE_NAME, SOCKET_LOCK_FILE_NAME,
+        VMInstance,
+    };
+    use std::fs;
+
+    #[test]
+    fn stale_socket_cleanup_preserves_vm_config() {
+        let runtime_dir =
+            std::env::temp_dir().join(format!("odorobo-stale-sockets-{}", ulid::Ulid::generate()));
+        fs::create_dir_all(&runtime_dir).expect("create temp runtime dir");
+        for name in [
+            SOCKET_FILE_NAME,
+            CONSOLE_SOCKET_FILE_NAME,
+            SOCKET_LOCK_FILE_NAME,
+        ] {
+            fs::write(runtime_dir.join(name), b"stale").expect("create stale socket placeholder");
+        }
+        let config_path = runtime_dir.join(CONFIG_FILE_NAME);
+        fs::write(&config_path, b"{}").expect("create VM config");
+
+        VMInstance::purge_stale_runtime_sockets(&runtime_dir).expect("purge stale sockets");
+
+        for name in [
+            SOCKET_FILE_NAME,
+            CONSOLE_SOCKET_FILE_NAME,
+            SOCKET_LOCK_FILE_NAME,
+        ] {
+            assert!(!runtime_dir.join(name).exists(), "{name} should be removed");
+        }
+        assert!(config_path.exists(), "VM config should be preserved");
+        fs::remove_dir_all(runtime_dir).expect("remove temp runtime dir");
     }
 }

@@ -12,6 +12,7 @@ use crate::ch_driver::actor::VMActor;
 use crate::messages::agent::{AgentStatusUpdate, GetAgentStatus, apply_status_update};
 use crate::messages::vm::{CreateVM, GetVMHeartbeat, GetVMInfo};
 use crate::utils::actor_names::{AGENT, VM};
+use odorobo::cluster_state::{ClusterStateStore, PLACEMENT_PREFIX, PlacementRecord, key};
 
 use super::{
     AgentActorDiscovered, AgentUpdated, AgentUpdaterStopped, CachedActorKind, CachedAgentActor,
@@ -510,9 +511,31 @@ impl Message<ReconcileVmPlacements> for SchedulerActor {
             .collect();
 
         for (vmid, config) in unplaced_vms {
-            let request = crate::messages::vm::CreateVM { vmid, config };
+            let request = crate::messages::vm::CreateVM {
+                vmid,
+                config: config.clone(),
+            };
             match self.schedule_agent(&request) {
                 Ok(agent) => {
+                    let agent_id = agent.id();
+                    let Some(node) = self
+                        .agent_data_cache
+                        .get(&agent_id)
+                        .map(|cached| cached.data.hostname.clone())
+                    else {
+                        warn!(%vmid, ?agent_id, "selected agent has no cached hostname; cannot persist placement");
+                        continue;
+                    };
+                    let placement = PlacementRecord { vmid, node };
+                    if let Err(error) = self
+                        .state_store
+                        .put(&key(PLACEMENT_PREFIX, &vmid), &placement)
+                        .await
+                    {
+                        warn!(?error, %vmid, "unable to persist reconciled VM placement");
+                        continue;
+                    }
+                    self.durable_placements.insert(vmid, placement);
                     self.vm_placements
                         .entry(vmid)
                         .or_default()

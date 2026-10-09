@@ -33,6 +33,10 @@ use ulid::Ulid;
 
 use kameo::error::PanicError;
 
+const VM_ACTOR_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(5);
+// Leave time for the scheduler's 30-second outer delete request to receive this failure.
+const VM_ACTOR_DELETE_TIMEOUT: Duration = Duration::from_secs(25);
+
 pub struct VMCacheData {
     actor_ref: ActorRef<VMActor>,
     config: VmManifest,
@@ -125,6 +129,26 @@ impl AgentActor {
             .ok()
             .flatten()
     }
+
+    /// Registering with Kademlia can wait indefinitely when no peers are
+    /// available. Keep it outside the agent's serial message handler so local
+    /// VM creation and status polling continue in single-node deployments.
+    fn register_vm_actor(actor_ref: ActorRef<VMActor>, vmid: Ulid) {
+        tokio::spawn(async move {
+            for name in [vm_actor_id(vmid), VM.to_owned()] {
+                match tokio::time::timeout(
+                    VM_ACTOR_REGISTRATION_TIMEOUT,
+                    actor_ref.register(name.clone()),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => warn!(?error, %vmid, %name, "Unable to register VM actor"),
+                    Err(_) => warn!(%vmid, %name, "Timed out registering VM actor"),
+                }
+            }
+        });
+    }
 }
 
 #[allow(clippy::unused_async_trait_impl)]
@@ -179,16 +203,7 @@ impl Actor for AgentActor {
                 warn!(%error, %vmid, "Unable to start recovered VM actor");
                 continue;
             }
-            if let Err(error) = actor.register(vm_actor_id(vmid)).await {
-                error!(?error, %vmid, "Unable to register recovered VM actor");
-                actor.kill();
-                continue;
-            }
-            if let Err(error) = actor.register(VM).await {
-                error!(?error, %vmid, "Unable to register recovered VM actor group");
-                actor.kill();
-                continue;
-            }
+            Self::register_vm_actor(actor.clone(), vmid);
             vms.insert(
                 vmid,
                 VMCacheData {
@@ -328,22 +343,7 @@ impl Message<CreateVM> for AgentActor {
             };
         }
 
-        if let Err(error) = actor_ref.register(vm_actor_id(vmid)).await {
-            error!(?error, %vmid, "Unable to register VM actor");
-            actor_ref.kill();
-            return CreateVMReply {
-                config: None,
-                actor_id: None,
-            };
-        }
-        if let Err(error) = actor_ref.register(VM).await {
-            error!(?error, %vmid, "Unable to register VM actor group");
-            actor_ref.kill();
-            return CreateVMReply {
-                config: None,
-                actor_id: None,
-            };
-        }
+        Self::register_vm_actor(actor_ref.clone(), vmid);
         self.insert_vm(
             vmid,
             VMCacheData {
@@ -374,8 +374,7 @@ impl Message<MigrateVMReceive> for AgentActor {
         let vmid = msg.vmid;
         let actor_ref = VMActor::spawn_link(ctx.actor_ref(), (vmid, None)).await;
 
-        _ = actor_ref.register(vm_actor_id(vmid)).await;
-        _ = actor_ref.register(VM).await;
+        Self::register_vm_actor(actor_ref.clone(), vmid);
         self.insert_vm(
             vmid,
             VMCacheData {
@@ -419,20 +418,30 @@ impl Message<DeleteVM> for AgentActor {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         match self.vms.get(&msg.vmid).map(|vm| vm.actor_ref.clone()) {
-            Some(actor_ref) => match actor_ref.ask(msg.clone()).await {
-                Ok(reply) => {
-                    if reply.error.is_none() {
-                        self.remove_vm(msg.vmid);
+            Some(actor_ref) => {
+                match tokio::time::timeout(VM_ACTOR_DELETE_TIMEOUT, actor_ref.ask(msg.clone()))
+                    .await
+                {
+                    Ok(Ok(reply)) => {
+                        if reply.error.is_none() {
+                            self.remove_vm(msg.vmid);
+                        }
+                        return reply;
                     }
-                    return reply;
+                    Ok(Err(error)) => {
+                        warn!(vm_id = %msg.vmid, ?error, "failed to delete VM actor");
+                        return DeleteVMReply {
+                            error: Some(error.to_string()),
+                        };
+                    }
+                    Err(_) => {
+                        warn!(vm_id = %msg.vmid, "timed out waiting for VM actor delete");
+                        return DeleteVMReply {
+                            error: Some("timed out waiting for VM actor delete".to_owned()),
+                        };
+                    }
                 }
-                Err(error) => {
-                    warn!(vm_id = %msg.vmid, ?error, "failed to delete VM actor");
-                    return DeleteVMReply {
-                        error: Some(error.to_string()),
-                    };
-                }
-            },
+            }
             None => {
                 warn!(vm_id = %msg.vmid, "VM actor not found for delete");
             }
