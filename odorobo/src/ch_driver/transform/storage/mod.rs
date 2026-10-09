@@ -587,6 +587,50 @@ impl Default for StorageDriverTransformer {
     }
 }
 
+fn raw_uri_scheme(path: &str) -> Option<String> {
+    // The URL parser ignores these characters in parts of its input and trims
+    // leading/trailing C0 controls and spaces. Mirror only that preprocessing
+    // to recognize malformed supported URIs; validation still uses `path` as-is.
+    let without_ignored_controls = path
+        .chars()
+        .filter(|character| !matches!(character, '\t' | '\n' | '\r'))
+        .collect::<String>();
+    let normalized = without_ignored_controls.trim_matches(|character: char| character <= '\u{20}');
+    let (scheme, _) = normalized.split_once(':')?;
+    let mut characters = scheme.chars();
+    if !characters.next()?.is_ascii_alphabetic()
+        || !characters.all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.')
+        })
+    {
+        return None;
+    }
+    Some(scheme.to_ascii_lowercase())
+}
+
+fn parse_storage_uri(path: &str) -> Result<Option<Url>> {
+    match Url::parse(path) {
+        Ok(uri) => {
+            // Check every URL the parser classifies as RBD against the original
+            // input. This rejects casing and parser cleanup/normalization rather
+            // than silently mapping a repaired URI.
+            if uri.scheme() == "rbd" {
+                rbd::RbdImage::parse_uri(path)?;
+            }
+            Ok(Some(uri))
+        }
+        Err(error)
+            if raw_uri_scheme(path).as_deref() == Some("rbd")
+                || ["file://", "iscsi://"]
+                    .iter()
+                    .any(|prefix| path.starts_with(prefix)) =>
+        {
+            Err(eyre!("Invalid supported storage URI: {error}"))
+        }
+        Err(_) => Ok(None),
+    }
+}
+
 impl ConfigTransform for StorageDriverTransformer {
     fn teardown(&self, vmid: &str, _config: &mut VmConfig) -> Result<()> {
         tokio::task::block_in_place(|| {
@@ -603,7 +647,7 @@ impl ConfigTransform for StorageDriverTransformer {
             let Some(path) = disk.path.as_deref() else {
                 continue;
             };
-            let Ok(uri) = Url::parse(path) else {
+            let Some(uri) = parse_storage_uri(path)? else {
                 continue;
             };
             let Some(backend) = self.find_backend(&uri) else {
@@ -831,6 +875,119 @@ mod tests {
         transform
             .resolve_disk(vmid, &uri, transform.find_backend(&uri).unwrap())
             .await
+    }
+
+    #[test]
+    fn malformed_supported_storage_uri_syntax_is_not_passed_through() {
+        for path in [
+            "rbd://[",
+            "RBD://[",
+            "file://[",
+            "rbd://pool/../other-image",
+            "rbd://pool/a/../image",
+            "rbd://pool/a/%2e%2e/image",
+            "RBD://pool/image",
+            "rBd://pool/image",
+            " rbd://pool/image",
+            "\trbd://pool/image",
+            "rbd://pool/\nimage",
+            "\u{1}rbd://pool/image",
+        ] {
+            assert!(parse_storage_uri(path).is_err(), "accepted {path:?}");
+        }
+        assert!(
+            parse_storage_uri("/var/lib/odorobo/disk.raw")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            parse_storage_uri("custom://storage/disk")
+                .unwrap()
+                .is_some()
+        );
+        assert!(parse_storage_uri("rbd://pool/image").unwrap().is_some());
+        assert!(
+            parse_storage_uri("rbd://UPPER/image")
+                .unwrap_err()
+                .to_string()
+                .contains("must be lowercase")
+        );
+    }
+
+    struct RbdMockStorage(Arc<StdMutex<MockState>>);
+
+    #[async_trait]
+    impl StorageDriver for RbdMockStorage {
+        fn scheme(&self) -> &'static str {
+            "rbd"
+        }
+
+        async fn acquire(&self, uri: &Url) -> Result<StorageAcquisition> {
+            self.0.lock().unwrap().acquisitions.push(uri.to_string());
+            Ok(StorageAcquisition::owned())
+        }
+
+        async fn resolve(&self, _uri: &Url) -> Result<PathBuf> {
+            Ok(PathBuf::from("/dev/fake-rbd"))
+        }
+
+        async fn release(&self, uri: &Url) -> Result<()> {
+            self.0.lock().unwrap().releases.push(uri.to_string());
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn malformed_rbd_uris_are_rejected_before_backend_or_lease_changes() {
+        let state = Arc::new(StdMutex::new(MockState::default()));
+        let mut transformer =
+            StorageDriverTransformer::new().with_backend(RbdMockStorage(Arc::clone(&state)));
+        transformer.registry = Arc::clone(&state.lock().unwrap().registry);
+
+        for (index, path) in [
+            "RBD://pool/image",
+            "rBd://pool/image",
+            " rbd://pool/image",
+            "\trbd://pool/image",
+            "rbd://pool/\nimage",
+            "\u{1}rbd://pool/image",
+            "rbd://pool/a/../image",
+            "rbd://pool/a/%2e%2e/image",
+            "RBD://[",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let vmid = format!("malformed-rbd-{index}");
+            let mut vm_config = config(&[path]);
+            let error = transformer
+                .transform(&vmid, &mut vm_config)
+                .expect_err("an invalid RBD source must fail closed");
+            assert!(error.to_string().contains("RBD") || error.to_string().contains("URI"));
+            assert_eq!(
+                vm_config.disks.as_ref().unwrap()[0].path.as_deref(),
+                Some(path)
+            );
+            assert_eq!(
+                vm_config.disks.as_ref().unwrap()[0].id.as_deref(),
+                Some("disk")
+            );
+
+            let registry = {
+                let backend_state = state.lock().unwrap();
+                assert!(
+                    backend_state.acquisitions.is_empty(),
+                    "backend acquired for {path:?}"
+                );
+                assert!(backend_state.releases.is_empty());
+                Arc::clone(&backend_state.registry)
+            };
+            let registry = registry.lock().await;
+            assert!(registry.resources.is_empty());
+            assert!(registry.leases.is_empty());
+            assert!(registry.resolving.is_empty());
+            drop(registry);
+        }
     }
 
     fn config(paths: &[&str]) -> VmConfig {
