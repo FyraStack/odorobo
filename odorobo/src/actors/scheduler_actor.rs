@@ -107,6 +107,15 @@ pub enum VmLifecycle {
     Running,
 }
 
+/// A requested VM lifecycle operation and its scheduler-side state effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum VmLifecycleCommand {
+    /// Power off the guest while retaining its actor, placement, and intent.
+    Shutdown,
+    /// Remove the VM and all scheduler-side desired state.
+    Delete,
+}
+
 /// A desired or observed placement of a VM on an agent.
 ///
 /// Multiple entries for one VM are valid during migration. `last_confirmed_at`

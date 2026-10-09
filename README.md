@@ -81,6 +81,19 @@ For more advanced usage, Odorobo Agent also exposes a passthrough route for the 
 
 See `docs/ch-passthrough.md` for Cloud Hypervisor API passthrough usage.
 
+### VM shutdown and deletion
+
+`PUT /vms/{vmid}/shutdown` shuts down the **guest** through Cloud Hypervisor but
+keeps the VM actor and VMM process alive. Its runtime/configuration, agent
+membership, scheduler intent, and resource reservation remain, so the VM is
+still managed and can be booted again through the Cloud Hypervisor passthrough
+API. Shutdown does not release storage or other resources acquired for the VM.
+
+`DELETE /vms/{vmid}` permanently removes the VM. It stops the VM actor and VMM,
+cleans up runtime state, releases transformed resources such as attached
+storage, and removes the VM from agent and scheduler state. Create the VM again
+to restore it.
+
 See [docs/future-work.md](docs/future-work.md) for planned scheduler,
 migration, and high-availability work that is not implemented yet.
 

@@ -3,7 +3,7 @@ use std::{collections::VecDeque, sync::Arc};
 use crate::messages::vm::{
     DeleteVM, GetConsoleHistory, GetConsoleHistoryReply, GetVMHeartbeat, GetVMHeartbeatReply,
     GetVMInfo, GetVMInfoReply, MigrateVMReceive, MigrateVMReceiveReply, PrepMigration,
-    SendConsoleInput, SendConsoleInputReply, ShutdownVM,
+    SendConsoleInput, SendConsoleInputReply, ShutdownVM, ShutdownVMReply,
 };
 use crate::{
     ch_driver::{VMInstance, manifest::to_vm_config},
@@ -518,15 +518,18 @@ impl Message<PrepMigration> for VMActor {
 
 #[remote_message]
 impl Message<ShutdownVM> for VMActor {
-    type Reply = ();
+    type Reply = Result<ShutdownVMReply, String>;
     async fn handle(
         &mut self,
         _msg: ShutdownVM,
-        ctx: &mut Context<Self, Self::Reply>,
+        _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        trace!(vmid = %self.vmid, "Shutting down VM actor");
-        ctx.actor_ref().stop_gracefully().await.unwrap();
-        // ctx.actor_ref().kill();
+        trace!(vmid = %self.vmid, "Shutting down VM guest while retaining its actor and runtime");
+        if let Err(error) = self.vm_instance.shutdown().await {
+            error!(vmid = %self.vmid, ?error, "Failed to shut down VM guest");
+            return Err(error.to_string());
+        }
+        Ok(ShutdownVMReply)
     }
 }
 #[remote_message]
@@ -537,7 +540,7 @@ impl Message<DeleteVM> for VMActor {
         _msg: DeleteVM,
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        trace!(vmid = %self.vmid, "Shutting down VM actor");
+        trace!(vmid = %self.vmid, "Deleting VM actor and tearing down runtime");
         ctx.actor_ref().stop_gracefully().await.unwrap();
     }
 }
