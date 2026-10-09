@@ -42,9 +42,12 @@ pub struct HookManager {
 }
 
 impl HookManager {
-    #[expect(
-        dead_code,
-        reason = "hook registration API is used as provisioning integrations are added"
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "hook registration API is used as provisioning integrations are added"
+        )
     )]
     pub fn add_hook<T: ProvisioningHook + 'static>(mut self, hook: T) -> Self {
         self.hooks.push(Box::new(hook));

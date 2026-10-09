@@ -17,7 +17,9 @@ use crate::messages::vm::{
 use crate::messages::{Ping, Pong};
 use crate::utils::actor_names::vm_actor_id;
 
-use super::{CachedActorKind, CachedVMActor, SchedulerActor, VmLifecycle, VmPlacement};
+use super::{
+    CachedActorKind, CachedVMActor, SchedulerActor, VmLifecycle, VmLifecycleCommand, VmPlacement,
+};
 
 /// Owns scheduler initialization and cleanup for linked remote actors.
 ///
@@ -208,7 +210,7 @@ impl Message<DeleteVM> for SchedulerActor {
         tracing::trace!(?vm, "DeleteVM");
         if let Some(vm) = vm {
             vm.tell(&msg).send()?;
-            self.remove_vm_intent(msg.vmid);
+            self.apply_vm_lifecycle_command(msg.vmid, VmLifecycleCommand::Delete);
             Ok(DeleteVMReply)
         } else {
             Err(eyre!("VM not found"))
@@ -216,7 +218,7 @@ impl Message<DeleteVM> for SchedulerActor {
     }
 }
 
-/// Looks up a VM actor, forwards shutdown, and suppresses automatic recreation.
+/// Powers off the guest while retaining its actor, placement, and desired intent.
 impl Message<ShutdownVM> for SchedulerActor {
     type Reply = Result<ShutdownVMReply, Report>;
 
@@ -228,8 +230,8 @@ impl Message<ShutdownVM> for SchedulerActor {
         let vm = RemoteActorRef::<VMActor>::lookup(vm_actor_id(msg.vmid)).await?;
         tracing::trace!(?vm, "ShutdownVM");
         if let Some(vm) = vm {
-            vm.tell(&msg).send()?;
-            self.remove_vm_intent(msg.vmid);
+            vm.ask(&msg).await?;
+            self.apply_vm_lifecycle_command(msg.vmid, VmLifecycleCommand::Shutdown);
             Ok(ShutdownVMReply)
         } else {
             Err(eyre!("VM not found"))

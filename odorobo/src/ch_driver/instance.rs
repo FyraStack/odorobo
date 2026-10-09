@@ -14,9 +14,11 @@ use std::{
     io::BufWriter,
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
 };
 use thiserror::Error;
-use tokio::task::JoinHandle;
+use tokio::{sync::Mutex, task::JoinHandle};
 use tracing::{debug, error, info, trace, warn};
 
 use crate::ch_driver::{
@@ -25,6 +27,9 @@ use crate::ch_driver::{
 };
 
 use super::api::call_request;
+
+#[cfg(test)]
+mod tests;
 
 pub const CONFIG_FILE_NAME: &str = "config.json";
 const SOCKET_FILE_NAME: &str = "ch.sock";
@@ -39,7 +44,8 @@ pub struct VMInstance {
     pub ch_socket_path: PathBuf,
     transformer: TransformChain,
     hook_manager: HookManager,
-    child_process: Option<tokio::process::Child>,
+    child_process: Option<Arc<Mutex<tokio::process::Child>>>,
+    vmm_stopped: bool,
     /// Pre-transformed VM config, if available
     pub vm_config: Option<models::VmConfig>,
 }
@@ -90,16 +96,15 @@ impl VMInstance {
             ch_socket_path,
             transformer: transformer.unwrap_or_default(),
             hook_manager: HookManager::default(),
-            child_process,
+            child_process: child_process.map(|child| Arc::new(Mutex::new(child))),
+            vmm_stopped: false,
             vm_config: None,
         }
     }
 
-    /// Takes the child process out of this instance, transferring ownership to the caller.
-    /// Useful for watching the process lifecycle externally (e.g. in an actor watcher task).
-    /// After calling this, `destroy()` will skip the child-kill step.
-    pub const fn take_child_process(&mut self) -> Option<tokio::process::Child> {
-        self.child_process.take()
+    /// Observe the process without giving up teardown's ability to kill and reap it.
+    pub fn child_process(&self) -> Option<Arc<Mutex<tokio::process::Child>>> {
+        self.child_process.as_ref().map(Arc::clone)
     }
 
     /// Get a VM instance by its ID through the filesystem database
@@ -268,7 +273,9 @@ impl VMInstance {
     }
 
     pub fn runtime_dir(&self) -> PathBuf {
-        Self::runtime_dir_for(&self.id)
+        self.ch_socket_path
+            .parent()
+            .map_or_else(|| Self::runtime_dir_for(&self.id), Path::to_path_buf)
     }
 
     pub fn config_path(&self) -> PathBuf {
@@ -336,9 +343,11 @@ impl VMInstance {
     }
 
     async fn stop_child_after_failed_start(&mut self) {
-        if let Some(mut child) = self.child_process.take() {
+        if let Some(child) = self.child_process.take() {
+            let mut child = child.lock().await;
             _ = child.start_kill();
             _ = child.wait().await;
+            drop(child);
         }
     }
 
@@ -351,9 +360,9 @@ impl VMInstance {
     }
 
     pub async fn shutdown(&self) -> Result<()> {
-        self.conn()
-            .shutdown_vm()
+        tokio::time::timeout(Duration::from_secs(5), self.conn().shutdown_vm())
             .await
+            .wrap_err(eyre!("Timed out shutting down VM {}", self.vm_id()))?
             .map_err(ChApiError::from)
             .wrap_err(eyre!("Failed to shutdown VM {}", self.vm_id()))
     }
@@ -399,6 +408,7 @@ impl VMInstance {
         let ch_process = tokio::process::Command::new("cloud-hypervisor")
             .arg("--api-socket")
             .arg(&ch_socket_path)
+            .kill_on_drop(true)
             .spawn()?;
         let mut instance = Self::new(id, ch_socket_path, transformer, Some(ch_process));
 
@@ -436,72 +446,132 @@ impl VMInstance {
             vm_id = self.vm_id(),
             "Destroying VM instance, shutting down VM and cleaning up runtime state"
         );
-        if let Ok(info) = self.info().await {
-            trace!(vm_id = self.vm_id(), state = ?info.state, "Checking VM state before destroy");
-            self.hook_manager.before_stop(self.vm_id(), &info).await?;
-            if matches!(
-                info.state,
-                models::VmState::Running | models::VmState::Paused
-            ) {
-                info!(vm_id = self.vm_id(), "Shutting down VM before destroy");
-                self.shutdown().await?;
-            }
-        } else {
-            warn!(
-                vm_id = self.vm_id(),
-                "Failed to get VM info before destroy, proceeding with shutdown and cleanup anyway"
-            );
-        }
-
-        if matches!(self.conn().shutdown_vmm().await, Ok(())) {
-            debug!(vm_id = self.vm_id(), "VMM shutdown successfully");
-        } else {
-            warn!(
-                vm_id = self.vm_id(),
-                "Failed to shutdown VMM, assuming it is already stopped or unresponsive"
-            );
-        }
-        let vm_config = self.vm_config.clone().unwrap_or_default();
-        if let Some(mut child) = self.child_process.take() {
-            trace!("VMM stopped... checking child process");
-            _ = child.start_kill();
-            if let Err(err) = child.wait().await {
+        let mut cleanup_error = None;
+        if !self.vmm_stopped {
+            if let Ok(Ok(info)) = tokio::time::timeout(Duration::from_secs(5), self.info()).await {
+                trace!(vm_id = self.vm_id(), state = ?info.state, "Checking VM state before destroy");
+                let before_stop = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    self.hook_manager.before_stop(self.vm_id(), &info),
+                )
+                .await
+                .map_err(|error| eyre!("Before-stop hook timed out: {error}"))
+                .and_then(std::convert::identity);
+                if let Err(error) = before_stop {
+                    warn!(
+                        vm_id = self.vm_id(),
+                        ?error,
+                        "VM before-stop hook failed; continuing teardown"
+                    );
+                    cleanup_error = Some(error);
+                }
+                if matches!(
+                    info.state,
+                    models::VmState::Running | models::VmState::Paused
+                ) {
+                    info!(vm_id = self.vm_id(), "Shutting down VM before destroy");
+                    let shutdown_result = self.shutdown().await;
+                    if let Err(error) = shutdown_result {
+                        warn!(
+                            vm_id = self.vm_id(),
+                            ?error,
+                            "VM shutdown failed; continuing VMM teardown"
+                        );
+                        if cleanup_error.is_none() {
+                            cleanup_error = Some(error);
+                        }
+                    }
+                }
+            } else {
                 warn!(
                     vm_id = self.vm_id(),
-                    ?err,
-                    "Failed to wait for child process, manual cleanup may be required"
+                    "Failed to get VM info before destroy, proceeding with shutdown and cleanup anyway"
                 );
+            }
+
+            let vmm_shutdown =
+                tokio::time::timeout(Duration::from_secs(5), self.conn().shutdown_vmm()).await;
+            let api_stopped = matches!(vmm_shutdown, Ok(Ok(())));
+            if !api_stopped {
+                warn!(
+                    vm_id = self.vm_id(),
+                    "VMM shutdown failed or timed out; attempting process cleanup"
+                );
+            }
+            if let Some(child) = self.child_process.as_ref() {
+                let mut child = child.lock().await;
+                // Never release storage while the VMM can still use it. Keep process
+                // ownership until wait succeeds, even if the API or a hook failed.
+                child
+                    .start_kill()
+                    .wrap_err("Failed to kill VMM before resource teardown")?;
+                child
+                    .wait()
+                    .await
+                    .wrap_err("Failed to reap VMM before resource teardown")?;
+                drop(child);
+                self.child_process.take();
+            } else if !api_stopped {
+                return Err(eyre!(
+                    "Cannot confirm VMM is stopped; retaining runtime and resources"
+                ));
+            }
+            self.vmm_stopped = true;
+        }
+        let vm_config = self.vm_config.clone().unwrap_or_default();
+
+        let after_stop = tokio::time::timeout(
+            Duration::from_secs(5),
+            self.hook_manager.after_stop(self.vm_id(), &vm_config),
+        )
+        .await
+        .map_err(|error| eyre!("After-stop hook timed out: {error}"))
+        .and_then(std::convert::identity);
+        if let Err(error) = after_stop {
+            warn!(vm_id = self.vm_id(), ?error, "VM after-stop hook failed");
+            if cleanup_error.is_none() {
+                cleanup_error = Some(error);
             }
         }
 
-        self.hook_manager
-            .after_stop(self.vm_id(), &vm_config)
-            .await?;
-
-        if let Err(err) = self.purge_instance_data() {
+        if let Err(error) = self.purge_instance_data() {
             warn!(
                 vm_id = self.vm_id(),
-                ?err,
+                ?error,
                 "Failed to purge runtime data, manual cleanup may be required"
             );
+            if cleanup_error.is_none() {
+                cleanup_error = Some(error);
+            }
         }
 
-        Ok(())
+        cleanup_error.map_or(Ok(()), Err)
     }
 
     /// Purge the runtime data for this VM instance.
     ///
     /// This removes the runtime directory and all its contents if it exists.
     pub fn purge_instance_data(&mut self) -> Result<()> {
-        let mut vm_config = self.vm_config.take().unwrap_or_default();
-        self.transformer.teardown(self.vm_id(), &mut vm_config)?;
+        let mut vm_config = self.vm_config.clone().unwrap_or_default();
+        let teardown = self.transformer.teardown(self.vm_id(), &mut vm_config);
+        // Successful resource releases are removed from the cleanup config by
+        // the storage transform. Preserve that progress for subsequent retries.
+        self.vm_config = Some(vm_config);
+        teardown.wrap_err(eyre!(
+            "Failed to teardown transformed resources for {}",
+            self.vm_id()
+        ))?;
         let runtime_dir = self.runtime_dir();
-        if runtime_dir.exists() {
+        let runtime_result = if runtime_dir.exists() {
             fs::remove_dir_all(runtime_dir).wrap_err(eyre!(
                 "Failed to remove runtime directory for {}",
                 self.vm_id()
-            ))?;
-        }
+            ))
+        } else {
+            Ok(())
+        };
+        runtime_result?;
+        self.vm_config.take();
         Ok(())
     }
 
