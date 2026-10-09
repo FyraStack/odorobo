@@ -6,7 +6,7 @@ use odorobo::{
 };
 use reqwest::{Client, Response};
 use serde::Deserialize;
-use stable_eyre::Result;
+use stable_eyre::{Result, eyre::eyre};
 use ulid::Ulid;
 
 #[derive(Parser)]
@@ -82,7 +82,7 @@ async fn print_api_error(response: Response) -> Result<()> {
         eprintln!("Error (HTTP {}): {:?}", status.as_u16(), body);
     }
 
-    Ok(())
+    Err(eyre!("API request failed with HTTP {}", status.as_u16()))
 }
 
 async fn print_message_response(response: Response, success_message: &str) -> Result<()> {
@@ -167,4 +167,44 @@ pub async fn run_command(cli: Cli) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Command, run_command};
+    use stable_eyre::{Result, eyre::eyre};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn delete_returns_error_when_api_responds_with_failure() -> Result<()> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await?;
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await?;
+            socket
+                .write_all(
+                    b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 5\r\nConnection: close\r\n\r\nerror",
+                )
+                .await?;
+            Ok::<(), std::io::Error>(())
+        });
+
+        let result = run_command(Cli {
+            manager_addr: format!("http://{address}"),
+            command: Command::Delete {
+                vmid: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            },
+        })
+        .await;
+
+        server.await??;
+        let error = result
+            .err()
+            .ok_or_else(|| eyre!("expected API failure to return an error"))?;
+        assert!(error.to_string().contains("500"));
+
+        Ok(())
+    }
 }
