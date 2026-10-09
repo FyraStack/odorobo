@@ -5,9 +5,11 @@ use std::time::Instant;
 
 use ahash::AHashMap;
 use kameo::prelude::*;
+use libp2p::futures::TryStreamExt;
 use stable_eyre::{Report, eyre::eyre};
 use tracing::{info, warn};
 
+use crate::actors::agent_actor::AgentActor;
 use crate::ch_driver::actor::VMActor;
 use crate::manifest::same_create_intent;
 use crate::messages::vm::{
@@ -16,9 +18,11 @@ use crate::messages::vm::{
     SendConsoleInputReply, ShutdownVM, ShutdownVMReply,
 };
 use crate::messages::{Ping, Pong};
-use crate::utils::actor_names::vm_actor_id;
+use crate::utils::actor_names::{AGENT, vm_actor_id};
 
-use super::{CachedActorKind, CachedVMActor, SchedulerActor, VmLifecycle, VmPlacement};
+use super::{
+    CachedActorKind, CachedVMActor, SchedulerActor, VmDeleteOwner, VmLifecycle, VmPlacement,
+};
 
 /// Owns scheduler initialization and cleanup for linked remote actors.
 ///
@@ -40,6 +44,7 @@ impl Actor for SchedulerActor {
             vm_manifests: AHashMap::new(),
             vm_effective_manifests: AHashMap::new(),
             vm_tombstones: AHashMap::new(),
+            known_agent_refs: AHashMap::new(),
             vm_delete_targets: AHashMap::new(),
             vm_placements: AHashMap::new(),
             vm_data_cache: AHashMap::new(),
@@ -127,6 +132,8 @@ impl Message<CreateVM> for SchedulerActor {
 
         let target_agent = self.schedule_agent(&msg)?;
 
+        self.remember_agent_ref(&target_agent);
+        self.remember_vm_delete_owner(msg.vmid, VmDeleteOwner::agent(target_agent.id()));
         self.vm_tombstones.remove(&msg.vmid);
         self.vm_manifests.insert(msg.vmid, msg.config.clone());
         self.invalidate_pending_resources();
@@ -170,6 +177,7 @@ impl Message<CreateVM> for SchedulerActor {
             && let Some(actor_id_bytes) = &reply.actor_id
             && let Ok(actor_id) = ActorId::from_bytes(actor_id_bytes)
         {
+            self.remember_vm_delete_owner(msg.vmid, VmDeleteOwner::vm(actor_id));
             self.vm_actorid_ulid_map.insert(actor_id, msg.vmid);
         }
 
@@ -250,8 +258,8 @@ impl Message<SendConsoleInput> for SchedulerActor {
     }
 }
 
-/// Deletes through agents so process exit and all node-local CID releases are
-/// confirmed before acknowledging deletion and removing desired intent.
+/// Suppresses recreation immediately but retains cleanup ownership until agents
+/// confirm process exit and node-local CID release, including evicted owners.
 impl Message<DeleteVM> for SchedulerActor {
     type Reply = Result<DeleteVMReply, Report>;
 
@@ -260,37 +268,98 @@ impl Message<DeleteVM> for SchedulerActor {
         msg: DeleteVM,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
+        let already_deleted = self.vm_tombstones.get(&msg.vmid) == Some(&false)
+            && !self.vm_delete_targets.contains_key(&msg.vmid);
         self.remove_vm_intent(msg.vmid);
         self.vm_tombstones.insert(msg.vmid, true);
-        // Always contact agents, including when a VM actor is discoverable.
-        // Direct tells acknowledge only enqueueing and leave a race with CID
-        // release during teardown. Other nodes may also retain stopped leases.
-        let targets = self.vm_delete_targets.entry(msg.vmid).or_default();
-        for agent in self.agent_data_cache.values() {
-            targets.insert(agent.actor_ref.id(), agent.actor_ref.clone());
+        // The unique VM name may expose a migration owner before its agent
+        // status arrives. Do not ask VM actors directly: that cannot acknowledge
+        // the agent's stopped lease cleanup.
+        let mut vms = RemoteActorRef::<VMActor>::lookup_all(vm_actor_id(msg.vmid));
+        while let Some(vm) = vms.try_next().await? {
+            self.remember_vm_delete_owner(msg.vmid, VmDeleteOwner::vm(vm.id()));
         }
-        let agents: Vec<_> = targets.values().cloned().collect();
-        if agents.is_empty() {
-            return Err(eyre!(
-                "no reachable agents can delete the VM and release its CID"
-            ));
+        if already_deleted && !self.vm_delete_targets.contains_key(&msg.vmid) {
+            self.vm_tombstones.insert(msg.vmid, false);
+            return Ok(DeleteVMReply { error: None });
+        }
+        // Discovery is required even with cached targets: an agent restarted on
+        // the same peer has a new actor ID and must replace the obsolete route.
+        let mut discovered = RemoteActorRef::<AgentActor>::lookup_all(AGENT);
+        let mut available = AHashMap::new();
+        while let Some(agent) = discovered.try_next().await? {
+            available.insert(agent.id(), agent.clone());
+            self.remember_agent_ref(&agent);
+        }
+        if self
+            .vm_delete_targets
+            .get(&msg.vmid)
+            .is_none_or(|targets| targets.is_empty())
+        {
+            // No ownership history (e.g. a stopped VM after scheduler restart):
+            // search currently known agents, never all historical dead agents.
+            available.extend(
+                self.agent_data_cache
+                    .values()
+                    .map(|agent| (agent.actor_ref.id(), agent.actor_ref.clone())),
+            );
+            for agent in available.values() {
+                self.remember_vm_delete_owner(msg.vmid, VmDeleteOwner::agent(agent.id()));
+            }
+        }
+        let targets: Vec<_> = self
+            .vm_delete_targets
+            .get(&msg.vmid)
+            .into_iter()
+            .flat_map(|targets| targets.iter())
+            .filter(|(_, target)| !target.confirmed)
+            .map(|(owner, target)| (*owner, target.actor_ref.clone()))
+            .collect();
+        if targets.is_empty() {
+            return if self.finish_vm_delete(msg.vmid) {
+                Ok(DeleteVMReply { error: None })
+            } else {
+                Err(eyre!("no agents can confirm VM teardown and CID release"))
+            };
         }
 
         let mut failures = Vec::new();
-        for agent in agents {
-            match agent.ask(&msg).await {
-                Ok(reply) if reply.error.is_none() => {
-                    if let Some(targets) = self.vm_delete_targets.get_mut(&msg.vmid) {
-                        targets.remove(&agent.id());
+        for (owner, retained) in targets {
+            // Registry results can contain both old and replacement actors on
+            // one peer. A stale route must not permanently mask a working one.
+            let mut candidates: AHashMap<_, _> = available
+                .iter()
+                .filter(|(id, _)| owner.matches_agent(**id))
+                .map(|(id, agent)| (*id, agent.clone()))
+                .collect();
+            if let Some(agent) = retained.filter(|agent| owner.matches_agent(agent.id())) {
+                candidates.entry(agent.id()).or_insert(agent);
+            }
+            let mut errors = Vec::new();
+            let mut confirmed = false;
+            for agent in candidates.values() {
+                match agent.ask(&msg).await {
+                    Ok(reply) if reply.error.is_none() => {
+                        self.acknowledge_vm_delete_owner(msg.vmid, owner);
+                        confirmed = true;
+                        break;
                     }
+                    Ok(reply) => errors.push(reply.error.unwrap_or_default()),
+                    Err(error) => errors.push(error.to_string()),
                 }
-                Ok(reply) => failures.push(reply.error.unwrap_or_default()),
-                Err(error) => failures.push(error.to_string()),
+            }
+            if !confirmed {
+                failures.push(format!(
+                    "{owner:?}: {}",
+                    if errors.is_empty() {
+                        "missing agent for known VM owner".to_owned()
+                    } else {
+                        errors.join("; ")
+                    }
+                ));
             }
         }
-        if failures.is_empty() {
-            self.vm_delete_targets.remove(&msg.vmid);
-            self.vm_tombstones.insert(msg.vmid, false);
+        if failures.is_empty() && self.finish_vm_delete(msg.vmid) {
             Ok(DeleteVMReply { error: None })
         } else {
             Err(eyre!(
@@ -314,6 +383,7 @@ impl Message<ShutdownVM> for SchedulerActor {
         tracing::trace!(?vm, "ShutdownVM");
         if let Some(vm) = vm {
             vm.tell(&msg).send()?;
+            self.remember_vm_delete_owner(msg.vmid, VmDeleteOwner::vm(vm.id()));
             self.remove_vm_intent(msg.vmid);
             Ok(ShutdownVMReply)
         } else {

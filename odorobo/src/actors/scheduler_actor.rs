@@ -129,6 +129,42 @@ pub struct CachedVMActor {
     pub actor_ref: Option<RemoteActorRef<VMActor>>,
 }
 
+/// Node-local cleanup ownership survives actor replacement and cache eviction.
+/// A peer identifies the agent responsible for both VM teardown and CID leases.
+/// Without a peer, retain the exact identity rather than guessing another owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum VmDeleteOwner {
+    Peer(libp2p::PeerId),
+    Agent(ActorId),
+    Vm(ActorId),
+}
+
+impl VmDeleteOwner {
+    fn agent(actor_id: ActorId) -> Self {
+        actor_id
+            .peer_id()
+            .copied()
+            .map_or(Self::Agent(actor_id), Self::Peer)
+    }
+
+    fn vm(actor_id: ActorId) -> Self {
+        actor_id
+            .peer_id()
+            .copied()
+            .map_or(Self::Vm(actor_id), Self::Peer)
+    }
+
+    fn matches_agent(self, actor_id: ActorId) -> bool {
+        self == Self::agent(actor_id)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct VmDeleteTarget {
+    actor_ref: Option<RemoteActorRef<AgentActor>>,
+    confirmed: bool,
+}
+
 /// An eventually consistent, in-memory VM scheduler.
 ///
 /// Public caches are exposed for inspection, but correlated maps must be
@@ -149,8 +185,14 @@ pub struct SchedulerActor {
     /// Suppresses late discovery after explicit stop/delete. True means delete
     /// cleanup is still pending, so recreation must wait for a successful retry.
     vm_tombstones: AHashMap<Ulid, bool>,
-    /// Failed deletion targets retained even after discovery evicts an agent.
-    vm_delete_targets: AHashMap<Ulid, AHashMap<ActorId, RemoteActorRef<AgentActor>>>,
+    /// Last discovered agent per owner, retained across reachability-cache eviction.
+    /// These references resolve known VM owners; they are never a broadcast list.
+    known_agent_refs: AHashMap<VmDeleteOwner, RemoteActorRef<AgentActor>>,
+    /// Potential cleanup owners recorded at create/discovery time and retained
+    /// through shutdown, migration, and eviction. Confirmed entries remain until
+    /// all owners acknowledge deletion so stale discovery cannot re-add them.
+    /// A missing reference keeps an undiscovered owner pending instead of losing it.
+    vm_delete_targets: AHashMap<Ulid, AHashMap<VmDeleteOwner, VmDeleteTarget>>,
     /// Desired and observed VM placements; multiple entries allow migration.
     pub vm_placements: AHashMap<Ulid, Vec<VmPlacement>>,
     /// VM actor references. `None` marks a placement awaiting discovery.
