@@ -194,7 +194,9 @@ impl RbdImage {
 }
 
 impl RbdImage {
-    /// Parse the original URI before `Url` can normalize host case or dot segments.
+    /// Validate the original URI before URL parsing can normalize dot segments or
+    /// strip URL whitespace/control characters. The raw lowercase contract is
+    /// enforced here; the `rbd` URL parser does not normalize pool-name casing.
     pub(super) fn parse_uri(value: &str) -> Result<Self> {
         let resource = value
             .strip_prefix("rbd://")
@@ -217,8 +219,8 @@ impl RbdImage {
             Url::parse(value).map_err(|error| eyre!("Invalid RBD storage URI: {error}"))?;
         let parsed_image = Self::try_from(&parsed)?;
         if parsed_image.pool != pool || parsed_image.image != image {
-            // Hostnames are case-insensitive and URL parsers normalize them;
-            // refusing normalization avoids silently selecting another pool.
+            // Refusing any parser rewrite avoids silently selecting a different
+            // pool or image than the original URI named.
             return Err(eyre!(
                 "RBD URI components must not change during URL normalization"
             ));

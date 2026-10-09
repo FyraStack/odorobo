@@ -43,9 +43,10 @@ Specify an existing RBD image as `rbd://<pool>/<image>`:
 The pool and image are part of the VM attachment URI, not a local cache path.
 For the initial contract, pool and image names use ASCII letters, digits, `.`,
 `_`, or `-`; names cannot be empty or start with `-`. Pool names must be
-lowercase because URI parsing normalizes the authority's case. The URI must have exactly
-one image path segment. Credentials, ports, query parameters, fragments,
-namespaces, and snapshot selectors are not accepted. In particular,
+lowercase; the transformer validates the original URI and rejects case variants
+rather than normalizing them. The URI must have exactly one image path segment.
+Credentials, ports, query parameters, fragments, namespaces, and snapshot
+selectors are not accepted. In particular,
 `rbd://pool/ns/image` and `rbd://pool/image@snapshot` are not supported by this
 contract. These restrictions prevent an ambiguous URI from selecting a
 resource different from the one Odorobo tracks.
