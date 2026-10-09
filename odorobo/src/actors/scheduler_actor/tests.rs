@@ -333,6 +333,10 @@ fn vm_cleanup_unplaces_vm_without_another_discovered_actor() {
         agent_keepalive_tasks: AHashMap::new(),
         vm_actorid_ulid_map: AHashMap::from([(vm_actor_id, vmid)]),
         vm_manifests: AHashMap::from([(vmid, test_manifest(1, 1))]),
+        vm_effective_manifests: AHashMap::new(),
+        vm_tombstones: AHashMap::new(),
+        known_agent_refs: AHashMap::new(),
+        vm_delete_targets: AHashMap::new(),
         vm_placements: AHashMap::from([(
             vmid,
             vec![VmPlacement {
@@ -360,6 +364,7 @@ fn vm_cleanup_unplaces_vm_without_another_discovered_actor() {
 fn failed_create_rolls_back_state_without_an_actor() {
     let vmid = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("valid ulid");
     let mut manifests = AHashMap::from([(vmid, test_manifest(1, 1))]);
+    let mut effective_manifests = AHashMap::new();
     let mut actor_map = AHashMap::new();
     let mut placements = AHashMap::from([(
         vmid,
@@ -378,11 +383,13 @@ fn failed_create_rolls_back_state_without_an_actor() {
         None,
         &mut actor_map,
         &mut manifests,
+        &mut effective_manifests,
         &mut placements,
         &mut data_cache,
     );
 
     assert!(!manifests.contains_key(&vmid));
+    assert!(!effective_manifests.contains_key(&vmid));
     assert!(!placements.contains_key(&vmid));
     assert!(!data_cache.contains_key(&vmid));
 }
@@ -391,6 +398,7 @@ fn failed_create_rolls_back_state_without_an_actor() {
 fn failed_create_keeps_state_if_actor_exists() {
     let vmid = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("valid ulid");
     let mut manifests = AHashMap::from([(vmid, test_manifest(1, 1))]);
+    let mut effective_manifests = AHashMap::new();
     let mut actor_map = AHashMap::new();
     let mut placements = AHashMap::new();
     let mut data_cache = AHashMap::new();
@@ -401,6 +409,7 @@ fn failed_create_keeps_state_if_actor_exists() {
         None,
         &mut actor_map,
         &mut manifests,
+        &mut effective_manifests,
         &mut placements,
         &mut data_cache,
     );
@@ -418,6 +427,10 @@ fn explicit_stop_removes_vm_intent_and_actor_mapping() {
         agent_keepalive_tasks: AHashMap::new(),
         vm_actorid_ulid_map: AHashMap::from([(vm_actor_id, vmid)]),
         vm_manifests: AHashMap::from([(vmid, test_manifest(1, 1))]),
+        vm_effective_manifests: AHashMap::new(),
+        vm_tombstones: AHashMap::new(),
+        known_agent_refs: AHashMap::new(),
+        vm_delete_targets: AHashMap::new(),
         vm_placements: AHashMap::from([(vmid, Vec::new())]),
         vm_data_cache: AHashMap::from([(vmid, vec![CachedVMActor { actor_ref: None }])]),
         vm_keepalive_tasks: AHashMap::new(),
@@ -429,6 +442,7 @@ fn explicit_stop_removes_vm_intent_and_actor_mapping() {
 
     scheduler.remove_vm_intent(vmid);
 
+    assert!(scheduler.vm_tombstones.contains_key(&vmid));
     assert!(!scheduler.vm_manifests.contains_key(&vmid));
     assert!(!scheduler.vm_placements.contains_key(&vmid));
     assert!(!scheduler.vm_data_cache.contains_key(&vmid));
@@ -447,6 +461,10 @@ fn agent_cleanup_does_not_remove_unrelated_vm_state() {
         agent_keepalive_tasks: AHashMap::new(),
         vm_actorid_ulid_map: AHashMap::from([(vm_actor_id, vmid)]),
         vm_manifests: AHashMap::from([(vmid, test_manifest(1, 1))]),
+        vm_effective_manifests: AHashMap::new(),
+        vm_tombstones: AHashMap::new(),
+        known_agent_refs: AHashMap::new(),
+        vm_delete_targets: AHashMap::new(),
         vm_placements: AHashMap::from([(
             vmid,
             vec![VmPlacement {
@@ -482,6 +500,10 @@ fn vm_cleanup_does_not_remove_unrelated_agent_state() {
         agent_keepalive_tasks: AHashMap::new(),
         vm_actorid_ulid_map: AHashMap::from([(vm_actor_id, vmid)]),
         vm_manifests: AHashMap::from([(vmid, test_manifest(1, 1))]),
+        vm_effective_manifests: AHashMap::new(),
+        vm_tombstones: AHashMap::new(),
+        known_agent_refs: AHashMap::new(),
+        vm_delete_targets: AHashMap::new(),
         vm_placements: AHashMap::new(),
         vm_data_cache: AHashMap::from([(vmid, vec![CachedVMActor { actor_ref: None }])]),
         vm_keepalive_tasks: AHashMap::new(),
@@ -496,6 +518,196 @@ fn vm_cleanup_does_not_remove_unrelated_agent_state() {
     assert!(scheduler.actor_kinds.contains_key(&agent_id));
     assert!(scheduler.vm_manifests.contains_key(&vmid));
     assert!(scheduler.vm_data_cache.contains_key(&vmid));
+}
+
+fn empty_scheduler() -> SchedulerActor {
+    SchedulerActor {
+        agent_data_cache: AHashMap::new(),
+        agent_keepalive_tasks: AHashMap::new(),
+        vm_actorid_ulid_map: AHashMap::new(),
+        vm_manifests: AHashMap::new(),
+        vm_effective_manifests: AHashMap::new(),
+        vm_tombstones: AHashMap::new(),
+        known_agent_refs: AHashMap::new(),
+        vm_delete_targets: AHashMap::new(),
+        vm_placements: AHashMap::new(),
+        vm_data_cache: AHashMap::new(),
+        vm_keepalive_tasks: AHashMap::new(),
+        pending_resources_cache: None,
+        agent_vm_index: AHashMap::new(),
+        actor_kinds: AHashMap::new(),
+        cache_actor_finder: None,
+    }
+}
+
+fn running_placement(agent_id: super::ActorId) -> VmPlacement {
+    VmPlacement {
+        agent_id,
+        lifecycle: VmLifecycle::Running,
+        created_at: Instant::now(),
+        last_confirmed_at: Some(Instant::now()),
+    }
+}
+
+#[test]
+fn delete_captures_evicted_and_undiscovered_migration_owners_before_intent_removal() {
+    let vmid = Ulid::generate();
+    let source = super::ActorId::new_with_peer_id(1, libp2p::PeerId::random());
+    let destination = super::ActorId::new_with_peer_id(2, libp2p::PeerId::random());
+    let undiscovered_vm = super::ActorId::new_with_peer_id(3, libp2p::PeerId::random());
+    let mut scheduler = empty_scheduler();
+    scheduler.vm_placements.insert(
+        vmid,
+        vec![running_placement(source), running_placement(destination)],
+    );
+    scheduler.vm_actorid_ulid_map.insert(undiscovered_vm, vmid);
+
+    scheduler.cleanup_agent_actor(source);
+    assert_eq!(scheduler.vm_placements[&vmid].len(), 1);
+    scheduler.remove_vm_intent(vmid);
+    assert!(!scheduler.vm_placements.contains_key(&vmid));
+    assert!(!scheduler.vm_actorid_ulid_map.contains_key(&undiscovered_vm));
+    let targets = &scheduler.vm_delete_targets[&vmid];
+    assert_eq!(targets.len(), 3);
+    for owner in [
+        super::VmDeleteOwner::agent(source),
+        super::VmDeleteOwner::agent(destination),
+        super::VmDeleteOwner::vm(undiscovered_vm),
+    ] {
+        assert!(targets.contains_key(&owner));
+        assert!(targets[&owner].actor_ref.is_none());
+    }
+    assert!(!scheduler.finish_vm_delete(vmid));
+}
+
+#[test]
+fn delete_retains_stopped_lease_owners_after_status_and_placement_removal() {
+    let vmid = Ulid::generate();
+    let agent = super::ActorId::new_with_peer_id(1, libp2p::PeerId::random());
+    let owner = super::VmDeleteOwner::agent(agent);
+    let mut scheduler = empty_scheduler();
+    scheduler.remember_vm_delete_owner(vmid, owner);
+    scheduler.vm_manifests.insert(vmid, test_manifest(1, 1));
+    scheduler
+        .vm_placements
+        .insert(vmid, vec![running_placement(agent)]);
+    SchedulerActor::reconcile_agent_delta(
+        agent,
+        &[],
+        &[vmid],
+        &scheduler.vm_manifests,
+        &mut scheduler.vm_placements,
+    );
+    assert!(scheduler.vm_placements[&vmid].is_empty());
+
+    scheduler.remove_vm_intent(vmid);
+    assert!(scheduler.vm_delete_targets[&vmid].contains_key(&owner));
+    assert!(!scheduler.finish_vm_delete(vmid));
+    scheduler.acknowledge_vm_delete_owner(vmid, owner);
+    assert!(scheduler.finish_vm_delete(vmid));
+}
+
+#[test]
+fn unrelated_success_cannot_complete_delete_and_failures_survive_retries() {
+    let vmid = Ulid::generate();
+    let source = super::VmDeleteOwner::agent(super::ActorId::new(1));
+    let destination = super::VmDeleteOwner::agent(super::ActorId::new(2));
+    let unrelated = super::VmDeleteOwner::agent(super::ActorId::new(3));
+    let mut scheduler = empty_scheduler();
+    scheduler.remember_vm_delete_owner(vmid, source);
+    scheduler.remember_vm_delete_owner(vmid, destination);
+    scheduler.remove_vm_intent(vmid);
+    scheduler.vm_tombstones.insert(vmid, true);
+    scheduler.acknowledge_vm_delete_owner(vmid, unrelated);
+    assert!(!scheduler.finish_vm_delete(vmid));
+    assert_eq!(scheduler.vm_delete_targets[&vmid].len(), 2);
+
+    scheduler.acknowledge_vm_delete_owner(vmid, source);
+    // Stale discovery and retry must not undo partial progress.
+    scheduler.remember_vm_delete_owner(vmid, source);
+    scheduler.remove_vm_intent(vmid);
+    assert!(scheduler.vm_delete_targets[&vmid][&source].confirmed);
+    assert!(!scheduler.vm_delete_targets[&vmid][&destination].confirmed);
+    assert!(!scheduler.finish_vm_delete(vmid));
+    assert_eq!(scheduler.vm_tombstones.get(&vmid), Some(&true));
+    scheduler.acknowledge_vm_delete_owner(vmid, destination);
+    assert!(scheduler.finish_vm_delete(vmid));
+    assert!(!scheduler.vm_delete_targets.contains_key(&vmid));
+    assert_eq!(scheduler.vm_tombstones.get(&vmid), Some(&false));
+}
+
+#[test]
+fn delete_owner_routes_to_replacement_actor_on_same_peer_only() {
+    let peer = libp2p::PeerId::random();
+    let old_agent = super::ActorId::new_with_peer_id(1, peer);
+    let replacement = super::ActorId::new_with_peer_id(2, peer);
+    let vm = super::ActorId::new_with_peer_id(3, peer);
+    let unrelated = super::ActorId::new_with_peer_id(2, libp2p::PeerId::random());
+    let owner = super::VmDeleteOwner::agent(old_agent);
+    assert_eq!(owner, super::VmDeleteOwner::vm(vm));
+    assert!(owner.matches_agent(replacement));
+    assert!(!owner.matches_agent(unrelated));
+    // A VM without peer evidence must not guess an unrelated local agent.
+    assert!(
+        !super::VmDeleteOwner::vm(super::ActorId::new(3)).matches_agent(super::ActorId::new(1))
+    );
+}
+
+#[test]
+fn deleting_one_vm_does_not_include_other_vms_historical_dead_owners() {
+    let vmid = Ulid::generate();
+    let unrelated_vmid = Ulid::generate();
+    let owner = super::VmDeleteOwner::agent(super::ActorId::new(1));
+    let unrelated = super::VmDeleteOwner::agent(super::ActorId::new(2));
+    let mut scheduler = empty_scheduler();
+    scheduler.remember_vm_delete_owner(vmid, owner);
+    scheduler.remember_vm_delete_owner(unrelated_vmid, unrelated);
+    scheduler.remove_vm_intent(vmid);
+    assert_eq!(scheduler.vm_delete_targets[&vmid].len(), 1);
+    assert!(!scheduler.vm_delete_targets[&vmid].contains_key(&unrelated));
+    scheduler.acknowledge_vm_delete_owner(vmid, owner);
+    assert!(scheduler.finish_vm_delete(vmid));
+    assert!(scheduler.vm_delete_targets[&unrelated_vmid].contains_key(&unrelated));
+}
+
+#[test]
+fn late_discovery_adds_new_owner_without_losing_confirmed_progress() {
+    let vmid = Ulid::generate();
+    let source = super::VmDeleteOwner::agent(super::ActorId::new(1));
+    let late_owner = super::VmDeleteOwner::agent(super::ActorId::new(2));
+    let mut scheduler = empty_scheduler();
+    scheduler.remember_vm_delete_owner(vmid, source);
+    scheduler.acknowledge_vm_delete_owner(vmid, source);
+    scheduler.remember_vm_delete_owner(vmid, late_owner);
+    assert!(scheduler.vm_delete_targets[&vmid][&source].confirmed);
+    assert!(!scheduler.finish_vm_delete(vmid));
+    scheduler.acknowledge_vm_delete_owner(vmid, late_owner);
+    assert!(scheduler.finish_vm_delete(vmid));
+}
+
+#[test]
+fn agent_replacement_and_vm_actor_on_same_peer_are_one_cleanup_owner() {
+    let vmid = Ulid::generate();
+    let peer = libp2p::PeerId::random();
+    let owner = super::VmDeleteOwner::agent(super::ActorId::new_with_peer_id(1, peer));
+    let replacement = super::VmDeleteOwner::agent(super::ActorId::new_with_peer_id(2, peer));
+    let vm_owner = super::VmDeleteOwner::vm(super::ActorId::new_with_peer_id(3, peer));
+    let mut scheduler = empty_scheduler();
+    for candidate in [owner, replacement, vm_owner] {
+        scheduler.remember_vm_delete_owner(vmid, candidate);
+    }
+    assert_eq!(scheduler.vm_delete_targets[&vmid].len(), 1);
+    scheduler.acknowledge_vm_delete_owner(vmid, replacement);
+    assert!(scheduler.finish_vm_delete(vmid));
+}
+
+#[test]
+fn delete_without_any_ownership_or_acknowledgement_cannot_finish() {
+    let vmid = Ulid::generate();
+    let mut scheduler = empty_scheduler();
+    assert!(!scheduler.finish_vm_delete(vmid));
+    scheduler.vm_delete_targets.insert(vmid, AHashMap::new());
+    assert!(!scheduler.finish_vm_delete(vmid));
 }
 
 #[test]

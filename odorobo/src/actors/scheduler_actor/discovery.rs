@@ -15,8 +15,8 @@ use crate::utils::actor_names::{AGENT, VM};
 
 use super::{
     AgentActorDiscovered, AgentUpdated, AgentUpdaterStopped, CachedActorKind, CachedAgentActor,
-    CachedVMActor, ReconcileVmPlacements, SchedulerActor, VmActorDiscovered, VmUpdated,
-    VmUpdaterStopped,
+    CachedVMActor, ReconcileVmPlacements, SchedulerActor, VmActorDiscovered, VmDeleteOwner,
+    VmUpdated, VmUpdaterStopped,
 };
 
 impl SchedulerActor {
@@ -232,6 +232,7 @@ impl Message<AgentActorDiscovered> for SchedulerActor {
 
     async fn handle(&mut self, msg: AgentActorDiscovered, ctx: &mut Context<Self, Self::Reply>) {
         let actor_id = msg.actor_ref.id();
+        self.remember_agent_ref(&msg.actor_ref);
         let updater_is_running = self
             .agent_keepalive_tasks
             .get(&actor_id)
@@ -260,10 +261,25 @@ impl Message<VmUpdated> for SchedulerActor {
 
     async fn handle(&mut self, msg: VmUpdated, _ctx: &mut Context<Self, Self::Reply>) {
         let vmid = msg.data.vmid;
+        // Late discovery must still expose a previously unknown cleanup owner
+        // while deletion is pending, but must not recreate placement intent.
+        if self.vm_tombstones.get(&vmid) != Some(&false)
+            || self.vm_delete_targets.contains_key(&vmid)
+        {
+            self.remember_vm_delete_owner(vmid, VmDeleteOwner::vm(msg.actor_ref.id()));
+        }
+        if self.vm_tombstones.contains_key(&vmid) {
+            return;
+        }
         let actor_id = msg.actor_ref.id();
         self.vm_actorid_ulid_map.insert(actor_id, vmid);
         if let Some(manifest) = msg.data.config {
-            self.vm_manifests.insert(vmid, manifest);
+            self.vm_effective_manifests.insert(vmid, manifest.clone());
+            // A manifest discovered after scheduler startup is the only intent
+            // available. Otherwise preserve the original request: effective
+            // values such as an agent-assigned vsock CID are node-local and
+            // must not become hard requirements during failover.
+            self.vm_manifests.entry(vmid).or_insert(manifest);
             Self::reconcile_discovered_vm(
                 vmid,
                 &self.agent_vm_index,
@@ -295,6 +311,38 @@ impl Message<AgentUpdated> for SchedulerActor {
     type Reply = ();
 
     async fn handle(&mut self, msg: AgentUpdated, _ctx: &mut Context<Self, Self::Reply>) {
+        // Only accepted snapshots/additions establish ownership. A removal
+        // says nothing about a stopped node-local CID lease.
+        let observed = match &msg.update {
+            AgentStatusUpdate::Full { revision, status }
+                if self
+                    .agent_data_cache
+                    .get(&msg.actor_id)
+                    .is_none_or(|cached| *revision > cached.status_revision) =>
+            {
+                Some(status.vms.as_slice())
+            }
+            AgentStatusUpdate::Delta {
+                revision, added, ..
+            } if self
+                .agent_data_cache
+                .get(&msg.actor_id)
+                .is_some_and(|cached| *revision > cached.status_revision) =>
+            {
+                Some(added.as_slice())
+            }
+            AgentStatusUpdate::Full { .. } | AgentStatusUpdate::Delta { .. } => None,
+        };
+        if let Some(observed) = observed {
+            self.remember_agent_ref(&msg.actor_ref);
+            for vmid in observed {
+                if self.vm_tombstones.get(vmid) != Some(&false)
+                    || self.vm_delete_targets.contains_key(vmid)
+                {
+                    self.remember_vm_delete_owner(*vmid, VmDeleteOwner::agent(msg.actor_id));
+                }
+            }
+        }
         let Some(cached) = self.agent_data_cache.get_mut(&msg.actor_id) else {
             if let AgentStatusUpdate::Full { revision, status } = msg.update {
                 self.agent_vm_index
@@ -397,6 +445,8 @@ impl Message<ReconcileVmPlacements> for SchedulerActor {
             let request = crate::messages::vm::CreateVM { vmid, config };
             match self.schedule_agent(&request) {
                 Ok(agent) => {
+                    self.remember_agent_ref(&agent);
+                    self.remember_vm_delete_owner(vmid, VmDeleteOwner::agent(agent.id()));
                     self.vm_placements
                         .entry(vmid)
                         .or_default()

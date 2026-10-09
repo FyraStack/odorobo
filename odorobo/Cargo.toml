@@ -33,6 +33,8 @@ futures-util = "0.3"
 libc = "0.2"
 random-port = "0.1"
 if-addrs = "0.15"
+fatfs = "0.3.6"
+fs2 = "0.4.3"
 libp2p = { version = "0.56", features = ["yamux", "serde", "mdns"] }
 sysinfo = "0.39.6"
 rand = "0.10"
