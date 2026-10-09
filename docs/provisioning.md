@@ -50,7 +50,9 @@ default registry is `/var/lib/odorobo/vsock-cids.json`; set
 agent/VM shutdown and restart, and are released on explicit VM deletion;
 reservations from failed startup attempts are rolled back only after confirmed
 process exit. An active lease cannot be reused—even for the same VM ID—until
-exit is confirmed. After an unclean agent/host failure, stale active leases may
+exit is confirmed. Every reservation has a distinct persisted lease token;
+startup rollback, exit recording, and deletion retries use that token so one
+incarnation cannot release a newer incarnation's lease. After an unclean agent/host failure, stale active leases may
 need manual recovery rather than assuming the old VMM is gone. A requested CID is
 reserved if free; a conflict fails VM creation rather than silently assigning
 a different CID. `GetVMInfo` returns the effective VM manifest, including the
@@ -58,6 +60,33 @@ allocated CID in `observed.vsock_guest_cid` and the desired socket path;
 automatic allocation leaves `desired.vsock.guest_cid` omitted.
 
 ## Runtime and migration limits
+
+Deletion is acknowledged only after the known VM-owning agents confirm process
+exit and node-local cleanup. Missing owners keep deletion pending; retry after
+those agents become reachable. Cleanup ownership survives discovery-cache
+eviction in scheduler memory, but is not a durable cluster inventory across
+scheduler restarts. Keep node identities stable when recovering failed agents.
+
+Storage teardown releases only resources acquired by Odorobo. Shared mappings
+are reference-counted within the agent process; pre-existing external mappings
+are borrowed rather than detached. Failed releases retain process-local cleanup
+state and block ID reuse until an explicit delete retries successfully. This
+state does not survive an unclean agent restart; inspect and recover leftover
+host mappings manually rather than assuming they can safely be detached. A
+failed acquisition command cannot prove ownership of a mapping that appeared
+concurrently. Such ambiguous resources are quarantined and never automatically
+detached; they require manual reconciliation rather than a destructive retry.
+There is no automatic in-process reset for uncertain ownership: stop managed
+VMs and reconcile affected mappings/sessions with external users before
+restarting the agent to clear that process-local state. Restart alone is not
+proof that the old VMM exited or that storage can safely be detached.
+
+Storage operations run as agent-owned tasks with bounded caller waits. A timeout
+or cancelled request does not abandon an in-flight map/logout: cleanup keeps
+its ownership record, and the same resource cannot be reused while release is
+pending. Unrelated resources are not serialized behind backend I/O. Ambiguous
+release outcomes also require manual reconciliation; an apparently absent device
+is not sufficient if a timed-out daemon operation might still complete later.
 
 The seed builder caps images at 64 MiB, but this is not the distributed API
 payload limit: actor requests are limited to 1 MiB (including the serialized

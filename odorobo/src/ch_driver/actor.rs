@@ -15,7 +15,7 @@ use crate::messages::vm::{
 use crate::{
     ch_driver::{VMInstance, manifest::to_vm_config},
     manifest::VmManifest,
-    vsock_cid::{VsockCidAllocator, VsockCidReservation},
+    vsock_cid::{PublishedRegistryUpdate, VsockCidAllocator, VsockCidReservation, VsockLeaseToken},
 };
 use kameo::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -33,15 +33,71 @@ pub struct MigrationState {
     pub listening_address: String,
     /// The task handle for the migration process.
     pub migration_task: Option<JoinHandle<Result<()>>>,
+    /// Set by the receive operation itself, before its completion notification.
+    /// Teardown must commit a successful receive even if its mailbox is closed.
+    receive_succeeded: Arc<AtomicBool>,
+    completion_task: Option<JoinHandle<()>>,
+    receive_abort: Option<tokio::task::AbortHandle>,
     console_attach_task: Option<JoinHandle<()>>,
     /// Reservation is committed only after the incoming migration completes.
     cid_reservation: Option<VsockCidReservation>,
     previous_manifest: Option<VmManifest>,
 }
 
+impl MigrationState {
+    fn uncommitted_reservation(&mut self) -> Option<VsockCidReservation> {
+        if self.receive_succeeded.load(Ordering::SeqCst) {
+            self.cid_reservation = None;
+            None
+        } else {
+            self.cid_reservation.take()
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("VM startup cleanup failed: {0}")]
 pub struct FailedStartupCleanup(pub String);
+
+/// Shared with the agent even when startup/teardown fails and no actor remains.
+/// Process exit alone grants no authority over a lease acquired by another VMM.
+#[derive(Debug)]
+pub struct VMCleanupProof {
+    process_exit_confirmed: AtomicBool,
+    lease_token: std::sync::Mutex<Option<VsockLeaseToken>>,
+}
+
+impl VMCleanupProof {
+    pub const fn new(process_exit_confirmed: bool) -> Self {
+        Self {
+            process_exit_confirmed: AtomicBool::new(process_exit_confirmed),
+            lease_token: std::sync::Mutex::new(None),
+        }
+    }
+
+    pub fn process_exit_confirmed(&self) -> bool {
+        self.process_exit_confirmed.load(Ordering::SeqCst)
+    }
+
+    fn set_process_exit_confirmed(&self, confirmed: bool) {
+        self.process_exit_confirmed
+            .store(confirmed, Ordering::SeqCst);
+    }
+
+    pub fn lease_token(&self) -> Option<VsockLeaseToken> {
+        *self
+            .lease_token
+            .lock()
+            .expect("cleanup proof lock poisoned")
+    }
+
+    pub(crate) fn own_lease(&self, token: VsockLeaseToken) {
+        *self
+            .lease_token
+            .lock()
+            .expect("cleanup proof lock poisoned") = Some(token);
+    }
+}
 
 const CONSOLE_SPOOL_SIZE: usize = 1024 * 1024;
 
@@ -211,8 +267,8 @@ pub struct VMActor {
     pub manifest: Option<VmManifest>,
     /// Explicit VM deletion releases any persistent vsock CID; shutdown keeps it.
     release_vsock_cid: bool,
-    /// Shared with the owning agent; independent of whether a CID was present.
-    process_exit_confirmed: Arc<AtomicBool>,
+    /// Exit and exact lease identity survive actor teardown for agent retries.
+    cleanup_proof: Arc<VMCleanupProof>,
     /// Owns and supervises the child after it is transferred out of `VMInstance`.
     process_watcher: Option<(
         tokio::sync::oneshot::Sender<()>,
@@ -224,6 +280,7 @@ fn allocate_vsock_cid(
     vmid: ulid::Ulid,
     manifest: &mut VmManifest,
     use_observed_cid: bool,
+    cleanup_proof: &VMCleanupProof,
 ) -> Result<Option<VsockCidReservation>> {
     manifest.validate()?;
     let observed_cid = use_observed_cid
@@ -237,14 +294,36 @@ fn allocate_vsock_cid(
     if let Some(vsock) = manifest.desired.vsock.as_ref() {
         let requested_cid = migration_vsock_cid(vsock.guest_cid, observed_cid, use_observed_cid)?;
         let allocator = VsockCidAllocator::from_environment();
-        let reservation = allocator.reserve_with_previous(vmid, requested_cid)?;
+        let reservation = allocator
+            .reserve_with_previous(vmid, requested_cid)
+            .map_err(|error| classify_cid_reservation_error(error, cleanup_proof))?;
+        cleanup_proof.own_lease(reservation.token);
         manifest
             .observed
             .get_or_insert_with(Default::default)
             .vsock_guest_cid = Some(reservation.cid);
         return Ok(Some(reservation));
     }
+    // Disabling vsock cannot evade an older incarnation's active lease after
+    // an agent restart. Stopping this new VMM would not prove the old one exited.
+    VsockCidAllocator::from_environment().ensure_no_active_lease(vmid)?;
     Ok(None)
+}
+
+fn classify_cid_reservation_error(error: Report, cleanup_proof: &VMCleanupProof) -> Report {
+    if let Some(token) = error
+        .downcast_ref::<PublishedRegistryUpdate>()
+        .and_then(|published| published.reservation_token)
+    {
+        cleanup_proof.own_lease(token);
+        error.wrap_err(FailedStartupCleanup(
+            "vsock CID reservation was published but not durably synced".to_owned(),
+        ))
+    } else {
+        // Validation/pre-publication failures may refer to another live
+        // incarnation's lease. Never give the agent proof to release that one.
+        error
+    }
 }
 
 fn validate_migration_manifest(manifest: &VmManifest) -> Result<()> {
@@ -291,28 +370,55 @@ fn manifest_with_resolved_vsock_cid(manifest: &VmManifest) -> VmManifest {
     resolved
 }
 
-fn rollback_vsock_cid(vmid: ulid::Ulid, reservation: Option<VsockCidReservation>) {
-    if let Some(reservation) = reservation
-        && let Err(error) = VsockCidAllocator::from_environment().rollback(vmid, reservation)
-    {
-        warn!(%vmid, ?error, "failed to roll back vsock CID reservation");
+fn rollback_vsock_cid(
+    allocator: &VsockCidAllocator,
+    vmid: ulid::Ulid,
+    reservation: Option<VsockCidReservation>,
+) -> Result<()> {
+    if let Some(reservation) = reservation {
+        allocator.rollback(vmid, reservation).map_err(|error| {
+            Report::new(FailedStartupCleanup(format!(
+                "failed to roll back vsock CID reservation: {error}"
+            )))
+        })?;
     }
+    Ok(())
+}
+
+fn finish_vsock_lease(
+    allocator: &VsockCidAllocator,
+    vmid: ulid::Ulid,
+    lease_token: Option<VsockLeaseToken>,
+    delete: bool,
+) -> Result<()> {
+    if let Some(token) = lease_token {
+        if delete {
+            allocator.release_owned(vmid, token)?;
+        } else {
+            allocator.mark_process_exited_owned(vmid, token)?;
+        }
+    } else if delete {
+        // Deletion of a no-vsock incarnation may release a retained *stopped*
+        // assignment, but never an older active lease whose exit we can't prove.
+        allocator.release_stopped(vmid)?;
+    }
+    Ok(())
 }
 
 impl Actor for VMActor {
     // The actor accepts intent; CH conversion happens inside on_start.
-    type Args = (ulid::Ulid, Option<VmManifest>, Arc<AtomicBool>);
+    type Args = (ulid::Ulid, Option<VmManifest>, Arc<VMCleanupProof>);
     type Error = Report;
 
     #[tracing::instrument(skip_all)]
     #[allow(clippy::too_many_lines)]
     async fn on_start(
-        (vmid, mut vm_config, process_exit_confirmed): Self::Args,
+        (vmid, mut vm_config, cleanup_proof): Self::Args,
         actor_ref: ActorRef<Self>,
     ) -> Result<Self> {
         let cid_reservation = vm_config
             .as_mut()
-            .map(|manifest| allocate_vsock_cid(vmid, manifest, false))
+            .map(|manifest| allocate_vsock_cid(vmid, manifest, false, &cleanup_proof))
             .transpose()?
             .flatten();
         // Boot is manifest intent, not a Cloud Hypervisor default. Preserve it
@@ -330,11 +436,16 @@ impl Actor for VMActor {
         {
             Ok(config) => config,
             Err(error) => {
-                rollback_vsock_cid(vmid, cid_reservation);
+                rollback_vsock_cid(
+                    &VsockCidAllocator::from_environment(),
+                    vmid,
+                    cid_reservation,
+                )
+                .map_err(|cleanup_error| cleanup_error.wrap_err(error.to_string()))?;
                 return Err(error);
             }
         };
-        process_exit_confirmed.store(false, Ordering::SeqCst);
+        cleanup_proof.set_process_exit_confirmed(false);
         let mut vminstance = match VMInstance::spawn(
             &vmid.to_string(),
             vm_config_for_ch,
@@ -352,13 +463,23 @@ impl Actor for VMActor {
                     warn!(%vmid, ?error, "retaining runtime files and vsock lease because VMM exit was not confirmed");
                     return Err(error);
                 }
-                process_exit_confirmed.store(true, Ordering::SeqCst);
+                cleanup_proof.set_process_exit_confirmed(true);
+                if error.downcast_ref::<FailedStartupCleanup>().is_some() {
+                    return Err(error);
+                }
                 if let Err(cleanup_error) = std::fs::remove_dir_all(&runtime_dir)
                     && cleanup_error.kind() != std::io::ErrorKind::NotFound
                 {
-                    warn!(%vmid, ?cleanup_error, "failed to clean VM runtime directory after startup failure");
+                    return Err(Report::new(FailedStartupCleanup(format!(
+                        "{error}; failed to clean VM runtime directory: {cleanup_error}"
+                    ))));
                 }
-                rollback_vsock_cid(vmid, cid_reservation);
+                rollback_vsock_cid(
+                    &VsockCidAllocator::from_environment(),
+                    vmid,
+                    cid_reservation,
+                )
+                .map_err(|cleanup_error| cleanup_error.wrap_err(error.to_string()))?;
                 return Err(error);
             }
         };
@@ -373,18 +494,26 @@ impl Actor for VMActor {
         {
             match vminstance.destroy().await {
                 Ok(()) => {
-                    process_exit_confirmed.store(true, Ordering::SeqCst);
-                    rollback_vsock_cid(vmid, cid_reservation);
+                    cleanup_proof.set_process_exit_confirmed(true);
+                    rollback_vsock_cid(
+                        &VsockCidAllocator::from_environment(),
+                        vmid,
+                        cid_reservation,
+                    )
+                    .map_err(|cleanup_error| cleanup_error.wrap_err(error.to_string()))?;
                 }
                 Err(cleanup_error) => {
                     if cleanup_error
                         .downcast_ref::<super::instance::UnconfirmedProcessExit>()
                         .is_none()
                     {
-                        process_exit_confirmed.store(true, Ordering::SeqCst);
-                        if let Err(record_error) =
-                            VsockCidAllocator::from_environment().mark_process_exited(vmid)
-                        {
+                        cleanup_proof.set_process_exit_confirmed(true);
+                        if let Err(record_error) = finish_vsock_lease(
+                            &VsockCidAllocator::from_environment(),
+                            vmid,
+                            cleanup_proof.lease_token(),
+                            false,
+                        ) {
                             warn!(%vmid, ?record_error, "failed to record process exit after console attachment failure");
                         }
                     }
@@ -449,7 +578,7 @@ impl Actor for VMActor {
             console,
             manifest: vm_config,
             release_vsock_cid: false,
-            process_exit_confirmed,
+            cleanup_proof,
             process_watcher,
         })
     }
@@ -495,23 +624,44 @@ impl Actor for VMActor {
             false
         };
 
+        // Reaping closes the receive connection. Let its task observe the
+        // final response before deciding whether to roll back the reservation.
+        if let Some(state) = self.migration_state.as_mut()
+            && let Some(mut task) = state.completion_task.take()
+            && tokio::time::timeout(std::time::Duration::from_secs(5), &mut task)
+                .await
+                .is_err()
+        {
+            if let Some(abort) = self
+                .migration_state
+                .as_mut()
+                .and_then(|state| state.receive_abort.take())
+            {
+                abort.abort();
+            }
+            task.abort();
+            drop(task.await);
+        }
+
         let cleanup_result = if process_exited {
-            self.process_exit_confirmed.store(true, Ordering::SeqCst);
+            self.cleanup_proof.set_process_exit_confirmed(true);
             self.vm_instance.cleanup_after_stop().await
         } else {
             Ok(())
         };
 
         if process_exited {
-            if let Some(mut migration_state) = self.migration_state.take() {
-                rollback_vsock_cid(self.vmid, migration_state.cid_reservation.take());
-            }
             let allocator = VsockCidAllocator::from_environment();
-            if self.release_vsock_cid {
-                allocator.release(self.vmid)?;
-            } else {
-                allocator.mark_process_exited(self.vmid)?;
-            }
+            let rollback_result = self.migration_state.take().map_or(Ok(()), |mut state| {
+                rollback_vsock_cid(&allocator, self.vmid, state.uncommitted_reservation())
+            });
+            finish_vsock_lease(
+                &allocator,
+                self.vmid,
+                self.cleanup_proof.lease_token(),
+                self.release_vsock_cid,
+            )?;
+            rollback_result?;
         }
 
         stop_result?;
@@ -624,21 +774,28 @@ impl Message<MigrateVMReceive> for VMActor {
             };
         }
         let mut prep_manifest = msg.config.clone();
-        let cid_reservation = match allocate_vsock_cid(self.vmid, &mut prep_manifest, true) {
-            Ok(reservation) => reservation,
-            Err(error) => {
-                return MigrateVMReceiveReply {
-                    listening_address: String::new(),
-                    error: Some(error.to_string()),
-                };
-            }
-        };
+        let cid_reservation =
+            match allocate_vsock_cid(self.vmid, &mut prep_manifest, true, &self.cleanup_proof) {
+                Ok(reservation) => reservation,
+                Err(error) => {
+                    // allocate_vsock_cid retains only the exact published token.
+                    // Rejection of another incarnation never grants ownership.
+                    return MigrateVMReceiveReply {
+                        listening_address: String::new(),
+                        error: Some(error.to_string()),
+                    };
+                }
+            };
 
         // Keep ownership of this reservation in the actor until the process
         // exits. Any failure below tears down the receiver and rolls back from
         // on_stop, after the process watcher confirms exit.
+        let receive_succeeded = Arc::new(AtomicBool::new(false));
         self.migration_state = Some(MigrationState {
             migration_task: None,
+            receive_succeeded: Arc::clone(&receive_succeeded),
+            completion_task: None,
+            receive_abort: None,
             console_attach_task: None,
             listening_address: String::new(),
             cid_reservation,
@@ -652,7 +809,7 @@ impl Message<MigrateVMReceive> for VMActor {
         let config = match to_vm_config(&resolved_manifest, &runtime_dir) {
             Ok(config) => config,
             Err(error) => {
-                ctx.actor_ref().stop_gracefully().await.unwrap();
+                ctx.stop();
                 return MigrateVMReceiveReply {
                     listening_address: String::new(),
                     error: Some(error.to_string()),
@@ -663,7 +820,7 @@ impl Message<MigrateVMReceive> for VMActor {
         // Perform every fallible preparation step before opening the receiver.
         // On failure, stop the actor so on_stop rolls back after process exit.
         if let Err(error) = self.vm_instance.prep_config(config.clone()).await {
-            ctx.actor_ref().stop_gracefully().await.unwrap();
+            ctx.stop();
             return MigrateVMReceiveReply {
                 listening_address: String::new(),
                 error: Some(error.to_string()),
@@ -671,16 +828,17 @@ impl Message<MigrateVMReceive> for VMActor {
         }
 
         // Start receiving migration on the destination VM (this actor).
-        let (listening_address, migration_task) = match self.vm_instance.receive_migration().await {
-            Ok(result) => result,
-            Err(error) => {
-                ctx.actor_ref().stop_gracefully().await.unwrap();
-                return MigrateVMReceiveReply {
-                    listening_address: String::new(),
-                    error: Some(error.to_string()),
-                };
-            }
-        };
+        let (listening_address, migration_task) =
+            match self.vm_instance.receive_migration(receive_succeeded).await {
+                Ok(result) => result,
+                Err(error) => {
+                    ctx.stop();
+                    return MigrateVMReceiveReply {
+                        listening_address: String::new(),
+                        error: Some(error.to_string()),
+                    };
+                }
+            };
 
         self.manifest = Some(prep_manifest);
         if let Some(state) = self.migration_state.as_mut() {
@@ -712,7 +870,8 @@ impl Message<MigrateVMReceive> for VMActor {
             && let Some(migration_task) = migration_state.migration_task.take()
         {
             let actor_ref = ctx.actor_ref().clone();
-            tokio::spawn(async move {
+            migration_state.receive_abort = Some(migration_task.abort_handle());
+            migration_state.completion_task = Some(tokio::spawn(async move {
                 let succeeded = match migration_task.await {
                     Ok(Ok(())) => true,
                     Ok(Err(error)) => {
@@ -727,7 +886,7 @@ impl Message<MigrateVMReceive> for VMActor {
                 if let Err(error) = actor_ref.tell(MigrationFinished { succeeded }).await {
                     error!(?error, "failed to notify actor that migration finished");
                 }
-            });
+            }));
         }
 
         MigrateVMReceiveReply {
@@ -766,7 +925,7 @@ impl Message<MigrationFinished> for VMActor {
         } else if let Some(state) = self.migration_state.as_ref() {
             self.manifest.clone_from(&state.previous_manifest);
             warn!(vmid = %self.vmid, "migration failed; stopping receiver before rolling back CID reservation");
-            ctx.actor_ref().stop_gracefully().await.unwrap();
+            ctx.stop();
         } else {
             warn!(vmid = %self.vmid, "received migration failed notification with no active migration state");
         }
@@ -776,9 +935,191 @@ impl Message<MigrationFinished> for VMActor {
 #[cfg(test)]
 mod vsock_manifest_tests {
     use super::{
-        manifest_with_resolved_vsock_cid, migration_vsock_cid, validate_migration_manifest,
+        FailedStartupCleanup, MigrationState, VMCleanupProof, classify_cid_reservation_error,
+        finish_vsock_lease, manifest_with_resolved_vsock_cid, migration_vsock_cid,
+        rollback_vsock_cid, validate_migration_manifest,
     };
     use crate::manifest::{ObservedState, ObservedStatus, VmManifest};
+    use crate::vsock_cid::VsockCidAllocator;
+
+    #[test]
+    fn failed_cid_rollback_is_quarantined_and_recoverable_after_registry_repair() {
+        let directory = std::env::temp_dir().join(format!(
+            "odorobo-rollback-failure-{}",
+            ulid::Ulid::generate()
+        ));
+        let registry_path = directory.join("registry.json");
+        let allocator = VsockCidAllocator::new(&registry_path);
+        let vmid = ulid::Ulid::generate();
+        let reservation = allocator.reserve_with_previous(vmid, Some(42)).unwrap();
+        let registry = std::fs::read(&registry_path).unwrap();
+        // An unreadable registry prevents completing rollback, independently
+        // of whether the tests run as root or as an unprivileged user.
+        std::fs::write(&registry_path, b"invalid registry").unwrap();
+        let error = rollback_vsock_cid(&allocator, vmid, Some(reservation)).unwrap_err();
+        assert!(error.downcast_ref::<FailedStartupCleanup>().is_some());
+        std::fs::write(&registry_path, registry).unwrap();
+        // The agent's quarantine retains the confirmed-exit proof, allowing
+        // explicit deletion to repair the persisted lease after storage recovers.
+        allocator
+            .mark_process_exited_owned(vmid, reservation.token)
+            .unwrap();
+        allocator.release_owned(vmid, reservation.token).unwrap();
+        assert_eq!(
+            allocator.reserve_with_previous(vmid, Some(42)).unwrap().cid,
+            42
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn rejected_receiver_exit_does_not_mark_older_active_lease_stopped() {
+        let directory = std::env::temp_dir().join(format!(
+            "odorobo-rejected-receiver-{}",
+            ulid::Ulid::generate()
+        ));
+        let allocator = VsockCidAllocator::new(directory.join("registry.json"));
+        let vmid = ulid::Ulid::generate();
+        let reservation = allocator.reserve_with_previous(vmid, Some(47)).unwrap();
+        drop(allocator.reserve_with_previous(vmid, Some(47)).unwrap_err());
+        finish_vsock_lease(&allocator, vmid, None, false).unwrap();
+        drop(allocator.release_stopped(vmid).unwrap_err());
+        drop(finish_vsock_lease(&allocator, vmid, None, true).unwrap_err());
+        drop(allocator.ensure_no_active_lease(vmid).unwrap_err());
+        finish_vsock_lease(&allocator, vmid, Some(reservation.token), false).unwrap();
+        allocator.ensure_no_active_lease(vmid).unwrap();
+        assert!(allocator.release_stopped(vmid).unwrap());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn ordinary_reservation_rejection_never_claims_cleanup_ownership() {
+        let proof = VMCleanupProof::new(true);
+        let error =
+            classify_cid_reservation_error(stable_eyre::Report::msg("active lease"), &proof);
+        assert!(error.downcast_ref::<FailedStartupCleanup>().is_none());
+        assert_eq!(proof.lease_token(), None);
+    }
+
+    #[test]
+    fn postpublication_failure_retains_owned_token_and_cleanup_marker_for_agent() {
+        let directory = std::env::temp_dir().join(format!(
+            "odorobo-published-ownership-{}",
+            ulid::Ulid::generate()
+        ));
+        let allocator = VsockCidAllocator::new(directory.join("registry.json"));
+        let vmid = ulid::Ulid::generate();
+        let reservation = allocator.reserve_with_previous(vmid, Some(42)).unwrap();
+        let proof = VMCleanupProof::new(true);
+        let error = classify_cid_reservation_error(
+            stable_eyre::Report::new(crate::vsock_cid::PublishedRegistryUpdate {
+                source: std::io::Error::other("directory sync failed"),
+                reservation_token: Some(reservation.token),
+            })
+            .wrap_err("reserve failed"),
+            &proof,
+        );
+        assert!(error.downcast_ref::<FailedStartupCleanup>().is_some());
+        assert!(
+            error
+                .downcast_ref::<crate::vsock_cid::PublishedRegistryUpdate>()
+                .is_some()
+        );
+        assert!(proof.process_exit_confirmed());
+        assert_eq!(proof.lease_token(), Some(reservation.token));
+        finish_vsock_lease(&allocator, vmid, proof.lease_token(), false).unwrap();
+        finish_vsock_lease(&allocator, vmid, proof.lease_token(), true).unwrap();
+        assert!(!allocator.release_stopped(vmid).unwrap());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_stop_returns_reply_with_a_full_bounded_mailbox() {
+        use kameo::prelude::*;
+        use std::sync::Arc;
+        use tokio::sync::Notify;
+
+        struct StopActor;
+        impl Actor for StopActor {
+            type Args = Self;
+            type Error = stable_eyre::Report;
+            async fn on_start(args: Self, _actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
+                Ok(args)
+            }
+        }
+        struct StopAfterPreparation {
+            entered: Arc<Notify>,
+            proceed: Arc<Notify>,
+        }
+        impl Message<StopAfterPreparation> for StopActor {
+            type Reply = ();
+            async fn handle(
+                &mut self,
+                msg: StopAfterPreparation,
+                ctx: &mut Context<Self, Self::Reply>,
+            ) {
+                msg.entered.notify_one();
+                msg.proceed.notified().await;
+                // The same non-enqueueing stop used by VM migration failures.
+                ctx.stop();
+            }
+        }
+        impl Message<()> for StopActor {
+            type Reply = ();
+            async fn handle(&mut self, _msg: (), _ctx: &mut Context<Self, Self::Reply>) {}
+        }
+        let actor = StopActor::spawn_with_mailbox(StopActor, kameo::mailbox::bounded(1));
+        actor.wait_for_startup().await;
+        let entered = Arc::new(Notify::new());
+        let proceed = Arc::new(Notify::new());
+        let requester = actor.clone();
+        let request = StopAfterPreparation {
+            entered: Arc::clone(&entered),
+            proceed: Arc::clone(&proceed),
+        };
+        let reply = tokio::spawn(async move { requester.ask(request).await });
+        entered.notified().await;
+        actor.tell(()).await.unwrap();
+        proceed.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            reply.await.unwrap().unwrap();
+            actor.wait_for_shutdown().await;
+        })
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn successful_receive_commits_cid_before_notification_is_delivered() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let directory = std::env::temp_dir().join(format!(
+            "odorobo-migration-commit-{}",
+            ulid::Ulid::generate()
+        ));
+        let allocator = VsockCidAllocator::new(directory.join("registry.json"));
+        let vmid = ulid::Ulid::generate();
+        let reservation = allocator.reserve_with_previous(vmid, Some(47)).unwrap();
+        let receive_succeeded = Arc::new(AtomicBool::new(false));
+        let mut state = MigrationState {
+            listening_address: String::new(),
+            migration_task: None,
+            receive_succeeded: Arc::clone(&receive_succeeded),
+            completion_task: None,
+            receive_abort: None,
+            console_attach_task: None,
+            cid_reservation: Some(reservation),
+            previous_manifest: None,
+        };
+        // The receive worker has finished but its notification is gated/closed.
+        receive_succeeded.store(true, Ordering::SeqCst);
+        rollback_vsock_cid(&allocator, vmid, state.uncommitted_reservation()).unwrap();
+        finish_vsock_lease(&allocator, vmid, Some(reservation.token), false).unwrap();
+        assert_eq!(allocator.reserve_with_previous(vmid, None).unwrap().cid, 47);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn cloud_init_migration_is_rejected_before_creating_artifacts() {
@@ -826,8 +1167,7 @@ impl Message<ShutdownVM> for VMActor {
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         trace!(vmid = %self.vmid, "Shutting down VM actor");
-        ctx.actor_ref().stop_gracefully().await.unwrap();
-        // ctx.actor_ref().kill();
+        ctx.stop();
     }
 }
 #[remote_message]
@@ -842,6 +1182,6 @@ impl Message<DeleteVM> for VMActor {
         // Explicit deletion also releases a lease retained by an earlier
         // incarnation, even if this incarnation no longer has a vsock device.
         self.release_vsock_cid = true;
-        ctx.actor_ref().stop_gracefully().await.unwrap();
+        ctx.stop();
     }
 }
