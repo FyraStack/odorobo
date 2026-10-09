@@ -197,17 +197,59 @@ impl TryFrom<&Url> for RbdImage {
     type Error = stable_eyre::Report;
 
     fn try_from(uri: &Url) -> Result<Self, Self::Error> {
+        if uri.scheme() != "rbd" {
+            return Err(eyre!("RBD storage URI must use the rbd:// scheme"));
+        }
+        if !uri.username().is_empty()
+            || uri.password().is_some()
+            || uri.port().is_some()
+            || uri.query().is_some()
+            || uri.fragment().is_some()
+        {
+            return Err(eyre!(
+                "RBD storage URI must not include credentials, a port, query, or fragment"
+            ));
+        }
+
         let pool = uri
             .host_str()
             .ok_or_else(|| eyre!("RBD URI must have a host (pool name)"))?
             .to_owned();
-        let path = uri.path();
-        if path.is_empty() || path == "/" {
-            return Err(eyre!("RBD URI must have a path (image name)"));
+        validate_rbd_component(&pool, "pool")?;
+
+        let image = uri
+            .path()
+            .strip_prefix('/')
+            .ok_or_else(|| eyre!("RBD URI must have exactly one image path segment"))?;
+        validate_rbd_component(image, "image")?;
+        if image.contains('/') {
+            return Err(eyre!(
+                "RBD URI supports only rbd://<pool>/<image>; namespaces and nested image paths are not supported"
+            ));
         }
-        let image = path.trim_start_matches('/').to_owned();
-        Ok(Self { pool, image })
+
+        Ok(Self {
+            pool,
+            image: image.to_owned(),
+        })
     }
+}
+
+fn validate_rbd_component(value: &str, name: &str) -> Result<()> {
+    if value.is_empty()
+        || value == "."
+        || value == ".."
+        || value.starts_with('-')
+        || value.contains('%')
+        || value.chars().any(|character| {
+            !(character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.'))
+        })
+    {
+        return Err(eyre!(
+            "RBD {name} must be a non-empty name using only ASCII letters, digits, '.', '_' or '-'"
+        ));
+    }
+    Ok(())
 }
 
 pub struct RbdStorage;
@@ -216,6 +258,14 @@ pub struct RbdStorage;
 impl StorageDriver for RbdStorage {
     fn scheme(&self) -> &'static str {
         "rbd"
+    }
+
+    async fn canonical_uri(&self, uri: &Url) -> Result<Url> {
+        // Unlike generic URI options, RBD query/fragment data is not meaningful
+        // to the backend. Reject it instead of silently dropping it and mapping
+        // a different image than the manifest requested.
+        RbdImage::try_from(uri)?;
+        Ok(uri.clone())
     }
 
     fn resource_key(&self, uri: &Url) -> Result<String> {
@@ -278,6 +328,27 @@ mod tests {
             image.device_path(),
             std::path::PathBuf::from("/dev/rbd/my-pool/my-image")
         );
+    }
+
+    #[test]
+    fn rejects_unsupported_rbd_uri_components() {
+        for input in [
+            "file:///pool/image",
+            "rbd:///image",
+            "rbd://pool/",
+            "rbd://pool/image/",
+            "rbd://pool/ns/image",
+            "rbd://pool/image@snapshot",
+            "rbd://pool/image?read_only=true",
+            "rbd://pool/image#snapshot",
+            "rbd://user@pool/image",
+            "rbd://pool:6789/image",
+            "rbd://pool/has%20space",
+            "rbd://pool/-option",
+        ] {
+            let uri = Url::parse(input).expect("test URI parses");
+            assert!(RbdImage::try_from(&uri).is_err(), "accepted {input}");
+        }
     }
 
     #[test]
