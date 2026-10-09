@@ -15,7 +15,10 @@ use serde::{Deserialize, Serialize};
 use stable_eyre::{Report, Result};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{UnixStream, unix::OwnedWriteHalf},
+    net::{
+        UnixStream,
+        unix::{OwnedReadHalf, OwnedWriteHalf},
+    },
     sync::{Mutex, broadcast},
     task::JoinHandle,
 };
@@ -41,6 +44,21 @@ pub struct Console {
     inner: Arc<Mutex<ConsoleBuffer>>,
     output: broadcast::Sender<Vec<u8>>,
     writer: Arc<Mutex<Option<OwnedWriteHalf>>>,
+    spool_task: Arc<Mutex<ConsoleTask>>,
+}
+
+#[derive(Default)]
+struct ConsoleTask {
+    handle: Option<JoinHandle<()>>,
+    stopped: bool,
+}
+
+impl Drop for ConsoleTask {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
 }
 
 impl Default for Console {
@@ -50,6 +68,7 @@ impl Default for Console {
             inner: Arc::new(Mutex::new(ConsoleBuffer::default())),
             output,
             writer: Arc::new(Mutex::new(None)),
+            spool_task: Arc::new(Mutex::new(ConsoleTask::default())),
         }
     }
 }
@@ -61,40 +80,111 @@ struct ConsoleBuffer {
 }
 
 impl Console {
-    /// Attach to a Cloud Hypervisor serial socket and start spooling its output.
+    /// Attach to a Cloud Hypervisor serial socket and keep the spool connected
+    /// across guest shutdown and boot cycles.
     pub async fn attach_socket(&self, socket_path: std::path::PathBuf) -> Result<()> {
-        let stream = UnixStream::connect(&socket_path).await.map_err(|err| {
-            Report::msg(format!(
-                "failed to attach console spool to {}: {err}",
-                socket_path.display()
-            ))
-        })?;
-        let (mut reader, writer) = stream.into_split();
-        let mut writer_guard = self.writer.lock().await;
-        if writer_guard.is_some() {
+        self.start_spooling(socket_path, false).await
+    }
+
+    /// Migration receivers do not have a serial endpoint until restore finishes.
+    /// Use the same owned task for initial connection and subsequent reconnects.
+    async fn wait_for_socket(&self, socket_path: std::path::PathBuf) -> Result<()> {
+        self.start_spooling(socket_path, true).await
+    }
+
+    async fn start_spooling(&self, socket_path: std::path::PathBuf, wait: bool) -> Result<()> {
+        let mut task_guard = self.spool_task.lock().await;
+        if task_guard.stopped {
+            return Err(Report::msg("console spool has been stopped"));
+        }
+        if task_guard
+            .handle
+            .as_ref()
+            .is_some_and(|task| !task.is_finished())
+        {
             return Ok(());
         }
-        *writer_guard = Some(writer);
-        drop(writer_guard);
 
-        let spool = self.clone();
-        tokio::spawn(async move {
-            let mut buffer = [0_u8; 16 * 1024];
-            loop {
-                match reader.read(&mut buffer).await {
-                    Ok(0) => {
-                        debug!("serial console closed");
-                        break;
+        let reader = if wait {
+            None
+        } else {
+            let stream = UnixStream::connect(&socket_path).await.map_err(|err| {
+                Report::msg(format!(
+                    "failed to attach console spool to {}: {err}",
+                    socket_path.display()
+                ))
+            })?;
+            let (reader, writer) = stream.into_split();
+            *self.writer.lock().await = Some(writer);
+            Some(reader)
+        };
+
+        // Do not let the task retain its own task owner: dropping the last
+        // external Console must abort the spool and close its socket halves.
+        let spool = Self {
+            inner: Arc::clone(&self.inner),
+            output: self.output.clone(),
+            writer: Arc::clone(&self.writer),
+            spool_task: Arc::new(Mutex::new(ConsoleTask::default())),
+        };
+        task_guard.handle = Some(tokio::spawn(async move {
+            spool.spool_socket(socket_path, reader).await;
+        }));
+        drop(task_guard);
+        Ok(())
+    }
+
+    #[expect(
+        clippy::infinite_loop,
+        reason = "the reconnecting console task runs until its VM actor is torn down"
+    )]
+    async fn spool_socket(
+        &self,
+        socket_path: std::path::PathBuf,
+        mut reader: Option<OwnedReadHalf>,
+    ) {
+        let mut buffer = vec![0_u8; 16 * 1024].into_boxed_slice();
+        loop {
+            if let Some(current_reader) = reader.as_mut() {
+                match current_reader.read(&mut buffer).await {
+                    Ok(0) => debug!("serial console closed; reconnecting"),
+                    Ok(read) => {
+                        self.push(buffer[..read].to_vec()).await;
+                        continue;
                     }
-                    Ok(read) => spool.push(buffer[..read].to_vec()).await,
-                    Err(err) => {
-                        warn!(?err, "serial console spool stopped reading");
-                        break;
-                    }
+                    Err(err) => warn!(?err, "serial console spool stopped reading; reconnecting"),
                 }
             }
-        });
-        Ok(())
+
+            reader.take();
+            self.writer.lock().await.take();
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            match UnixStream::connect(&socket_path).await {
+                Ok(stream) => {
+                    let (next_reader, next_writer) = stream.into_split();
+                    *self.writer.lock().await = Some(next_writer);
+                    reader = Some(next_reader);
+                    info!(path = %socket_path.display(), "serial console reconnected");
+                }
+                Err(err) => {
+                    trace!(?err, path = %socket_path.display(), "serial console is not available yet");
+                }
+            }
+        }
+    }
+
+    /// Stop the reconnecting console task when its VM actor is torn down.
+    async fn stop_spooling(&self) {
+        let task = {
+            let mut state = self.spool_task.lock().await;
+            state.stopped = true;
+            state.handle.take()
+        };
+        if let Some(task) = task {
+            task.abort();
+            task.await.unwrap_or(());
+        }
+        self.writer.lock().await.take();
     }
 
     async fn push(&self, chunk: Vec<u8>) {
@@ -143,12 +233,13 @@ impl Console {
             let writer = writer_guard
                 .as_mut()
                 .ok_or_else(|| Report::msg("console is not attached"))?;
-            let result = writer
-                .write_all(input)
-                .await
-                .map_err(|err| Report::msg(format!("failed to write to serial console: {err}")));
+            let result = writer.write_all(input).await;
+            if result.is_err() {
+                writer_guard.take();
+            }
             drop(writer_guard);
             result
+                .map_err(|error| Report::msg(format!("failed to write to serial console: {error}")))
         }
     }
 
@@ -169,7 +260,132 @@ impl Console {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::{CONSOLE_SPOOL_SIZE, Console};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::UnixListener,
+    };
+
+    async fn wait_for_history(console: &Console, expected_suffix: &[u8]) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if console.history().await.ends_with(expected_suffix) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("console output should reach the spool");
+    }
+
+    #[tokio::test]
+    async fn console_reconnects_after_socket_disconnect() {
+        let socket_path =
+            std::env::temp_dir().join(format!("odorobo-console-{}.sock", ulid::Ulid::generate()));
+        let listener = UnixListener::bind(&socket_path).expect("bind test console socket");
+        let console = Console::default();
+        console
+            .attach_socket(socket_path.clone())
+            .await
+            .expect("attach console spool");
+
+        let (mut first_connection, _) = listener.accept().await.expect("first connection");
+        first_connection
+            .write_all(b"before shutdown")
+            .await
+            .expect("write first console output");
+        wait_for_history(&console, b"before shutdown").await;
+        drop(first_connection);
+        drop(listener);
+        std::fs::remove_file(&socket_path).expect("remove stopped serial endpoint");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if console.writer.lock().await.is_none() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("stale console writer should be cleared");
+        assert!(console.write_input(b"disconnected").await.is_err());
+        // Keep the endpoint absent through at least one failed reconnect.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        let listener =
+            UnixListener::bind(&socket_path).expect("recreate serial endpoint after boot");
+
+        let (mut second_connection, _) =
+            tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .expect("console spool should reconnect")
+                .expect("accept reconnected console");
+        second_connection
+            .write_all(b"after boot")
+            .await
+            .expect("write reconnected console output");
+        wait_for_history(&console, b"after boot").await;
+
+        console
+            .write_input(b"hello")
+            .await
+            .expect("input should use reconnected socket");
+        let mut input = [0; 5];
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            second_connection.read_exact(&mut input),
+        )
+        .await
+        .expect("console input should arrive")
+        .expect("read console input");
+        assert_eq!(&input, b"hello");
+
+        console.stop_spooling().await;
+        drop(second_connection);
+        drop(listener);
+        std::fs::remove_file(socket_path).expect("remove test console socket");
+    }
+
+    #[tokio::test]
+    async fn dropping_console_cancels_its_spool_task() {
+        let socket_path =
+            std::env::temp_dir().join(format!("odorobo-drop-{}.sock", ulid::Ulid::generate()));
+        let listener = UnixListener::bind(&socket_path).expect("bind console socket");
+        let console = Console::default();
+        let inner = std::sync::Arc::downgrade(&console.inner);
+        console
+            .attach_socket(socket_path.clone())
+            .await
+            .expect("attach console");
+        let (mut connection, _) = listener.accept().await.expect("accept console");
+        drop(console);
+        let mut byte = [0];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), connection.read(&mut byte))
+                .await
+                .expect("spool should close socket")
+                .expect("read socket"),
+            0
+        );
+        assert!(inner.upgrade().is_none());
+        std::fs::remove_file(socket_path).expect("remove test socket");
+    }
+
+    #[tokio::test]
+    async fn stopping_console_cancels_initial_migration_connection_and_prevents_restart() {
+        let socket_path =
+            std::env::temp_dir().join(format!("odorobo-wait-{}.sock", ulid::Ulid::generate()));
+        let console = Console::default();
+        console
+            .wait_for_socket(socket_path.clone())
+            .await
+            .expect("start waiting for migration endpoint");
+        console.stop_spooling().await;
+        assert!(console.spool_task.lock().await.handle.is_none());
+        assert!(console.wait_for_socket(socket_path).await.is_err());
+    }
 
     #[tokio::test]
     async fn console_history_is_bounded_to_one_megabyte() {
@@ -212,8 +428,7 @@ impl Actor for VMActor {
             .as_ref()
             .is_some_and(|manifest| manifest.desired.boot.start);
         let vm_config_for_ch = vm_config.as_ref().map(to_vm_config).transpose()?;
-        let mut vminstance =
-            VMInstance::spawn(&vmid.to_string(), vm_config_for_ch, boot, None).await?;
+        let vminstance = VMInstance::spawn(&vmid.to_string(), vm_config_for_ch, boot, None).await?;
 
         let console = Console::default();
         // A migration receiver has no config yet; its serial socket is created
@@ -224,13 +439,27 @@ impl Actor for VMActor {
                 .await?;
         }
 
-        // Take the child process out so we can watch for unexpected death.
-        // destroy() handles a missing child_process gracefully.
-        if let Some(mut child_process) = vminstance.take_child_process() {
+        // Poll without holding the process lock across wait: teardown must be
+        // able to kill and reap the VMM before releasing its attached resources.
+        if let Some(child_process) = vminstance.child_process() {
+            let child_process = Arc::downgrade(&child_process);
             let actor_ref = actor_ref.clone();
             tokio::spawn(async move {
                 debug!(%vmid, "watching child process to handle actor cleanup");
-                match child_process.wait().await {
+                let result = loop {
+                    let Some(child) = child_process.upgrade() else {
+                        return;
+                    };
+                    let status = child.lock().await.try_wait();
+                    drop(child);
+                    match status {
+                        Ok(None) => {}
+                        Ok(Some(status)) => break Ok(status),
+                        Err(error) => break Err(error),
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                };
+                match result {
                     Ok(status) => {
                         if status.success() {
                             warn!(%vmid, "child process exited outside of actor teardown");
@@ -279,6 +508,7 @@ impl Actor for VMActor {
             }
         }
 
+        self.console.stop_spooling().await;
         self.vm_instance.destroy().await?;
 
         // info!(vmid = %self.vmid, ?res, "VM process exited");
@@ -412,19 +642,13 @@ impl Message<MigrateVMReceive> for VMActor {
             config,
         });
 
-        let console = self.console.clone();
-        let console_socket_path = self.vm_instance.console_socket_path();
-        tokio::spawn(async move {
-            loop {
-                match console.attach_socket(console_socket_path.clone()).await {
-                    Ok(()) => break,
-                    Err(err) => {
-                        trace!(?err, "serial console socket not ready during migration");
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    }
-                }
-            }
-        });
+        if let Err(error) = self
+            .console
+            .wait_for_socket(self.vm_instance.console_socket_path())
+            .await
+        {
+            warn!(?error, "failed to start migration console spool");
+        }
 
         let actor_ref = ctx.actor_ref().clone();
 
