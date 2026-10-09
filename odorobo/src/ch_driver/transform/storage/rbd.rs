@@ -193,6 +193,40 @@ impl RbdImage {
     }
 }
 
+impl RbdImage {
+    /// Parse the original URI before `Url` can normalize host case or dot segments.
+    pub(super) fn parse_uri(value: &str) -> Result<Self> {
+        let resource = value
+            .strip_prefix("rbd://")
+            .ok_or_else(|| eyre!("RBD storage URI must use the rbd:// scheme"))?;
+        let (pool, image) = resource
+            .split_once('/')
+            .ok_or_else(|| eyre!("RBD URI must have a pool and one image path segment"))?;
+        if pool != pool.to_ascii_lowercase() {
+            return Err(eyre!("RBD pool names in the URI must be lowercase"));
+        }
+        validate_rbd_component(pool, "pool")?;
+        if image.contains('/') {
+            return Err(eyre!(
+                "RBD URI supports only rbd://<pool>/<image>; namespaces and nested image paths are not supported"
+            ));
+        }
+        validate_rbd_component(image, "image")?;
+
+        let parsed =
+            Url::parse(value).map_err(|error| eyre!("Invalid RBD storage URI: {error}"))?;
+        let parsed_image = Self::try_from(&parsed)?;
+        if parsed_image.pool != pool || parsed_image.image != image {
+            // Hostnames are case-insensitive and URL parsers normalize them;
+            // refusing normalization avoids silently selecting another pool.
+            return Err(eyre!(
+                "RBD URI components must not change during URL normalization"
+            ));
+        }
+        Ok(parsed_image)
+    }
+}
+
 impl TryFrom<&Url> for RbdImage {
     type Error = stable_eyre::Report;
 
@@ -221,12 +255,12 @@ impl TryFrom<&Url> for RbdImage {
             .path()
             .strip_prefix('/')
             .ok_or_else(|| eyre!("RBD URI must have exactly one image path segment"))?;
-        validate_rbd_component(image, "image")?;
         if image.contains('/') {
             return Err(eyre!(
                 "RBD URI supports only rbd://<pool>/<image>; namespaces and nested image paths are not supported"
             ));
         }
+        validate_rbd_component(image, "image")?;
 
         Ok(Self {
             pool,
