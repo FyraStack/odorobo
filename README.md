@@ -55,13 +55,27 @@ Install the CLI helper
 cargo install --path odoroboctl
 ```
 
-You can then use `odoroboctl` to directly interact with the Manager, for example to spawn a VM instance
-
-Now apply the [Cloud Hypervisor VM spec](https://github.com/cloud-hypervisor/cloud-hypervisor/blob/main/docs/api.md#create-a-virtual-machine) to the instance, for example with a simple configuration that boots from a disk image
+You can then use `odoroboctl` to directly interact with the Manager. Create a VM by providing a disk image with `--image`:
 
 ```bash
-odoroboctl create vm.json
+odoroboctl create --image ./disk.img
 ```
+
+The create command accepts basic VM settings. If omitted, they default to the values shown below:
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `--name <NAME>` | `test_vm` | VM name |
+| `--vcpus <VCPUS>` | `4` | Number of virtual CPUs |
+| `--memory <MEMORY>` | `4GiB` | VM memory size; accepts byte-size values such as `2GiB` or `512MiB` |
+
+For example, to create a VM named `web` with 2 virtual CPUs and 8 GiB of memory:
+
+```bash
+odoroboctl create --image ./disk.img --name web --vcpus 2 --memory 8GiB
+```
+
+The image can be a local path or URI. The image can also be supplied through the `ODOROBO_VM_IMAGE` environment variable instead of `--image`.
 
 To connect directly on the host, connect to the VM's serial console socket in its runtime directory:
 

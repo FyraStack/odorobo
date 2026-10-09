@@ -34,6 +34,15 @@ pub enum Command {
         /// Path or URI of the VM disk image.
         #[arg(long, env = "ODOROBO_VM_IMAGE")]
         image: String,
+        /// Name to assign to the VM.
+        #[arg(long, default_value = "test_vm")]
+        name: String,
+        /// Number of virtual CPUs to assign to the VM.
+        #[arg(long, default_value_t = 4)]
+        vcpus: u32,
+        /// Memory to assign to the VM (for example, 4GiB).
+        #[arg(long, default_value = "4GiB")]
+        memory: ByteSize,
     },
 
     /// List VMs currently known by the manager/agent.
@@ -102,18 +111,23 @@ pub async fn run_command(cli: Cli) -> Result<()> {
     let base_url = cli.manager_addr;
 
     match cli.command {
-        Command::Create { image } => {
+        Command::Create {
+            image,
+            name,
+            vcpus,
+            memory,
+        } => {
             let vm = VmManifest {
                 api_version: odorobo::manifest::MANIFEST_VERSION,
                 id: Ulid::generate(),
                 desired: DesiredState {
                     metadata: Metadata {
-                        name: "test_vm".to_owned(),
+                        name,
                         ..Default::default()
                     },
                     compute: Compute {
-                        vcpus: 4,
-                        memory_bytes: ByteSize::gib(4).as_u64(),
+                        vcpus,
+                        memory_bytes: memory.as_u64(),
                         ..Default::default()
                     },
                     storage: vec![Storage {
@@ -167,4 +181,62 @@ pub async fn run_command(cli: Cli) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Command};
+    use bytesize::ByteSize;
+    use clap::Parser;
+
+    #[test]
+    fn create_options_default_to_current_vm_settings() {
+        let cli = Cli::try_parse_from(["odoroboctl", "create", "--image", "disk.img"])
+            .expect("default create options should parse");
+
+        match cli.command {
+            Command::Create {
+                name,
+                vcpus,
+                memory,
+                ..
+            } => {
+                assert_eq!(name, "test_vm");
+                assert_eq!(vcpus, 4);
+                assert_eq!(memory, ByteSize::gib(4));
+            }
+            _ => panic!("expected create command"),
+        }
+    }
+
+    #[test]
+    fn create_options_accept_vm_settings() {
+        let cli = Cli::try_parse_from([
+            "odoroboctl",
+            "create",
+            "--image",
+            "disk.img",
+            "--name",
+            "web",
+            "--vcpus",
+            "8",
+            "--memory",
+            "16GiB",
+        ])
+        .expect("custom create options should parse");
+
+        match cli.command {
+            Command::Create {
+                name,
+                vcpus,
+                memory,
+                ..
+            } => {
+                assert_eq!(name, "web");
+                assert_eq!(vcpus, 8);
+                assert_eq!(memory, ByteSize::gib(16));
+            }
+            _ => panic!("expected create command"),
+        }
+    }
 }
