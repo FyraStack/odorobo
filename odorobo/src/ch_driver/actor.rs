@@ -11,7 +11,6 @@ use crate::{
 };
 use cloud_hypervisor_client::models::VmConfig;
 use kameo::prelude::*;
-use odorobo::cluster_state::{PlacementLifecycle, VMStopFence};
 use serde::{Deserialize, Serialize};
 use stable_eyre::{Report, Result};
 use tokio::{
@@ -170,9 +169,7 @@ impl Console {
 
 #[cfg(test)]
 mod tests {
-    use super::{CONSOLE_SPOOL_SIZE, Console, stop_fence_matches_runtime};
-    use odorobo::cluster_state::{PlacementLifecycle, VMStopFence};
-    use ulid::Ulid;
+    use super::{CONSOLE_SPOOL_SIZE, Console};
 
     #[tokio::test]
     async fn console_history_is_bounded_to_one_megabyte() {
@@ -185,27 +182,6 @@ mod tests {
         assert_eq!(&history[..4], b"aaaa");
         assert_eq!(&history[CONSOLE_SPOOL_SIZE - 4..], b"tail");
     }
-
-    #[test]
-    fn delayed_stop_command_cannot_kill_new_runtime_generation() {
-        let old_fence = VMStopFence {
-            generation: Ulid::generate(),
-            owner: "node-a".to_owned(),
-            lifecycle: PlacementLifecycle::Deleting,
-        };
-        let current_generation = Ulid::generate();
-        assert_ne!(old_fence.generation, current_generation);
-        assert!(!stop_fence_matches_runtime(
-            current_generation,
-            "node-a",
-            &old_fence
-        ));
-        assert!(stop_fence_matches_runtime(
-            old_fence.generation,
-            "node-a",
-            &old_fence
-        ));
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -214,8 +190,6 @@ pub struct MigrationFinished;
 #[derive(RemoteActor)]
 pub struct VMActor {
     pub vmid: ulid::Ulid,
-    pub generation: ulid::Ulid,
-    pub owner: String,
     /// path to the Cloud Hypervisor socket, in /run/odorobo/vms/<VMID>/ch.sock
     pub vm_instance: VMInstance,
     pub migration_state: Option<MigrationState>,
@@ -224,39 +198,22 @@ pub struct VMActor {
     /// The translated Cloud Hypervisor config lives only in `VMInstance`.
     pub manifest: Option<VmManifest>,
     destroyed: bool,
-    heartbeat_failures: u8,
-}
-
-fn stop_fence_matches_runtime(generation: ulid::Ulid, owner: &str, fence: &VMStopFence) -> bool {
-    fence.generation == generation
-        && fence.owner == owner
-        && fence.lifecycle != PlacementLifecycle::Active
-}
-
-impl VMActor {
-    fn accept_stop_fence(&self, expected: Option<VMStopFence>) -> Option<VMStopFence> {
-        expected.filter(|fence| stop_fence_matches_runtime(self.generation, &self.owner, fence))
-    }
 }
 
 impl Actor for VMActor {
     // The actor accepts intent; CH conversion happens inside on_start.
-    type Args = (ulid::Ulid, Option<VmManifest>, ulid::Ulid, String);
+    type Args = (ulid::Ulid, Option<VmManifest>);
     type Error = Report;
 
     #[tracing::instrument(skip_all)]
-    async fn on_start(
-        (vmid, vm_config, generation, owner): Self::Args,
-        actor_ref: ActorRef<Self>,
-    ) -> Result<Self> {
+    async fn on_start((vmid, vm_config): Self::Args, _actor_ref: ActorRef<Self>) -> Result<Self> {
         // Boot is manifest intent, not a Cloud Hypervisor default. Preserve it
         // separately because VMInstance also supports create-without-boot paths.
         let boot = vm_config
             .as_ref()
             .is_some_and(|manifest| manifest.desired.boot.start);
         let vm_config_for_ch = vm_config.as_ref().map(to_vm_config).transpose()?;
-        let mut vminstance =
-            VMInstance::spawn(&vmid.to_string(), vm_config_for_ch, boot, None).await?;
+        let vminstance = VMInstance::spawn(&vmid.to_string(), vm_config_for_ch, boot, None).await?;
 
         let console = Console::default();
         // A migration receiver has no config yet; its serial socket is created
@@ -267,46 +224,13 @@ impl Actor for VMActor {
                 .await?;
         }
 
-        // Transfer the child into a watcher while preserving a control path for
-        // VMInstance::destroy to request kill-and-reap before purging runtime files.
-        if let Some((child_process, watcher)) = vminstance.take_child_process_for_watcher() {
-            let actor_ref = actor_ref.clone();
-            tokio::spawn(async move {
-                debug!(%vmid, "watching child process to handle actor cleanup");
-                let (wait_result, stopped_for_teardown) = watcher.wait(child_process).await;
-                if stopped_for_teardown {
-                    debug!(%vmid, "child process exited after requested VM teardown");
-                    return;
-                }
-                match wait_result {
-                    Ok(status) if status.success() => {
-                        warn!(%vmid, "child process exited outside of actor teardown");
-                        _ = actor_ref.stop_gracefully().await;
-                    }
-                    Ok(status) => {
-                        error!(%vmid, ?status, "child process exited unexpectedly, killing actor");
-                        actor_ref.kill();
-                    }
-                    Err(err) => {
-                        error!(%vmid, ?err, "failed to wait on child process, killing actor");
-                        actor_ref.kill();
-                    }
-                }
-            });
-        } else {
-            warn!(%vmid, "VMInstance has no child process to watch");
-        }
-
         Ok(Self {
             vmid,
-            generation,
-            owner,
             vm_instance: vminstance,
             migration_state: None,
             console,
             manifest: vm_config,
             destroyed: false,
-            heartbeat_failures: 0,
         })
     }
 
@@ -410,26 +334,16 @@ impl Message<GetVMHeartbeat> for VMActor {
     async fn handle(
         &mut self,
         _msg: GetVMHeartbeat,
-        ctx: &mut Context<Self, Self::Reply>,
+        _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        let error = self
-            .vm_instance
-            .ping()
-            .await
-            .err()
-            .map(|error| error.to_string());
-        if error.is_some() {
-            self.heartbeat_failures = self.heartbeat_failures.saturating_add(1);
-            if self.heartbeat_failures > 5 {
-                _ = ctx.actor_ref().stop_gracefully().await;
-            }
-        } else {
-            self.heartbeat_failures = 0;
-        }
         GetVMHeartbeatReply {
             vmid: self.vmid,
-            generation: self.generation,
-            error,
+            error: self
+                .vm_instance
+                .ping()
+                .await
+                .err()
+                .map(|error| error.to_string()),
         }
     }
 }
@@ -588,55 +502,50 @@ impl Message<PrepMigration> for VMActor {
 
 #[remote_message]
 impl Message<ShutdownVM> for VMActor {
-    type Reply = Result<crate::messages::vm::ShutdownVMReply, String>;
+    type Reply = crate::messages::vm::ShutdownVMReply;
+
     async fn handle(
         &mut self,
-        msg: ShutdownVM,
+        _msg: ShutdownVM,
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        let Some(fence) = self.accept_stop_fence(msg.expected) else {
-            return Err("VM stop fence does not match this runtime".to_owned());
-        };
         trace!(vmid = %self.vmid, "Shutting down VM actor");
-        self.vm_instance
-            .destroy()
-            .await
-            .map_err(|error| error.to_string())?;
+        if let Err(error) = self.vm_instance.destroy().await {
+            return crate::messages::vm::ShutdownVMReply {
+                error: Some(error.to_string()),
+            };
+        }
         self.destroyed = true;
-        ctx.actor_ref()
-            .stop_gracefully()
-            .await
-            .map_err(|error| error.to_string())?;
-        Ok(crate::messages::vm::ShutdownVMReply { completed: fence })
+        crate::messages::vm::ShutdownVMReply {
+            error: ctx
+                .actor_ref()
+                .stop_gracefully()
+                .await
+                .err()
+                .map(|error| error.to_string()),
+        }
     }
 }
 #[remote_message]
 impl Message<DeleteVM> for VMActor {
     type Reply = crate::messages::vm::DeleteVMReply;
-    async fn handle(&mut self, msg: DeleteVM, ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
-        let Some(fence) = self.accept_stop_fence(msg.expected) else {
-            return crate::messages::vm::DeleteVMReply {
-                error: Some("VM stop fence does not match this runtime".to_owned()),
-                completed: None,
-            };
-        };
+    async fn handle(
+        &mut self,
+        _msg: DeleteVM,
+        ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
         trace!(vmid = %self.vmid, "Deleting VM actor");
         if let Err(error) = self.vm_instance.destroy().await {
             return crate::messages::vm::DeleteVMReply {
                 error: Some(error.to_string()),
-                completed: None,
             };
         }
         self.destroyed = true;
         if let Err(error) = ctx.actor_ref().stop_gracefully().await {
             return crate::messages::vm::DeleteVMReply {
                 error: Some(error.to_string()),
-                completed: None,
             };
         }
-        crate::messages::vm::DeleteVMReply {
-            error: None,
-            completed: Some(fence),
-        }
+        crate::messages::vm::DeleteVMReply { error: None }
     }
 }

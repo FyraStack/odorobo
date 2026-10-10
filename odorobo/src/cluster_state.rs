@@ -22,7 +22,7 @@ pub const NODE_STATE_PREFIX: &str = "/odorobo/v1/node-state";
 pub const OPERATIONS_PREFIX: &str = "/odorobo/v1/operations";
 pub const RECORD_VERSION: u16 = 1;
 
-/// The agent hostname selected to run a VM manifest.
+/// Lifecycle of an explicitly managed VM placement.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlacementLifecycle {
@@ -32,54 +32,57 @@ pub enum PlacementLifecycle {
     Deleting,
 }
 
+/// The agent hostname selected to run a VM manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VMStopFence {
-    pub generation: Ulid,
-    pub owner: String,
-    pub lifecycle: PlacementLifecycle,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PlacementRecord {
     pub vmid: Ulid,
     pub node: String,
-    /// Fences delayed create requests from earlier incarnations of this VM ID.
+    /// Fences delayed requests from a later incarnation; absent on legacy records.
     #[serde(default)]
-    pub generation: Ulid,
-    /// Old records without a lifecycle field remain active.
+    pub generation: Option<Ulid>,
+    /// Older version-1 records are active unless explicitly marked otherwise.
     #[serde(default)]
     pub lifecycle: PlacementLifecycle,
 }
 
-impl PlacementRecord {
-    #[must_use]
-    pub fn active(vmid: Ulid, node: String) -> Self {
-        Self {
-            vmid,
-            node,
-            generation: Ulid::generate(),
-            lifecycle: PlacementLifecycle::Active,
-        }
-    }
+/// Version-1 payload for `/odorobo/v1/node-state/<node>` records.
+/// The enclosing store record supplies the version wrapper.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeStateRecord {
+    /// Stable node identifier, matching the key suffix.
+    pub node: String,
+    /// User-visible labels and annotations associated with the node.
+    #[serde(default)]
+    pub metadata: crate::types::ObjectMetadata,
+}
 
-    #[must_use]
-    pub fn stop_fence(&self) -> VMStopFence {
-        VMStopFence {
-            generation: self.generation,
-            owner: self.node.clone(),
-            lifecycle: self.lifecycle,
-        }
-    }
+/// Status of a version-1 operation record; this is descriptive state only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationState {
+    Pending,
+    Running,
+    Succeeded,
+    Failed,
+}
 
-    fn matches_fence(&self, fence: &VMStopFence) -> bool {
-        if self.generation != fence.generation {
-            return false;
-        }
-        if self.node != fence.owner {
-            return false;
-        }
-        self.lifecycle == fence.lifecycle && self.lifecycle != PlacementLifecycle::Active
-    }
+/// Version-1 payload for `/odorobo/v1/operations/<operation_id>` records.
+/// Operation processing and state transitions are intentionally unspecified.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperationRecord {
+    /// Stable operation identifier, matching the key suffix.
+    pub operation_id: Ulid,
+    /// Opaque operation kind understood by a future operation processor.
+    pub kind: String,
+    /// Opaque target identifier (for example, a VM ID).
+    pub target: String,
+    pub state: OperationState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VmState<T> {
+    pub manifest: T,
+    pub placement: PlacementRecord,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,9 +108,11 @@ pub enum StateError {
     UnsupportedVersion(u16),
     #[error("state record is missing")]
     Missing,
-    #[error("state record already exists")]
+    #[error("state record already exists with different intent")]
     AlreadyExists,
-    #[error("state changed concurrently or lifecycle transition is not allowed")]
+    #[error("manifest and placement are incomplete or inconsistent")]
+    Incomplete,
+    #[error("state changed concurrently or stop lifecycle conflicts")]
     Conflict,
     #[error("state serialization failed: {0}")]
     Serialization(#[from] serde_json::Error),
@@ -129,6 +134,35 @@ fn decode_record<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, StateError> {
 
 fn list_prefix(prefix: &str) -> String {
     format!("{}/", prefix.trim_end_matches('/'))
+}
+
+fn pair_vm_state<T: DeserializeOwned>(
+    entries: Vec<(String, Vec<u8>)>,
+) -> Result<Vec<VmState<T>>, StateError> {
+    let mut records = BTreeMap::<Ulid, (Option<T>, Option<PlacementRecord>)>::new();
+    for (record_key, bytes) in entries {
+        if let Some(id) = record_key.strip_prefix(&list_prefix(VM_MANIFESTS_PREFIX)) {
+            let vmid = id.parse().map_err(|_| StateError::Incomplete)?;
+            records.entry(vmid).or_default().0 = Some(decode_record(&bytes)?);
+        } else if let Some(id) = record_key.strip_prefix(&list_prefix(PLACEMENT_PREFIX)) {
+            let vmid: Ulid = id.parse().map_err(|_| StateError::Incomplete)?;
+            let placement: PlacementRecord = decode_record(&bytes)?;
+            if placement.vmid != vmid {
+                return Err(StateError::Incomplete);
+            }
+            records.entry(vmid).or_default().1 = Some(placement);
+        }
+    }
+    records
+        .into_values()
+        .map(|(manifest, placement)| match (manifest, placement) {
+            (Some(manifest), Some(placement)) => Ok(VmState {
+                manifest,
+                placement,
+            }),
+            _ => Err(StateError::Incomplete),
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -228,163 +262,182 @@ impl StateStore {
         ))
     }
 
-    /// Atomically creates the desired manifest and its placement. A retry while
-    /// either key exists cannot replace a VM's current intent or placement.
-    pub async fn create_vm_state<T: Serialize + Send + Sync>(
+    /// Reads manifests and placements from one etcd range read (or one memory
+    /// read lock), rejecting orphaned or mismatched records.
+    pub async fn list_vm_state<T: DeserializeOwned + Send>(
+        &self,
+    ) -> Result<Vec<VmState<T>>, StateError> {
+        let entries = match self {
+            Self::Etcd(store) => store.read_vm_entries().await?,
+            Self::Memory(store) => store
+                .values
+                .read()
+                .await
+                .iter()
+                .filter(|(record_key, _)| {
+                    record_key.starts_with(&list_prefix(VM_MANIFESTS_PREFIX))
+                        || record_key.starts_with(&list_prefix(PLACEMENT_PREFIX))
+                })
+                .map(|(record_key, value)| (record_key.clone(), value.clone()))
+                .collect(),
+        };
+        pair_vm_state(entries)
+    }
+
+    pub async fn get_vm_state<T: DeserializeOwned + Send>(
+        &self,
+        vmid: Ulid,
+    ) -> Result<Option<VmState<T>>, StateError> {
+        Ok(self
+            .list_vm_state::<T>()
+            .await?
+            .into_iter()
+            .find(|state| state.placement.vmid == vmid))
+    }
+
+    /// Atomically creates desired state; an identical active pair is an
+    /// idempotent retry, while conflicts and incomplete pairs are rejected.
+    pub async fn create_vm_state<T: Serialize + DeserializeOwned + PartialEq + Send + Sync>(
         &self,
         vmid: Ulid,
         manifest: &T,
         placement: &PlacementRecord,
     ) -> Result<(), StateError> {
+        if placement.vmid != vmid || placement.lifecycle != PlacementLifecycle::Active {
+            return Err(StateError::Conflict);
+        }
+        if let Some(existing) = self.get_vm_state::<T>(vmid).await? {
+            return if existing.manifest == *manifest && existing.placement == *placement {
+                Ok(())
+            } else {
+                Err(StateError::AlreadyExists)
+            };
+        }
+
         let manifest_key = key(VM_MANIFESTS_PREFIX, &vmid);
         let placement_key = key(PLACEMENT_PREFIX, &vmid);
-        let manifest = serde_json::to_vec(&VersionedRecord {
+        let manifest_bytes = serde_json::to_vec(&VersionedRecord {
             version: RECORD_VERSION,
             value: manifest,
         })?;
-        let placement = serde_json::to_vec(&VersionedRecord {
+        let placement_bytes = serde_json::to_vec(&VersionedRecord {
             version: RECORD_VERSION,
             value: placement,
         })?;
 
-        match self {
+        let result = match self {
             Self::Etcd(store) => {
                 store
-                    .create_vm_state(&manifest_key, manifest, &placement_key, placement)
+                    .create_vm_state(
+                        &manifest_key,
+                        manifest_bytes,
+                        &placement_key,
+                        placement_bytes,
+                    )
                     .await
             }
             Self::Memory(store) => {
                 let mut values = store.values.write().await;
                 if values.contains_key(&manifest_key) || values.contains_key(&placement_key) {
+                    Err(StateError::AlreadyExists)
+                } else {
+                    values.insert(manifest_key, manifest_bytes);
+                    values.insert(placement_key, placement_bytes);
                     drop(values);
-                    return Err(StateError::AlreadyExists);
+                    Ok(())
                 }
-                values.insert(manifest_key, manifest);
-                values.insert(placement_key, placement);
-                drop(values);
-                Ok(())
             }
+        };
+        if matches!(result, Err(StateError::AlreadyExists))
+            && let Some(existing) = self.get_vm_state::<T>(vmid).await?
+            && existing.manifest == *manifest
+            && existing.placement == *placement
+        {
+            return Ok(());
         }
+        result
     }
 
-    /// Atomically assigns a previously unplaced VM. Existing placement is never
-    /// overwritten by a manager acting on stale observations.
-    pub async fn assign_placement_if_absent(
-        &self,
-        placement: &PlacementRecord,
-    ) -> Result<(), StateError> {
-        let placement_key = key(PLACEMENT_PREFIX, &placement.vmid);
-        let manifest_key = key(VM_MANIFESTS_PREFIX, &placement.vmid);
-        match self {
-            Self::Etcd(store) => {
-                store
-                    .assign_placement_if_absent(&manifest_key, &placement_key, placement)
-                    .await
-            }
-            Self::Memory(store) => {
-                let mut values = store.values.write().await;
-                if values.contains_key(&placement_key) {
-                    return Err(StateError::AlreadyExists);
-                }
-                if !values.contains_key(&manifest_key) {
-                    return Err(StateError::Missing);
-                }
-                let record = serde_json::to_vec(&VersionedRecord {
-                    version: RECORD_VERSION,
-                    value: placement,
-                })?;
-                values.insert(placement_key, record);
-                drop(values);
-                Ok(())
-            }
-        }
-    }
-
-    /// Marks a VM as stopping before any runtime teardown is dispatched.
-    /// Repeated requests preserve the first durable stop intent.
+    /// Persists the stop marker before runtime teardown is requested.
     pub async fn begin_vm_stop(
         &self,
         vmid: Ulid,
         intent: StopIntent,
     ) -> Result<PlacementRecord, StateError> {
+        self.get_vm_state::<serde_json::Value>(vmid)
+            .await?
+            .ok_or(StateError::Missing)?;
         let placement_key = key(PLACEMENT_PREFIX, &vmid);
+        let manifest_key = key(VM_MANIFESTS_PREFIX, &vmid);
         match self {
-            Self::Etcd(store) => store.begin_vm_stop(&placement_key, intent).await,
             Self::Memory(store) => {
                 let mut values = store.values.write().await;
-                let encoded = values.get(&placement_key).ok_or(StateError::Missing)?;
-                let mut placement: PlacementRecord = decode_record(encoded)?;
-                if placement.lifecycle == PlacementLifecycle::Active {
-                    placement.lifecycle = intent.lifecycle();
-                    let record = serde_json::to_vec(&VersionedRecord {
+                let Some(bytes) = values.get(&placement_key) else {
+                    return if values.contains_key(&manifest_key) {
+                        Err(StateError::Incomplete)
+                    } else {
+                        Err(StateError::Missing)
+                    };
+                };
+                if !values.contains_key(&manifest_key) {
+                    return Err(StateError::Incomplete);
+                }
+                let mut placement: PlacementRecord = decode_record(bytes)?;
+                if placement.vmid != vmid {
+                    return Err(StateError::Incomplete);
+                }
+                if placement.lifecycle == intent.lifecycle() {
+                    return Ok(placement);
+                }
+                if placement.lifecycle != PlacementLifecycle::Active {
+                    return Err(StateError::Conflict);
+                }
+                placement.lifecycle = intent.lifecycle();
+                values.insert(
+                    placement_key,
+                    serde_json::to_vec(&VersionedRecord {
                         version: RECORD_VERSION,
                         value: &placement,
-                    })?;
-                    values.insert(placement_key, record);
-                }
+                    })?,
+                );
                 drop(values);
                 Ok(placement)
             }
+            Self::Etcd(store) => store.begin_vm_stop(&placement_key, intent).await,
         }
     }
 
-    /// Removes desired state only after runtime teardown has been confirmed and
-    /// only if the placement still identifies the exact stopped incarnation.
-    /// The operation is idempotent once both records have been removed.
+    /// Deletes both records only if the exact marked placement is still current.
     pub async fn complete_vm_stop(&self, expected: &PlacementRecord) -> Result<(), StateError> {
+        if expected.lifecycle == PlacementLifecycle::Active {
+            return Err(StateError::Conflict);
+        }
         let manifest_key = key(VM_MANIFESTS_PREFIX, &expected.vmid);
         let placement_key = key(PLACEMENT_PREFIX, &expected.vmid);
         match self {
             Self::Etcd(store) => {
                 store
-                    .complete_vm_stop(&manifest_key, &placement_key, &expected.stop_fence())
+                    .complete_vm_stop(&manifest_key, &placement_key, expected)
                     .await
             }
             Self::Memory(store) => {
                 let mut values = store.values.write().await;
-                if let Some(encoded) = values.get(&placement_key) {
-                    let placement: PlacementRecord = decode_record(encoded)?;
-                    if !placement.matches_fence(&expected.stop_fence()) {
-                        return Err(StateError::Conflict);
-                    }
-                    values.remove(&placement_key);
-                    values.remove(&manifest_key);
-                } else if values.contains_key(&manifest_key) {
+                let Some(encoded) = values.get(&placement_key) else {
+                    return if values.contains_key(&manifest_key) {
+                        Err(StateError::Incomplete)
+                    } else {
+                        Ok(())
+                    };
+                };
+                let placement: PlacementRecord = decode_record(encoded)?;
+                if !values.contains_key(&manifest_key) {
+                    return Err(StateError::Incomplete);
+                }
+                if placement != *expected {
                     return Err(StateError::Conflict);
                 }
-                drop(values);
-                Ok(())
-            }
-        }
-    }
-
-    /// Reads paired VM state as one consistent snapshot.
-    pub async fn list_vm_state(
-        &self,
-    ) -> Result<
-        (
-            Vec<(String, serde_json::Value)>,
-            Vec<(String, PlacementRecord)>,
-        ),
-        StateError,
-    > {
-        match self {
-            Self::Etcd(store) => store.list_vm_state().await,
-            Self::Memory(store) => store.list_vm_state().await,
-        }
-    }
-
-    /// Atomically removes both halves of a VM's desired state. Kept for callers
-    /// that need unconditional cleanup; lifecycle handlers use `complete_vm_stop`.
-    pub async fn delete_vm_state(&self, vmid: Ulid) -> Result<(), StateError> {
-        let manifest_key = key(VM_MANIFESTS_PREFIX, &vmid);
-        let placement_key = key(PLACEMENT_PREFIX, &vmid);
-        match self {
-            Self::Etcd(store) => store.delete_vm_state(&manifest_key, &placement_key).await,
-            Self::Memory(store) => {
-                let mut values = store.values.write().await;
-                values.remove(&manifest_key);
                 values.remove(&placement_key);
+                values.remove(&manifest_key);
                 drop(values);
                 Ok(())
             }
@@ -524,15 +577,7 @@ impl ClusterStateStore for EtcdStateStore {
 }
 
 impl EtcdStateStore {
-    async fn list_vm_state(
-        &self,
-    ) -> Result<
-        (
-            Vec<(String, serde_json::Value)>,
-            Vec<(String, PlacementRecord)>,
-        ),
-        StateError,
-    > {
+    async fn read_vm_entries(&self) -> Result<Vec<(String, Vec<u8>)>, StateError> {
         let prefix = list_prefix(KEY_PREFIX);
         let response = self
             .client
@@ -544,50 +589,18 @@ impl EtcdStateStore {
             )
             .await
             .map_err(|error| StateError::Backend(error.to_string()))?;
-        let manifests_prefix = list_prefix(VM_MANIFESTS_PREFIX);
-        let placements_prefix = list_prefix(PLACEMENT_PREFIX);
-        let mut manifests = Vec::new();
-        let mut placements = Vec::new();
-        for kv in response.kvs() {
-            let key = kv.key_str().unwrap_or_default().to_owned();
-            if key.starts_with(&manifests_prefix) {
-                manifests.push((key, decode_record(kv.value())?));
-            } else if key.starts_with(&placements_prefix) {
-                placements.push((key, decode_record(kv.value())?));
+        let mut entries = Vec::new();
+        for value in response.kvs() {
+            let record_key = value
+                .key_str()
+                .map_err(|error| StateError::Backend(error.to_string()))?;
+            if record_key.starts_with(&list_prefix(VM_MANIFESTS_PREFIX))
+                || record_key.starts_with(&list_prefix(PLACEMENT_PREFIX))
+            {
+                entries.push((record_key.to_owned(), value.value().to_vec()));
             }
         }
-        Ok((manifests, placements))
-    }
-
-    async fn assign_placement_if_absent(
-        &self,
-        manifest_key: &str,
-        placement_key: &str,
-        placement: &PlacementRecord,
-    ) -> Result<(), StateError> {
-        let record = serde_json::to_vec(&VersionedRecord {
-            version: RECORD_VERSION,
-            value: placement,
-        })?;
-        let response = self
-            .client
-            .as_ref()
-            .clone()
-            .txn(
-                Txn::new()
-                    .when([
-                        Compare::version(manifest_key, CompareOp::Greater, 0),
-                        Compare::version(placement_key, CompareOp::Equal, 0),
-                    ])
-                    .and_then([TxnOp::put(placement_key, record, None)]),
-            )
-            .await
-            .map_err(|error| StateError::Backend(error.to_string()))?;
-        if response.succeeded() {
-            Ok(())
-        } else {
-            Err(StateError::AlreadyExists)
-        }
+        Ok(entries)
     }
 
     async fn begin_vm_stop(
@@ -595,52 +608,77 @@ impl EtcdStateStore {
         placement_key: &str,
         intent: StopIntent,
     ) -> Result<PlacementRecord, StateError> {
-        for _ in 0..5 {
-            let response = self
-                .client
-                .as_ref()
-                .clone()
-                .get(placement_key, None)
-                .await
-                .map_err(|error| StateError::Backend(error.to_string()))?;
-            let Some(kv) = response.kvs().first() else {
-                return Err(StateError::Missing);
-            };
-            let mut placement: PlacementRecord = decode_record(kv.value())?;
-            if placement.lifecycle != PlacementLifecycle::Active {
-                return Ok(placement);
-            }
-            placement.lifecycle = intent.lifecycle();
-            let record = serde_json::to_vec(&VersionedRecord {
-                version: RECORD_VERSION,
-                value: &placement,
-            })?;
-            let transaction = Txn::new()
-                .when([Compare::mod_revision(
-                    placement_key,
-                    CompareOp::Equal,
-                    kv.mod_revision(),
-                )])
-                .and_then([TxnOp::put(placement_key, record, None)]);
-            let response = self
-                .client
-                .as_ref()
-                .clone()
-                .txn(transaction)
-                .await
-                .map_err(|error| StateError::Backend(error.to_string()))?;
-            if response.succeeded() {
-                return Ok(placement);
-            }
+        let response = self
+            .client
+            .as_ref()
+            .clone()
+            .get(placement_key, None)
+            .await
+            .map_err(|error| StateError::Backend(error.to_string()))?;
+        let value = response.kvs().first().ok_or(StateError::Missing)?;
+        let previous = value.value().to_vec();
+        let mut placement: PlacementRecord = decode_record(&previous)?;
+        let manifest_key = key(VM_MANIFESTS_PREFIX, &placement.vmid);
+        if self
+            .client
+            .as_ref()
+            .clone()
+            .get(manifest_key, None)
+            .await
+            .map_err(|error| StateError::Backend(error.to_string()))?
+            .kvs()
+            .is_empty()
+        {
+            return Err(StateError::Incomplete);
         }
-        Err(StateError::Conflict)
+        if placement.lifecycle == intent.lifecycle() {
+            return Ok(placement);
+        }
+        if placement.lifecycle != PlacementLifecycle::Active {
+            return Err(StateError::Conflict);
+        }
+        placement.lifecycle = intent.lifecycle();
+        let encoded = serde_json::to_vec(&VersionedRecord {
+            version: RECORD_VERSION,
+            value: &placement,
+        })?;
+        let response = self
+            .client
+            .as_ref()
+            .clone()
+            .txn(
+                Txn::new()
+                    .when([Compare::value(placement_key, CompareOp::Equal, previous)])
+                    .and_then([TxnOp::put(placement_key, encoded, None)]),
+            )
+            .await
+            .map_err(|error| StateError::Backend(error.to_string()))?;
+        if response.succeeded() {
+            return Ok(placement);
+        }
+        let current = self
+            .client
+            .as_ref()
+            .clone()
+            .get(placement_key, None)
+            .await
+            .map_err(|error| StateError::Backend(error.to_string()))?;
+        let Some(value) = current.kvs().first() else {
+            return Err(StateError::Missing);
+        };
+        let current: PlacementRecord = decode_record(value.value())?;
+        if current.lifecycle == intent.lifecycle() {
+            Ok(current)
+        } else {
+            Err(StateError::Conflict)
+        }
     }
 
     async fn complete_vm_stop(
         &self,
         manifest_key: &str,
         placement_key: &str,
-        expected: &VMStopFence,
+        expected: &PlacementRecord,
     ) -> Result<(), StateError> {
         let response = self
             .client
@@ -649,7 +687,7 @@ impl EtcdStateStore {
             .get(placement_key, None)
             .await
             .map_err(|error| StateError::Backend(error.to_string()))?;
-        let Some(kv) = response.kvs().first() else {
+        let Some(value) = response.kvs().first() else {
             let manifest = self
                 .client
                 .as_ref()
@@ -660,24 +698,35 @@ impl EtcdStateStore {
             return if manifest.kvs().is_empty() {
                 Ok(())
             } else {
-                Err(StateError::Conflict)
+                Err(StateError::Incomplete)
             };
         };
-        let placement: PlacementRecord = decode_record(kv.value())?;
-        if !placement.matches_fence(expected) {
+        let encoded = value.value().to_vec();
+        let current: PlacementRecord = decode_record(&encoded)?;
+        if current != *expected {
             return Err(StateError::Conflict);
         }
+        let manifest = self
+            .client
+            .as_ref()
+            .clone()
+            .get(manifest_key, None)
+            .await
+            .map_err(|error| StateError::Backend(error.to_string()))?;
+        let Some(manifest) = manifest.kvs().first() else {
+            return Err(StateError::Incomplete);
+        };
+        let manifest = manifest.value().to_vec();
         let response = self
             .client
             .as_ref()
             .clone()
             .txn(
                 Txn::new()
-                    .when([Compare::mod_revision(
-                        placement_key,
-                        CompareOp::Equal,
-                        kv.mod_revision(),
-                    )])
+                    .when([
+                        Compare::value(placement_key, CompareOp::Equal, encoded),
+                        Compare::value(manifest_key, CompareOp::Equal, manifest),
+                    ])
                     .and_then([
                         TxnOp::delete(manifest_key, None),
                         TxnOp::delete(placement_key, None),
@@ -720,50 +769,6 @@ impl EtcdStateStore {
         } else {
             Err(StateError::AlreadyExists)
         }
-    }
-
-    async fn delete_vm_state(
-        &self,
-        manifest_key: &str,
-        placement_key: &str,
-    ) -> Result<(), StateError> {
-        self.client
-            .as_ref()
-            .clone()
-            .txn(Txn::new().and_then([
-                TxnOp::delete(manifest_key, None),
-                TxnOp::delete(placement_key, None),
-            ]))
-            .await
-            .map(|_| ())
-            .map_err(|error| StateError::Backend(error.to_string()))
-    }
-}
-
-impl MemoryStateStore {
-    async fn list_vm_state(
-        &self,
-    ) -> Result<
-        (
-            Vec<(String, serde_json::Value)>,
-            Vec<(String, PlacementRecord)>,
-        ),
-        StateError,
-    > {
-        let values = self.values.read().await;
-        let manifests_prefix = list_prefix(VM_MANIFESTS_PREFIX);
-        let placements_prefix = list_prefix(PLACEMENT_PREFIX);
-        let mut manifests = Vec::new();
-        let mut placements = Vec::new();
-        for (key, value) in values.iter() {
-            if key.starts_with(&manifests_prefix) {
-                manifests.push((key.clone(), decode_record(value)?));
-            } else if key.starts_with(&placements_prefix) {
-                placements.push((key.clone(), decode_record(value)?));
-            }
-        }
-        drop(values);
-        Ok((manifests, placements))
     }
 }
 
@@ -821,30 +826,47 @@ impl ClusterStateStore for MemoryStateStore {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClusterStateStore, MemoryStateStore, PLACEMENT_PREFIX, PlacementLifecycle, PlacementRecord,
+        ClusterStateStore, MemoryStateStore, NODE_STATE_PREFIX, NodeStateRecord, OPERATIONS_PREFIX,
+        OperationRecord, OperationState, PLACEMENT_PREFIX, PlacementLifecycle, PlacementRecord,
         StateError, StateStore, StopIntent, VM_MANIFESTS_PREFIX, key,
     };
-    use std::sync::Arc;
+    use std::collections::BTreeMap;
     use ulid::Ulid;
 
-    #[tokio::test]
-    async fn round_trips_versioned_records_without_destructive_reads() {
-        let store = MemoryStateStore::default();
-        let key = key(VM_MANIFESTS_PREFIX, &"vm-1");
+    fn memory_store() -> StateStore {
+        StateStore::Memory(MemoryStateStore::default())
+    }
+
+    fn placement(vmid: Ulid) -> PlacementRecord {
+        PlacementRecord {
+            vmid,
+            node: "manager-owned-node".to_owned(),
+            generation: Some(Ulid::generate()),
+            lifecycle: PlacementLifecycle::Active,
+        }
+    }
+
+    async fn create_pair(store: &StateStore, vmid: Ulid) -> (serde_json::Value, PlacementRecord) {
+        let manifest = serde_json::json!({"id": vmid, "name": "demo"});
+        let placement = placement(vmid);
         store
-            .put(&key, &serde_json::json!({"name": "demo"}))
+            .create_vm_state(vmid, &manifest, &placement)
+            .await
+            .unwrap();
+        (manifest, placement)
+    }
+
+    #[tokio::test]
+    async fn versioned_crud_is_non_destructive_and_rejects_future_versions() {
+        let store = MemoryStateStore::default();
+        let record_key = key(VM_MANIFESTS_PREFIX, &"vm-1");
+        store
+            .put(&record_key, &serde_json::json!({"name": "demo"}))
             .await
             .unwrap();
         assert_eq!(
-            store.get::<serde_json::Value>(&key).await.unwrap(),
+            store.get::<serde_json::Value>(&record_key).await.unwrap(),
             Some(serde_json::json!({"name": "demo"}))
-        );
-        assert!(
-            store
-                .get::<serde_json::Value>("missing")
-                .await
-                .unwrap()
-                .is_none()
         );
         assert_eq!(
             store
@@ -856,242 +878,253 @@ mod tests {
         );
         assert!(
             store
-                .get::<serde_json::Value>(&key)
-                .await
-                .unwrap()
-                .is_some()
-        );
-        store.delete(&key).await.unwrap();
-        assert!(
-            store
-                .get::<serde_json::Value>(&key)
+                .get::<serde_json::Value>("missing")
                 .await
                 .unwrap()
                 .is_none()
         );
-
         store.values.write().await.insert(
-            key.clone(),
-            serde_json::to_vec(&serde_json::json!({"version": 2, "value": {"name": "future"}}))
-                .unwrap(),
+            record_key.clone(),
+            serde_json::to_vec(&serde_json::json!({"version": 2, "value": {}})).unwrap(),
         );
         assert!(matches!(
-            store.get::<serde_json::Value>(&key).await,
-            Err(super::StateError::UnsupportedVersion(2))
+            store.get::<serde_json::Value>(&record_key).await,
+            Err(StateError::UnsupportedVersion(2))
         ));
-
-        store.values.write().await.insert(
-            key.clone(),
-            serde_json::to_vec(&serde_json::json!({"version": 2, "value": "future"})).unwrap(),
+        assert!(store.values.read().await.contains_key(&record_key));
+        store.delete(&record_key).await.unwrap();
+        assert!(
+            store
+                .get::<serde_json::Value>(&record_key)
+                .await
+                .unwrap()
+                .is_none()
         );
-        assert!(matches!(
-            store.get::<PlacementRecord>(&key).await,
-            Err(super::StateError::UnsupportedVersion(2))
-        ));
     }
 
     #[tokio::test]
-    async fn list_only_matches_children_of_the_requested_prefix() {
+    async fn prefix_listing_excludes_similarly_named_keys() {
         let store = MemoryStateStore::default();
         store
-            .put(
-                &key(PLACEMENT_PREFIX, &"vm-1"),
-                &serde_json::json!({"name": "included"}),
-            )
+            .put(&key(PLACEMENT_PREFIX, &"vm-1"), &serde_json::json!(1))
             .await
             .unwrap();
         store
             .put(
                 &format!("{PLACEMENT_PREFIX}-backup/vm-2"),
-                &serde_json::json!({"name": "excluded"}),
+                &serde_json::json!(2),
             )
             .await
             .unwrap();
-
-        let records = store
-            .list::<serde_json::Value>(PLACEMENT_PREFIX)
-            .await
-            .unwrap();
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].1, serde_json::json!({"name": "included"}));
+        assert_eq!(
+            store
+                .list::<serde_json::Value>(PLACEMENT_PREFIX)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
-    async fn creates_and_deletes_paired_vm_state_atomically() {
-        let vmid = Ulid::generate();
-        let store = Arc::new(StateStore::Memory(MemoryStateStore::default()));
-        let placement = PlacementRecord::active(vmid, "node-a".to_owned());
+    async fn reserved_v1_node_and_operation_payloads_roundtrip_in_memory() {
+        let store = memory_store();
+        let node = NodeStateRecord {
+            node: "node-a".to_owned(),
+            metadata: crate::types::ObjectMetadata {
+                labels: BTreeMap::from([("zone".to_owned(), "west".to_owned())]),
+                annotations: BTreeMap::from([("owner".to_owned(), "platform".to_owned())]),
+            },
+        };
+        let operation = OperationRecord {
+            operation_id: Ulid::generate(),
+            kind: "vm.delete".to_owned(),
+            target: "vm-123".to_owned(),
+            state: OperationState::Running,
+        };
+        let node_key = key(NODE_STATE_PREFIX, "node-a");
+        let operation_key = key(OPERATIONS_PREFIX, &operation.operation_id);
+        store.put(&node_key, &node).await.unwrap();
+        store.put(&operation_key, &operation).await.unwrap();
 
+        let decoded_node = store
+            .get::<NodeStateRecord>(&node_key)
+            .await
+            .unwrap()
+            .unwrap();
+        let decoded_operation = store
+            .get::<OperationRecord>(&operation_key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded_node.node, node.node);
+        assert_eq!(decoded_node.metadata.labels, node.metadata.labels);
+        assert_eq!(decoded_node.metadata.annotations, node.metadata.annotations);
+        assert_eq!(decoded_operation, operation);
+        drop(store);
+    }
+
+    #[tokio::test]
+    async fn paired_create_is_atomic_idempotent_and_conflict_safe() {
+        let store = memory_store();
+        let vmid = Ulid::generate();
+        let (manifest, placement) = create_pair(&store, vmid).await;
         store
-            .create_vm_state(vmid, &serde_json::json!({"name": "demo"}), &placement)
+            .create_vm_state(vmid, &manifest, &placement)
             .await
             .unwrap();
         assert!(matches!(
             store
-                .create_vm_state(vmid, &serde_json::json!({"name": "other"}), &placement)
+                .create_vm_state(vmid, &serde_json::json!({"other": true}), &placement)
                 .await,
             Err(StateError::AlreadyExists)
         ));
-
-        store.delete_vm_state(vmid).await.unwrap();
-        assert!(
-            store
-                .get::<serde_json::Value>(&key(VM_MANIFESTS_PREFIX, &vmid))
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            store
-                .get::<PlacementRecord>(&key(PLACEMENT_PREFIX, &vmid))
-                .await
-                .unwrap()
-                .is_none()
-        );
-        drop(store);
-    }
-
-    #[tokio::test]
-    async fn durable_stop_intent_precedes_teardown_and_survives_failed_shutdown() {
-        let vmid = Ulid::generate();
-        let memory = MemoryStateStore::default();
-        let store = StateStore::Memory(memory.clone());
-        let manifest_key = key(VM_MANIFESTS_PREFIX, &vmid);
-        store
-            .create_vm_state(
-                vmid,
-                &serde_json::json!({"name": "demo"}),
-                &PlacementRecord::active(vmid, "node-a".to_owned()),
-            )
-            .await
-            .unwrap();
-
-        let stopping = store
-            .begin_vm_stop(vmid, StopIntent::Shutdown)
-            .await
-            .unwrap();
-        assert_eq!(stopping.lifecycle, PlacementLifecycle::Stopping);
-        assert!(
-            store
-                .get::<serde_json::Value>(&manifest_key)
-                .await
-                .unwrap()
-                .is_some()
-        );
-        drop(store);
-
-        // A restart sees the same stop marker; it must not treat the manifest
-        // as active desired state if teardown had failed before confirmation.
-        let restarted = StateStore::Memory(memory);
-        let recovered = restarted
-            .get::<PlacementRecord>(&key(PLACEMENT_PREFIX, &vmid))
+        let state = store
+            .get_vm_state::<serde_json::Value>(vmid)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(recovered.lifecycle, PlacementLifecycle::Stopping);
-        assert!(
-            restarted
-                .get::<serde_json::Value>(&manifest_key)
-                .await
-                .unwrap()
-                .is_some()
-        );
-        // A failed runtime stop does not call complete_vm_stop; the durable
-        // marker remains available for an owner agent to recover it.
-        restarted.complete_vm_stop(&recovered).await.unwrap();
-        assert!(
-            restarted
-                .get::<serde_json::Value>(&manifest_key)
-                .await
-                .unwrap()
-                .is_none()
-        );
-        drop(restarted);
-    }
-
-    #[tokio::test]
-    async fn delayed_stop_completion_cannot_delete_a_recreated_vm_incarnation() {
-        let vmid = Ulid::generate();
-        let store = StateStore::Memory(MemoryStateStore::default());
-        let manifest = serde_json::json!({"name": "same-vm-id"});
-        let generation_one = PlacementRecord::active(vmid, "node-a".to_owned());
-        store
-            .create_vm_state(vmid, &manifest, &generation_one)
-            .await
-            .unwrap();
-        let stopped_generation_one = store.begin_vm_stop(vmid, StopIntent::Delete).await.unwrap();
-        store
-            .complete_vm_stop(&stopped_generation_one)
-            .await
-            .unwrap();
-
-        let generation_two = PlacementRecord::active(vmid, "node-a".to_owned());
-        assert_ne!(generation_one.generation, generation_two.generation);
-        store
-            .create_vm_state(vmid, &manifest, &generation_two)
-            .await
-            .unwrap();
-        let stopped_generation_two = store
-            .begin_vm_stop(vmid, StopIntent::Shutdown)
-            .await
-            .unwrap();
-
-        // The delayed acknowledgement from G1 arrives while G2 is itself in a
-        // durable stop transition but has not yet completed runtime teardown.
-        assert!(matches!(
-            store.complete_vm_stop(&stopped_generation_one).await,
-            Err(StateError::Conflict)
-        ));
-        let current = store
-            .get::<PlacementRecord>(&key(PLACEMENT_PREFIX, &vmid))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(current.generation, generation_two.generation);
-        assert_eq!(current.lifecycle, PlacementLifecycle::Stopping);
-        assert_eq!(current.generation, stopped_generation_two.generation);
-        assert!(
-            store
-                .get::<serde_json::Value>(&key(VM_MANIFESTS_PREFIX, &vmid))
-                .await
-                .unwrap()
-                .is_some()
-        );
+        assert_eq!(state.manifest, manifest);
+        assert_eq!(state.placement, placement);
         drop(store);
     }
 
     #[tokio::test]
-    async fn placement_assignment_is_create_only_and_stop_intent_is_not_reverted() {
+    async fn paired_snapshot_rejects_orphans_and_returns_consistent_records() {
+        let store = memory_store();
         let vmid = Ulid::generate();
-        let store = StateStore::Memory(MemoryStateStore::default());
         store
             .put(
                 &key(VM_MANIFESTS_PREFIX, &vmid),
-                &serde_json::json!({"name": "demo"}),
+                &serde_json::json!({"id": vmid}),
             )
             .await
             .unwrap();
-        let original = PlacementRecord::active(vmid, "node-a".to_owned());
-        store.assign_placement_if_absent(&original).await.unwrap();
-        let other = PlacementRecord::active(vmid, "node-b".to_owned());
         assert!(matches!(
-            store.assign_placement_if_absent(&other).await,
-            Err(StateError::AlreadyExists)
+            store.list_vm_state::<serde_json::Value>().await,
+            Err(StateError::Incomplete)
         ));
-        assert_eq!(
-            store
-                .begin_vm_stop(vmid, StopIntent::Delete)
-                .await
-                .unwrap()
-                .node,
-            "node-a"
-        );
-        let repeated = store
-            .begin_vm_stop(vmid, StopIntent::Shutdown)
+        let placement = placement(vmid);
+        store
+            .put(&key(PLACEMENT_PREFIX, &vmid), &placement)
             .await
             .unwrap();
-        assert_eq!(repeated.lifecycle, PlacementLifecycle::Deleting);
-        assert_eq!(repeated.generation, original.generation);
+        let snapshot = store.list_vm_state::<serde_json::Value>().await.unwrap();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].placement, placement);
         drop(store);
+    }
+
+    #[tokio::test]
+    async fn stop_marker_is_durable_and_preserves_manager_owner_and_generation() {
+        let store = memory_store();
+        let vmid = Ulid::generate();
+        let (manifest, original) = create_pair(&store, vmid).await;
+        let stopping = store.begin_vm_stop(vmid, StopIntent::Delete).await.unwrap();
+        assert_eq!(stopping.node, original.node);
+        assert_eq!(stopping.generation, original.generation);
+        assert_eq!(stopping.lifecycle, PlacementLifecycle::Deleting);
+        assert_eq!(
+            store.begin_vm_stop(vmid, StopIntent::Delete).await.unwrap(),
+            stopping
+        );
+        assert!(matches!(
+            store.begin_vm_stop(vmid, StopIntent::Shutdown).await,
+            Err(StateError::Conflict)
+        ));
+        let state = store
+            .get_vm_state::<serde_json::Value>(vmid)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.manifest, manifest);
+        assert_eq!(state.placement, stopping);
+        assert!(matches!(
+            store.create_vm_state(vmid, &manifest, &original).await,
+            Err(StateError::AlreadyExists)
+        ));
+        drop(store);
+    }
+
+    #[tokio::test]
+    async fn failed_or_ambiguous_teardown_leaves_both_records_intact() {
+        let store = memory_store();
+        let vmid = Ulid::generate();
+        let (manifest, _) = create_pair(&store, vmid).await;
+        let marker = store.begin_vm_stop(vmid, StopIntent::Delete).await.unwrap();
+        // No completion call represents an absent or uncertain owner acknowledgement.
+        let state = store
+            .get_vm_state::<serde_json::Value>(vmid)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.manifest, manifest);
+        assert_eq!(state.placement, marker);
+        drop(store);
+    }
+
+    #[tokio::test]
+    async fn completion_compare_rejects_stale_generation_and_retries_exactly() {
+        let store = memory_store();
+        let vmid = Ulid::generate();
+        create_pair(&store, vmid).await;
+        let expected = store.begin_vm_stop(vmid, StopIntent::Delete).await.unwrap();
+        let mut stale = expected.clone();
+        stale.generation = Some(Ulid::generate());
+        assert!(matches!(
+            store.complete_vm_stop(&stale).await,
+            Err(StateError::Conflict)
+        ));
+        assert!(
+            store
+                .get_vm_state::<serde_json::Value>(vmid)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        store.complete_vm_stop(&expected).await.unwrap();
+        store.complete_vm_stop(&expected).await.unwrap();
+        assert!(
+            store
+                .get_vm_state::<serde_json::Value>(vmid)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        drop(store);
+    }
+
+    #[tokio::test]
+    async fn completion_rejects_incomplete_pairs_without_deleting_the_remaining_record() {
+        let store = memory_store();
+        let vmid = Ulid::generate();
+        create_pair(&store, vmid).await;
+        let expected = store.begin_vm_stop(vmid, StopIntent::Delete).await.unwrap();
+        let manifest_key = key(VM_MANIFESTS_PREFIX, &vmid);
+        let placement_key = key(PLACEMENT_PREFIX, &vmid);
+        store.delete(&manifest_key).await.unwrap();
+
+        assert!(matches!(
+            store.complete_vm_stop(&expected).await,
+            Err(StateError::Incomplete)
+        ));
+        assert!(
+            store
+                .get::<PlacementRecord>(&placement_key)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        drop(store);
+    }
+
+    #[test]
+    fn legacy_placement_defaults_to_active_without_a_generation() {
+        let placement: PlacementRecord = serde_json::from_value(serde_json::json!({
+            "vmid": Ulid::generate(), "node": "legacy-node"
+        }))
+        .unwrap();
+        assert_eq!(placement.lifecycle, PlacementLifecycle::Active);
+        assert_eq!(placement.generation, None);
     }
 }

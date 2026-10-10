@@ -2,33 +2,22 @@ use std::hint::black_box;
 use std::time::Instant;
 
 use bytesize::ByteSize;
-use odorobo::messages::agent::{
-    AgentStatus, AgentStatusUpdate, VMResourceCharge, apply_status_update,
-};
+use odorobo::messages::agent::{AgentStatus, AgentStatusUpdate, apply_status_update};
 use odorobo::types::ObjectMetadata;
 use ulid::Ulid;
 
 fn status(vm_count: usize) -> AgentStatus {
-    let mut vms: Vec<_> = (0..vm_count).map(|_| Ulid::generate()).collect();
-    vms.sort_unstable();
-    let resource_charges = vms
-        .iter()
-        .map(|vmid| VMResourceCharge {
-            vmid: *vmid,
-            generation: Ulid::generate(),
-            vcpus: 1,
-            memory_bytes: 1,
-        })
-        .collect();
     AgentStatus {
         hostname: "benchmark-agent".to_owned(),
         vcpus: 64,
         ram: ByteSize::gb(256),
         used_vcpus: u32::try_from(vm_count).expect("benchmark VM count fits in u32"),
         used_ram: ByteSize::gb(vm_count as u64),
-        vms,
-        reserved_vms: Vec::new(),
-        resource_charges,
+        vms: {
+            let mut vms: Vec<_> = (0..vm_count).map(|_| Ulid::generate()).collect();
+            vms.sort_unstable();
+            vms
+        },
         metadata: ObjectMetadata::default(),
     }
 }
@@ -55,8 +44,6 @@ fn main() {
             revision: 1,
             added,
             removed,
-            reserved_vms: Vec::new(),
-            resource_charges: base.resource_charges.clone(),
             used_vcpus: base.used_vcpus,
             used_ram: base.used_ram,
         };

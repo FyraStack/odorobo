@@ -160,7 +160,6 @@ impl SchedulerActor {
             &mut self.vm_data_cache,
         );
         self.durable_placements.remove(&vmid);
-        self.stop_manifests.remove(&vmid);
         self.vm_actorid_ulid_map
             .retain(|_, mapped_vmid| *mapped_vmid != vmid);
         for index in self.agent_vm_index.values_mut() {

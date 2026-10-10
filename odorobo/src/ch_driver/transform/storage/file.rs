@@ -32,10 +32,6 @@ impl StorageDriver for FileStorage {
         "file"
     }
 
-    fn ownership_key(&self, _uri: &Url) -> Result<Option<String>> {
-        Ok(None)
-    }
-
     async fn resolve(&self, uri: &Url) -> Result<PathBuf> {
         Ok(FileTarget::try_from(uri)?.path)
     }

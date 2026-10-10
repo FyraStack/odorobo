@@ -2,19 +2,19 @@ use super::{
     CachedActorKind, CachedVMActor, SchedulerActor, VmLifecycle, VmPlacement,
     scheduling::{
         affinity_delta, evaluate_affinity_rule, evaluate_table_value, has_capacity,
-        pending_resources_for_agent, pending_resources_with_status_for_agent,
+        pending_resources_for_agent,
     },
 };
 
+use crate::cluster_state::{MemoryStateStore, StateStore};
 use crate::manifest::{
     AffinityRequirement, AffinityRule, AffinityStrictness, AffinityType, Boot, Compute,
     DesiredState, Metadata, MetadataTable, Operator, VmManifest,
 };
-use crate::messages::agent::{AgentStatus, AgentStatusUpdate, apply_status_update};
+use crate::messages::agent::AgentStatus;
 use crate::types::ObjectMetadata;
 use ahash::{AHashMap, AHashSet};
 use bytesize::ByteSize;
-use odorobo::cluster_state::{MemoryStateStore, StateStore};
 use std::time::{Duration, Instant};
 use std::{collections::BTreeMap, sync::Arc};
 use ulid::Ulid;
@@ -99,314 +99,6 @@ fn reserves_pending_vm_resources_until_agent_status_confirms_them() {
 }
 
 #[test]
-fn durable_create_intent_is_reserved_once_until_agent_status_charges_it() {
-    let vmid = Ulid::generate();
-    let agent_id = super::ActorId::new(7);
-    let mut manifest = test_manifest(4, ByteSize::gib(8).as_u64());
-    manifest.id = vmid;
-    let manifests = AHashMap::from([(vmid, manifest)]);
-    let placement = odorobo::cluster_state::PlacementRecord::active(vmid, "owner-a".to_owned());
-    let durable = AHashMap::from([(vmid, placement.clone())]);
-    let pending = AHashMap::from([(
-        vmid,
-        vec![VmPlacement {
-            agent_id,
-            lifecycle: VmLifecycle::Pending,
-            created_at: Instant::now(),
-            last_confirmed_at: None,
-        }],
-    )]);
-    let uncharged_status = AgentStatus {
-        hostname: "owner-a".to_owned(),
-        vcpus: 8,
-        ram: ByteSize::gib(32),
-        used_vcpus: 0,
-        used_ram: ByteSize::b(0),
-        vms: Vec::new(),
-        reserved_vms: Vec::new(),
-        resource_charges: Vec::new(),
-        metadata: ObjectMetadata::default(),
-    };
-    let agents = AHashMap::from([(agent_id, uncharged_status.clone())]);
-
-    // An adopted durable create reserves its original owner even before local
-    // placement reconciliation has created a pending placeholder.
-    assert_eq!(
-        pending_resources_with_status_for_agent(
-            &manifests,
-            &AHashMap::new(),
-            &AHashMap::new(),
-            &durable,
-            &agents,
-            agent_id,
-        ),
-        (4, ByteSize::gib(8).as_u64())
-    );
-
-    // Repeated reconciliation and local pending state still represent one
-    // reservation, not two.
-    assert_eq!(
-        pending_resources_with_status_for_agent(
-            &manifests,
-            &AHashMap::new(),
-            &pending,
-            &durable,
-            &agents,
-            agent_id,
-        ),
-        (4, ByteSize::gib(8).as_u64())
-    );
-
-    // Once the agent reports the reservation, scheduler-side pending accounting
-    // must not add the same allocation again.
-    let mut charged_status = uncharged_status;
-    charged_status.reserved_vms.push(vmid);
-    charged_status
-        .resource_charges
-        .push(crate::messages::agent::VMResourceCharge {
-            vmid,
-            generation: placement.generation,
-            vcpus: 4,
-            memory_bytes: ByteSize::gib(8).as_u64(),
-        });
-    let charged_agents = AHashMap::from([(agent_id, charged_status)]);
-    assert_eq!(
-        pending_resources_with_status_for_agent(
-            &manifests,
-            &AHashMap::new(),
-            &pending,
-            &durable,
-            &charged_agents,
-            agent_id,
-        ),
-        (0, 0)
-    );
-}
-
-#[test]
-fn unresolved_stop_reservation_survives_restart_and_deduplicates_matching_status() {
-    let vmid = Ulid::generate();
-    let agent_id = super::ActorId::new(7);
-    let mut manifest = test_manifest(4, ByteSize::gib(8).as_u64());
-    manifest.id = vmid;
-    let manifests = AHashMap::from([(vmid, manifest.clone())]);
-    let placement = odorobo::cluster_state::PlacementRecord::active(vmid, "owner-a".to_owned());
-    let mut durable = AHashMap::from([(vmid, placement.clone())]);
-    let uncharged = AgentStatus {
-        hostname: "owner-a".to_owned(),
-        vcpus: 8,
-        ram: ByteSize::gib(32),
-        used_vcpus: 0,
-        used_ram: ByteSize::b(0),
-        vms: Vec::new(),
-        reserved_vms: Vec::new(),
-        resource_charges: Vec::new(),
-        metadata: ObjectMetadata::default(),
-    };
-    let agents = AHashMap::from([(agent_id, uncharged.clone())]);
-    assert_eq!(
-        pending_resources_with_status_for_agent(
-            &manifests,
-            &AHashMap::new(),
-            &AHashMap::new(),
-            &durable,
-            &agents,
-            agent_id,
-        ),
-        (4, ByteSize::gib(8).as_u64())
-    );
-
-    // A timed-out stop drops active reconciliation intent, but keeps its paired
-    // manifest and owner as a capacity reservation across manager reconstruction.
-    let mut stopping = placement;
-    stopping.lifecycle = odorobo::cluster_state::PlacementLifecycle::Stopping;
-    durable.insert(vmid, stopping.clone());
-    let active_manifests = AHashMap::new();
-    let stop_manifests = AHashMap::from([(vmid, manifest)]);
-    for _manager_restart in 0..2 {
-        assert_eq!(
-            pending_resources_with_status_for_agent(
-                &active_manifests,
-                &stop_manifests,
-                &AHashMap::new(),
-                &durable,
-                &agents,
-                agent_id,
-            ),
-            (4, ByteSize::gib(8).as_u64())
-        );
-    }
-
-    let mut charged = uncharged;
-    charged.reserved_vms.push(vmid);
-    charged
-        .resource_charges
-        .push(crate::messages::agent::VMResourceCharge {
-            vmid,
-            generation: stopping.generation,
-            vcpus: 4,
-            memory_bytes: ByteSize::gib(8).as_u64(),
-        });
-    let charged_agents = AHashMap::from([(agent_id, charged)]);
-    assert_eq!(
-        pending_resources_with_status_for_agent(
-            &active_manifests,
-            &stop_manifests,
-            &AHashMap::new(),
-            &durable,
-            &charged_agents,
-            agent_id,
-        ),
-        (0, 0)
-    );
-}
-
-#[test]
-fn stale_generation_status_cannot_certify_larger_durable_recreation() {
-    let vmid = Ulid::generate();
-    let agent_id = super::ActorId::new(7);
-    let generation_g1 = Ulid::generate();
-    let generation_g2 = Ulid::generate();
-    let mut manifest_g2 = test_manifest(4, ByteSize::gib(24).as_u64());
-    manifest_g2.id = vmid;
-    let manifests = AHashMap::from([(vmid, manifest_g2)]);
-    let placement_g2 = odorobo::cluster_state::PlacementRecord {
-        vmid,
-        node: "owner-a".to_owned(),
-        generation: generation_g2,
-        lifecycle: odorobo::cluster_state::PlacementLifecycle::Active,
-    };
-    let durable = AHashMap::from([(vmid, placement_g2)]);
-    let old_status = AgentStatus {
-        hostname: "owner-a".to_owned(),
-        vcpus: 16,
-        ram: ByteSize::gib(32),
-        used_vcpus: 0,
-        used_ram: ByteSize::b(0),
-        vms: vec![vmid],
-        reserved_vms: Vec::new(),
-        resource_charges: vec![crate::messages::agent::VMResourceCharge {
-            vmid,
-            generation: generation_g1,
-            vcpus: 4,
-            memory_bytes: ByteSize::gib(4).as_u64(),
-        }],
-        metadata: ObjectMetadata::default(),
-    };
-    let agents = AHashMap::from([(agent_id, old_status.clone())]);
-
-    let pending = pending_resources_with_status_for_agent(
-        &manifests,
-        &AHashMap::new(),
-        &AHashMap::new(),
-        &durable,
-        &agents,
-        agent_id,
-    );
-    assert_eq!(pending, (4, ByteSize::gib(24).as_u64()));
-    assert!(!has_capacity(
-        32,
-        old_status.used_vcpus,
-        1,
-        ByteSize::gib(32).as_u64(),
-        old_status.used_ram.as_u64().saturating_add(pending.1),
-        ByteSize::gib(12).as_u64(),
-    ));
-
-    // Only a confirmation matching G2 and its requested resources can transfer
-    // the durable reservation into status-reported usage.
-    let mut legacy_status = old_status.clone();
-    legacy_status.resource_charges.clear();
-    assert_eq!(
-        pending_resources_with_status_for_agent(
-            &manifests,
-            &AHashMap::new(),
-            &AHashMap::new(),
-            &durable,
-            &AHashMap::from([(agent_id, legacy_status)]),
-            agent_id,
-        ),
-        (4, ByteSize::gib(24).as_u64())
-    );
-
-    let mut current_status = old_status;
-    current_status.used_vcpus = 4;
-    current_status.used_ram = ByteSize::gib(24);
-    current_status.resource_charges[0].generation = generation_g2;
-    current_status.resource_charges[0].memory_bytes = ByteSize::gib(24).as_u64();
-    let matching_agents = AHashMap::from([(agent_id, current_status.clone())]);
-    assert_eq!(
-        pending_resources_with_status_for_agent(
-            &manifests,
-            &AHashMap::new(),
-            &AHashMap::new(),
-            &durable,
-            &matching_agents,
-            agent_id,
-        ),
-        (0, 0)
-    );
-    assert!(has_capacity(
-        32,
-        current_status.used_vcpus,
-        1,
-        ByteSize::gib(32).as_u64(),
-        current_status.used_ram.as_u64(),
-        ByteSize::gib(8).as_u64(),
-    ));
-}
-
-#[test]
-fn newer_agent_status_delta_applies_capacity_without_membership_changes() {
-    let vmid = Ulid::generate();
-    let mut status = AgentStatus {
-        hostname: "agent".to_owned(),
-        vcpus: 8,
-        ram: ByteSize::gib(16),
-        used_vcpus: 4,
-        used_ram: ByteSize::gib(8),
-        vms: vec![vmid],
-        reserved_vms: Vec::new(),
-        resource_charges: Vec::new(),
-        metadata: ObjectMetadata::default(),
-    };
-    let reserved_vmid = Ulid::generate();
-    let reserved_generation = Ulid::generate();
-    let revision = apply_status_update(
-        &mut status,
-        AgentStatusUpdate::Delta {
-            revision: 12,
-            added: Vec::new(),
-            removed: Vec::new(),
-            reserved_vms: vec![reserved_vmid],
-            resource_charges: vec![crate::messages::agent::VMResourceCharge {
-                vmid: reserved_vmid,
-                generation: reserved_generation,
-                vcpus: 2,
-                memory_bytes: ByteSize::gib(4).as_u64(),
-            }],
-            used_vcpus: 2,
-            used_ram: ByteSize::gib(4),
-        },
-    );
-
-    assert_eq!(revision, 12);
-    assert_eq!(status.vms, vec![vmid]);
-    assert_eq!(status.reserved_vms, vec![reserved_vmid]);
-    assert_eq!(
-        status.resource_charges,
-        vec![crate::messages::agent::VMResourceCharge {
-            vmid: reserved_vmid,
-            generation: reserved_generation,
-            vcpus: 2,
-            memory_bytes: ByteSize::gib(4).as_u64(),
-        }]
-    );
-    assert_eq!(status.used_vcpus, 2);
-    assert_eq!(status.used_ram, ByteSize::gib(4));
-}
-
-#[test]
 fn reconciling_source_agent_preserves_destination_migration_placement() {
     let vmid = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("valid ulid");
     let source_agent = super::ActorId::new(1);
@@ -426,8 +118,6 @@ fn reconciling_source_agent_preserves_destination_migration_placement() {
         used_vcpus: 0,
         used_ram: ByteSize::b(0),
         vms: vec![vmid],
-        reserved_vms: Vec::new(),
-        resource_charges: Vec::new(),
         metadata: ObjectMetadata::default(),
     };
     SchedulerActor::reconcile_agent_placements(
@@ -445,8 +135,6 @@ fn reconciling_source_agent_preserves_destination_migration_placement() {
         used_vcpus: 0,
         used_ram: ByteSize::b(0),
         vms: Vec::new(),
-        reserved_vms: Vec::new(),
-        resource_charges: Vec::new(),
         metadata: ObjectMetadata::default(),
     };
 
@@ -585,8 +273,6 @@ fn pending_placement_survives_full_snapshot_until_pending_timeout() {
         used_vcpus: 0,
         used_ram: ByteSize::b(0),
         vms: Vec::new(),
-        reserved_vms: Vec::new(),
-        resource_charges: Vec::new(),
         metadata: ObjectMetadata::default(),
     };
 
@@ -625,8 +311,6 @@ fn stale_running_placement_is_expired_by_full_snapshot() {
         used_vcpus: 0,
         used_ram: ByteSize::b(0),
         vms: Vec::new(),
-        reserved_vms: Vec::new(),
-        resource_charges: Vec::new(),
         metadata: ObjectMetadata::default(),
     };
 
@@ -650,7 +334,6 @@ fn vm_cleanup_unplaces_vm_without_another_discovered_actor() {
         agent_keepalive_tasks: AHashMap::new(),
         vm_actorid_ulid_map: AHashMap::from([(vm_actor_id, vmid)]),
         vm_manifests: AHashMap::from([(vmid, test_manifest(1, 1))]),
-        stop_manifests: AHashMap::new(),
         durable_placements: AHashMap::new(),
         vm_placements: AHashMap::from([(
             vmid,
@@ -687,10 +370,14 @@ fn explicit_stop_removes_vm_intent_and_actor_mapping() {
         agent_keepalive_tasks: AHashMap::new(),
         vm_actorid_ulid_map: AHashMap::from([(vm_actor_id, vmid)]),
         vm_manifests: AHashMap::from([(vmid, test_manifest(1, 1))]),
-        stop_manifests: AHashMap::new(),
         durable_placements: AHashMap::from([(
             vmid,
-            odorobo::cluster_state::PlacementRecord::active(vmid, "node-a".to_owned()),
+            crate::cluster_state::PlacementRecord {
+                vmid,
+                node: "node-a".to_owned(),
+                generation: Some(Ulid::generate()),
+                lifecycle: crate::cluster_state::PlacementLifecycle::Active,
+            },
         )]),
         vm_placements: AHashMap::from([(vmid, Vec::new())]),
         vm_data_cache: AHashMap::from([(vmid, vec![CachedVMActor { actor_ref: None }])]),
@@ -724,7 +411,6 @@ fn agent_cleanup_does_not_remove_unrelated_vm_state() {
         agent_keepalive_tasks: AHashMap::new(),
         vm_actorid_ulid_map: AHashMap::from([(vm_actor_id, vmid)]),
         vm_manifests: AHashMap::from([(vmid, test_manifest(1, 1))]),
-        stop_manifests: AHashMap::new(),
         vm_placements: AHashMap::from([(
             vmid,
             vec![VmPlacement {
@@ -763,7 +449,6 @@ fn vm_cleanup_does_not_remove_unrelated_agent_state() {
         agent_keepalive_tasks: AHashMap::new(),
         vm_actorid_ulid_map: AHashMap::from([(vm_actor_id, vmid)]),
         vm_manifests: AHashMap::from([(vmid, test_manifest(1, 1))]),
-        stop_manifests: AHashMap::new(),
         vm_placements: AHashMap::new(),
         durable_placements: AHashMap::new(),
         vm_data_cache: AHashMap::from([(vmid, vec![CachedVMActor { actor_ref: None }])]),

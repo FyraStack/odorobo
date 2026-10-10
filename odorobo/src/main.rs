@@ -3,9 +3,9 @@
 
 pub mod actors;
 mod ch_driver;
+pub mod cluster_state;
 
 pub mod config;
-pub use odorobo::cluster_state;
 pub mod http_api;
 mod manifest;
 pub mod messages;
@@ -23,10 +23,10 @@ use stable_eyre::{Result, eyre::eyre};
 use crate::actors::agent_actor::AgentActor;
 use crate::actors::http_actor::HTTPActor;
 use crate::actors::scheduler_actor::SchedulerActor;
+use crate::cluster_state::{ClusterStateStore, StateStore, TlsConfig};
 use crate::config::Config;
 use crate::utils::actor_names::{AGENT, HTTP_API_SERVER, SCHEDULER};
 use crate::utils::{connect_to_swarm, init};
-use odorobo::cluster_state::{ClusterStateStore, StateStore, TlsConfig};
 
 fn main() -> Result<()> {
     let config = Config::init();

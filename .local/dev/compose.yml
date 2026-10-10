@@ -54,9 +54,9 @@ services:
       - /dev:/dev
 
     healthcheck:
-      test: ["CMD", "/usr/local/bin/odorobo-ceph-healthcheck"]
+      test: ["CMD", "ceph", "-s"]
       interval: 5s
-      timeout: 10s
+      timeout: 5s
       retries: 30
 
   odorobo:
