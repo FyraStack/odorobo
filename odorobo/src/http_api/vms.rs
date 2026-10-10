@@ -60,6 +60,7 @@ async fn create_vm(
 ) -> Result<Json<serde_json::Value>, OdoroboError> {
     let message = CreateVM {
         vmid: request.vm.id,
+        generation: ulid::Ulid::nil(),
         config: request.vm,
     };
 
@@ -74,7 +75,12 @@ async fn delete_vm(
     State(state): State<ActorRef<HTTPActor>>,
     Path(VmId(vmid)): Path<VmId>,
 ) -> Result<impl IntoApiResponse, OdoroboError> {
-    let _reply = state.ask(DeleteVM { vmid }).await?;
+    let _reply = state
+        .ask(DeleteVM {
+            vmid,
+            expected: None,
+        })
+        .await?;
 
     Ok(Json(()))
 }
@@ -83,7 +89,12 @@ async fn shutdown_vm(
     State(state): State<ActorRef<HTTPActor>>,
     Path(VmId(vmid)): Path<VmId>,
 ) -> Result<impl IntoApiResponse, OdoroboError> {
-    let _reply = state.ask(ShutdownVM { vmid }).await?;
+    let _reply = state
+        .ask(ShutdownVM {
+            vmid,
+            expected: None,
+        })
+        .await?;
 
     Ok(Json(()))
 }

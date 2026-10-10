@@ -2,6 +2,7 @@
 
 This directory runs the local development stack in containers:
 
+- `etcd` provides the persistent local cluster-state store.
 - `ceph` provides a single-node Ceph cluster and a file-backed OSD.
 - `odorobo` runs the agent, sharing Ceph's network and PID namespaces and the host's `/dev`.
 
@@ -40,16 +41,16 @@ Initialize Ceph and start Odorobo:
 sudo bash .local/dev/init.sh
 ```
 
-This builds both images, starts Ceph and waits up to two minutes for it to become healthy, provisions the `odorobo-blockpool/dev-disk` RBD image, and then starts Odorobo with manager mode enabled. On a bootstrap failure, it prints the last 200 Ceph log lines instead of waiting indefinitely. It prefers `podman compose` and falls back to `docker compose` when Podman Compose is unavailable.
+This builds the development images, starts Ceph and etcd, waits for both health checks, and then starts Odorobo with manager mode enabled. Ceph is not considered healthy until bootstrap and RBD provisioning finish, the generated client credentials authenticate, and the configured `odorobo-blockpool/dev-disk` image is accessible. Image builds are outside the startup timeout, but Odorobo's initial release-mode Cargo compilation happens during `cargo run` and is included. Once Ceph and etcd are healthy, `ODOROBO_STARTUP_TIMEOUT` (30 minutes by default) bounds Compose's agent/dependency startup wait—including that compilation—and the agent's `/health` readiness probe. Set it to a different number of seconds if needed. Startup failures report recent service logs. It prefers `podman compose` and falls back to `docker compose` when Podman Compose is unavailable.
 
-Start and stop the complete stack without deleting data. `start` only works on existing containers; after a reset, run `init.sh` again:
+Start and stop the complete stack without deleting data. Compose waits for healthy etcd and Ceph before starting Odorobo; after a destructive reset, run `init.sh` again to recreate and provision the stack:
 
 ```bash
-sudo podman compose -f .local/dev/compose.yml start ceph odorobo
-sudo podman compose -f .local/dev/compose.yml stop odorobo ceph
+sudo podman compose -f .local/dev/compose.yml up -d etcd ceph odorobo
+sudo podman compose -f .local/dev/compose.yml stop odorobo ceph etcd
 ```
 
-Destructively remove the containers and all local Ceph state (the named volumes are removed by `--volumes`). 
+Destructively remove the containers and all local Ceph and etcd state (the named volumes are removed by `--volumes`).
 
 ```bash
 sudo podman compose -f .local/dev/compose.yml down --remove-orphans --volumes
@@ -59,12 +60,18 @@ Useful direct commands:
 
 ```bash
 sudo podman compose -f .local/dev/compose.yml ps
-sudo podman compose -f .local/dev/compose.yml logs -f ceph odorobo
+sudo podman compose -f .local/dev/compose.yml logs -f etcd ceph odorobo
 sudo podman compose -f .local/dev/compose.yml exec ceph ceph -s
 sudo podman compose -f .local/dev/compose.yml exec -it odorobo sh
 ```
 
-Because `odorobo` uses Ceph's network namespace, the generated Ceph config intentionally uses `127.0.0.1` for the monitor. The application and monitor share that namespace.
+Because `odorobo` uses Ceph's network namespace, the generated Ceph config intentionally uses `127.0.0.1` for the monitor. The application and monitor share that namespace. The local etcd service is reachable there by the Compose DNS name `etcd`; Compose sets `ODOROBO_ETCD_ENDPOINTS=http://etcd:2379` by default. It also sets `ODOROBO_HOSTNAME=odorobo` by default, giving the application a stable identity across container recreation without relying on container hostname support in the shared-network mode. Override it with a stable, unique node ID when multiple Odorobo nodes use one shared etcd store; every node in that store must have its own identity, kept unchanged across restarts. The etcd data is stored in the `etcd_data` named volume and survives container recreation. To use an existing shared etcd instead, export both variables and pass them through `sudo` when running the rootful stack (the local etcd service remains part of this development stack):
+
+```bash
+export ODOROBO_ETCD_ENDPOINTS=http://etcd.example.net:2379
+export ODOROBO_HOSTNAME=dev-node-1
+sudo --preserve-env=ODOROBO_ETCD_ENDPOINTS,ODOROBO_HOSTNAME bash .local/dev/init.sh
+```
 
 ## Application development
 
@@ -103,7 +110,7 @@ Do not map the image from the host. To test the exact application path, use an O
 
 ## Configuration
 
-The following environment variables can be set before `init.sh` or passed through Compose:
+The following environment variables can be set before `init.sh`; all except `ODOROBO_STARTUP_TIMEOUT` are passed through Compose:
 
 ```bash
 CEPH_IMAGE=quay.io/ceph/ceph:v20.2.3
@@ -113,6 +120,9 @@ CEPH_CLIENT=odorobo
 CEPH_IMAGE_NAME=dev-disk
 CEPH_IMAGE_SIZE=1G
 CEPH_OSD_SIZE=10G
+ODOROBO_ETCD_ENDPOINTS=http://etcd:2379
+ODOROBO_HOSTNAME=odorobo # stable; set a unique node ID for a shared etcd store
+ODOROBO_STARTUP_TIMEOUT=1800 # seconds; includes initial Cargo compilation, excludes image builds
 ```
 
 `CEPH_MON_IP` should remain `127.0.0.1` with the provided Compose topology. If you change the network topology, it must be an address reachable from both services.
@@ -154,13 +164,14 @@ cleans up after you detach. See TEST.md for details and overrides.
 
 ## Layout
 
-- `init.sh` — builds and starts the stack, waits for Ceph health, and reports bootstrap failures with logs.
-- `test.sh` — the end-to-end firmware-boot test (run from the host; see TEST.md).
-- `compose.yml` — Ceph and Odorobo services, shared namespaces, privilege, mounts, and ports.
+- `init.sh` — builds and starts the stack, waits for etcd, Ceph, and Odorobo health, and reports startup failures with logs.
+- `test.sh` — the end-to-end firmware-boot test (run from the host; see TEST.md); it preflights etcd, Ceph, and agent health.
+- `validate-deployment.sh` — safe shell-syntax and Compose-rendering regression checks; it does not start containers or change host state.
+- `compose.yml` — etcd, Ceph, and Odorobo services, shared namespaces, health checks, privilege, and mounts.
 - `ceph/Containerfile` — pinned Ceph image.
 - `ceph/entrypoint.sh` — direct MON bootstrap, filesystem-backed OSD initialization, pool/client/image provisioning, and daemon lifecycle.
 - `odorobo/Containerfile` — runnable Odorobo development image.
 - `test-assets/` — firmware and guest image downloaded by `test.sh`; ignored by git.
-- Ceph state (config, daemons, logs, file-backed OSD) and the generated credentials live in podman named volumes (`ceph_etc`, `ceph_lib`, `ceph_log`, `ceph_run`, `ceph_osd`, `ceph_creds`); `ceph_creds` is shared read-only with Odorobo. They are removed by `compose down --volumes`.
+- Ceph state (config, daemons, logs, file-backed OSD) and generated credentials live in named volumes (`ceph_etc`, `ceph_lib`, `ceph_log`, `ceph_run`, `ceph_osd`, `ceph_creds`); `ceph_creds` is shared read-only with Odorobo. Etcd data lives in `etcd_data`. All are removed by `compose down --volumes`, which resets both the local Ceph cluster and durable cluster state.
 
 This setup is intentionally not production-ready: it has one monitor, one OSD, no redundancy, and privileged containers.

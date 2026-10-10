@@ -143,8 +143,11 @@ pub struct SchedulerActor {
     pub agent_keepalive_tasks: AHashMap<ActorId, JoinHandle<()>>,
     /// Maps discovered VM actor IDs to canonical VM IDs.
     pub vm_actorid_ulid_map: AHashMap<ActorId, Ulid>,
-    /// Canonical VM intent retained while a VM is reconciled or migrated.
+    /// Canonical active VM intent retained while a VM is reconciled or migrated.
     pub vm_manifests: AHashMap<Ulid, VmManifest>,
+    /// Paired manifests for durable stops, retained only for conservative capacity
+    /// accounting until the stop is confirmed and atomically completed.
+    pub stop_manifests: AHashMap<Ulid, VmManifest>,
     /// Desired and observed VM placements; multiple entries allow migration.
     pub vm_placements: AHashMap<Ulid, Vec<VmPlacement>>,
     /// Durable hostname assignments used to rebuild actor-specific placements.

@@ -9,11 +9,19 @@ use crate::types::ObjectMetadata;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy)]
 pub struct GetAgentStatus {
-    /// Membership revision already applied by the caller.
+    /// Agent status revision (membership and resource accounting) already applied by the caller.
     pub since_revision: u64,
     /// Requests the initial full snapshot. Later requests can use revision zero
     /// without forcing a full snapshot when the agent has not changed.
     pub initial: bool,
+}
+
+#[derive(Serialize, Deserialize, Reply, Debug, Clone, PartialEq, Eq)]
+pub struct VMResourceCharge {
+    pub vmid: Ulid,
+    pub generation: Ulid,
+    pub vcpus: u32,
+    pub memory_bytes: u64,
 }
 
 #[derive(Serialize, Deserialize, Reply, Debug, Clone)]
@@ -25,6 +33,13 @@ pub struct AgentStatus {
     pub used_vcpus: u32,
     pub used_ram: ByteSize,
     pub vms: Vec<Ulid>,
+    /// VM allocations charged to capacity but not currently in the running VM cache.
+    #[serde(default)]
+    pub reserved_vms: Vec<Ulid>,
+    /// Generation- and resource-specific confirmations for VM allocations included
+    /// in `used_vcpus` and `used_ram`. Empty on legacy agents/status records.
+    #[serde(default)]
+    pub resource_charges: Vec<VMResourceCharge>,
     pub metadata: ObjectMetadata,
 }
 
@@ -38,6 +53,12 @@ pub enum AgentStatusUpdate {
         revision: u64,
         added: Vec<Ulid>,
         removed: Vec<Ulid>,
+        /// Snapshot of actorless/uncertain VM allocations included in used resources.
+        #[serde(default)]
+        reserved_vms: Vec<Ulid>,
+        /// Full charge confirmations snapshot for allocations included in usage.
+        #[serde(default)]
+        resource_charges: Vec<VMResourceCharge>,
         used_vcpus: u32,
         used_ram: ByteSize,
     },
@@ -67,6 +88,8 @@ pub fn apply_status_update(status: &mut AgentStatus, update: AgentStatusUpdate) 
             revision,
             added,
             removed,
+            reserved_vms,
+            resource_charges,
             used_vcpus,
             used_ram,
         } => {
@@ -81,6 +104,8 @@ pub fn apply_status_update(status: &mut AgentStatus, update: AgentStatusUpdate) 
                     Err(index) => status.vms.insert(index, vmid),
                 }
             }
+            status.reserved_vms = reserved_vms;
+            status.resource_charges = resource_charges;
             status.used_vcpus = used_vcpus;
             status.used_ram = used_ram;
             revision

@@ -5,6 +5,7 @@ pub mod actors;
 mod ch_driver;
 
 pub mod config;
+pub use odorobo::cluster_state;
 pub mod http_api;
 mod manifest;
 pub mod messages;

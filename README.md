@@ -29,17 +29,37 @@ Build the Agent binary with `cargo build --release` and run it on the host machi
 
 ```bash
 # Install dependencies (fedora)
-sudo dnf in -y clang-devel nftables cloud-hypervisor
+sudo dnf in -y clang-devel nftables cloud-hypervisor protobuf-compiler
 
 # Build the Agent
 cargo build --release
 
 # Run the Agent & Manager (requires write permissions to /run/odorobo)
-sudo ./target/release/odorobo --manager-enabled # or set ODOROBO_MANAGER_ENABLED=true
+sudo ./target/release/odorobo --manager-enabled true # or set ODOROBO_MANAGER_ENABLED=true
 
 # Run on other boxes
 sudo ./target/release/odorobo
 ```
+
+Odorobo requires an etcd v3 endpoint for durable cluster state. The default is
+`http://127.0.0.1:2379`, so start etcd locally or configure a reachable shared
+service with `ODOROBO_ETCD_ENDPOINTS` (comma-separated for multiple endpoints).
+Every manager and agent participating in the same cluster must use the same
+etcd store; pointing nodes at separate stores breaks shared cluster state.
+When multiple nodes share that store, configure a stable, unique
+`ODOROBO_HOSTNAME` for each node (retain it across restarts) so node identities
+do not collide. For a systemd installation, set the endpoint and node identity
+in `/etc/odorobo/config.env`, which is loaded by `systemd/odorobo.service`:
+
+```ini
+ODOROBO_ETCD_ENDPOINTS=http://etcd.example.net:2379
+ODOROBO_HOSTNAME=node-1
+```
+
+The local development setup in [.local/dev/README.md](.local/dev/README.md)
+starts a persistent etcd service with Compose and configures the development
+agent to use it automatically. `protobuf-compiler` is also required at build
+time by `etcd-client` and is included above.
 
 ### Sentry error reporting
 

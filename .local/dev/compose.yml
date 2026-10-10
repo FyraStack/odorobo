@@ -1,4 +1,28 @@
 services:
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.17
+    container_name: odorobo-etcd
+    hostname: etcd
+    restart: "no"
+    command:
+      - /usr/local/bin/etcd
+      - --name=odorobo-dev-etcd
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd:2379
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-advertise-peer-urls=http://etcd:2380
+      - --initial-cluster=odorobo-dev-etcd=http://etcd:2380
+      - --initial-cluster-state=new
+    volumes:
+      - etcd_data:/etcd-data
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/etcdctl", "--endpoints=http://127.0.0.1:2379", "endpoint", "health"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
   ceph:
     build:
       context: ./ceph
@@ -30,9 +54,9 @@ services:
       - /dev:/dev
 
     healthcheck:
-      test: ["CMD", "ceph", "-s"]
+      test: ["CMD", "/usr/local/bin/odorobo-ceph-healthcheck"]
       interval: 5s
-      timeout: 5s
+      timeout: 10s
       retries: 30
 
   odorobo:
@@ -43,6 +67,8 @@ services:
     privileged: true
     depends_on:
       ceph:
+        condition: service_healthy
+      etcd:
         condition: service_healthy
     # podman-compose supports container namespace targets, but not the
     # Compose `service:ceph` shorthand.
@@ -66,6 +92,8 @@ services:
       # Release compilation is memory-intensive; keep the default usable on
       # development laptops while allowing an override for faster machines.
       CARGO_BUILD_JOBS: ${CARGO_BUILD_JOBS:-2}
+      ODOROBO_ETCD_ENDPOINTS: "${ODOROBO_ETCD_ENDPOINTS:-http://etcd:2379}"
+      ODOROBO_HOSTNAME: "${ODOROBO_HOSTNAME:-odorobo}"
     command: ["cargo", "run", "--release", "-p", "odorobo", "--", "--manager-enabled", "true"]
 
 volumes:
@@ -75,3 +103,4 @@ volumes:
   ceph_run:
   ceph_osd:
   ceph_creds:
+  etcd_data:

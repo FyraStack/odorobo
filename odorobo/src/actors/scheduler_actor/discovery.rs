@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use ahash::{AHashMap, AHashSet};
 use kameo::prelude::*;
 use libp2p::futures::TryStreamExt;
 use stable_eyre::{Report, eyre::eyre};
@@ -10,9 +11,9 @@ use tracing::{trace, warn};
 use crate::actors::agent_actor::AgentActor;
 use crate::ch_driver::actor::VMActor;
 use crate::messages::agent::{AgentStatusUpdate, GetAgentStatus, apply_status_update};
-use crate::messages::vm::{CreateVM, GetVMHeartbeat, GetVMInfo};
+use crate::messages::vm::{CreateVM, DeleteVM, GetVMHeartbeat, GetVMInfo, ShutdownVM};
 use crate::utils::actor_names::{AGENT, VM};
-use odorobo::cluster_state::{ClusterStateStore, PLACEMENT_PREFIX, PlacementRecord, key};
+use odorobo::cluster_state::{PlacementLifecycle, PlacementRecord};
 
 use super::{
     AgentActorDiscovered, AgentUpdated, AgentUpdaterStopped, CachedActorKind, CachedAgentActor,
@@ -20,7 +21,94 @@ use super::{
     VmUpdaterStopped,
 };
 
+fn has_no_durable_owner(
+    vmid: ulid::Ulid,
+    durable_placements: &AHashMap<ulid::Ulid, PlacementRecord>,
+) -> bool {
+    !durable_placements.contains_key(&vmid)
+}
+
+fn observed_on_other_agent(
+    vmid: ulid::Ulid,
+    owner: ActorId,
+    index: &AHashMap<ActorId, AHashSet<ulid::Ulid>>,
+) -> bool {
+    index
+        .iter()
+        .any(|(agent_id, vmids)| *agent_id != owner && vmids.contains(&vmid))
+}
+
 impl SchedulerActor {
+    async fn finish_durable_stops_for_agent(
+        &mut self,
+        actor_ref: &RemoteActorRef<AgentActor>,
+        hostname: &str,
+    ) {
+        let stops: Vec<_> = self
+            .durable_placements
+            .iter()
+            .filter(|(_, placement)| {
+                placement.node == hostname && placement.lifecycle != PlacementLifecycle::Active
+            })
+            .map(|(vmid, placement)| (*vmid, placement.clone()))
+            .collect();
+        for (vmid, placement) in stops {
+            let expected = placement.stop_fence();
+            let stopped = match placement.lifecycle {
+                PlacementLifecycle::Stopping => {
+                    match tokio::time::timeout(
+                        Duration::from_secs(30),
+                        actor_ref.ask(&ShutdownVM {
+                            vmid,
+                            expected: Some(expected.clone()),
+                        }),
+                    )
+                    .await
+                    {
+                        Ok(Ok(reply)) if reply.completed == expected => Ok(()),
+                        Ok(Ok(_)) => {
+                            Err("agent acknowledged a different VM stop incarnation".to_owned())
+                        }
+                        Ok(Err(error)) => Err(error.to_string()),
+                        Err(_) => Err("timed out waiting for VM shutdown".to_owned()),
+                    }
+                }
+                PlacementLifecycle::Deleting => {
+                    match tokio::time::timeout(
+                        Duration::from_secs(30),
+                        actor_ref.ask(&DeleteVM {
+                            vmid,
+                            expected: Some(expected.clone()),
+                        }),
+                    )
+                    .await
+                    {
+                        Ok(Ok(reply))
+                            if reply.error.is_none()
+                                && reply.completed.as_ref() == Some(&expected) =>
+                        {
+                            Ok(())
+                        }
+                        Ok(Ok(reply)) => Err(reply.error.unwrap_or_else(|| {
+                            "agent acknowledged a different VM stop incarnation".to_owned()
+                        })),
+                        Ok(Err(error)) => Err(error.to_string()),
+                        Err(_) => Err("timed out waiting for VM deletion".to_owned()),
+                    }
+                }
+                PlacementLifecycle::Active => unreachable!(),
+            };
+            if let Err(error) = stopped {
+                warn!(%error, %vmid, %hostname, "Unable to finish durable VM stop");
+                continue;
+            }
+            match self.state_store.complete_vm_stop(&placement).await {
+                Ok(()) => self.remove_vm_intent(vmid),
+                Err(error) => warn!(?error, %vmid, "Unable to finalize durable VM stop"),
+            }
+        }
+    }
+
     async fn reconcile_durable_vms_for_agent(
         &mut self,
         actor_id: ActorId,
@@ -32,8 +120,13 @@ impl SchedulerActor {
         let pending: Vec<_> = self
             .durable_placements
             .iter()
-            .filter(|(vmid, placement)| placement.node == hostname && !observed.contains(vmid))
-            .filter_map(|(vmid, _)| {
+            .filter(|(vmid, placement)| {
+                placement.node == hostname
+                    && placement.lifecycle == PlacementLifecycle::Active
+                    && !observed.contains(vmid)
+                    && !observed_on_other_agent(**vmid, actor_id, &self.agent_vm_index)
+            })
+            .filter_map(|(vmid, placement)| {
                 let config = self.vm_manifests.get(vmid)?.clone();
                 let entries = self.vm_placements.entry(*vmid).or_default();
                 if entries.iter().any(|entry| {
@@ -54,6 +147,7 @@ impl SchedulerActor {
                     .push(CachedVMActor { actor_ref: None });
                 Some(CreateVM {
                     vmid: *vmid,
+                    generation: placement.generation,
                     config,
                 })
             })
@@ -84,6 +178,9 @@ impl SchedulerActor {
                 ),
             }
         }
+
+        self.finish_durable_stops_for_agent(&actor_ref, hostname)
+            .await;
     }
 
     /// Enumerates currently discoverable VM actors and forwards each to the scheduler.
@@ -334,8 +431,9 @@ impl Message<VmUpdated> for SchedulerActor {
         let vmid = msg.data.vmid;
         let actor_id = msg.actor_ref.id();
         self.vm_actorid_ulid_map.insert(actor_id, vmid);
-        if let Some(manifest) = msg.data.config {
-            self.vm_manifests.insert(vmid, manifest);
+        // VM actor metadata is observational only. Durable active intent is
+        // loaded from etcd; a delayed discovery event must never resurrect it.
+        if self.vm_manifests.contains_key(&vmid) {
             Self::reconcile_discovered_vm(
                 vmid,
                 &self.agent_vm_index,
@@ -479,6 +577,13 @@ impl Message<ReconcileVmPlacements> for SchedulerActor {
     type Reply = ();
 
     async fn handle(&mut self, _msg: ReconcileVmPlacements, _ctx: &mut Context<Self, Self::Reply>) {
+        if let Err(error) = self.refresh_durable_state().await {
+            warn!(
+                ?error,
+                "Unable to refresh authoritative VM intent; skipping reconciliation"
+            );
+            return;
+        }
         Self::cleanup_unresolved_vm_cache(&mut self.vm_placements, &mut self.vm_data_cache);
         self.invalidate_pending_resources();
         let agents: Vec<_> = self
@@ -503,16 +608,16 @@ impl Message<ReconcileVmPlacements> for SchedulerActor {
             .vm_manifests
             .iter()
             .filter_map(|(vmid, manifest)| {
-                self.vm_placements
-                    .get(vmid)
-                    .is_none_or(Vec::is_empty)
-                    .then_some((*vmid, manifest.clone()))
+                (self.vm_placements.get(vmid).is_none_or(Vec::is_empty)
+                    && has_no_durable_owner(*vmid, &self.durable_placements))
+                .then_some((*vmid, manifest.clone()))
             })
             .collect();
 
         for (vmid, config) in unplaced_vms {
             let request = crate::messages::vm::CreateVM {
                 vmid,
+                generation: ulid::Ulid::nil(),
                 config: config.clone(),
             };
             match self.schedule_agent(&request) {
@@ -526,15 +631,19 @@ impl Message<ReconcileVmPlacements> for SchedulerActor {
                         warn!(%vmid, ?agent_id, "selected agent has no cached hostname; cannot persist placement");
                         continue;
                     };
-                    let placement = PlacementRecord { vmid, node };
+                    let placement = PlacementRecord::active(vmid, node);
                     if let Err(error) = self
                         .state_store
-                        .put(&key(PLACEMENT_PREFIX, &vmid), &placement)
+                        .assign_placement_if_absent(&placement)
                         .await
                     {
-                        warn!(?error, %vmid, "unable to persist reconciled VM placement");
+                        // Another manager may have assigned the owner after our
+                        // refresh. Never overwrite it based on stale observations.
+                        warn!(?error, %vmid, "unable to claim unassigned VM placement");
                         continue;
                     }
+                    let mut request = request;
+                    request.generation = placement.generation;
                     self.durable_placements.insert(vmid, placement);
                     self.vm_placements
                         .entry(vmid)
@@ -560,5 +669,31 @@ impl Message<ReconcileVmPlacements> for SchedulerActor {
                 Err(error) => trace!(?error, %vmid, "no eligible agent to recreate VM"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{has_no_durable_owner, observed_on_other_agent};
+    use ahash::{AHashMap, AHashSet};
+    use kameo::prelude::ActorId;
+    use odorobo::cluster_state::PlacementRecord;
+    use ulid::Ulid;
+
+    #[test]
+    fn does_not_auto_reassign_when_durable_owner_is_unreachable() {
+        let vmid = Ulid::generate();
+        let durable = AHashMap::from([(
+            vmid,
+            PlacementRecord::active(vmid, "offline-node".to_owned()),
+        )]);
+        assert!(!has_no_durable_owner(vmid, &durable));
+        assert!(has_no_durable_owner(Ulid::generate(), &durable));
+
+        let owner = ActorId::new(1);
+        let other = ActorId::new(2);
+        let observations = AHashMap::from([(other, AHashSet::from([vmid]))]);
+        assert!(observed_on_other_agent(vmid, owner, &observations));
+        assert!(!observed_on_other_agent(vmid, other, &observations));
     }
 }

@@ -12,7 +12,10 @@ use crate::actors::agent_actor::AgentActor;
 use crate::manifest::{
     AffinityRequirement, AffinityStrictness, AffinityType, MetadataTable, Operator, VmManifest,
 };
+use crate::messages::agent::AgentStatus;
 use crate::messages::vm::CreateVM;
+
+use odorobo::cluster_state::{PlacementLifecycle, PlacementRecord};
 
 use super::{CachedAgentActor, SchedulerActor, VmLifecycle, VmPlacement};
 
@@ -30,9 +33,17 @@ impl SchedulerActor {
     /// are added here to prevent concurrent create requests from overcommitting.
     pub(super) fn pending_resources(&mut self) -> &AHashMap<ActorId, (u32, u64)> {
         if self.pending_resources_cache.is_none() {
+            let agents = self
+                .agent_data_cache
+                .iter()
+                .map(|(agent_id, cached)| (*agent_id, cached.data.clone()))
+                .collect();
             self.pending_resources_cache = Some(pending_resources_by_agent(
                 &self.vm_manifests,
+                &self.stop_manifests,
                 &self.vm_placements,
+                &self.durable_placements,
+                &agents,
             ));
         }
         self.pending_resources_cache
@@ -235,21 +246,67 @@ pub(super) const fn has_capacity(
 
 fn pending_resources_by_agent(
     manifests: &AHashMap<Ulid, VmManifest>,
+    stop_manifests: &AHashMap<Ulid, VmManifest>,
     placements: &AHashMap<Ulid, Vec<VmPlacement>>,
+    durable_placements: &AHashMap<Ulid, PlacementRecord>,
+    agents: &AHashMap<ActorId, AgentStatus>,
 ) -> AHashMap<ActorId, (u32, u64)> {
     let mut resources = AHashMap::new();
+    let mut reserved = ahash::AHashSet::new();
+    let mut reserve = |vmid: Ulid,
+                       agent_id: ActorId,
+                       manifest: &VmManifest,
+                       placement: Option<&PlacementRecord>| {
+        let confirmed = placement.is_some_and(|placement| {
+            !placement.generation.is_nil()
+                && agents.get(&agent_id).is_some_and(|agent| {
+                    agent.hostname == placement.node
+                        && agent.resource_charges.iter().any(|charge| {
+                            charge.vmid == vmid
+                                && charge.generation == placement.generation
+                                && charge.vcpus == manifest.desired.compute.vcpus
+                                && charge.memory_bytes == manifest.desired.compute.memory_bytes
+                        })
+                })
+        });
+        if confirmed || !reserved.insert((vmid, agent_id)) {
+            return;
+        }
+        let totals = resources.entry(agent_id).or_insert((0u32, 0u64));
+        totals.0 = totals.0.saturating_add(manifest.desired.compute.vcpus);
+        totals.1 = totals
+            .1
+            .saturating_add(manifest.desired.compute.memory_bytes);
+    };
+
     for (vmid, entries) in placements {
         let Some(manifest) = manifests.get(vmid) else {
             continue;
         };
         for entry in entries {
             if entry.lifecycle == VmLifecycle::Pending {
-                let totals = resources.entry(entry.agent_id).or_insert((0u32, 0u64));
-                totals.0 = totals.0.saturating_add(manifest.desired.compute.vcpus);
-                totals.1 = totals
-                    .1
-                    .saturating_add(manifest.desired.compute.memory_bytes);
+                let placement = durable_placements.get(vmid).filter(|placement| {
+                    agents
+                        .get(&entry.agent_id)
+                        .is_some_and(|agent| agent.hostname == placement.node)
+                });
+                reserve(*vmid, entry.agent_id, manifest, placement);
             }
+        }
+    }
+    for (vmid, placement) in durable_placements {
+        let manifest = match placement.lifecycle {
+            PlacementLifecycle::Active => manifests.get(vmid),
+            PlacementLifecycle::Stopping | PlacementLifecycle::Deleting => stop_manifests.get(vmid),
+        };
+        let Some(manifest) = manifest else {
+            continue;
+        };
+        for (agent_id, _) in agents
+            .iter()
+            .filter(|(_, agent)| agent.hostname == placement.node)
+        {
+            reserve(*vmid, *agent_id, manifest, Some(placement));
         }
     }
     resources
@@ -261,10 +318,37 @@ pub(super) fn pending_resources_for_agent(
     placements: &AHashMap<Ulid, Vec<VmPlacement>>,
     agent_id: ActorId,
 ) -> (u32, u64) {
-    pending_resources_by_agent(manifests, placements)
-        .get(&agent_id)
-        .copied()
-        .unwrap_or_default()
+    pending_resources_by_agent(
+        manifests,
+        &AHashMap::new(),
+        placements,
+        &AHashMap::new(),
+        &AHashMap::new(),
+    )
+    .get(&agent_id)
+    .copied()
+    .unwrap_or_default()
+}
+
+#[cfg(test)]
+pub(super) fn pending_resources_with_status_for_agent(
+    manifests: &AHashMap<Ulid, VmManifest>,
+    stop_manifests: &AHashMap<Ulid, VmManifest>,
+    placements: &AHashMap<Ulid, Vec<VmPlacement>>,
+    durable_placements: &AHashMap<Ulid, PlacementRecord>,
+    agents: &AHashMap<ActorId, AgentStatus>,
+    agent_id: ActorId,
+) -> (u32, u64) {
+    pending_resources_by_agent(
+        manifests,
+        stop_manifests,
+        placements,
+        durable_placements,
+        agents,
+    )
+    .get(&agent_id)
+    .copied()
+    .unwrap_or_default()
 }
 
 /// Converts an affinity result into a score contribution or rejection.

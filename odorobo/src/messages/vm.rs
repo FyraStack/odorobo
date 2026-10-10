@@ -5,6 +5,7 @@ use kameo::prelude::*;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
+use crate::cluster_state::VMStopFence;
 use crate::manifest::VmManifest;
 
 /// Message to create a new VM
@@ -15,6 +16,10 @@ use crate::manifest::VmManifest;
 pub struct CreateVM {
     /// the ULID of the VM to create
     pub vmid: Ulid,
+    /// Durable incarnation token assigned by the scheduler. User requests omit
+    /// it; agent-side reconciliation requires an exact placement match.
+    #[serde(default)]
+    pub generation: Ulid,
     /// Provider-neutral VM intent. Cloud Hypervisor conversion happens in the
     /// Cloud Hypervisor driver on the destination agent.
     pub config: VmManifest,
@@ -66,21 +71,35 @@ pub struct MigrateVMReceiveReply {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DeleteVM {
     pub vmid: Ulid,
+    /// Present on owner-agent/runtime dispatches; omitted for user requests to
+    /// the scheduler, which binds the request to the durable stop intent.
+    #[serde(default)]
+    pub expected: Option<VMStopFence>,
 }
 
 #[derive(Serialize, Deserialize, Reply, Debug, Clone)]
 pub struct DeleteVMReply {
     pub error: Option<String>,
+    /// The exact placement incarnation whose teardown completed.
+    #[serde(default)]
+    pub completed: Option<VMStopFence>,
 }
 
 /// Shuts down a VM temporarily
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ShutdownVM {
     pub vmid: Ulid,
+    /// Present on owner-agent/runtime dispatches; omitted for user requests to
+    /// the scheduler, which binds the request to the durable stop intent.
+    #[serde(default)]
+    pub expected: Option<VMStopFence>,
 }
 
-#[derive(Serialize, Deserialize, Reply, Debug)]
-pub struct ShutdownVMReply;
+#[derive(Serialize, Deserialize, Reply, Debug, Clone)]
+pub struct ShutdownVMReply {
+    /// The exact placement incarnation whose teardown completed.
+    pub completed: VMStopFence,
+}
 
 /// List VMs on an agent
 #[derive(Serialize, Deserialize, Debug)]
@@ -111,6 +130,8 @@ pub struct GetVMHeartbeat;
 #[derive(Serialize, Deserialize, Reply, Debug, Clone)]
 pub struct GetVMHeartbeatReply {
     pub vmid: Ulid,
+    #[serde(default)]
+    pub generation: Ulid,
     pub error: Option<String>,
 }
 

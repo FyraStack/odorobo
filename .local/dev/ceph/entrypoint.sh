@@ -37,6 +37,9 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 mkdir -p /etc/ceph "$CEPH_DATA_DIR" /var/log/ceph /run/ceph "$OSD_STATE_DIR" /generated
+# Do not let a previous successful bootstrap make this run appear ready while
+# daemons or provisioning are being restarted.
+rm -f /generated/.odorobo-ceph-ready
 chown ceph:ceph /run/ceph
 
 # These paths are bind-mounted from the host and may retain ownership from a
@@ -206,6 +209,15 @@ chmod 600 "$OSD_STATE_DIR/client.$CEPH_CLIENT.key"
 cp "$OSD_STATE_DIR/ceph.conf" /generated/ceph.conf
 cp "$OSD_STATE_DIR/client.$CEPH_CLIENT.key" /generated/client."$CEPH_CLIENT".key
 chmod 600 /generated/client."$CEPH_CLIENT".key
+
+# Readiness means the application-facing credentials actually work and the
+# requested image is available, not merely that the monitor answered ceph -s.
+ceph --conf=/generated/ceph.conf --id="$CEPH_CLIENT" \
+  --keyfile="/generated/client.$CEPH_CLIENT.key" -s >/dev/null
+rbd --conf=/generated/ceph.conf --id="$CEPH_CLIENT" \
+  --keyfile="/generated/client.$CEPH_CLIENT.key" \
+  info "$CEPH_POOL/$CEPH_IMAGE_NAME" >/dev/null
+touch /generated/.odorobo-ceph-ready
 
 for pid in "$MON_PID" "$OSD_PID"; do
   [[ -n "$pid" ]] || continue
