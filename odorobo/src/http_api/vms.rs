@@ -61,6 +61,7 @@ async fn create_vm(
     let message = CreateVM {
         vmid: request.vm.id,
         config: request.vm,
+        placement: None,
     };
 
     let reply = state.ask(message).await?;
@@ -74,7 +75,12 @@ async fn delete_vm(
     State(state): State<ActorRef<HTTPActor>>,
     Path(VmId(vmid)): Path<VmId>,
 ) -> Result<impl IntoApiResponse, OdoroboError> {
-    let _reply = state.ask(DeleteVM { vmid }).await?;
+    let _reply = state
+        .ask(DeleteVM {
+            vmid,
+            placement: None,
+        })
+        .await?;
 
     Ok(Json(()))
 }
@@ -83,7 +89,12 @@ async fn shutdown_vm(
     State(state): State<ActorRef<HTTPActor>>,
     Path(VmId(vmid)): Path<VmId>,
 ) -> Result<impl IntoApiResponse, OdoroboError> {
-    let _reply = state.ask(ShutdownVM { vmid }).await?;
+    let _reply = state
+        .ask(ShutdownVM {
+            vmid,
+            placement: None,
+        })
+        .await?;
 
     Ok(Json(()))
 }

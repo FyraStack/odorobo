@@ -197,6 +197,7 @@ pub struct VMActor {
     /// Desired provider-neutral intent retained for VM info and migration.
     /// The translated Cloud Hypervisor config lives only in `VMInstance`.
     pub manifest: Option<VmManifest>,
+    destroyed: bool,
 }
 
 impl Actor for VMActor {
@@ -205,15 +206,14 @@ impl Actor for VMActor {
     type Error = Report;
 
     #[tracing::instrument(skip_all)]
-    async fn on_start((vmid, vm_config): Self::Args, actor_ref: ActorRef<Self>) -> Result<Self> {
+    async fn on_start((vmid, vm_config): Self::Args, _actor_ref: ActorRef<Self>) -> Result<Self> {
         // Boot is manifest intent, not a Cloud Hypervisor default. Preserve it
         // separately because VMInstance also supports create-without-boot paths.
         let boot = vm_config
             .as_ref()
             .is_some_and(|manifest| manifest.desired.boot.start);
         let vm_config_for_ch = vm_config.as_ref().map(to_vm_config).transpose()?;
-        let mut vminstance =
-            VMInstance::spawn(&vmid.to_string(), vm_config_for_ch, boot, None).await?;
+        let vminstance = VMInstance::spawn(&vmid.to_string(), vm_config_for_ch, boot, None).await?;
 
         let console = Console::default();
         // A migration receiver has no config yet; its serial socket is created
@@ -224,38 +224,13 @@ impl Actor for VMActor {
                 .await?;
         }
 
-        // Take the child process out so we can watch for unexpected death.
-        // destroy() handles a missing child_process gracefully.
-        if let Some(mut child_process) = vminstance.take_child_process() {
-            let actor_ref = actor_ref.clone();
-            tokio::spawn(async move {
-                debug!(%vmid, "watching child process to handle actor cleanup");
-                match child_process.wait().await {
-                    Ok(status) => {
-                        if status.success() {
-                            warn!(%vmid, "child process exited outside of actor teardown");
-                            _ = actor_ref.stop_gracefully().await;
-                        } else {
-                            error!(%vmid, ?status, "child process exited unexpectedly, killing actor");
-                            actor_ref.kill();
-                        }
-                    }
-                    Err(err) => {
-                        error!(%vmid, ?err, "failed to wait on child process, killing actor");
-                        actor_ref.kill();
-                    }
-                }
-            });
-        } else {
-            warn!(%vmid, "VMInstance has no child process to watch");
-        }
-
         Ok(Self {
             vmid,
             vm_instance: vminstance,
             migration_state: None,
             console,
             manifest: vm_config,
+            destroyed: false,
         })
     }
 
@@ -279,7 +254,9 @@ impl Actor for VMActor {
             }
         }
 
-        self.vm_instance.destroy().await?;
+        if !self.destroyed {
+            self.vm_instance.destroy().await?;
+        }
 
         // info!(vmid = %self.vmid, ?res, "VM process exited");
 
@@ -351,7 +328,6 @@ impl Message<GetVMInfo> for VMActor {
 }
 
 #[remote_message]
-#[allow(clippy::unused_async_trait_impl)]
 impl Message<GetVMHeartbeat> for VMActor {
     type Reply = GetVMHeartbeatReply;
 
@@ -360,7 +336,15 @@ impl Message<GetVMHeartbeat> for VMActor {
         _msg: GetVMHeartbeat,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        GetVMHeartbeatReply { vmid: self.vmid }
+        GetVMHeartbeatReply {
+            vmid: self.vmid,
+            error: self
+                .vm_instance
+                .ping()
+                .await
+                .err()
+                .map(|error| error.to_string()),
+        }
     }
 }
 
@@ -518,26 +502,50 @@ impl Message<PrepMigration> for VMActor {
 
 #[remote_message]
 impl Message<ShutdownVM> for VMActor {
-    type Reply = ();
+    type Reply = crate::messages::vm::ShutdownVMReply;
+
     async fn handle(
         &mut self,
         _msg: ShutdownVM,
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         trace!(vmid = %self.vmid, "Shutting down VM actor");
-        ctx.actor_ref().stop_gracefully().await.unwrap();
-        // ctx.actor_ref().kill();
+        if let Err(error) = self.vm_instance.destroy().await {
+            return crate::messages::vm::ShutdownVMReply {
+                error: Some(error.to_string()),
+            };
+        }
+        self.destroyed = true;
+        crate::messages::vm::ShutdownVMReply {
+            error: ctx
+                .actor_ref()
+                .stop_gracefully()
+                .await
+                .err()
+                .map(|error| error.to_string()),
+        }
     }
 }
 #[remote_message]
 impl Message<DeleteVM> for VMActor {
-    type Reply = ();
+    type Reply = crate::messages::vm::DeleteVMReply;
     async fn handle(
         &mut self,
         _msg: DeleteVM,
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        trace!(vmid = %self.vmid, "Shutting down VM actor");
-        ctx.actor_ref().stop_gracefully().await.unwrap();
+        trace!(vmid = %self.vmid, "Deleting VM actor");
+        if let Err(error) = self.vm_instance.destroy().await {
+            return crate::messages::vm::DeleteVMReply {
+                error: Some(error.to_string()),
+            };
+        }
+        self.destroyed = true;
+        if let Err(error) = ctx.actor_ref().stop_gracefully().await {
+            return crate::messages::vm::DeleteVMReply {
+                error: Some(error.to_string()),
+            };
+        }
+        crate::messages::vm::DeleteVMReply { error: None }
     }
 }

@@ -6,9 +6,11 @@ RUN dnf do -y --action=install \
     clang-devel \
     cloud-hypervisor-nightly \
     cmake \
+    curl \
     git \
     libvirt-devel \
     ninja \
+    protobuf-compiler \
     rust \
     rustup \
     zig
