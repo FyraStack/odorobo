@@ -106,7 +106,10 @@ async fn inner_main(config: Config) -> Result<()> {
         StateStore::connect(
             &endpoints,
             config.etcd_username.as_deref(),
-            config.etcd_password.as_deref(),
+            config
+                .etcd_password
+                .as_ref()
+                .map(crate::config::SecretString::expose),
             tls,
             Duration::from_millis(timeout_ms),
             retries,

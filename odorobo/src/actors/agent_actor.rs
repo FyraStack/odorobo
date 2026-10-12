@@ -1,6 +1,6 @@
 use crate::cluster_state::{PlacementLifecycle, PlacementRecord, StateStore};
 use crate::{
-    ch_driver::actor::VMActor,
+    ch_driver::{VMInstance, actor::VMActor},
     config::Config,
     manifest::VmManifest,
     messages::{
@@ -13,7 +13,7 @@ use crate::{
         vm::{
             AgentListVMs, AgentListVMsReply, CreateVM, CreateVMReply, DeleteVM, DeleteVMReply,
             GetVMInfo, GetVMInfoReply, MigrateVMReceive, MigrateVMReceiveReply, ShutdownVM,
-            ShutdownVMReply,
+            ShutdownVMReply, VM_STOP_TIMEOUT,
         },
     },
     networking::actor::NetworkAgentActor,
@@ -32,33 +32,12 @@ use ulid::Ulid;
 use kameo::error::PanicError;
 
 const VM_ACTOR_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(5);
-// Leave time for the scheduler's 30-second outer delete request to receive this failure.
-const VM_ACTOR_DELETE_TIMEOUT: Duration = Duration::from_secs(25);
 
 pub struct VMCacheData {
     actor_ref: ActorRef<VMActor>,
     config: VmManifest,
     vcpus: u32,
     memory_bytes: u64,
-}
-
-/// A stop confirmation is process-local evidence, never inferred from an empty
-/// runtime cache. Keep only the latest completed incarnation for each VM ID.
-#[derive(Default)]
-struct ConfirmedStopFences(AHashMap<Ulid, PlacementRecord>);
-
-impl ConfirmedStopFences {
-    fn confirm(&mut self, placement: &PlacementRecord) {
-        self.0.insert(placement.vmid, placement.clone());
-    }
-
-    fn matches(&self, placement: &PlacementRecord) -> bool {
-        self.0.get(&placement.vmid) == Some(placement)
-    }
-
-    fn invalidate(&mut self, vmid: Ulid) {
-        self.0.remove(&vmid);
-    }
 }
 
 #[derive(RemoteActor)]
@@ -71,8 +50,6 @@ pub struct AgentActor {
     status_history: StatusChangeHistory,
     pub config: Config,
     pub vms: AHashMap<Ulid, VMCacheData>,
-    /// Exact, in-process teardown acknowledgements retained for finalization retries.
-    confirmed_stops: ConfirmedStopFences,
     // pub network_actor: ActorRef<NetworkAgentActor>,
     pub metadata: ObjectMetadata,
     pub state_store: Arc<StateStore>,
@@ -136,12 +113,58 @@ impl AgentActor {
         Some(removed)
     }
 
+    /// Tears down a VM whose durable stop marker matches `placement`.
+    ///
+    /// A cached VM actor is asked to tear down via `ask`, which returns the
+    /// actor's reported error. Without a live cached actor, any runtime left on
+    /// disk (by a previous agent process, a failed start, or a timed-out
+    /// teardown) is cleaned up; an absent runtime directory confirms teardown.
+    async fn teardown_vm<F, Fut>(
+        &mut self,
+        placement: &PlacementRecord,
+        lifecycle: PlacementLifecycle,
+        ask: F,
+    ) -> std::result::Result<(), String>
+    where
+        F: FnOnce(ActorRef<VMActor>) -> Fut,
+        Fut: Future<Output = std::result::Result<Option<String>, String>>,
+    {
+        let vmid = placement.vmid;
+        self.validate_vm_state(vmid, placement, lifecycle, None)
+            .await?;
+        let cached = self.vms.get(&vmid).map(|vm| vm.actor_ref.clone());
+        if let Some(actor_ref) = cached.filter(ActorRef::is_alive) {
+            let result = tokio::time::timeout(VM_STOP_TIMEOUT, ask(actor_ref))
+                .await
+                .map_err(|_| "timed out waiting for VM actor teardown".to_owned())
+                .and_then(|reply| reply.and_then(|error| error.map_or(Ok(()), Err)));
+            if result.is_ok() {
+                self.remove_vm(vmid);
+            }
+            return result;
+        }
+
+        // A dead cached actor is removed by on_link_died; do it eagerly here.
+        self.remove_vm(vmid);
+        tokio::time::timeout(
+            VM_STOP_TIMEOUT,
+            VMInstance::teardown_orphan(&vmid.to_string()),
+        )
+        .await
+        .map_err(|_| "timed out tearing down uncached VM runtime".to_owned())?
+        .map_err(|error| format!("uncached VM runtime teardown is unconfirmed: {error:#}"))
+    }
+
     /// Registering with Kademlia can wait indefinitely when no peers are
     /// available. Keep it outside the agent's serial message handler so local
     /// VM creation and status polling continue in single-node deployments.
     fn register_vm_actor(actor_ref: ActorRef<VMActor>, vmid: Ulid) {
         tokio::spawn(async move {
             for name in [vm_actor_id(vmid), VM.to_owned()] {
+                // A VM deleted before registration ran must not be advertised.
+                if !actor_ref.is_alive() {
+                    return;
+                }
                 match tokio::time::timeout(
                     VM_ACTOR_REGISTRATION_TIMEOUT,
                     actor_ref.register(name.clone()),
@@ -189,7 +212,6 @@ impl Actor for AgentActor {
             used_memory_bytes,
             membership_revision: 0,
             status_history: StatusChangeHistory::new(),
-            confirmed_stops: ConfirmedStopFences::default(),
             metadata: ObjectMetadata::default(),
             state_store,
         })
@@ -257,9 +279,6 @@ impl Message<CreateVM> for AgentActor {
                 error: Some(error),
             };
         }
-        // A validated active placement is a new incarnation, so an older
-        // teardown acknowledgement must no longer authorize a stop retry.
-        self.confirmed_stops.invalidate(vmid);
         if let Some(existing) = self.vms.get(&vmid) {
             if existing.config != msg.config {
                 return CreateVMReply {
@@ -363,77 +382,62 @@ impl Message<DeleteVM> for AgentActor {
         msg: DeleteVM,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        let Some(placement) = msg.placement.as_ref() else {
+        let Some(placement) = msg.placement.clone() else {
             return DeleteVMReply {
                 error: Some("delete is missing its durable stop fence".to_owned()),
             };
         };
-        if let Err(error) = self
-            .validate_vm_state(msg.vmid, placement, PlacementLifecycle::Deleting, None)
-            .await
-        {
-            return DeleteVMReply { error: Some(error) };
-        }
-        let Some(actor_ref) = self.vms.get(&msg.vmid).map(|vm| vm.actor_ref.clone()) else {
-            return if self.confirmed_stops.matches(placement) {
-                DeleteVMReply { error: None }
-            } else {
-                DeleteVMReply {
-                    error: Some("VM runtime is not cached; teardown is unconfirmed".to_owned()),
-                }
-            };
-        };
-        match tokio::time::timeout(VM_ACTOR_DELETE_TIMEOUT, actor_ref.ask(msg.clone())).await {
-            Ok(Ok(reply)) => {
-                if reply.error.is_none() {
-                    self.remove_vm(msg.vmid);
-                    self.confirmed_stops.confirm(placement);
-                }
-                reply
-            }
-            Ok(Err(error)) => DeleteVMReply {
-                error: Some(error.to_string()),
-            },
-            Err(_) => DeleteVMReply {
-                error: Some("timed out waiting for VM actor delete".to_owned()),
-            },
+        let request = msg.clone();
+        let result = self
+            .teardown_vm(
+                &placement,
+                PlacementLifecycle::Deleting,
+                |actor_ref| async move {
+                    actor_ref
+                        .ask(request)
+                        .await
+                        .map(|reply| reply.error)
+                        .map_err(|error| error.to_string())
+                },
+            )
+            .await;
+        DeleteVMReply {
+            error: result.err(),
         }
     }
 }
 
 #[remote_message]
 impl Message<ShutdownVM> for AgentActor {
-    type Reply = Result<ShutdownVMReply, String>;
+    type Reply = ShutdownVMReply;
 
     async fn handle(
         &mut self,
         msg: ShutdownVM,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        let Some(placement) = msg.placement.as_ref() else {
-            return Err("shutdown is missing its durable stop fence".to_owned());
-        };
-        self.validate_vm_state(msg.vmid, placement, PlacementLifecycle::Stopping, None)
-            .await?;
-        let Some(actor_ref) = self.vms.get(&msg.vmid).map(|vm| vm.actor_ref.clone()) else {
-            return if self.confirmed_stops.matches(placement) {
-                Ok(ShutdownVMReply { error: None })
-            } else {
-                Err("VM runtime is not cached; teardown is unconfirmed".to_owned())
+        let Some(placement) = msg.placement.clone() else {
+            return ShutdownVMReply {
+                error: Some("shutdown is missing its durable stop fence".to_owned()),
             };
         };
         trace!(?msg, "Requesting VM shutdown");
-        match tokio::time::timeout(Duration::from_secs(30), actor_ref.ask(msg.clone())).await {
-            Ok(Ok(reply)) if reply.error.is_none() => {
-                self.remove_vm(msg.vmid);
-                self.confirmed_stops.confirm(placement);
-                Ok(reply)
-            }
-            Ok(Ok(reply)) => Err(reply
-                .error
-                .unwrap_or_else(|| "VM shutdown failed".to_owned())),
-            Ok(Err(error)) => Err(error.to_string()),
-            Err(_) => Err("timed out waiting for VM actor shutdown".to_owned()),
+        let request = msg.clone();
+        let result = self
+            .teardown_vm(
+                &placement,
+                PlacementLifecycle::Stopping,
+                |actor_ref| async move {
+                    actor_ref
+                        .ask(request)
+                        .await
+                        .map(|reply| reply.error)
+                        .map_err(|error| error.to_string())
+                },
+            )
+            .await;
+        ShutdownVMReply {
+            error: result.err(),
         }
     }
 }
@@ -581,68 +585,5 @@ impl Message<GetAgentStatus> for AgentActor {
             used_vcpus,
             used_ram,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::ConfirmedStopFences;
-    use crate::cluster_state::{
-        MemoryStateStore, PlacementLifecycle, PlacementRecord, StateError, StateStore, StopIntent,
-    };
-    use ulid::Ulid;
-
-    #[tokio::test]
-    async fn confirmed_teardown_fence_retries_finalization_but_not_a_new_generation() {
-        let store = StateStore::Memory(MemoryStateStore::default());
-        let vmid = Ulid::generate();
-        let manifest = serde_json::json!({"id": vmid});
-        let active = PlacementRecord {
-            vmid,
-            node: "node-a".to_owned(),
-            generation: Some(Ulid::generate()),
-            lifecycle: PlacementLifecycle::Active,
-        };
-        store
-            .create_vm_state(vmid, &manifest, &active)
-            .await
-            .unwrap();
-        let stop = store.begin_vm_stop(vmid, StopIntent::Delete).await.unwrap();
-
-        let mut fences = ConfirmedStopFences::default();
-        assert!(!fences.matches(&stop));
-        // The VM actor acknowledged teardown. A failed/stale store finalization
-        // leaves this exact owner/generation/lifecycle fence for a retry.
-        fences.confirm(&stop);
-        let mut stale = stop.clone();
-        stale.generation = Some(Ulid::generate());
-        assert!(matches!(
-            store.complete_vm_stop(&stale).await,
-            Err(StateError::Conflict)
-        ));
-        assert!(fences.matches(&stop));
-        store.complete_vm_stop(&stop).await.unwrap();
-
-        let mut next_incarnation = active;
-        next_incarnation.generation = Some(Ulid::generate());
-        store
-            .create_vm_state(vmid, &manifest, &next_incarnation)
-            .await
-            .unwrap();
-        fences.invalidate(vmid);
-        let next_stop = store.begin_vm_stop(vmid, StopIntent::Delete).await.unwrap();
-        assert!(!fences.matches(&next_stop));
-        assert!(matches!(
-            store.complete_vm_stop(&stop).await,
-            Err(StateError::Conflict)
-        ));
-        assert!(
-            store
-                .get_vm_state::<serde_json::Value>(vmid)
-                .await
-                .unwrap()
-                .is_some()
-        );
-        drop(store);
     }
 }

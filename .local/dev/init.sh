@@ -50,5 +50,16 @@ done
 
 "${COMPOSE[@]}" up -d odorobo
 
-echo "etcd, Ceph, and Odorobo are ready."
-echo "etcd data is stored in the etcd_data volume; compose down --volumes resets it."
+cat <<EOF
+
+etcd, Ceph, and Odorobo are ready.
+etcd data is stored in the etcd_data volume; compose down --volumes resets it.
+Ceph credentials live in the ceph_creds named volume, mounted at /generated
+in both containers.
+
+For tools running inside the Odorobo container:
+  export CEPH_CONFIG=/generated/ceph.conf
+  export CEPH_ID=${CEPH_CLIENT:-odorobo}
+  export CEPH_KEYFILE=/generated/client.${CEPH_CLIENT:-odorobo}.key
+  export CEPH_CLUSTER=ceph
+EOF

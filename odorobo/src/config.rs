@@ -8,6 +8,32 @@ use tracing::{info, warn};
 
 const CONFIG_PATH: &str = "config.json";
 
+/// A secret value that is redacted from `Debug` output and never serialized.
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+#[serde(transparent)]
+pub struct SecretString(String);
+
+impl SecretString {
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SecretString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+impl std::str::FromStr for SecretString {
+    type Err = std::convert::Infallible;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self(value.to_owned()))
+    }
+}
+
 fn default_bridge_name() -> String {
     "vmbr0".into()
 }
@@ -166,7 +192,8 @@ pub struct Config {
     pub etcd_username: Option<String>,
     /// Optional etcd password. Prefer the `ODOROBO_ETCD_PASSWORD` environment variable.
     #[clap(long, env = "ODOROBO_ETCD_PASSWORD", hide_env_values = true)]
-    pub etcd_password: Option<String>,
+    #[serde(default, skip_serializing)]
+    pub etcd_password: Option<SecretString>,
     /// Enable TLS for etcd connections.
     #[clap(long)]
     #[serde(default)]
@@ -279,6 +306,18 @@ mod tests {
         let json = serde_json::to_string_pretty(&config).unwrap();
         // assert_eq!(json, )
         println!("{json}");
+    }
+
+    #[test]
+    fn etcd_password_is_redacted_and_not_serialized() {
+        let config = Config {
+            etcd_password: Some("hunter2".parse().unwrap()),
+            ..Config::default()
+        };
+        assert!(!format!("{config:?}").contains("hunter2"));
+        assert!(!serde_json::to_string(&config).unwrap().contains("hunter2"));
+        let parsed: Config = serde_json::from_str(r#"{"etcd_password":"hunter2"}"#).unwrap();
+        assert_eq!(parsed.etcd_password.unwrap().expose(), "hunter2");
     }
 
     #[test]
