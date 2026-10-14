@@ -304,10 +304,11 @@ mod tests {
             "zig init compile failed: {}",
             String::from_utf8_lossy(&compiled.stderr)
         );
-        let oci_layout = crate::ch_driver::containers::tests::fixture_oci_layout_with_init(
-            &fixture_dir,
-            &init_binary,
-        );
+        let oci_layout = crate::ch_driver::containers::test_support::OciFixture {
+            init_binary: Some(&init_binary),
+            ..Default::default()
+        }
+        .layout(&fixture_dir);
         let image_ref = format!("oci:{}:latest", oci_layout.display());
         let manifest = VmManifest {
             api_version: MANIFEST_VERSION,
@@ -525,6 +526,10 @@ pub struct VMActor {
     /// OCI lifecycle owners survive failed startup and cold stop, so cleanup
     /// remains reachable without pulling or booting the image again.
     startup_error: Option<String>,
+    /// A startup failure from `on_start` not yet returned to a `StartVM`
+    /// caller. The first `StartVM` after spawn reports it instead of
+    /// immediately re-running the whole (possibly minutes-long) start.
+    unreported_start_failure: Option<String>,
     started: bool,
     /// Distinguishes queued exit notifications from previous VMM instances.
     generation: u64,
@@ -602,6 +607,9 @@ impl Message<StartVM> for VMActor {
     async fn handle(&mut self, _msg: StartVM, ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
         if self.started {
             return Ok(());
+        }
+        if let Some(message) = self.unreported_start_failure.take() {
+            return Err(message);
         }
         if let Err(err) = self.start(ctx.actor_ref().clone()).await {
             let cleanup = async {
@@ -767,6 +775,7 @@ impl Actor for VMActor {
             rootfs_mount: None,
             manifest,
             startup_error: None,
+            unreported_start_failure: None,
             started: false,
             generation: 0,
         };
@@ -779,6 +788,7 @@ impl Actor for VMActor {
             .await;
             let message = format!("{err:#}; cleanup: {cleanup:?}");
             error!(%vmid, %message, "VM startup failed; retaining lifecycle owner for retry or delete");
+            actor.unreported_start_failure = Some(message.clone());
             actor.startup_error = Some(message);
         }
         Ok(actor)
