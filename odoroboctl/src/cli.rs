@@ -31,18 +31,9 @@ pub struct Cli {
 pub enum Command {
     /// Create a VM via the scheduler endpoint.
     Create {
-        /// Storage URI: file://, rbd://, or iscsi:// (local files use file:///absolute/path).
+        /// Path or URI of the VM disk image.
         #[arg(long, env = "ODOROBO_VM_IMAGE")]
         image: String,
-        /// Name to assign to the VM.
-        #[arg(long, default_value = "test_vm")]
-        name: String,
-        /// Number of virtual CPUs to assign to the VM.
-        #[arg(long, default_value_t = 4)]
-        vcpus: u32,
-        /// Memory to assign to the VM (for example, 4GiB).
-        #[arg(long, default_value = "4GiB")]
-        memory: ByteSize,
     },
 
     /// List VMs currently known by the manager/agent.
@@ -111,23 +102,18 @@ pub async fn run_command(cli: Cli) -> Result<()> {
     let base_url = cli.manager_addr;
 
     match cli.command {
-        Command::Create {
-            image,
-            name,
-            vcpus,
-            memory,
-        } => {
+        Command::Create { image } => {
             let vm = VmManifest {
                 api_version: odorobo::manifest::MANIFEST_VERSION,
                 id: Ulid::generate(),
                 desired: DesiredState {
                     metadata: Metadata {
-                        name,
+                        name: "test_vm".to_owned(),
                         ..Default::default()
                     },
                     compute: Compute {
-                        vcpus,
-                        memory_bytes: memory.as_u64(),
+                        vcpus: 4,
+                        memory_bytes: ByteSize::gib(4).as_u64(),
                         ..Default::default()
                     },
                     storage: vec![Storage {
@@ -144,7 +130,6 @@ pub async fn run_command(cli: Cli) -> Result<()> {
                 observed: None,
             };
 
-            vm.validate()?;
             let request = CreateVMRequest { vm };
 
             let url = format!("{base_url}/vms");
@@ -182,169 +167,4 @@ pub async fn run_command(cli: Cli) -> Result<()> {
     }
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{Cli, Command};
-    use bytesize::ByteSize;
-    use clap::Parser;
-
-    #[test]
-    fn create_options_default_to_current_vm_settings() {
-        let cli = Cli::try_parse_from(["odoroboctl", "create", "--image", "disk.img"])
-            .expect("default create options should parse");
-
-        match cli.command {
-            Command::Create {
-                name,
-                vcpus,
-                memory,
-                ..
-            } => {
-                assert_eq!(name, "test_vm");
-                assert_eq!(vcpus, 4);
-                assert_eq!(memory, ByteSize::gib(4));
-            }
-            _ => panic!("expected create command"),
-        }
-    }
-
-    #[tokio::test]
-    async fn create_rejects_invalid_settings_before_sending_request() {
-        let invalid_settings = [
-            (
-                " ",
-                4,
-                ByteSize::gib(4),
-                "metadata must define a non-empty name",
-            ),
-            ("test_vm", 0, ByteSize::gib(4), "at least one vCPU"),
-            (
-                "test_vm",
-                4,
-                ByteSize::b(0),
-                "memory must be greater than zero",
-            ),
-        ];
-
-        for (name, vcpus, memory, expected_error) in invalid_settings {
-            let error = super::run_command(Cli {
-                manager_addr: "http://127.0.0.1:1".to_owned(),
-                command: Command::Create {
-                    image: "file:///var/lib/odorobo/disk.img".to_owned(),
-                    name: name.to_owned(),
-                    vcpus,
-                    memory,
-                },
-            })
-            .await
-            .expect_err("invalid VM settings should fail locally");
-
-            assert!(
-                error.to_string().contains(expected_error),
-                "unexpected error for invalid settings: {error}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn create_sends_valid_settings_to_manager() {
-        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind test manager");
-        let manager_addr = listener.local_addr().expect("get test manager address");
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("accept request");
-            let mut reader = BufReader::new(stream);
-            let mut line = String::new();
-            reader
-                .read_line(&mut line)
-                .await
-                .expect("read request line");
-            assert!(line.starts_with("POST /vms "));
-
-            let mut content_length = None;
-            loop {
-                line.clear();
-                let bytes_read = reader.read_line(&mut line).await.expect("read header");
-                assert_ne!(bytes_read, 0, "request ended before headers completed");
-                if line == "\r\n" || line == "\n" {
-                    break;
-                }
-                if let Some((name, value)) = line.split_once(':') {
-                    if name.eq_ignore_ascii_case("content-length") {
-                        content_length =
-                            Some(value.trim().parse::<usize>().expect("valid content length"));
-                    }
-                }
-            }
-
-            let mut body = vec![0; content_length.expect("content-length header")];
-            reader
-                .read_exact(&mut body)
-                .await
-                .expect("read complete request body");
-            let request: serde_json::Value =
-                serde_json::from_slice(&body).expect("request body should be valid JSON");
-            assert_eq!(request["vm"]["desired"]["metadata"]["name"], "web");
-            assert_eq!(request["vm"]["desired"]["compute"]["vcpus"], 2);
-            assert_eq!(
-                request["vm"]["desired"]["compute"]["memory_bytes"],
-                ByteSize::gib(8).as_u64()
-            );
-
-            reader
-                .get_mut()
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
-                .await
-                .expect("write response");
-        });
-
-        super::run_command(Cli {
-            manager_addr: format!("http://{manager_addr}"),
-            command: Command::Create {
-                image: "file:///var/lib/odorobo/disk.img".to_owned(),
-                name: "web".to_owned(),
-                vcpus: 2,
-                memory: ByteSize::gib(8),
-            },
-        })
-        .await
-        .expect("valid VM settings should be sent to the manager");
-        server.await.expect("test manager should finish");
-    }
-
-    #[test]
-    fn create_options_accept_vm_settings() {
-        let cli = Cli::try_parse_from([
-            "odoroboctl",
-            "create",
-            "--image",
-            "disk.img",
-            "--name",
-            "web",
-            "--vcpus",
-            "8",
-            "--memory",
-            "16GiB",
-        ])
-        .expect("custom create options should parse");
-
-        match cli.command {
-            Command::Create {
-                name,
-                vcpus,
-                memory,
-                ..
-            } => {
-                assert_eq!(name, "web");
-                assert_eq!(vcpus, 8);
-                assert_eq!(memory, ByteSize::gib(16));
-            }
-            _ => panic!("expected create command"),
-        }
-    }
 }
