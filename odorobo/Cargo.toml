@@ -31,6 +31,7 @@ axum_responses = "0.5"
 thiserror = "2.0"
 futures-util = "0.3"
 libc = "0.2"
+xattr = "1"
 random-port = "0.1"
 if-addrs = "0.15"
 libp2p = { version = "0.56", features = ["yamux", "serde", "mdns"] }
