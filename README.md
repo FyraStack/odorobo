@@ -77,9 +77,26 @@ Replace the VM ID in the socket path with your VM's ID. The serial console socke
 
 See [docs/console.md](docs/console.md) for direct serial socket access, WebSocket console usage, and integration details.
 
-For more advanced usage, Odorobo Agent also exposes a passthrough route for the local Cloud Hypervisor API, allowing you to call the full Cloud Hypervisor API directly through the agent's REST API
+The manager HTTP API does not currently expose Cloud Hypervisor passthrough
+routes. For advanced host-local diagnostics, use the VMM Unix socket directly.
+`docs/ch-passthrough.md` records the planned passthrough interface, not an
+implemented route.
 
-See `docs/ch-passthrough.md` for Cloud Hypervisor API passthrough usage.
+### VM shutdown and deletion
+
+`PUT /vms/{vmid}/shutdown` shuts down the **guest** through Cloud Hypervisor but
+keeps the VM actor and VMM process alive. Its runtime/configuration, agent
+membership, scheduler intent, and resource reservation remain. Shutdown does
+not release storage or other resources acquired for the VM. The manager API does
+not currently expose a boot operation for restarting a shut-down guest. For
+host-local diagnostics, Cloud Hypervisor can boot the retained VM through
+`/run/odorobo/vms/<vmid>/ch.sock`; this bypasses Odorobo boot hooks, including
+network bridge attachment, and is not a supported manager restart workflow.
+
+`DELETE /vms/{vmid}` permanently removes the VM. It stops the VM actor and VMM,
+cleans up runtime state, releases transformed resources such as attached
+storage, and removes the VM from agent and scheduler state. Create the VM again
+to restore it.
 
 See [docs/future-work.md](docs/future-work.md) for planned scheduler,
 migration, and high-availability work that is not implemented yet.

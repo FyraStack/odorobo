@@ -10,6 +10,9 @@ mod file;
 mod iscsi;
 mod rbd;
 
+#[cfg(test)]
+mod tests;
+
 /// A storage backend for Odorobo to resolve storage URIs to local paths.
 ///
 /// This allows Odorobo to actually convert a custom URI
@@ -69,10 +72,11 @@ impl StorageDriverTransformer {
     /// Checks both `path` and `id` fields for a URI, since after transforms `path` is the
     /// resolved device path while `id` holds the original URI.
     /// Errors are logged as warnings and do not abort the remaining releases.
-    pub async fn release_config(&self, config: &VmConfig) {
-        let Some(disks) = config.disks.as_ref() else {
-            return;
+    pub async fn release_config(&self, config: &mut VmConfig) -> Result<()> {
+        let Some(disks) = config.disks.as_mut() else {
+            return Ok(());
         };
+        let mut first_error = None;
         for disk in disks {
             let candidates = [disk.path.as_deref(), disk.id.as_deref()];
             let Some((uri, backend)) = candidates.into_iter().flatten().find_map(|s| {
@@ -84,8 +88,17 @@ impl StorageDriverTransformer {
             };
             if let Err(e) = backend.release(&uri).await {
                 warn!(path = uri.as_str(), error = ?e, "Failed to release storage for disk");
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
+            } else {
+                // This config is now cleanup state, not a runnable VM config.
+                // Clearing both URI candidates prevents duplicate releases on retry.
+                disk.path = None;
+                disk.id = None;
             }
         }
+        first_error.map_or(Ok(()), Err)
     }
 }
 
@@ -101,9 +114,8 @@ impl Default for StorageDriverTransformer {
 impl ConfigTransform for StorageDriverTransformer {
     fn teardown(&self, _vmid: &str, config: &mut VmConfig) -> Result<()> {
         tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(self.release_config(config));
-        });
-        Ok(())
+            tokio::runtime::Handle::current().block_on(self.release_config(config))
+        })
     }
 
     fn transform(&self, _vmid: &str, config: &mut VmConfig) -> Result<()> {

@@ -150,8 +150,23 @@ impl SchedulerActor {
         data_cache.remove(&vmid);
     }
 
-    /// Removes VM intent and every actor-ID association so reconciliation cannot
-    /// recreate a VM after an explicit stop or delete request.
+    /// Applies the scheduler-side effect of an explicit lifecycle command.
+    /// Shutdown keeps the VM managed and its resource reservation intact;
+    /// deletion removes all state so reconciliation cannot recreate it.
+    pub(super) fn apply_vm_lifecycle_command(
+        &mut self,
+        vmid: Ulid,
+        command: super::VmLifecycleCommand,
+    ) {
+        match command {
+            super::VmLifecycleCommand::Shutdown => {
+                // The guest is powered off, but the VMM actor and VM intent remain.
+            }
+            super::VmLifecycleCommand::Delete => self.remove_vm_intent(vmid),
+        }
+    }
+
+    /// Removes VM intent and every actor-ID association after explicit deletion.
     pub(super) fn remove_vm_intent(&mut self, vmid: Ulid) {
         Self::remove_vm_state(
             vmid,
