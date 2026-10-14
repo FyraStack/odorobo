@@ -55,7 +55,7 @@ impl StorageDriverTransformer {
     pub fn new() -> Self {
         Self {
             backends: vec![],
-            attempts: Default::default(),
+            attempts: std::sync::Mutex::default(),
         }
     }
 
@@ -146,7 +146,7 @@ impl ConfigTransform for StorageDriverTransformer {
             // resources. Backends must reconcile absence as successful cleanup.
             self.attempts
                 .lock()
-                .unwrap()
+                .map_err(|_| stable_eyre::eyre::eyre!("storage attempt registry poisoned"))?
                 .entry(vmid.to_owned())
                 .or_default()
                 .push(uri.clone());
@@ -195,7 +195,7 @@ mod tests {
     async fn partial_resolution_never_releases_untouched_desired_disks() {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let transformer =
-            StorageDriverTransformer::new().with_backend(RecordingStorage(calls.clone()));
+            StorageDriverTransformer::new().with_backend(RecordingStorage(Arc::clone(&calls)));
         let mut config = VmConfig {
             disks: Some(
                 ["acquired", "failed", "untouched"]

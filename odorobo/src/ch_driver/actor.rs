@@ -263,10 +263,14 @@ mod tests {
     /// it is ignored by default: `cargo test -p odorobo --bin odorobo faas_vm_boots -- --ignored --nocapture`
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "boots a real VM; needs /dev/kvm, cloud-hypervisor, virtiofsd, skopeo, composefs host support, and zig"]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "end-to-end test exercises one long scenario"
+    )]
     async fn faas_vm_boots_oci_rootfs_through_the_actor() {
         use crate::ch_driver::{VMInstance, actor::VMActor, containers};
         use crate::manifest::{
-            Boot, Compute, DesiredState, MANIFEST_VERSION, Metadata, Rootfs, VmManifest,
+            Boot, Compute, DesiredState, MANIFEST_VERSION, Metadata, Placement, Rootfs, VmManifest,
         };
         use crate::messages::vm::{DeleteVM, GetConsoleHistory};
         use kameo::prelude::*;
@@ -320,7 +324,7 @@ mod tests {
                 },
                 storage: vec![],
                 networks: vec![],
-                placement: Default::default(),
+                placement: Placement::default(),
                 boot: Boot {
                     start: true,
                     // The fixture installs our static init at /bin/sh.
@@ -345,7 +349,9 @@ mod tests {
         let handle = prepared.spawn((vmid, Some(manifest)));
 
         // Require userspace execution, not merely a kernel driver log.
-        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        let deadline = std::time::Instant::now()
+            .checked_add(Duration::from_secs(120))
+            .expect("deadline in range");
         let mut virtiofs_seen = false;
         while std::time::Instant::now() < deadline {
             let reply = match actor_ref.ask(GetConsoleHistory { vmid }).await {
@@ -475,11 +481,10 @@ mod tests {
             "DeleteVM must remove stopped persistent state"
         );
         // The actor handle resolves once on_stop teardown has finished.
-        let (actor, reason) = handle
+        let (_, reason) = handle
             .await
             .expect("actor task")
             .expect("actor stopped cleanly");
-        let _ = actor;
         info!(?reason, "faas boot test actor stopped");
         tokio::time::sleep(Duration::from_secs(1)).await;
 
@@ -510,7 +515,7 @@ pub struct VMActor {
     pub migration_state: Option<MigrationState>,
     pub console: Console,
     /// Supervised virtiofsd child (extra process supervised by this actor)
-    /// when the VM boots an OCI rootfs over virtiofs (FaaS, issue #112).
+    /// when the VM boots an OCI rootfs over virtiofs (`FaaS`, issue #112).
     pub virtiofs: Option<VirtioFsSupervisor>,
     /// This VM's digest-pinned composefs mount of its OCI rootfs.
     pub rootfs_mount: Option<PreparedRootfs>,
@@ -676,7 +681,7 @@ impl VMActor {
                 log: runtime_dir.join("virtiofsd.log"),
             };
             let start = async {
-                *virtiofs = Some(VirtioFsSupervisor::start(spec)?);
+                *virtiofs = Some(VirtioFsSupervisor::start(spec));
                 virtiofs
                     .as_ref()
                     .unwrap()
@@ -1086,10 +1091,10 @@ impl Message<ShutdownVM> for VMActor {
         self.started = false;
         // Keep OCI ownership and identity reachable for restart/delete. This
         // is process-local lifecycle state, not durable scheduler inventory.
-        if !self
+        if self
             .manifest
             .as_ref()
-            .is_some_and(|m| m.desired.rootfs.is_some())
+            .is_none_or(|m| m.desired.rootfs.is_none())
         {
             ctx.actor_ref()
                 .stop_gracefully()
@@ -1130,16 +1135,15 @@ impl Message<DeleteVM> for VMActor {
                 )),
             };
         }
-        if persistent {
-            if let Err(err) =
+        if persistent
+            && let Err(err) =
                 crate::ch_driver::containers::delete_persistent_rootfs(&self.vmid.to_string()).await
-            {
-                return DeleteVMReply {
-                    error: Some(format!(
-                        "persistent rootfs deletion failed; actor retained for retry: {err}"
-                    )),
-                };
-            }
+        {
+            return DeleteVMReply {
+                error: Some(format!(
+                    "persistent rootfs deletion failed; actor retained for retry: {err}"
+                )),
+            };
         }
         if let Err(err) = self.vm_instance.purge_instance_data() {
             return DeleteVMReply {

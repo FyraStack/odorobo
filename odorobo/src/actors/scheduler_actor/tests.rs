@@ -333,8 +333,8 @@ fn vm_cleanup_unplaces_vm_without_another_discovered_actor() {
         agent_keepalive_tasks: AHashMap::new(),
         vm_actorid_ulid_map: AHashMap::from([(vm_actor_id, vmid)]),
         vm_manifests: AHashMap::from([(vmid, test_manifest(1, 1))]),
-        stopped_vms: Default::default(),
-        retired_vm_actors: Default::default(),
+        stopped_vms: AHashSet::default(),
+        retired_vm_actors: AHashSet::default(),
         vm_placements: AHashMap::from([(
             vmid,
             vec![VmPlacement {
@@ -420,8 +420,8 @@ fn explicit_stop_removes_vm_intent_and_actor_mapping() {
         agent_keepalive_tasks: AHashMap::new(),
         vm_actorid_ulid_map: AHashMap::from([(vm_actor_id, vmid)]),
         vm_manifests: AHashMap::from([(vmid, test_manifest(1, 1))]),
-        stopped_vms: Default::default(),
-        retired_vm_actors: Default::default(),
+        stopped_vms: AHashSet::default(),
+        retired_vm_actors: AHashSet::default(),
         vm_placements: AHashMap::from([(vmid, Vec::new())]),
         vm_data_cache: AHashMap::from([(vmid, vec![CachedVMActor { actor_ref: None }])]),
         vm_keepalive_tasks: AHashMap::new(),
@@ -461,8 +461,8 @@ fn agent_cleanup_does_not_remove_unrelated_vm_state() {
         agent_keepalive_tasks: AHashMap::new(),
         vm_actorid_ulid_map: AHashMap::from([(vm_actor_id, vmid)]),
         vm_manifests: AHashMap::from([(vmid, test_manifest(1, 1))]),
-        stopped_vms: Default::default(),
-        retired_vm_actors: Default::default(),
+        stopped_vms: AHashSet::default(),
+        retired_vm_actors: AHashSet::default(),
         vm_placements: AHashMap::from([(
             vmid,
             vec![VmPlacement {
@@ -498,8 +498,8 @@ fn vm_cleanup_does_not_remove_unrelated_agent_state() {
         agent_keepalive_tasks: AHashMap::new(),
         vm_actorid_ulid_map: AHashMap::from([(vm_actor_id, vmid)]),
         vm_manifests: AHashMap::from([(vmid, test_manifest(1, 1))]),
-        stopped_vms: Default::default(),
-        retired_vm_actors: Default::default(),
+        stopped_vms: AHashSet::default(),
+        retired_vm_actors: AHashSet::default(),
         vm_placements: AHashMap::new(),
         vm_data_cache: AHashMap::from([(vmid, vec![CachedVMActor { actor_ref: None }])]),
         vm_keepalive_tasks: AHashMap::new(),

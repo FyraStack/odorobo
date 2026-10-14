@@ -257,11 +257,10 @@ impl StorageDriver for ISCSIStorage {
             }
             ids.pop();
         }
-        SESSION_RESERVATIONS
-            .lock()
-            .unwrap()
-            .remove(&(ownership.target.host.clone(), ownership.target.iqn.clone()));
+        let reservation = (ownership.target.host.clone(), ownership.target.iqn.clone());
         owned.remove(uri.as_str());
+        drop(owned);
+        SESSION_RESERVATIONS.lock().unwrap().remove(&reservation);
         Ok(())
     }
 }

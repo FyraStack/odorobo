@@ -137,35 +137,6 @@ impl RbdImage {
         }
         Ok(PathBuf::from(device))
     }
-
-    /// Unmaps the RBD image from the kernel block device.
-    #[tracing::instrument(skip(self))]
-    pub async fn unmap(&self) -> Result<()> {
-        let rbd_path = self.rbd_path();
-        if !rbd_map_list()
-            .await?
-            .iter()
-            .any(|(path, _)| path == &rbd_path)
-        {
-            return Ok(());
-        }
-        info!(?rbd_path, "Unmapping RBD image");
-        let output = Command::new("rbd")
-            .args(rbd_extra_args())
-            .arg("device")
-            .arg("unmap")
-            .arg("--options")
-            .arg("noudev")
-            .arg(&rbd_path)
-            .output()
-            .await
-            .map_err(|e| eyre!("Failed to execute rbd command: {e}"))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(eyre!("rbd unmap failed: {stderr}"));
-        }
-        Ok(())
-    }
 }
 
 impl TryFrom<&Url> for RbdImage {
@@ -301,6 +272,7 @@ impl StorageDriver for RbdStorage {
             ));
         }
         owned.remove(uri.as_str());
+        drop(owned);
         crate::ch_driver::containers::RBD_RESERVATIONS
             .lock()
             .unwrap()
@@ -326,14 +298,12 @@ mod tests {
             .is_none()
         );
         let mappings = vec![("pool/original".into(), "/dev/rbd1".into())];
-        assert!(
-            owned_mapping_device(
-                "pool/original",
-                std::path::Path::new("/dev/rbd0"),
-                &mappings
-            )
-            .is_err()
-        );
+        let _err = owned_mapping_device(
+            "pool/original",
+            std::path::Path::new("/dev/rbd0"),
+            &mappings,
+        )
+        .unwrap_err();
     }
 
     #[tokio::test]

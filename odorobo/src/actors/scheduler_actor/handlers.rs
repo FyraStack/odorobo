@@ -3,7 +3,7 @@
 use std::ops::ControlFlow;
 use std::time::Instant;
 
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use kameo::prelude::*;
 use stable_eyre::{Report, eyre::eyre};
 use tracing::{info, warn};
@@ -37,8 +37,8 @@ impl Actor for SchedulerActor {
             agent_keepalive_tasks: AHashMap::new(),
             vm_actorid_ulid_map: AHashMap::new(),
             vm_manifests: AHashMap::new(),
-            stopped_vms: Default::default(),
-            retired_vm_actors: Default::default(),
+            stopped_vms: AHashSet::default(),
+            retired_vm_actors: AHashSet::default(),
             vm_placements: AHashMap::new(),
             vm_data_cache: AHashMap::new(),
             vm_keepalive_tasks: AHashMap::new(),
