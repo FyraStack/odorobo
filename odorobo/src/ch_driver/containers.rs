@@ -1,13 +1,13 @@
 //! OCI container microVM roots served over virtiofs. All OCI, composefs,
-//! OverlayFS, fs-verity, and persistence preparation happens on the host; the
+//! `OverlayFS`, fs-verity, and persistence preparation happens on the host; the
 //! guest sees an ordinary virtiofs root and does not need composefs support.
 //!
 //! Skopeo layouts keep per-reference metadata while verified compressed blobs
 //! are hard-linked into a node-local digest CAS. Each unique OCI layer is
-//! extracted temporarily, translated to OverlayFS whiteout semantics, and
+//! extracted temporarily, translated to `OverlayFS` whiteout semantics, and
 //! built as an immutable fs-verity composefs image with a per-layer object
 //! store. Temporary extraction is deleted. Per-VM composefs mounts are stacked
-//! in OCI order with OverlayFS before actor-supervised virtiofsd exports them.
+//! in OCI order with `OverlayFS` before actor-supervised virtiofsd exports them.
 //! Security notes: layers are unpacked by this process as root; tar paths
 //! are validated (`..` rejected) and every unpack/whiteout operation refuses
 //! to traverse symlinks planted by earlier layers, so a hostile image cannot
@@ -16,7 +16,7 @@
 
 use std::io::Read;
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -41,7 +41,7 @@ pub const ROOTFS_TAG: &str = "rootfs";
 pub const MICROVM_KERNEL_PATH: &str = "/var/lib/odorobo/microvm/vmlinux";
 /// Direct-kernel-boot cmdline for a composefs/virtiofs root. The guest init
 /// must live at /sbin/init, /etc/init, /bin/init or /bin/sh (kernel default).
-/// console=ttyS0 (the 16550 UART) because the driver's ConsoleTransform
+/// console=ttyS0 (the 16550 UART) because the driver's `ConsoleTransform`
 /// sockets the UART; the virtio-console (hvc0) is off.
 pub const DEFAULT_ROOTFS_CMDLINE: &str = "console=ttyS0 root=rootfs rootfstype=virtiofs rw";
 
@@ -55,7 +55,7 @@ const SKOPEO_TIMEOUT: Duration = Duration::from_secs(600);
 struct RemovePathOnDrop(Option<PathBuf>);
 
 impl RemovePathOnDrop {
-    fn new(path: PathBuf) -> Self {
+    const fn new(path: PathBuf) -> Self {
         Self(Some(path))
     }
     fn disarm(&mut self) {
@@ -93,7 +93,7 @@ pub struct PreparedRootfs {
     pub upper: Option<PathBuf>,
     /// Per-VM overlayfs work directory when the root is writable.
     pub work: Option<PathBuf>,
-    /// Per-layer composefs mounts backing the merged OverlayFS lower.
+    /// Per-layer composefs mounts backing the merged `OverlayFS` lower.
     layer_mounts: Vec<PathBuf>,
     /// Persistent backend mount directory; populated only for RBD state.
     persistent_state_mount: Option<PathBuf>,
@@ -155,6 +155,10 @@ enum Compression {
 }
 
 #[derive(Clone, Copy, Debug)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "each field is a maximum; the prefix keeps call sites unambiguous"
+)]
 struct OciUnpackLimits {
     max_compressed_bytes: u64,
     max_layer_bytes: u64,
@@ -251,7 +255,11 @@ fn compression_of_media_type(media_type: &str) -> Option<Compression> {
 }
 
 fn to_hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    use std::fmt::Write as _;
+    bytes.iter().fold(String::new(), |mut out, byte| {
+        write!(out, "{byte:02x}").expect("writing to a String cannot fail");
+        out
+    })
 }
 
 fn digest_blob_path(layout: &Path, digest: &str) -> Result<PathBuf> {
@@ -374,6 +382,10 @@ fn oci_layout_blob_bytes(layout: &Path) -> Result<u64> {
 }
 
 fn set_child_file_size_limit(command: &mut Command, limit_bytes: u64) -> Result<()> {
+    #[allow(
+        clippy::useless_conversion,
+        reason = "rlim_t is not u64 on every target"
+    )]
     let limit: libc::rlim_t = limit_bytes
         .try_into()
         .map_err(|_| eyre!("file size limit exceeds RLIMIT_FSIZE"))?;
@@ -385,12 +397,12 @@ fn set_child_file_size_limit(command: &mut Command, limit_bytes: u64) -> Result<
                 rlim_cur: limit,
                 rlim_max: limit,
             };
-            if libc::setrlimit(libc::RLIMIT_FSIZE, &limits) != 0 {
+            if libc::setrlimit(libc::RLIMIT_FSIZE, &raw const limits) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
-        });
-    }
+        })
+    };
     Ok(())
 }
 
@@ -410,14 +422,14 @@ async fn inspect_raw_manifest(image_ref: &str) -> Result<Vec<u8>> {
     let mut child = command
         .spawn()
         .wrap_err("failed to start skopeo manifest preflight")?;
-    let status = match tokio::time::timeout(Duration::from_secs(60), child.wait()).await {
-        Ok(status) => status?,
-        Err(_) => {
+    let status =
+        if let Ok(status) = tokio::time::timeout(Duration::from_secs(60), child.wait()).await {
+            status?
+        } else {
             _ = child.start_kill();
             _ = child.wait().await;
             bail!("skopeo manifest preflight timed out");
-        }
-    };
+        };
     if !status.success() {
         bail!("skopeo inspect --raw failed for {image_ref} ({status})");
     }
@@ -431,11 +443,10 @@ fn docker_digest_ref(image_ref: &str, digest: &str) -> Result<String> {
     let repository = if let Some((repository, _tag_or_digest)) = name.split_once('@') {
         repository
     } else {
-        let slash = name.rfind('/').map_or(0, |index| index + 1);
-        match name[slash..].rfind(':') {
-            Some(index) => &name[..slash + index],
-            None => name,
-        }
+        // A tag separator is a ':' in the final path component (not a port).
+        name.rsplit_once(':')
+            .filter(|(_, tag)| !tag.contains('/'))
+            .map_or(name, |(repository, _)| repository)
     };
     if repository.is_empty() {
         bail!("empty Docker repository in {image_ref:?}");
@@ -609,6 +620,10 @@ async fn pull_oci(image_ref: &str, max_compressed_bytes: u64) -> Result<PathBuf>
         .map_err(|err| eyre!("OCI pull task failed: {err}"))?
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential setup with interleaved cleanup; splitting would obscure ownership"
+)]
 async fn pull_oci_inner(image_ref: &str, max_compressed_bytes: u64) -> Result<PathBuf> {
     let normalized = normalize_image_ref(image_ref);
     // Keep human-readable names but include the full ref hash so sanitization
@@ -832,7 +847,7 @@ struct Whiteout {
     file_name: String,
 }
 
-/// Preserve whiteouts in layer form. OverlayFS supports the trusted.overlay
+/// Preserve whiteouts in layer form. `OverlayFS` supports the trusted.overlay
 /// xattr encoding as well as char-device whiteouts; the xattr form works on
 /// filesystems and container policies where creating device nodes is forbidden.
 fn apply_whiteout(tree: &Path, parent_rel: &Path, file_name: &str) -> Result<()> {
@@ -855,7 +870,6 @@ fn apply_whiteout(tree: &Path, parent_rel: &Path, file_name: &str) -> Result<()>
                 target.display()
             );
         }
-        use std::os::unix::fs::OpenOptionsExt;
         std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -926,7 +940,6 @@ fn apply_xattrs(target: &Path, xattrs: &[(Vec<u8>, Vec<u8>)]) -> Result<()> {
 }
 
 fn restore_directory_metadata(tree: &Path, directories: &mut [DirectoryMetadata]) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
     // Descendants first: default ACLs must not affect extraction, and final
     // directory modes/times must not be disturbed by children or whiteouts.
     directories.sort_by_key(|directory| std::cmp::Reverse(directory.relative.components().count()));
@@ -946,8 +959,11 @@ fn restore_directory_metadata(tree: &Path, directories: &mut [DirectoryMetadata]
         }
         file.set_permissions(std::fs::Permissions::from_mode(directory.mode))?;
         file.set_times(
-            std::fs::FileTimes::new()
-                .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(directory.mtime)),
+            std::fs::FileTimes::new().set_modified(
+                std::time::UNIX_EPOCH
+                    .checked_add(Duration::from_secs(directory.mtime))
+                    .ok_or_else(|| eyre!("directory mtime out of range"))?,
+            ),
         )?;
         apply_xattrs(&path, &directory.xattrs)?;
     }
@@ -972,7 +988,7 @@ fn unpack_entry<R: Read>(
         if entry.header().entry_type() != tar::EntryType::Regular || entry.header().size()? != 0 {
             bail!("OCI whiteout {rel:?} must be an empty regular file");
         }
-        let parent = rel.parent().unwrap_or(Path::new("")).to_path_buf();
+        let parent = rel.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
         return Ok(Some(Whiteout { parent, file_name }));
     }
 
@@ -1192,14 +1208,16 @@ impl<R: Read> Read for LimitedReader<R> {
                 )),
             };
         }
-        let allowed = buf.len().min(remaining.saturating_add(1) as usize);
+        let allowed = buf
+            .len()
+            .min(usize::try_from(remaining.saturating_add(1)).unwrap_or(usize::MAX));
         let count = self.inner.read(&mut buf[..allowed])?;
         if count as u64 > remaining {
             return Err(std::io::Error::other(
                 "OCI layer exceeds configured uncompressed-byte limit",
             ));
         }
-        self.bytes += count as u64;
+        self.bytes = self.bytes.saturating_add(count as u64);
         self.hasher.update(&buf[..count]);
         Ok(count)
     }
@@ -1237,7 +1255,7 @@ fn unpack_tar<R: Read>(
 }
 
 /// Unpack a layer whose compressed digest was fully checked by `hash_file`.
-/// The bounded decompressor also computes the config's uncompressed DiffID.
+/// The bounded decompressor also computes the config's uncompressed `DiffID`.
 fn unpack_layer<R: Read>(
     reader: R,
     compression: Compression,
@@ -1274,14 +1292,8 @@ fn hash_file(path: &Path) -> Result<String> {
     let mut file = std::fs::File::open(path)
         .wrap_err_with(|| format!("open {} for digest verification", path.display()))?;
     let mut hasher = sha2::Sha256::new();
-    let mut buf = [0_u8; 1024 * 1024];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
+    std::io::copy(&mut file, &mut hasher)
+        .wrap_err_with(|| format!("hash {} for digest verification", path.display()))?;
     Ok(format!("sha256:{}", to_hex(&hasher.finalize())))
 }
 
@@ -1512,6 +1524,10 @@ async fn materialize_layer_at_limited(
     .map_err(|err| eyre!("layer builder task failed: {err}"))?
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential setup with interleaved cleanup; splitting would obscure ownership"
+)]
 async fn materialize_layer_inner(
     layout: &Path,
     desc: &OciLayerDescriptor,
@@ -1553,9 +1569,8 @@ async fn materialize_layer_inner(
     let tree = tmp.join("tree");
     // Create staging privately from the outset; the blocking writer owns
     // cleanup until it explicitly hands the finished tree back to the builder.
-    use std::os::unix::fs::DirBuilderExt;
     std::fs::DirBuilder::new().mode(0o700).create(&tmp)?;
-    std::fs::create_dir(&tree)?;
+    std::fs::create_dir_all(&tree)?;
     let cleanup = RemovePathOnDrop::new(tmp.clone());
     let blob_for_unpack = blob.clone();
     let tree_clone = tree.clone();
@@ -1661,7 +1676,7 @@ async fn materialize_layer_inner(
 // ---------------------------------------------------------------------------
 
 /// vhost-user socket path for a VM's rootfs device. Single source of truth
-/// shared with the manifest conversion's FsConfig so the actor's virtiofsd
+/// shared with the manifest conversion's `FsConfig` so the actor's virtiofsd
 /// supervisor and the CH fs device config always agree.
 pub fn socket_path_for(vmid: &str) -> PathBuf {
     crate::ch_driver::VMInstance::runtime_dir_for(vmid).join(format!("{ROOTFS_TAG}.sock"))
@@ -1819,6 +1834,7 @@ async fn acquire_rootfs_lock(vmid: &str) -> Result<Arc<std::fs::File>> {
     tokio::fs::create_dir_all(&dir).await?;
     let file = std::fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(dir.join(format!("{vmid}.lock")))?;
@@ -1858,17 +1874,14 @@ async fn run_owned_command(mut command: Command) -> Result<std::process::Output>
             .ok_or_else(|| eyre!("external tool child has no PID"))?;
         let output = child.wait_with_output();
         tokio::pin!(output);
-        match tokio::time::timeout(Duration::from_secs(120), &mut output).await {
-            Ok(result) => result.wrap_err("external tool operation failed"),
-            Err(_) => {
-                // SAFETY: child is still owned by the pinned wait future and
-                // unreaped; its PID cannot be reused before that future ends.
-                unsafe {
-                    libc::kill(-i32::try_from(pid)?, libc::SIGKILL);
-                }
-                _ = output.await;
-                bail!("external tool timed out; process group killed and child reaped");
-            }
+        if let Ok(result) = tokio::time::timeout(Duration::from_secs(120), &mut output).await {
+            result.wrap_err("external tool operation failed")
+        } else {
+            // SAFETY: child is still owned by the pinned wait future and
+            // unreaped; its PID cannot be reused before that future ends.
+            unsafe { libc::killpg(i32::try_from(pid)?, libc::SIGKILL) };
+            _ = output.await;
+            bail!("external tool timed out; process group killed and child reaped");
         }
     });
     task.await
@@ -1894,8 +1907,8 @@ async fn rbd_image_exists(image: &str) -> Result<bool> {
     }
 }
 
-pub(crate) static PERSISTENT_OPERATIONS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-pub(crate) static RBD_RESERVATIONS: std::sync::LazyLock<
+pub static PERSISTENT_OPERATIONS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+pub static RBD_RESERVATIONS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashSet<String>>,
 > = std::sync::LazyLock::new(Default::default);
 // None = command started but device not yet established; absence of a key =
@@ -1945,6 +1958,10 @@ async fn mount_persistent_state(vmid: &str) -> Result<(PathBuf, Option<String>)>
     .map_err(|err| eyre!("persistent attachment task failed: {err}"))?
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential setup with interleaved cleanup; splitting would obscure ownership"
+)]
 async fn mount_persistent_state_inner(vmid: &str) -> Result<(PathBuf, Option<String>)> {
     let path = PathBuf::from(PERSISTENT_ROOTFS_ROOT).join(vmid);
     tokio::fs::create_dir_all(&path).await?;
@@ -2190,7 +2207,15 @@ async fn is_device_mounted(device: &Path) -> Result<bool> {
 struct UpperState {
     upper: Option<PathBuf>,
     work: Option<PathBuf>,
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "inspected by persistence tests")
+    )]
     state_mount: Option<PathBuf>,
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "inspected by persistence tests")
+    )]
     rbd_image: Option<String>,
 }
 
@@ -2247,14 +2272,13 @@ async fn prepare_upper(
     let (upper, work) = match result {
         Ok(paths) => paths,
         Err(err) => {
-            if let Some(image) = &rbd_image {
-                if let Err(cleanup) =
+            if let Some(image) = &rbd_image
+                && let Err(cleanup) =
                     release_persistent_backend(Some(&state_dir), Some(image)).await
-                {
-                    return Err(err.wrap_err(format!(
-                        "persistent rootfs preparation failed; rollback failed: {cleanup}"
-                    )));
-                }
+            {
+                return Err(err.wrap_err(format!(
+                    "persistent rootfs preparation failed; rollback failed: {cleanup}"
+                )));
             }
             return Err(err);
         }
@@ -2344,7 +2368,7 @@ async fn unmount_layer_mounts(mounts: &[PathBuf]) -> Result<()> {
 }
 
 /// Prepare a digest-addressed composefs mount for each OCI layer, then expose
-/// their OCI-ordered OverlayFS stack as the VM root. No flattened image copy is
+/// their OCI-ordered `OverlayFS` stack as the VM root. No flattened image copy is
 /// retained; only per-layer stores and per-reference OCI layouts are cached.
 #[cfg(test)]
 async fn mount_rootfs(vmid: &str, rootfs: &Rootfs) -> Result<PreparedRootfs> {
@@ -2362,6 +2386,10 @@ async fn mount_rootfs(vmid: &str, rootfs: &Rootfs) -> Result<PreparedRootfs> {
 
 /// Publish acquired resources to a lifecycle owner before the first mount.
 /// A failed startup retains this inventory for an explicit teardown retry.
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential setup with interleaved cleanup; splitting would obscure ownership"
+)]
 pub async fn mount_rootfs_owned(
     vmid: &str,
     rootfs: &Rootfs,
@@ -2402,7 +2430,6 @@ pub async fn mount_rootfs_owned(
 
     let runtime_dir = crate::ch_driver::VMInstance::runtime_dir_for(vmid);
     tokio::fs::create_dir_all(&runtime_dir).await?;
-    use std::os::unix::fs::PermissionsExt;
     tokio::fs::set_permissions(&runtime_dir, std::fs::Permissions::from_mode(0o700)).await?;
     let root_mount = runtime_dir.join(ROOTFS_TAG);
     tokio::fs::create_dir_all(&root_mount).await?;
@@ -2550,9 +2577,9 @@ pub async fn mount_rootfs_owned(
     let upper_state = prepare_upper(vmid, rootfs.mode, &manifest_digest, &runtime_dir).await?;
     {
         let prepared = owner.as_mut().unwrap();
-        prepared.upper = upper_state.upper.clone();
-        prepared.work = upper_state.work.clone();
-    }
+        prepared.upper.clone_from(&upper_state.upper);
+        prepared.work.clone_from(&upper_state.work);
+    };
     if rootfs.mode == RootfsMode::ReadOnly && lowerdirs.len() == 1 {
         // A second, controlled empty lower preserves OverlayFS interpretation
         // of OCI whiteouts. A direct bind export would expose marker files.
@@ -2569,11 +2596,13 @@ pub async fn mount_rootfs_owned(
             .join(":")
     );
     if let (Some(upper), Some(work)) = (&upper_state.upper, &upper_state.work) {
-        options.push_str(&format!(
+        use std::fmt::Write as _;
+        write!(
+            options,
             ",upperdir={},workdir={}",
             upper.display(),
             work.display()
-        ));
+        )?;
     } else {
         options.push_str(",ro");
     }
@@ -2617,7 +2646,6 @@ pub async fn mount_rootfs_owned(
 }
 
 fn copy_directory_attributes(source: &Path, destination: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
     let metadata = std::fs::symlink_metadata(source)?;
     if !metadata.is_dir() {
         bail!("directory metadata source is not a directory");
@@ -2632,17 +2660,13 @@ fn copy_directory_attributes(source: &Path, destination: &Path) -> Result<()> {
     let path = std::ffi::CString::new(source.as_os_str().as_encoded_bytes())?;
     // SAFETY: valid path; null buffer queries length.
     let length = unsafe { libc::llistxattr(path.as_ptr(), std::ptr::null_mut(), 0) };
-    if length < 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    let mut names = vec![0_u8; length as usize];
+    let length = usize::try_from(length).map_err(|_| std::io::Error::last_os_error())?;
+    let mut names = vec![0_u8; length];
     // SAFETY: valid allocated buffer and path.
     let length = unsafe { libc::llistxattr(path.as_ptr(), names.as_mut_ptr().cast(), names.len()) };
-    if length < 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
+    let length = usize::try_from(length).map_err(|_| std::io::Error::last_os_error())?;
     let mut attributes = Vec::new();
-    for name in names[..length as usize]
+    for name in names[..length]
         .split(|byte| *byte == 0)
         .filter(|name| !name.is_empty())
     {
@@ -2653,10 +2677,8 @@ fn copy_directory_attributes(source: &Path, destination: &Path) -> Result<()> {
         // SAFETY: valid strings, null buffer for length query.
         let size =
             unsafe { libc::lgetxattr(path.as_ptr(), cname.as_ptr(), std::ptr::null_mut(), 0) };
-        if size < 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        let mut value = vec![0_u8; size as usize];
+        let size = usize::try_from(size).map_err(|_| std::io::Error::last_os_error())?;
+        let mut value = vec![0_u8; size];
         // SAFETY: valid output buffer sized by preceding query.
         if unsafe {
             libc::lgetxattr(
@@ -2758,7 +2780,6 @@ async fn compose_directory_metadata_inner(
             .file_name()
             .ok_or_else(|| eyre!("VM runtime has no identity"))?,
     );
-    use std::os::unix::fs::PermissionsExt;
     tokio::fs::create_dir_all(&metadata_dir).await?;
     tokio::fs::set_permissions(&metadata_dir, std::fs::Permissions::from_mode(0o700)).await?;
     let tree = metadata_dir.join("tree");
@@ -2902,7 +2923,9 @@ fn scratch_size_mb(env: &str, default_mb: u64) -> Result<u64> {
 }
 
 fn parse_scratch_size_mb(env: &str, value: &str) -> Result<u64> {
-    parse_size_bytes(env, value, 2 * 1024_u64.pow(3), false).map(|bytes| bytes / 1024_u64.pow(2))
+    const MAX_SCRATCH_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+    const MIB: u64 = 1024 * 1024;
+    parse_size_bytes(env, value, MAX_SCRATCH_BYTES, false).map(|bytes| bytes / MIB)
 }
 
 /// Resolve the three scratch locations completely before mounting any tmpfs.
@@ -2966,7 +2989,7 @@ async fn unmount_scratch_mounts(mounts: &[PathBuf]) -> Result<()> {
 }
 
 /// Read-only root supports only bounded volatile scratch: /tmp, /run, /var/tmp.
-/// Sizes are node policy via ODOROBO_ROOTFS_{TMP,RUN,VARTMP}_SIZE (M/G).
+/// Sizes are node policy via `ODOROBO_ROOTFS_{TMP,RUN,VARTMP}_SIZE` (M/G).
 async fn mount_readonly_scratch(root: &Path) -> Result<Vec<PathBuf>> {
     let targets = validate_scratch_targets(root)?;
     // Private propagation prevents nested per-VM tmpfs mounts escaping through
@@ -2998,7 +3021,7 @@ async fn mount_readonly_scratch(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(mounted)
 }
 
-/// Remove persistent upper state only from the explicit DeleteVM path.
+/// Remove persistent upper state only from the explicit `DeleteVM` path.
 pub async fn delete_persistent_rootfs(vmid: &str) -> Result<()> {
     let _operations = PERSISTENT_OPERATIONS.lock().await;
     validate_vmid(vmid)?;
@@ -3051,12 +3074,11 @@ pub fn virtiofsd_path() -> Option<PathBuf> {
     if let Ok(output) = std::process::Command::new("which")
         .arg("virtiofsd")
         .output()
+        && output.status.success()
     {
-        if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-            if !path.is_empty() {
-                return Some(PathBuf::from(path));
-            }
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        if !path.is_empty() {
+            return Some(PathBuf::from(path));
         }
     }
     let libexec = PathBuf::from("/usr/libexec/virtiofsd");
@@ -3066,7 +3088,7 @@ pub fn virtiofsd_path() -> Option<PathBuf> {
 /// Everything needed to (re)spawn one virtiofsd instance.
 #[derive(Debug, Clone)]
 pub struct VirtiofsdSpec {
-    /// Binary to run (normally virtiofsd_path(); override in tests).
+    /// Binary to run (normally `virtiofsd_path()`; override in tests).
     pub program: PathBuf,
     /// vhost-user socket the Cloud Hypervisor process connects to.
     pub socket: PathBuf,
@@ -3105,7 +3127,7 @@ impl Drop for VirtioFsSupervisor {
 
 impl VirtioFsSupervisor {
     /// Start supervising a virtiofsd instance for this spec.
-    pub fn start(spec: VirtiofsdSpec) -> Result<Self> {
+    pub fn start(spec: VirtiofsdSpec) -> Self {
         // A stale socket from a previous run would make CH connect to
         // nothing; virtiofsd also refuses to replace an existing socket.
         std::fs::remove_file(&spec.socket).ok();
@@ -3174,7 +3196,7 @@ impl VirtioFsSupervisor {
                                 .store(task_spec.socket.exists(), Ordering::Relaxed);
                             tokio::select! {
                                 () = tokio::time::sleep(Duration::from_millis(50)) => {}
-                                _ = task_state.notify.notified() => {
+                                () = task_state.notify.notified() => {
                                     _ = child.start_kill();
                                     break child.wait().await;
                                 }
@@ -3209,12 +3231,12 @@ impl VirtioFsSupervisor {
             debug!("virtiofsd supervisor loop exiting");
         });
 
-        Ok(Self {
+        Self {
             spec,
             state,
             abort: handle.abort_handle(),
             task: Mutex::new(Some(handle)),
-        })
+        }
     }
 
     /// Number of unexpected exits / failed spawns since start
@@ -3226,12 +3248,12 @@ impl VirtioFsSupervisor {
     /// Wait until the vhost-user socket exists (virtiofsd creates it at
     /// startup) so CH can attach the fs device.
     pub async fn wait_socket_ready(&self, timeout: Duration) -> Result<()> {
-        let deadline = tokio::time::Instant::now() + timeout;
+        let started = tokio::time::Instant::now();
         loop {
             if self.state.ready.load(Ordering::Relaxed) {
                 return Ok(());
             }
-            if tokio::time::Instant::now() >= deadline {
+            if started.elapsed() >= timeout {
                 bail!(
                     "virtiofsd socket {} did not appear within {timeout:?} — see {}",
                     self.spec.socket.display(),
@@ -3266,14 +3288,14 @@ impl VirtioFsSupervisor {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+pub mod tests {
     use super::{
         Compression, OciLayerDescriptor, VirtioFsSupervisor, VirtiofsdSpec, apply_whiteout,
         compression_of_media_type, digest_blob_path, ensure_no_symlink_ancestors, hash_file,
         materialize_layer_at, read_oci_manifest, safe_rel_path, sanitize_image_ref, to_hex,
     };
     use sha2::Digest;
-    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
@@ -3344,10 +3366,8 @@ pub(crate) mod tests {
             .unwrap();
         archive.finish().unwrap();
         drop(archive);
-        assert!(
-            super::unpack_layer(bytes.as_slice(), Compression::None, &base, 1024 * 1024, 10)
-                .is_err()
-        );
+        let _err = super::unpack_layer(bytes.as_slice(), Compression::None, &base, 1024 * 1024, 10)
+            .unwrap_err();
         std::fs::remove_dir_all(base).unwrap();
     }
 
@@ -3510,15 +3530,13 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&base).unwrap();
         let script = base.join("stub");
         std::fs::write(&script, "#!/usr/bin/python3\nimport socket,sys,time,pathlib\np=pathlib.Path(__file__).parent\ns=socket.socket(socket.AF_UNIX)\ns.bind(str(p/'sock'))\nf=p/'generation'\nn=int(f.read_text())+1 if f.exists() else 1\nf.write_text(str(n))\ntime.sleep(0.15 if n==1 else 100)\n").unwrap();
-        use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
         let supervisor = VirtioFsSupervisor::start(VirtiofsdSpec {
             program: script,
             socket: base.join("sock"),
             shared_dir: base.clone(),
             log: base.join("log"),
-        })
-        .unwrap();
+        });
         supervisor
             .wait_socket_ready(Duration::from_secs(2))
             .await
@@ -3607,7 +3625,7 @@ pub(crate) mod tests {
             mode: crate::manifest::RootfsMode::Ephemeral,
             scratch_mounts: vec![],
         };
-        let result = async {
+        async {
             assert!(super::unmount_rootfs(&prepared).await.is_err());
             assert!(!super::is_mountpoint(&mount).await.unwrap());
             assert!(super::is_mountpoint(&layer).await.unwrap());
@@ -3624,7 +3642,6 @@ pub(crate) mod tests {
         _ = busy.kill().await;
         _ = super::unmount_rootfs(&prepared).await;
         _ = instance.purge_instance_data();
-        result
     }
 
     #[tokio::test]
@@ -3748,10 +3765,10 @@ pub(crate) mod tests {
                 .to_string_lossy(),
             good
         );
-        assert!(digest_blob_path(layout, "sha256:../../etc/shadow").is_err());
-        assert!(digest_blob_path(layout, "sha256:deadbeef").is_err());
-        assert!(digest_blob_path(layout, "md5:aaaa").is_err());
-        assert!(digest_blob_path(layout, "garbage").is_err());
+        let _err = digest_blob_path(layout, "sha256:../../etc/shadow").unwrap_err();
+        let _err = digest_blob_path(layout, "sha256:deadbeef").unwrap_err();
+        let _err = digest_blob_path(layout, "md5:aaaa").unwrap_err();
+        let _err = digest_blob_path(layout, "garbage").unwrap_err();
     }
 
     #[test]
@@ -3765,7 +3782,7 @@ pub(crate) mod tests {
 
         assert!(ensure_no_symlink_ancestors(&tree, Path::new("etc/passwd")).is_err());
         assert!(ensure_no_symlink_ancestors(&tree, Path::new("etc")).is_err());
-        assert!(ensure_no_symlink_ancestors(&tree, Path::new("usr/bin")).is_ok());
+        ensure_no_symlink_ancestors(&tree, Path::new("usr/bin")).unwrap();
         // Whiteouts through the planted symlink are refused too.
         assert!(apply_whiteout(&tree, Path::new("etc"), ".wh..wh..opk").is_err());
 
@@ -3797,7 +3814,7 @@ pub(crate) mod tests {
         fixture_oci_layout_with_options_and_init(base, fill, include_run, None)
     }
 
-    pub(crate) fn fixture_oci_layout_with_init(base: &Path, init_binary: &Path) -> PathBuf {
+    pub fn fixture_oci_layout_with_init(base: &Path, init_binary: &Path) -> PathBuf {
         fixture_oci_layout_with_options_and_init(base, b'x', true, Some(init_binary)).0
     }
 
@@ -3812,63 +3829,61 @@ pub(crate) mod tests {
         let layout = base.join("layout");
         std::fs::create_dir_all(&layout).unwrap();
         let mut tar_bytes = Vec::new();
-        {
-            let mut tar = tar::Builder::new(&mut tar_bytes);
-            for (path, mode) in [
-                ("etc/", 0o755),
-                ("bin/", 0o755),
-                ("tmp/", 0o1777),
-                ("run/", 0o755),
-                ("var/", 0o755),
-                ("var/tmp/", 0o1777),
-            ]
-            .into_iter()
-            .filter(|(path, _)| {
-                (include_run || *path != "run/") && (init_binary.is_some() || *path != "bin/")
-            }) {
-                let mut directory = tar::Header::new_gnu();
-                directory.set_uid(0);
-                directory.set_gid(0);
-                directory.set_entry_type(tar::EntryType::Directory);
-                directory.set_size(0);
-                directory.set_mode(mode);
-                directory.set_cksum();
-                tar.append_data(&mut directory, path, std::io::empty())
-                    .unwrap();
-            }
-            let payload = vec![fill; 16 * 1024];
-            let mut header = tar::Header::new_gnu();
-            header.set_uid(0);
-            header.set_gid(0);
-            header.set_size(payload.len() as u64);
-            header.set_mode(0o644);
-            header.set_cksum();
-            tar.append_data(&mut header, "etc/x", payload.as_slice())
+        let mut tar = tar::Builder::new(&mut tar_bytes);
+        for (path, mode) in [
+            ("etc/", 0o755),
+            ("bin/", 0o755),
+            ("tmp/", 0o1777),
+            ("run/", 0o755),
+            ("var/", 0o755),
+            ("var/tmp/", 0o1777),
+        ]
+        .into_iter()
+        .filter(|(path, _)| {
+            (include_run || *path != "run/") && (init_binary.is_some() || *path != "bin/")
+        }) {
+            let mut directory = tar::Header::new_gnu();
+            directory.set_uid(0);
+            directory.set_gid(0);
+            directory.set_entry_type(tar::EntryType::Directory);
+            directory.set_size(0);
+            directory.set_mode(mode);
+            directory.set_cksum();
+            tar.append_data(&mut directory, path, std::io::empty())
                 .unwrap();
-            if let Some(init_binary) = init_binary {
-                let binary = std::fs::read(init_binary).unwrap();
-                let mut init = tar::Header::new_gnu();
-                init.set_uid(0);
-                init.set_gid(0);
-                init.set_size(binary.len() as u64);
-                init.set_mode(0o755);
-                init.set_cksum();
-                tar.append_data(&mut init, "bin/sh", binary.as_slice())
-                    .unwrap();
-            }
-            let mut whiteout = tar::Header::new_gnu();
-            whiteout.set_uid(0);
-            whiteout.set_gid(0);
-            whiteout.set_size(0);
-            whiteout.set_mode(0o000);
-            whiteout.set_cksum();
-            tar.append_data(&mut whiteout, "etc/.wh.deleted", std::io::empty())
-                .unwrap();
-            tar.finish().unwrap();
         }
+        let payload = vec![fill; 16 * 1024];
+        let mut header = tar::Header::new_gnu();
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_size(payload.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, "etc/x", payload.as_slice())
+            .unwrap();
+        if let Some(init_binary) = init_binary {
+            let binary = std::fs::read(init_binary).unwrap();
+            let mut init = tar::Header::new_gnu();
+            init.set_uid(0);
+            init.set_gid(0);
+            init.set_size(binary.len() as u64);
+            init.set_mode(0o755);
+            init.set_cksum();
+            tar.append_data(&mut init, "bin/sh", binary.as_slice())
+                .unwrap();
+        }
+        let mut whiteout = tar::Header::new_gnu();
+        whiteout.set_uid(0);
+        whiteout.set_gid(0);
+        whiteout.set_size(0);
+        whiteout.set_mode(0o000);
+        whiteout.set_cksum();
+        tar.append_data(&mut whiteout, "etc/.wh.deleted", std::io::empty())
+            .unwrap();
+        tar.into_inner().unwrap();
         let layer_digest = put_blob(&layout, &tar_bytes);
         let diff_id = format!("sha256:{}", to_hex(&sha2::Sha256::digest(&tar_bytes)));
-        let config = serde_json::to_vec(&json!({"architecture": super::normalized_arch(std::env::consts::ARCH), "os":"linux", "rootfs":{"type":"layers","diff_ids":[diff_id.clone()]}})).unwrap();
+        let config = serde_json::to_vec(&json!({"architecture": super::normalized_arch(std::env::consts::ARCH), "os":"linux", "rootfs":{"type":"layers","diff_ids":[diff_id]}})).unwrap();
         let config_digest = put_blob(&layout, &config);
         let manifest = serde_json::to_vec(&json!({"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":config_digest,"size":config.len()},"layers":[{"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":layer_digest,"size":tar_bytes.len()}]})).unwrap();
         let manifest_digest = put_blob(&layout, &manifest);
@@ -3928,7 +3943,7 @@ pub(crate) mod tests {
         );
         let leftovers = std::fs::read_dir(PathBuf::from(super::OCI_CACHE_ROOT))
             .unwrap()
-            .filter_map(|entry| entry.ok())
+            .filter_map(std::result::Result::ok)
             .filter(|entry| entry.file_name().to_string_lossy().starts_with(".pull-"))
             .count();
         assert_eq!(leftovers, 0, "partial pull directories must be removed");
@@ -4007,11 +4022,9 @@ pub(crate) mod tests {
         assert_eq!(descriptors[0].digest, layer.digest);
         let mut bad_diff_id = layer.clone();
         bad_diff_id.diff_id = format!("sha256:{}", "b".repeat(64));
-        assert!(
-            materialize_layer_at(&layout, &bad_diff_id, &base.join("cache-diffid"))
-                .await
-                .is_err()
-        );
+        let _err = materialize_layer_at(&layout, &bad_diff_id, &base.join("cache-diffid"))
+            .await
+            .unwrap_err();
         assert_eq!(
             hash_file(&digest_blob_path(&layout, &layer.digest).unwrap()).unwrap(),
             layer.digest
@@ -4021,11 +4034,9 @@ pub(crate) mod tests {
         let mut bytes = std::fs::read(&blob).unwrap();
         bytes[0] ^= 1;
         std::fs::write(&blob, bytes).unwrap();
-        assert!(
-            materialize_layer_at(&layout, &layer, &base.join("cache"))
-                .await
-                .is_err()
-        );
+        let _err = materialize_layer_at(&layout, &layer, &base.join("cache"))
+            .await
+            .unwrap_err();
         std::fs::remove_dir_all(&base).unwrap();
     }
 
@@ -4105,9 +4116,9 @@ pub(crate) mod tests {
     fn read_only_scratch_size_policy_is_bounded_and_configurable() {
         assert_eq!(super::parse_scratch_size_mb("tmp", "64M").unwrap(), 64);
         assert_eq!(super::parse_scratch_size_mb("run", "2G").unwrap(), 2048);
-        assert!(super::parse_scratch_size_mb("tmp", "0M").is_err());
-        assert!(super::parse_scratch_size_mb("tmp", "3G").is_err());
-        assert!(super::parse_scratch_size_mb("tmp", "1K").is_err());
+        let _err = super::parse_scratch_size_mb("tmp", "0M").unwrap_err();
+        let _err = super::parse_scratch_size_mb("tmp", "3G").unwrap_err();
+        let _err = super::parse_scratch_size_mb("tmp", "1K").unwrap_err();
     }
 
     #[test]
@@ -4142,10 +4153,10 @@ pub(crate) mod tests {
     fn rbd_size_policy_is_bounded_and_validated() {
         assert_eq!(super::parse_rbd_size("64M").unwrap(), "64M");
         assert_eq!(super::parse_rbd_size("1G").unwrap(), "1G");
-        assert!(super::parse_rbd_size("63M").is_err());
-        assert!(super::parse_rbd_size("65G").is_err());
-        assert!(super::parse_rbd_size("1Gjunk").is_err());
-        assert!(super::parse_rbd_size("-1G").is_err());
+        let _err = super::parse_rbd_size("63M").unwrap_err();
+        let _err = super::parse_rbd_size("65G").unwrap_err();
+        let _err = super::parse_rbd_size("1Gjunk").unwrap_err();
+        let _err = super::parse_rbd_size("-1G").unwrap_err();
     }
 
     #[test]
@@ -4179,52 +4190,44 @@ pub(crate) mod tests {
         let tree = base.join("tree");
         std::fs::create_dir_all(&tree).unwrap();
         let mut fifo_tar = Vec::new();
-        {
-            let mut tar = tar::Builder::new(&mut fifo_tar);
-            let mut header = tar::Header::new_gnu();
-            header.set_entry_type(tar::EntryType::Fifo);
-            header.set_size(0);
-            header.set_mode(0o600);
-            header.set_cksum();
-            tar.append_data(&mut header, "run/host-socket", std::io::empty())
-                .unwrap();
-            tar.finish().unwrap();
-        }
-        assert!(
-            super::unpack_layer(
-                fifo_tar.as_slice(),
-                Compression::None,
-                &tree,
-                1024 * 1024,
-                10
-            )
-            .is_err()
-        );
+        let mut tar = tar::Builder::new(&mut fifo_tar);
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Fifo);
+        header.set_size(0);
+        header.set_mode(0o600);
+        header.set_cksum();
+        tar.append_data(&mut header, "run/host-socket", std::io::empty())
+            .unwrap();
+        tar.into_inner().unwrap();
+        let _err = super::unpack_layer(
+            fifo_tar.as_slice(),
+            Compression::None,
+            &tree,
+            1024 * 1024,
+            10,
+        )
+        .unwrap_err();
 
         let mut device_tar = Vec::new();
-        {
-            let mut tar = tar::Builder::new(&mut device_tar);
-            let mut header = tar::Header::new_gnu();
-            header.set_entry_type(tar::EntryType::Char);
-            header.set_size(0);
-            header.set_mode(0o666);
-            header.set_device_major(1).unwrap();
-            header.set_device_minor(3).unwrap();
-            header.set_cksum();
-            tar.append_data(&mut header, "dev/null", std::io::empty())
-                .unwrap();
-            tar.finish().unwrap();
-        }
-        assert!(
-            super::unpack_layer(
-                device_tar.as_slice(),
-                Compression::None,
-                &tree,
-                1024 * 1024,
-                10
-            )
-            .is_ok()
-        );
+        let mut tar = tar::Builder::new(&mut device_tar);
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Char);
+        header.set_size(0);
+        header.set_mode(0o666);
+        header.set_device_major(1).unwrap();
+        header.set_device_minor(3).unwrap();
+        header.set_cksum();
+        tar.append_data(&mut header, "dev/null", std::io::empty())
+            .unwrap();
+        tar.into_inner().unwrap();
+        super::unpack_layer(
+            device_tar.as_slice(),
+            Compression::None,
+            &tree,
+            1024 * 1024,
+            10,
+        )
+        .unwrap();
         assert!(
             !tree.join("dev/null").exists(),
             "guest devtmpfs supplies /dev nodes"
@@ -4239,52 +4242,44 @@ pub(crate) mod tests {
         let tree = base.join("tree");
         std::fs::create_dir_all(&tree).unwrap();
         let mut fifo_tar = Vec::new();
-        {
-            let mut tar = tar::Builder::new(&mut fifo_tar);
-            let mut header = tar::Header::new_gnu();
-            header.set_entry_type(tar::EntryType::Fifo);
-            header.set_size(0);
-            header.set_mode(0o600);
-            header.set_cksum();
-            tar.append_data(&mut header, "run/host-socket", std::io::empty())
-                .unwrap();
-            tar.finish().unwrap();
-        }
-        assert!(
-            super::unpack_layer(
-                fifo_tar.as_slice(),
-                Compression::None,
-                &tree,
-                1024 * 1024,
-                10
-            )
-            .is_err()
-        );
+        let mut tar = tar::Builder::new(&mut fifo_tar);
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Fifo);
+        header.set_size(0);
+        header.set_mode(0o600);
+        header.set_cksum();
+        tar.append_data(&mut header, "run/host-socket", std::io::empty())
+            .unwrap();
+        tar.into_inner().unwrap();
+        let _err = super::unpack_layer(
+            fifo_tar.as_slice(),
+            Compression::None,
+            &tree,
+            1024 * 1024,
+            10,
+        )
+        .unwrap_err();
 
         let mut device_tar = Vec::new();
-        {
-            let mut tar = tar::Builder::new(&mut device_tar);
-            let mut header = tar::Header::new_gnu();
-            header.set_entry_type(tar::EntryType::Char);
-            header.set_size(0);
-            header.set_mode(0o666);
-            header.set_device_major(1).unwrap();
-            header.set_device_minor(3).unwrap();
-            header.set_cksum();
-            tar.append_data(&mut header, "dev/null", std::io::empty())
-                .unwrap();
-            tar.finish().unwrap();
-        }
-        assert!(
-            super::unpack_layer(
-                device_tar.as_slice(),
-                Compression::None,
-                &tree,
-                1024 * 1024,
-                10
-            )
-            .is_ok()
-        );
+        let mut tar = tar::Builder::new(&mut device_tar);
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Char);
+        header.set_size(0);
+        header.set_mode(0o666);
+        header.set_device_major(1).unwrap();
+        header.set_device_minor(3).unwrap();
+        header.set_cksum();
+        tar.append_data(&mut header, "dev/null", std::io::empty())
+            .unwrap();
+        tar.into_inner().unwrap();
+        super::unpack_layer(
+            device_tar.as_slice(),
+            Compression::None,
+            &tree,
+            1024 * 1024,
+            10,
+        )
+        .unwrap();
         assert!(
             !tree.join("dev/null").exists(),
             "guest devtmpfs supplies /dev nodes"
@@ -4303,6 +4298,10 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "end-to-end test exercises one long scenario"
+    )]
     fn tar_layer_extraction_preserves_whiteouts_and_directory_metadata() {
         use std::os::unix::fs::MetadataExt;
         let base =
@@ -4310,40 +4309,38 @@ pub(crate) mod tests {
         let tree = base.join("layer");
         std::fs::create_dir_all(&tree).unwrap();
         let mut bytes = Vec::new();
-        {
-            let mut tar = tar::Builder::new(&mut bytes);
-            for (path, mode) in [("restricted/", 0o700), ("restricted/opaque/", 0o755)] {
-                let mut dir = tar::Header::new_gnu();
-                dir.set_uid(0);
-                dir.set_gid(0);
-                dir.set_entry_type(tar::EntryType::Directory);
-                dir.set_size(0);
-                dir.set_mode(mode);
-                dir.set_cksum();
-                tar.append_data(&mut dir, path, std::io::empty()).unwrap();
-            }
-            for marker in [
-                "restricted/.wh.removed",
-                "restricted/.wh.gone",
-                "restricted/opaque/.wh..wh..opq",
-            ] {
-                let mut header = tar::Header::new_gnu();
-                header.set_size(0);
-                header.set_mode(0o000);
-                header.set_cksum();
-                tar.append_data(&mut header, marker, std::io::empty())
-                    .unwrap();
-            }
-            let mut file = tar::Header::new_gnu();
-            file.set_uid(0);
-            file.set_gid(0);
-            file.set_size(4);
-            file.set_mode(0o644);
-            file.set_cksum();
-            tar.append_data(&mut file, "restricted/removed", &b"same"[..])
-                .unwrap();
-            tar.finish().unwrap();
+        let mut tar = tar::Builder::new(&mut bytes);
+        for (path, mode) in [("restricted/", 0o700), ("restricted/opaque/", 0o755)] {
+            let mut dir = tar::Header::new_gnu();
+            dir.set_uid(0);
+            dir.set_gid(0);
+            dir.set_entry_type(tar::EntryType::Directory);
+            dir.set_size(0);
+            dir.set_mode(mode);
+            dir.set_cksum();
+            tar.append_data(&mut dir, path, std::io::empty()).unwrap();
         }
+        for marker in [
+            "restricted/.wh.removed",
+            "restricted/.wh.gone",
+            "restricted/opaque/.wh..wh..opq",
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(0);
+            header.set_mode(0o000);
+            header.set_cksum();
+            tar.append_data(&mut header, marker, std::io::empty())
+                .unwrap();
+        }
+        let mut file = tar::Header::new_gnu();
+        file.set_uid(0);
+        file.set_gid(0);
+        file.set_size(4);
+        file.set_mode(0o644);
+        file.set_cksum();
+        tar.append_data(&mut file, "restricted/removed", &b"same"[..])
+            .unwrap();
+        tar.into_inner().unwrap();
         let stats =
             super::unpack_layer(bytes.as_slice(), Compression::None, &tree, 1024 * 1024, 10)
                 .unwrap();
@@ -4351,28 +4348,24 @@ pub(crate) mod tests {
         assert!(stats.uncompressed_bytes <= 1024 * 1024);
         let oversized_tree = base.join("oversized");
         std::fs::create_dir_all(&oversized_tree).unwrap();
-        assert!(
-            super::unpack_layer(
-                bytes.as_slice(),
-                Compression::None,
-                &oversized_tree,
-                1024,
-                10
-            )
-            .is_err()
-        );
+        let _err = super::unpack_layer(
+            bytes.as_slice(),
+            Compression::None,
+            &oversized_tree,
+            1024,
+            10,
+        )
+        .unwrap_err();
         let too_many_tree = base.join("too-many");
         std::fs::create_dir_all(&too_many_tree).unwrap();
-        assert!(
-            super::unpack_layer(
-                bytes.as_slice(),
-                Compression::None,
-                &too_many_tree,
-                1024 * 1024,
-                2
-            )
-            .is_err()
-        );
+        let _err = super::unpack_layer(
+            bytes.as_slice(),
+            Compression::None,
+            &too_many_tree,
+            1024 * 1024,
+            2,
+        )
+        .unwrap_err();
         assert_eq!(
             std::fs::metadata(tree.join("restricted")).unwrap().mode() & 0o777,
             0o700
@@ -4463,6 +4456,10 @@ pub(crate) mod tests {
 
     #[tokio::test]
     #[ignore = "requires skopeo, composefs/OverlayFS mounts, fs-verity, and a privileged host mount namespace"]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "end-to-end test exercises one long scenario"
+    )]
     async fn oci_rootfs_modes_share_verified_layers_and_keep_writes_isolated() {
         let test_id = ulid::Ulid::generate().to_string();
         let base = PathBuf::from("/var/lib/odorobo/oci-rootfs-tests").join(&test_id);
@@ -4571,17 +4568,15 @@ pub(crate) mod tests {
             fixture_oci_layout_with_options(&base.join("missing-scratch"), b'z', false);
         let incomplete_ref = format!("oci:{}:latest", incomplete_layout.display());
         let failed_scratch_vmid = ulid::Ulid::generate().to_string();
-        assert!(
-            super::mount_rootfs(
-                &failed_scratch_vmid,
-                &crate::manifest::Rootfs {
-                    oci: incomplete_ref,
-                    mode: crate::manifest::RootfsMode::ReadOnly,
-                }
-            )
-            .await
-            .is_err()
-        );
+        let _err = super::mount_rootfs(
+            &failed_scratch_vmid,
+            &crate::manifest::Rootfs {
+                oci: incomplete_ref,
+                mode: crate::manifest::RootfsMode::ReadOnly,
+            },
+        )
+        .await
+        .unwrap_err();
         let failed_runtime = crate::ch_driver::VMInstance::runtime_dir_for(&failed_scratch_vmid);
         assert!(
             !super::is_mountpoint(&failed_runtime.join(super::ROOTFS_TAG))
@@ -4667,7 +4662,7 @@ pub(crate) mod tests {
             .as_ref()
             .expect("failed acquisition must retain ownership");
         assert!(super::is_mountpoint(&prepared.mount).await.unwrap());
-        assert!(super::acquire_rootfs_lock(&vmid).await.is_err());
+        let _err = super::acquire_rootfs_lock(&vmid).await.unwrap_err();
         let layer = &prepared.layer_mounts[0];
         let mut busy = tokio::process::Command::new("sleep")
             .arg("100")
@@ -4676,11 +4671,11 @@ pub(crate) mod tests {
             .spawn()
             .unwrap();
         assert!(super::unmount_rootfs(prepared).await.is_err());
-        assert!(super::acquire_rootfs_lock(&vmid).await.is_err());
+        let _err = super::acquire_rootfs_lock(&vmid).await.unwrap_err();
         busy.kill().await.unwrap();
         super::unmount_rootfs(prepared).await.unwrap();
         drop(owner);
-        assert!(super::acquire_rootfs_lock(&vmid).await.is_ok());
+        super::acquire_rootfs_lock(&vmid).await.unwrap();
         std::fs::remove_dir_all(crate::ch_driver::VMInstance::runtime_dir_for(&vmid)).unwrap();
         std::fs::remove_dir_all(base).unwrap();
     }
@@ -4831,7 +4826,7 @@ pub(crate) mod tests {
                     std::fs::metadata(base.join("alias")).unwrap().ino()
                 );
             } else {
-                assert!(result.is_err());
+                let _err = result.unwrap_err();
             }
             std::fs::remove_dir_all(base).unwrap();
         }
@@ -4936,8 +4931,8 @@ pub(crate) mod tests {
         for path in [&base, &top, &merged] {
             std::fs::create_dir_all(path).unwrap();
         }
-        std::fs::create_dir(base.join("app")).unwrap();
-        std::fs::create_dir(top.join("app")).unwrap();
+        std::fs::create_dir_all(base.join("app")).unwrap();
+        std::fs::create_dir_all(top.join("app")).unwrap();
         std::fs::write(base.join("app/old"), b"old").unwrap();
         std::fs::write(top.join("app/new"), b"new").unwrap();
         for path in [&base, &base.join("app")] {
@@ -4993,7 +4988,7 @@ pub(crate) mod tests {
 
     /// Exercises the product's Ceph RBD persistence helpers against a unique
     /// disposable image. Run only in the privileged `.local/dev` Odorobo
-    /// container with ODOROBO_ROOTFS_BACKEND=rbd and a small test size.
+    /// container with `ODOROBO_ROOTFS_BACKEND=rbd` and a small test size.
     #[tokio::test]
     #[ignore = "requires privileged RBD access; uses and deletes a uniquely named disposable image"]
     async fn rbd_persistent_upper_cold_reattach_and_delete() {
@@ -5061,8 +5056,7 @@ pub(crate) mod tests {
             socket: base.join("sock"),
             shared_dir: base.clone(),
             log: base.join("log"),
-        })
-        .expect("supervisor starts");
+        });
 
         tokio::time::sleep(Duration::from_millis(2500)).await;
         assert!(
@@ -5090,15 +5084,13 @@ pub(crate) mod tests {
             "#!/bin/sh\necho $$ > \"$(dirname \"$0\")/pid\"\nexec sleep 100\n",
         )
         .unwrap();
-        use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
         let supervisor = VirtioFsSupervisor::start(VirtiofsdSpec {
             program: script.clone(),
             socket: base2.join("sock"),
             shared_dir: base2.clone(),
             log: base2.join("log"),
-        })
-        .expect("supervisor starts");
+        });
         tokio::time::sleep(Duration::from_millis(300)).await;
         supervisor.stop().await;
         let pid: u32 = std::fs::read_to_string(base2.join("pid"))
@@ -5115,8 +5107,7 @@ pub(crate) mod tests {
             socket: base2.join("sock"),
             shared_dir: base2.clone(),
             log: base2.join("log"),
-        })
-        .unwrap();
+        });
         tokio::time::sleep(Duration::from_millis(300)).await;
         let pid: u32 = std::fs::read_to_string(base2.join("pid"))
             .unwrap()

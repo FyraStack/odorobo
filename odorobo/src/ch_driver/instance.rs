@@ -37,24 +37,21 @@ const RUNTIME_ROOT_ENV_VAR: &str = "ODOROBO_RUNTIME_DIR";
 /// mountinfo escapes whitespace and backslashes with octal sequences.
 fn decode_mount_path(value: &str) -> PathBuf {
     use std::os::unix::ffi::OsStringExt;
-    let bytes = value.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'\\'
-            && index + 3 < bytes.len()
-            && bytes[index + 1..index + 4]
-                .iter()
-                .all(|b| (b'0'..=b'7').contains(b))
-        {
-            decoded.push(
-                (bytes[index + 1] - b'0') * 64 + (bytes[index + 2] - b'0') * 8 + bytes[index + 3]
-                    - b'0',
-            );
-            index += 4;
+    let mut decoded = Vec::with_capacity(value.len());
+    let mut rest = value.as_bytes();
+    while let Some((&byte, tail)) = rest.split_first() {
+        let escaped = (byte == b'\\')
+            .then(|| tail.get(..3))
+            .flatten()
+            .and_then(|digits| std::str::from_utf8(digits).ok())
+            .filter(|digits| digits.bytes().all(|b| (b'0'..=b'7').contains(&b)))
+            .and_then(|digits| u8::from_str_radix(digits, 8).ok());
+        if let Some(escaped) = escaped {
+            decoded.push(escaped);
+            rest = &tail[3..];
         } else {
-            decoded.push(bytes[index]);
-            index += 1;
+            decoded.push(byte);
+            rest = tail;
         }
     }
     std::ffi::OsString::from_vec(decoded).into()
@@ -175,15 +172,21 @@ impl VMInstance {
     }
 
     /// Watch exit without transferring child ownership away from teardown.
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "the slot lock must cover both the stopping check and try_wait"
+    )]
     pub fn watch_child(
         &self,
     ) -> impl std::future::Future<Output = Result<Option<std::process::ExitStatus>>> + Send + 'static
     {
-        let child = self.child_process.clone();
-        let stopping = self.stopping.clone();
+        let child = std::sync::Arc::clone(&self.child_process);
+        let stopping = std::sync::Arc::clone(&self.stopping);
         async move {
             loop {
-                {
+                // Hold the slot across the stopping check and try_wait so
+                // teardown cannot take the child in between.
+                let status = {
                     let mut slot = child.lock().await;
                     if stopping.load(std::sync::atomic::Ordering::Relaxed) {
                         return Ok(None);
@@ -191,12 +194,13 @@ impl VMInstance {
                     let Some(process) = slot.as_mut() else {
                         return Ok(None);
                     };
-                    if let Some(status) = process.try_wait()? {
-                        if stopping.load(std::sync::atomic::Ordering::Relaxed) {
-                            return Ok(None);
-                        }
-                        return Ok(Some(status));
+                    process.try_wait()?
+                };
+                if let Some(status) = status {
+                    if stopping.load(std::sync::atomic::Ordering::Relaxed) {
+                        return Ok(None);
                     }
+                    return Ok(Some(status));
                 }
                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
             }
@@ -436,8 +440,10 @@ impl VMInstance {
         &self.ch_socket_path
     }
 
+    #[cfg(test)]
     async fn stop_child_after_failed_start(&self) {
-        if let Some(mut child) = self.child_process.lock().await.take() {
+        let child = self.child_process.lock().await.take();
+        if let Some(mut child) = child {
             _ = child.start_kill();
             _ = child.wait().await;
         }
@@ -513,9 +519,7 @@ impl VMInstance {
                 info!(vm_id = id, "CH socket available");
                 if let Some(vm_config) = vm_config {
                     info!(boot, ?vm_config, "Creating VM config");
-                    if let Err(error) = instance.create_config(vm_config, boot).await {
-                        return Err(error);
-                    }
+                    instance.create_config(vm_config, boot).await?;
                 }
                 return Ok(());
             }
@@ -588,7 +592,7 @@ impl VMInstance {
                 }
             }
             *slot = None;
-        }
+        };
 
         self.hook_manager
             .after_stop(self.vm_id(), &vm_config)
@@ -752,13 +756,11 @@ mod tests {
             )
             .is_err()
         );
-        assert!(
-            check_runtime_mounts(
-                runtime,
-                "1 0 0:1 / /run/odorobo/vms/a\\040b-other rw - tmpfs tmpfs rw"
-            )
-            .is_ok()
-        );
+        check_runtime_mounts(
+            runtime,
+            "1 0 0:1 / /run/odorobo/vms/a\\040b-other rw - tmpfs tmpfs rw",
+        )
+        .unwrap();
         assert!(check_runtime_mounts(runtime, "malformed").is_err());
         assert_eq!(decode_mount_path("/a\\134b"), Path::new("/a\\b"));
     }
@@ -792,7 +794,7 @@ mod tests {
         let mut instance = VMInstance::new(
             "transform-fixture",
             PathBuf::from("/unused"),
-            Some(TransformChain::new().add(RecordingTransform(releases.clone()))),
+            Some(TransformChain::new().add(RecordingTransform(Arc::clone(&releases)))),
             None,
         );
         assert!(
