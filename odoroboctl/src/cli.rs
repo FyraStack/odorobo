@@ -31,7 +31,7 @@ pub struct Cli {
 pub enum Command {
     /// Create a VM via the scheduler endpoint.
     Create {
-        /// Path or URI of the VM disk image.
+        /// Storage URI: file://, rbd://, or iscsi:// (local files use file:///absolute/path).
         #[arg(long, env = "ODOROBO_VM_IMAGE")]
         image: String,
         /// Name to assign to the VM.
@@ -144,6 +144,7 @@ pub async fn run_command(cli: Cli) -> Result<()> {
                 observed: None,
             };
 
+            vm.validate()?;
             let request = CreateVMRequest { vm };
 
             let url = format!("{base_url}/vms");
@@ -207,6 +208,113 @@ mod tests {
             }
             _ => panic!("expected create command"),
         }
+    }
+
+    #[tokio::test]
+    async fn create_rejects_invalid_settings_before_sending_request() {
+        let invalid_settings = [
+            (
+                " ",
+                4,
+                ByteSize::gib(4),
+                "metadata must define a non-empty name",
+            ),
+            ("test_vm", 0, ByteSize::gib(4), "at least one vCPU"),
+            (
+                "test_vm",
+                4,
+                ByteSize::b(0),
+                "memory must be greater than zero",
+            ),
+        ];
+
+        for (name, vcpus, memory, expected_error) in invalid_settings {
+            let error = super::run_command(Cli {
+                manager_addr: "http://127.0.0.1:1".to_owned(),
+                command: Command::Create {
+                    image: "file:///var/lib/odorobo/disk.img".to_owned(),
+                    name: name.to_owned(),
+                    vcpus,
+                    memory,
+                },
+            })
+            .await
+            .expect_err("invalid VM settings should fail locally");
+
+            assert!(
+                error.to_string().contains(expected_error),
+                "unexpected error for invalid settings: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn create_sends_valid_settings_to_manager() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test manager");
+        let manager_addr = listener.local_addr().expect("get test manager address");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept request");
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            reader
+                .read_line(&mut line)
+                .await
+                .expect("read request line");
+            assert!(line.starts_with("POST /vms "));
+
+            let mut content_length = None;
+            loop {
+                line.clear();
+                let bytes_read = reader.read_line(&mut line).await.expect("read header");
+                assert_ne!(bytes_read, 0, "request ended before headers completed");
+                if line == "\r\n" || line == "\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':') {
+                    if name.eq_ignore_ascii_case("content-length") {
+                        content_length =
+                            Some(value.trim().parse::<usize>().expect("valid content length"));
+                    }
+                }
+            }
+
+            let mut body = vec![0; content_length.expect("content-length header")];
+            reader
+                .read_exact(&mut body)
+                .await
+                .expect("read complete request body");
+            let request: serde_json::Value =
+                serde_json::from_slice(&body).expect("request body should be valid JSON");
+            assert_eq!(request["vm"]["desired"]["metadata"]["name"], "web");
+            assert_eq!(request["vm"]["desired"]["compute"]["vcpus"], 2);
+            assert_eq!(
+                request["vm"]["desired"]["compute"]["memory_bytes"],
+                ByteSize::gib(8).as_u64()
+            );
+
+            reader
+                .get_mut()
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .await
+                .expect("write response");
+        });
+
+        super::run_command(Cli {
+            manager_addr: format!("http://{manager_addr}"),
+            command: Command::Create {
+                image: "file:///var/lib/odorobo/disk.img".to_owned(),
+                name: "web".to_owned(),
+                vcpus: 2,
+                memory: ByteSize::gib(8),
+            },
+        })
+        .await
+        .expect("valid VM settings should be sent to the manager");
+        server.await.expect("test manager should finish");
     }
 
     #[test]

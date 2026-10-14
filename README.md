@@ -58,7 +58,7 @@ cargo install --path odoroboctl
 You can then use `odoroboctl` to directly interact with the Manager. Create a VM by providing a disk image with `--image`:
 
 ```bash
-odoroboctl create --image ./disk.img
+odoroboctl create --image file:///var/lib/odorobo/disk.img
 ```
 
 The create command accepts basic VM settings. If omitted, they default to the values shown below:
@@ -72,10 +72,13 @@ The create command accepts basic VM settings. If omitted, they default to the va
 For example, to create a VM named `web` with 2 virtual CPUs and 8 GiB of memory:
 
 ```bash
-odoroboctl create --image ./disk.img --name web --vcpus 2 --memory 8GiB
+odoroboctl create --image file:///var/lib/odorobo/disk.img --name web --vcpus 2 --memory 8GiB
 ```
 
-The image can be a local path or URI. The image can also be supplied through the `ODOROBO_VM_IMAGE` environment variable instead of `--image`.
+The image must use a supported storage URI: `file://`, `rbd://`, or `iscsi://`. For a
+local disk image, use a `file:///absolute/path` URI; the path is on the agent host.
+The image can also be supplied through the `ODOROBO_VM_IMAGE` environment variable
+instead of `--image`.
 
 To connect directly on the host, connect to the VM's serial console socket in its runtime directory:
 
