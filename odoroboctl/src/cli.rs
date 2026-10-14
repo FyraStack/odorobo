@@ -182,7 +182,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await?;
             let mut request = [0_u8; 1024];
-            let _ = socket.read(&mut request).await?;
+            let _: usize = socket.read(&mut request).await?;
             socket
                 .write_all(
                     b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 5\r\nConnection: close\r\n\r\nerror",
