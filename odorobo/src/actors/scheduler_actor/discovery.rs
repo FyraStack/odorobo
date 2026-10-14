@@ -47,26 +47,29 @@ impl SchedulerActor {
         let mut initialized = false;
 
         loop {
-            if !initialized {
-                if let Ok(data) = actor_ref.ask(&GetVMInfo { vmid: None }).await {
-                    let send_result = scheduler
-                        .tell(VmUpdated {
-                            actor_ref: actor_ref.clone(),
-                            data,
-                        })
-                        .send()
-                        .await
-                        .map_err(|error| eyre!("failed to send VM update: {error}"));
-                    if let Err(error) = send_result {
-                        warn!(?error, "VM updater could not notify scheduler");
-                        return;
+            if initialized {
+                match actor_ref.ask(&GetVMHeartbeat).await {
+                    Ok(reply) if reply.error.is_none() => fails = 0,
+                    Ok(reply) => {
+                        warn!(?reply.error, ?actor_ref, "VM heartbeat reported a VMM failure");
+                        fails = fails.saturating_add(1);
                     }
-                    initialized = true;
-                    fails = 0;
-                } else {
-                    fails = fails.saturating_add(1);
+                    Err(_) => fails = fails.saturating_add(1),
                 }
-            } else if actor_ref.ask(&GetVMHeartbeat).await.is_ok() {
+            } else if let Ok(data) = actor_ref.ask(&GetVMInfo { vmid: None }).await {
+                let send_result = scheduler
+                    .tell(VmUpdated {
+                        actor_ref: actor_ref.clone(),
+                        data,
+                    })
+                    .send()
+                    .await
+                    .map_err(|error| eyre!("failed to send VM update: {error}"));
+                if let Err(error) = send_result {
+                    warn!(?error, "VM updater could not notify scheduler");
+                    return;
+                }
+                initialized = true;
                 fails = 0;
             } else {
                 fails = fails.saturating_add(1);
@@ -101,7 +104,10 @@ impl SchedulerActor {
 
         let mut agent_actor_stream = RemoteActorRef::<AgentActor>::lookup_all(AGENT);
 
-        while let Some(agent_actor) = agent_actor_stream.try_next().await? {
+        loop {
+            let Some(agent_actor) = agent_actor_stream.try_next().await? else {
+                break;
+            };
             parent_actor_ref
                 .tell(AgentActorDiscovered {
                     actor_ref: agent_actor,
@@ -262,8 +268,7 @@ impl Message<VmUpdated> for SchedulerActor {
         let vmid = msg.data.vmid;
         let actor_id = msg.actor_ref.id();
         self.vm_actorid_ulid_map.insert(actor_id, vmid);
-        if let Some(manifest) = msg.data.config {
-            self.vm_manifests.insert(vmid, manifest);
+        if self.vm_manifests.contains_key(&vmid) {
             Self::reconcile_discovered_vm(
                 vmid,
                 &self.agent_vm_index,
@@ -374,53 +379,12 @@ impl Message<AgentUpdaterStopped> for SchedulerActor {
     }
 }
 
-/// Performs periodic pending-placement expiry and refreshes resource accounting.
+/// Expires observation placeholders; it never assigns or recreates durable VMs.
 impl Message<ReconcileVmPlacements> for SchedulerActor {
     type Reply = ();
 
     async fn handle(&mut self, _msg: ReconcileVmPlacements, _ctx: &mut Context<Self, Self::Reply>) {
         Self::cleanup_unresolved_vm_cache(&mut self.vm_placements, &mut self.vm_data_cache);
         self.invalidate_pending_resources();
-
-        let unplaced_vms: Vec<_> = self
-            .vm_manifests
-            .iter()
-            .filter_map(|(vmid, manifest)| {
-                self.vm_placements
-                    .get(vmid)
-                    .is_none_or(Vec::is_empty)
-                    .then_some((*vmid, manifest.clone()))
-            })
-            .collect();
-
-        for (vmid, config) in unplaced_vms {
-            let request = crate::messages::vm::CreateVM { vmid, config };
-            match self.schedule_agent(&request) {
-                Ok(agent) => {
-                    self.vm_placements
-                        .entry(vmid)
-                        .or_default()
-                        .push(super::VmPlacement {
-                            agent_id: agent.id(),
-                            lifecycle: super::VmLifecycle::Pending,
-                            created_at: std::time::Instant::now(),
-                            last_confirmed_at: None,
-                        });
-                    self.vm_data_cache
-                        .entry(vmid)
-                        .or_default()
-                        .push(CachedVMActor { actor_ref: None });
-                    if let Err(error) = agent.tell(&request).send() {
-                        warn!(?error, %vmid, "failed to recreate unplaced VM");
-                        self.vm_placements.insert(vmid, Vec::new());
-                        self.vm_data_cache.remove(&vmid);
-                    } else {
-                        // The next iteration must account for this new pending reservation.
-                        self.invalidate_pending_resources();
-                    }
-                }
-                Err(error) => trace!(?error, %vmid, "no eligible agent to recreate VM"),
-            }
-        }
     }
 }
