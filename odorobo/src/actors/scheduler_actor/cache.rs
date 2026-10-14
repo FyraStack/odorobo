@@ -138,6 +138,31 @@ impl SchedulerActor {
         vmids
     }
 
+    pub(super) fn observe_vm_manifest(
+        &mut self,
+        vmid: Ulid,
+        manifest: crate::manifest::VmManifest,
+    ) {
+        if !self.stopped_vms.contains(&vmid) {
+            self.vm_manifests.insert(vmid, manifest);
+        }
+    }
+
+    pub(super) fn should_resolve_unplaced_owner(&self, vmid: Ulid) -> bool {
+        !self.stopped_vms.contains(&vmid)
+            && !self
+                .vm_data_cache
+                .get(&vmid)
+                .is_some_and(|entries| entries.iter().any(|entry| entry.actor_ref.is_some()))
+    }
+
+    /// Explicit stop/delete suppression is established before removing intent,
+    /// so a response queued while forwarding cannot resurrect the VM.
+    pub(super) fn suppress_vm_intent(&mut self, vmid: Ulid) {
+        self.stopped_vms.insert(vmid);
+        self.remove_vm_intent(vmid);
+    }
+
     /// Removes all scheduler state correlated with a VM identifier.
     pub(super) fn remove_vm_state(
         vmid: Ulid,
@@ -161,9 +186,8 @@ impl SchedulerActor {
         );
         self.vm_actorid_ulid_map
             .retain(|_, mapped_vmid| *mapped_vmid != vmid);
-        for index in self.agent_vm_index.values_mut() {
-            index.remove(&vmid);
-        }
+        // This index is an observation of agent inventory, not VM intent.
+        // Retained OCI owners still belong to their agent after cold stop.
         self.invalidate_pending_resources();
     }
 

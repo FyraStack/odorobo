@@ -1,0 +1,16 @@
+{
+  "api_version": 1,
+  "id": "01J00000000000000000000006",
+  "desired": {
+    "metadata": { "name": "faas-function", "labels": {}, "annotations": {} },
+    "compute": { "vcpus": 1, "memory_bytes": 268435456 },
+    "storage": [],
+    "networks": [],
+    "placement": {},
+    "boot": { "start": true },
+    "rootfs": {
+      "oci": "docker://registry.fedoraproject.org/fedora:latest",
+      "mode": "read_only"
+    }
+  }
+}

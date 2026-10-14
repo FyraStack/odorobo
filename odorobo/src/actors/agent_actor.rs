@@ -159,20 +159,45 @@ impl Actor for AgentActor {
 
 #[remote_message]
 impl Message<CreateVM> for AgentActor {
-    type Reply = CreateVMReply;
+    // Startup (OCI pull, unpack, rootfs mount, virtiofsd) can take minutes.
+    // Inventory is updated synchronously; only the StartVM wait is delegated so
+    // the agent mailbox keeps serving other VMs. Concurrent lifecycle messages
+    // for the same VM are still ordered by that VM actor's own mailbox.
+    type Reply = DelegatedReply<CreateVMReply>;
 
     async fn handle(&mut self, msg: CreateVM, ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
         let vmid = msg.vmid;
+        if msg.config.id != vmid {
+            return ctx.reply(CreateVMReply {
+                config: None,
+                actor_id: None,
+            });
+        }
         if let Some(existing) = self.vms.get(&vmid) {
-            if existing.config == msg.config {
-                info!(?vmid, actor_id = ?existing.actor_ref.id(), "VM already exists; treating create as idempotent");
-            } else {
-                warn!(?vmid, actor_id = ?existing.actor_ref.id(), "Ignoring conflicting create for existing VM");
+            let actor_ref = existing.actor_ref.clone();
+            let config = existing.config.clone();
+            if config != msg.config {
+                warn!(?vmid, actor_id = ?actor_ref.id(), "Ignoring conflicting create for existing VM");
+                return ctx.reply(CreateVMReply {
+                    config: Some(config),
+                    actor_id: Some(actor_ref.id().to_bytes()),
+                });
             }
-            return CreateVMReply {
-                config: Some(existing.config.clone()),
-                actor_id: Some(existing.actor_ref.id().to_bytes()),
-            };
+            return ctx.spawn(async move {
+                let actor_id = Some(actor_ref.id().to_bytes());
+                if let Err(err) = actor_ref.ask(crate::ch_driver::actor::StartVM).await {
+                    warn!(%vmid, ?err, "VM startup failed; lifecycle owner retained");
+                    return CreateVMReply {
+                        config: None,
+                        actor_id,
+                    };
+                }
+                info!(?vmid, actor_id = ?actor_ref.id(), "VM already exists; treating create as idempotent");
+                CreateVMReply {
+                    config: Some(config),
+                    actor_id,
+                }
+            });
         }
 
         // Spawn and link at the same time.
@@ -191,11 +216,21 @@ impl Message<CreateVM> for AgentActor {
             },
         );
 
-        info!(?vmid, "VM Spawned successfully");
-        CreateVMReply {
-            config: Some(msg.config),
-            actor_id: Some(actor_ref.id().to_bytes()),
-        }
+        ctx.spawn(async move {
+            let actor_id = Some(actor_ref.id().to_bytes());
+            if let Err(err) = actor_ref.ask(crate::ch_driver::actor::StartVM).await {
+                warn!(%vmid, ?err, "VM startup failed; lifecycle owner retained for cleanup");
+                return CreateVMReply {
+                    config: None,
+                    actor_id,
+                };
+            }
+            info!(?vmid, "VM Spawned successfully");
+            CreateVMReply {
+                config: Some(msg.config),
+                actor_id,
+            }
+        })
     }
 }
 
@@ -209,6 +244,19 @@ impl Message<MigrateVMReceive> for AgentActor {
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         let vmid = msg.vmid;
+        // Reject unsupported OCI receive and occupied identities before any
+        // spawning, registry changes or inventory mutation.
+        if msg.config.desired.rootfs.is_some()
+            || self.vms.contains_key(&vmid)
+            || Self::lookup_vm_actor(vmid).await.is_some()
+        {
+            return MigrateVMReceiveReply {
+                listening_address: String::new(),
+                error: Some(
+                    "OCI migration is unsupported or destination VM ID already owned".into(),
+                ),
+            };
+        }
         let actor_ref = VMActor::spawn_link(ctx.actor_ref(), (vmid, None)).await;
 
         _ = actor_ref.register(vm_actor_id(vmid)).await;
@@ -246,54 +294,89 @@ impl Message<MigrateVMReceive> for AgentActor {
     }
 }
 
-#[remote_message]
-impl Message<DeleteVM> for AgentActor {
-    type Reply = DeleteVMReply;
+/// Drop a deleted VM from inventory, but only if it is still the same actor
+/// (a newer create may have replaced it while the delete was in flight).
+struct ForgetDeletedVM {
+    vmid: Ulid,
+    actor_id: ActorId,
+}
+
+impl Message<ForgetDeletedVM> for AgentActor {
+    type Reply = ();
 
     async fn handle(
         &mut self,
-        msg: DeleteVM,
+        msg: ForgetDeletedVM,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        match self.remove_vm(msg.vmid) {
-            Some(cache_data) => {
-                let res = cache_data.actor_ref.tell(msg.clone()).await;
-                if let Err(err) = res {
-                    // probably a bad way to do this
-                    warn!(vm_id = %msg.vmid, ?err, "failed to stop VM actor gracefully, killing");
-                    cache_data.actor_ref.kill();
+        if self
+            .vms
+            .get(&msg.vmid)
+            .is_some_and(|cache| cache.actor_ref.id() == msg.actor_id)
+        {
+            self.remove_vm(msg.vmid);
+        }
+    }
+}
+
+// Delete and shutdown queue behind the VM actor's own mailbox, which may be
+// running a minutes-long StartVM; wait for them off the agent mailbox.
+#[remote_message]
+impl Message<DeleteVM> for AgentActor {
+    type Reply = DelegatedReply<DeleteVMReply>;
+
+    async fn handle(&mut self, msg: DeleteVM, ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
+        let Some(actor_ref) = self.vms.get(&msg.vmid).map(|cache| cache.actor_ref.clone()) else {
+            warn!(vm_id = %msg.vmid, "VM actor not found for delete");
+            return ctx.reply(DeleteVMReply {
+                error: Some("VM actor not found; rootfs cleanup cannot be verified".to_owned()),
+            });
+        };
+        let agent = ctx.actor_ref().clone();
+        ctx.spawn(async move {
+            match actor_ref.ask(msg.clone()).await {
+                Ok(reply) if reply.error.is_none() => {
+                    // Update inventory before replying so a follow-up create
+                    // for this VM id never sees the deleted actor.
+                    let forget = ForgetDeletedVM {
+                        vmid: msg.vmid,
+                        actor_id: actor_ref.id(),
+                    };
+                    if let Err(err) = agent.ask(forget).await {
+                        warn!(vm_id = %msg.vmid, ?err, "failed to drop deleted VM from agent inventory");
+                    }
+                    reply
+                }
+                Ok(reply) => reply,
+                Err(err) => {
+                    warn!(vm_id = %msg.vmid, ?err, "failed to stop VM actor gracefully; retaining agent inventory for retry");
+                    DeleteVMReply {
+                        error: Some(err.to_string()),
+                    }
                 }
             }
-            None => {
-                warn!(vm_id = %msg.vmid, "VM actor not found for delete");
-            }
-        }
-
-        DeleteVMReply
+        })
     }
 }
 
 #[remote_message]
 impl Message<ShutdownVM> for AgentActor {
-    type Reply = Result<ShutdownVMReply, String>;
+    type Reply = DelegatedReply<Result<ShutdownVMReply, String>>;
 
     async fn handle(
         &mut self,
         msg: ShutdownVM,
-        _ctx: &mut Context<Self, Self::Reply>,
+        ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        if let Some(actor_ref) = Self::lookup_vm_actor(msg.vmid).await {
-            trace!(?msg, "Telling VM to shut down");
-            let res = actor_ref.tell(msg.clone()).await;
-            if let Err(err) = res {
-                warn!(vm_id = %msg.vmid, ?err, "failed to shutdown VM actor");
-            }
-        } else {
+        let Some(actor_ref) = Self::lookup_vm_actor(msg.vmid).await else {
             warn!(vm_id = %msg.vmid, "VM actor not found for shutdown");
-            return Err("VM actor not found for shutdown".to_owned());
-        }
-
-        Ok(ShutdownVMReply)
+            return ctx.reply(Err("VM actor not found for shutdown".to_owned()));
+        };
+        trace!(?msg, "Telling VM to shut down");
+        ctx.spawn(async move {
+            actor_ref.ask(msg).await.map_err(|err| err.to_string())?;
+            Ok(ShutdownVMReply)
+        })
     }
 }
 // forward GetVMInfo to VM actor
