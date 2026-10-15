@@ -240,6 +240,57 @@ impl SchedulerActor {
         }
     }
 
+    /// Confirms a create retry only when acceptance or actor discovery has been
+    /// recorded. A pending placeholder alone can represent a request whose
+    /// transport outcome is unknown.
+    pub(super) fn create_is_confirmed(&self, vmid: Ulid) -> bool {
+        self.vm_effective_manifests.contains_key(&vmid)
+            || self
+                .vm_actorid_ulid_map
+                .values()
+                .any(|mapped| *mapped == vmid)
+            || self
+                .vm_data_cache
+                .get(&vmid)
+                .is_some_and(|entries| entries.iter().any(|entry| entry.actor_ref.is_some()))
+            || self.vm_placements.get(&vmid).is_some_and(|entries| {
+                entries
+                    .iter()
+                    .any(|entry| entry.lifecycle == VmLifecycle::Running)
+            })
+    }
+
+    /// Settles cleanup ownership after an explicit create rejection and a
+    /// successful lookup found no VM actor. Unacknowledged cleanup remains a
+    /// deletion target and blocks recreation until a later delete retry.
+    pub(super) fn settle_failed_create_cleanup(
+        &mut self,
+        vmid: Ulid,
+        owner: VmDeleteOwner,
+        owner_was_new: bool,
+        cleanup_confirmed: bool,
+    ) {
+        if !cleanup_confirmed {
+            self.vm_tombstones.insert(vmid, true);
+            return;
+        }
+
+        if owner_was_new {
+            if let Some(targets) = self.vm_delete_targets.get_mut(&vmid) {
+                targets.remove(&owner);
+                if targets.is_empty() {
+                    self.vm_delete_targets.remove(&vmid);
+                }
+            }
+        } else {
+            self.acknowledge_vm_delete_owner(vmid, owner);
+        }
+
+        if !self.finish_vm_delete(vmid) && self.vm_delete_targets.contains_key(&vmid) {
+            self.vm_tombstones.insert(vmid, true);
+        }
+    }
+
     /// Marks only a positively acknowledged owner; failures and missing routes
     /// stay pending across retries, regardless of unrelated agents' replies.
     pub(super) fn acknowledge_vm_delete_owner(&mut self, vmid: Ulid, owner: VmDeleteOwner) {

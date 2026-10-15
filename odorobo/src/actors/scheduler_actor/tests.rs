@@ -395,6 +395,72 @@ fn failed_create_rolls_back_state_without_an_actor() {
 }
 
 #[test]
+fn settled_failed_create_cleanup_allows_corrected_recreate() {
+    let vmid = Ulid::generate();
+    let owner = super::VmDeleteOwner::agent(super::ActorId::new(1));
+    let mut scheduler = empty_scheduler();
+    scheduler.remember_vm_delete_owner(vmid, owner);
+
+    scheduler.settle_failed_create_cleanup(vmid, owner, true, true);
+
+    assert!(!scheduler.vm_delete_targets.contains_key(&vmid));
+    assert_ne!(scheduler.vm_tombstones.get(&vmid), Some(&true));
+    assert!(!scheduler.create_is_confirmed(vmid));
+}
+
+#[test]
+fn uncertain_failed_create_cleanup_retains_owner_and_blocks_recreate() {
+    let vmid = Ulid::generate();
+    let owner = super::VmDeleteOwner::agent(super::ActorId::new(1));
+    let mut scheduler = empty_scheduler();
+    scheduler.remember_vm_delete_owner(vmid, owner);
+
+    scheduler.settle_failed_create_cleanup(vmid, owner, true, false);
+
+    assert!(scheduler.vm_delete_targets[&vmid].contains_key(&owner));
+    assert_eq!(scheduler.vm_tombstones.get(&vmid), Some(&true));
+}
+
+#[test]
+fn unknown_create_retry_waits_for_acceptance_or_discovery() {
+    let vmid = Ulid::generate();
+    let mut scheduler = empty_scheduler();
+    scheduler.vm_manifests.insert(vmid, test_manifest(1, 1));
+    scheduler.vm_placements.insert(
+        vmid,
+        vec![VmPlacement {
+            agent_id: super::ActorId::new(1),
+            lifecycle: VmLifecycle::Pending,
+            created_at: Instant::now(),
+            last_confirmed_at: None,
+        }],
+    );
+    scheduler
+        .vm_data_cache
+        .insert(vmid, vec![CachedVMActor { actor_ref: None }]);
+
+    assert!(!scheduler.create_is_confirmed(vmid));
+
+    // A successful agent reply records its effective configuration even before
+    // status discovery observes the new VM.
+    scheduler
+        .vm_effective_manifests
+        .insert(vmid, test_manifest(1, 1));
+    assert!(scheduler.create_is_confirmed(vmid));
+}
+
+#[test]
+fn accepted_create_actor_id_confirms_idempotent_retry() {
+    let vmid = Ulid::generate();
+    let actor_id = super::ActorId::new(2);
+    let mut scheduler = empty_scheduler();
+    scheduler.vm_manifests.insert(vmid, test_manifest(1, 1));
+    scheduler.vm_actorid_ulid_map.insert(actor_id, vmid);
+
+    assert!(scheduler.create_is_confirmed(vmid));
+}
+
+#[test]
 fn failed_create_keeps_state_if_actor_exists() {
     let vmid = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("valid ulid");
     let mut manifests = AHashMap::from([(vmid, test_manifest(1, 1))]);
