@@ -114,6 +114,12 @@ impl Message<CreateVM> for SchedulerActor {
                 return Err(eyre!("conflicting create request for existing VM ID"));
             }
 
+            if !self.create_is_confirmed(msg.vmid) {
+                return Err(eyre!(
+                    "create outcome is unknown; VM creation is pending agent acceptance or discovery"
+                ));
+            }
+
             let actor_id = self
                 .vm_actorid_ulid_map
                 .iter()
@@ -133,7 +139,12 @@ impl Message<CreateVM> for SchedulerActor {
         let target_agent = self.schedule_agent(&msg)?;
 
         self.remember_agent_ref(&target_agent);
-        self.remember_vm_delete_owner(msg.vmid, VmDeleteOwner::agent(target_agent.id()));
+        let delete_owner = VmDeleteOwner::agent(target_agent.id());
+        let delete_owner_was_new = !self
+            .vm_delete_targets
+            .get(&msg.vmid)
+            .is_some_and(|targets| targets.contains_key(&delete_owner));
+        self.remember_vm_delete_owner(msg.vmid, delete_owner);
         self.vm_tombstones.remove(&msg.vmid);
         self.vm_manifests.insert(msg.vmid, msg.config.clone());
         self.invalidate_pending_resources();
@@ -181,29 +192,38 @@ impl Message<CreateVM> for SchedulerActor {
             self.vm_actorid_ulid_map.insert(actor_id, msg.vmid);
         }
 
-        // A transport failure is not proof that startup failed. Keep the
-        // pending placement while discovery has a chance to confirm it.
+        // A transport or discovery failure is not proof that startup failed.
+        // Roll back only after an explicit agent rejection and a successful
+        // lookup confirming no VM actor is present.
         if reply.is_err() && !startup_outcome_unknown {
-            let actor_exists = RemoteActorRef::<VMActor>::lookup(vm_actor_id(msg.vmid))
-                .await
-                .ok()
-                .flatten()
-                .is_some();
-            Self::rollback_failed_create(
-                msg.vmid,
-                actor_exists,
-                reply.as_ref().ok().and_then(|reply| {
-                    reply
-                        .actor_id
-                        .as_deref()
-                        .and_then(|bytes| ActorId::from_bytes(bytes).ok())
-                }),
-                &mut self.vm_actorid_ulid_map,
-                &mut self.vm_manifests,
-                &mut self.vm_effective_manifests,
-                &mut self.vm_placements,
-                &mut self.vm_data_cache,
-            );
+            if let Ok(None) = RemoteActorRef::<VMActor>::lookup(vm_actor_id(msg.vmid)).await {
+                Self::rollback_failed_create(
+                    msg.vmid,
+                    false,
+                    reply.as_ref().ok().and_then(|reply| {
+                        reply
+                            .actor_id
+                            .as_deref()
+                            .and_then(|bytes| ActorId::from_bytes(bytes).ok())
+                    }),
+                    &mut self.vm_actorid_ulid_map,
+                    &mut self.vm_manifests,
+                    &mut self.vm_effective_manifests,
+                    &mut self.vm_placements,
+                    &mut self.vm_data_cache,
+                );
+
+                let cleanup_confirmed = matches!(
+                    target_agent.ask(&DeleteVM { vmid: msg.vmid }).await,
+                    Ok(DeleteVMReply { error: None })
+                );
+                self.settle_failed_create_cleanup(
+                    msg.vmid,
+                    delete_owner,
+                    delete_owner_was_new,
+                    cleanup_confirmed,
+                );
+            }
         }
 
         if let Ok(reply) = &reply

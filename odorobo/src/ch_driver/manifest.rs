@@ -25,6 +25,7 @@ use crate::{
 /// silently omitted.
 pub fn to_vm_config(manifest: &VmManifest, runtime_dir: &Path) -> Result<VmConfig> {
     manifest.validate()?;
+    validate_generated_device_ids(manifest)?;
 
     let desired = &manifest.desired;
     // Keep URI-backed disks logical until StorageDriverTransformer resolves them
@@ -129,6 +130,29 @@ pub fn to_vm_config(manifest: &VmManifest, runtime_dir: &Path) -> Result<VmConfi
         }),
         ..Default::default()
     })
+}
+
+/// Reject storage IDs that conflict with devices generated from enabled
+/// manifest features. Cloud Hypervisor requires device IDs to be unique across
+/// disks and vsock devices.
+fn validate_generated_device_ids(manifest: &VmManifest) -> Result<()> {
+    let desired = &manifest.desired;
+    for (feature_enabled, generated_id, feature_name) in [
+        (desired.cloud_init.is_some(), "cloud-init", "cloud-init"),
+        (desired.vsock.is_some(), "odorobo-vsock", "vsock"),
+    ] {
+        if feature_enabled
+            && desired
+                .storage
+                .iter()
+                .any(|storage| storage.id == generated_id)
+        {
+            return Err(eyre!(
+                "storage ID {generated_id} conflicts with the generated {feature_name} device; choose a different storage ID or disable {feature_name}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Build a logical disk config while retaining the source URI for the storage
@@ -338,6 +362,81 @@ mod tests {
         assert_eq!(seed.readonly, Some(true));
         assert!(seed.path.as_deref().unwrap().ends_with("cloud-init.img"));
         assert_eq!(seed.image_type, Some(ImageType::Raw));
+    }
+
+    #[test]
+    fn rejects_cloud_init_storage_id_before_creating_seed_artifacts() {
+        let mut manifest = minimal();
+        manifest.desired.storage.push(Storage {
+            id: "cloud-init".to_owned(),
+            uri: Some("file:///var/lib/cloud-init.img".to_owned()),
+            ..Default::default()
+        });
+        manifest.desired.cloud_init = Some(crate::manifest::CloudInit {
+            user_data: Some("#cloud-config\n".to_owned()),
+            meta_data: Some("instance-id: test\n".to_owned()),
+            ..Default::default()
+        });
+        let runtime_dir = std::env::temp_dir().join(format!(
+            "odorobo-cloud-init-id-conflict-{}",
+            Ulid::generate()
+        ));
+
+        let error = to_vm_config(&manifest, &runtime_dir)
+            .expect_err("generated cloud-init ID must not collide with storage");
+        let message = error.to_string();
+        assert!(message.contains("cloud-init"));
+        assert!(message.contains("different storage ID or disable cloud-init"));
+        assert!(
+            !runtime_dir.exists(),
+            "seed runtime artifacts must not be created"
+        );
+    }
+
+    #[test]
+    fn rejects_vsock_storage_id_conflict() {
+        let mut manifest = minimal();
+        manifest.desired.storage.push(Storage {
+            id: "odorobo-vsock".to_owned(),
+            uri: Some("file:///var/lib/vsock.img".to_owned()),
+            ..Default::default()
+        });
+        manifest.desired.vsock = Some(crate::manifest::Vsock {
+            guest_cid: Some(42),
+            socket: "/run/odorobo/vsock.sock".to_owned(),
+        });
+
+        let error =
+            convert(&manifest).expect_err("generated vsock ID must not collide with storage");
+        let message = error.to_string();
+        assert!(message.contains("odorobo-vsock"));
+        assert!(message.contains("different storage ID or disable vsock"));
+    }
+
+    #[test]
+    fn permits_generated_device_names_when_features_are_disabled() {
+        let mut manifest = minimal();
+        manifest.desired.storage = vec![
+            Storage {
+                id: "cloud-init".to_owned(),
+                uri: Some("file:///var/lib/cloud-init.img".to_owned()),
+                ..Default::default()
+            },
+            Storage {
+                id: "odorobo-vsock".to_owned(),
+                uri: Some("file:///var/lib/vsock.img".to_owned()),
+                ..Default::default()
+            },
+        ];
+
+        let config = convert(&manifest).expect("disabled features do not generate colliding IDs");
+        let disk_ids = config
+            .disks
+            .expect("storage disks")
+            .into_iter()
+            .filter_map(|disk| disk.id)
+            .collect::<Vec<_>>();
+        assert_eq!(disk_ids, ["cloud-init", "odorobo-vsock"]);
     }
 
     #[test]
