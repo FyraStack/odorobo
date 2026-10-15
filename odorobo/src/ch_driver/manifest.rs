@@ -9,8 +9,12 @@ use cloud_hypervisor_client::models::{
     VmConfig, VsockConfig,
 };
 use stable_eyre::{Result, eyre::eyre};
+use std::path::Path;
 
-use crate::manifest::{Storage, VmManifest};
+use crate::{
+    ch_driver::cloud_init::create_seed_image,
+    manifest::{Storage, VmManifest},
+};
 
 /// Convert a validated Odorobo manifest to a Cloud Hypervisor configuration.
 ///
@@ -19,8 +23,9 @@ use crate::manifest::{Storage, VmManifest};
 /// network references for the node-local transform pipeline to resolve.
 /// Fields without a defined Cloud Hypervisor transport are rejected rather than
 /// silently omitted.
-pub fn to_vm_config(manifest: &VmManifest) -> Result<VmConfig> {
+pub fn to_vm_config(manifest: &VmManifest, runtime_dir: &Path) -> Result<VmConfig> {
     manifest.validate()?;
+    validate_generated_device_ids(manifest)?;
 
     let desired = &manifest.desired;
     // Keep URI-backed disks logical until StorageDriverTransformer resolves them
@@ -44,31 +49,59 @@ pub fn to_vm_config(manifest: &VmManifest) -> Result<VmConfig> {
         })
         .collect::<Vec<_>>();
 
-    if desired.cloud_init.is_some() {
-        return Err(eyre!(
-            "Cloud Hypervisor cloud-init conversion is not implemented yet"
-        ));
-    }
     // Unlike cloud-init, vsock has a direct Cloud Hypervisor representation, so
-    // the declarative manifest fields can be passed through without a sidecar.
-    let vsock = desired.vsock.as_ref().map(|vsock| VsockConfig {
-        cid: i64::from(vsock.guest_cid),
-        socket: vsock.socket.clone(),
-        id: Some("odorobo-vsock".to_owned()),
-        ..Default::default()
-    });
+    // the declarative manifest fields can be passed through after the node-local
+    // allocator resolves an optional guest CID.
+    let vsock = desired
+        .vsock
+        .as_ref()
+        .map(|vsock| -> Result<VsockConfig> {
+            let guest_cid = vsock
+                .guest_cid
+                .ok_or_else(|| eyre!("vsock guest CID was not allocated by the agent"))?;
+            Ok(VsockConfig {
+                cid: i64::from(guest_cid),
+                socket: vsock.socket.clone(),
+                id: Some("odorobo-vsock".to_owned()),
+                ..Default::default()
+            })
+        })
+        .transpose()?;
+
+    let boot_vcpus = i32::try_from(desired.compute.vcpus)
+        .map_err(|_| eyre!("vCPU count exceeds Cloud Hypervisor limits"))?;
+    let max_vcpus = i32::try_from(desired.compute.max_vcpus.unwrap_or(desired.compute.vcpus))
+        .map_err(|_| eyre!("maximum vCPU count exceeds Cloud Hypervisor limits"))?;
+    let memory_size = i64::try_from(desired.compute.memory_bytes)
+        .map_err(|_| eyre!("memory size exceeds Cloud Hypervisor limits"))?;
+
+    // Create the artifact only after all other fallible manifest conversions
+    // have succeeded, so rejected configs do not leave runtime files behind.
+    let cloud_init_disk = desired
+        .cloud_init
+        .as_ref()
+        .map(|cloud_init| create_seed_image(runtime_dir, cloud_init))
+        .transpose()?;
+
+    let mut disks = disks;
+    if let Some(seed_path) = cloud_init_disk {
+        disks.push(DiskConfig {
+            id: Some("cloud-init".to_owned()),
+            path: Some(seed_path.to_string_lossy().into_owned()),
+            readonly: Some(true),
+            image_type: Some(ImageType::Raw),
+            ..Default::default()
+        });
+    }
 
     Ok(VmConfig {
         cpus: Some(CpusConfig {
-            boot_vcpus: i32::try_from(desired.compute.vcpus)
-                .map_err(|_| eyre!("vCPU count exceeds Cloud Hypervisor limits"))?,
-            max_vcpus: i32::try_from(desired.compute.max_vcpus.unwrap_or(desired.compute.vcpus))
-                .map_err(|_| eyre!("maximum vCPU count exceeds Cloud Hypervisor limits"))?,
+            boot_vcpus,
+            max_vcpus,
             ..Default::default()
         }),
         memory: Some(MemoryConfig {
-            size: i64::try_from(desired.compute.memory_bytes)
-                .map_err(|_| eyre!("memory size exceeds Cloud Hypervisor limits"))?,
+            size: memory_size,
             ..Default::default()
         }),
         payload: PayloadConfig {
@@ -97,6 +130,29 @@ pub fn to_vm_config(manifest: &VmManifest) -> Result<VmConfig> {
         }),
         ..Default::default()
     })
+}
+
+/// Reject storage IDs that conflict with devices generated from enabled
+/// manifest features. Cloud Hypervisor requires device IDs to be unique across
+/// disks and vsock devices.
+fn validate_generated_device_ids(manifest: &VmManifest) -> Result<()> {
+    let desired = &manifest.desired;
+    for (feature_enabled, generated_id, feature_name) in [
+        (desired.cloud_init.is_some(), "cloud-init", "cloud-init"),
+        (desired.vsock.is_some(), "odorobo-vsock", "vsock"),
+    ] {
+        if feature_enabled
+            && desired
+                .storage
+                .iter()
+                .any(|storage| storage.id == generated_id)
+        {
+            return Err(eyre!(
+                "storage ID {generated_id} conflicts with the generated {feature_name} device; choose a different storage ID or disable {feature_name}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Build a logical disk config while retaining the source URI for the storage
@@ -139,6 +195,7 @@ fn storage_to_disk(storage: &Storage) -> Result<DiskConfig> {
 mod tests {
     use super::*;
     use crate::manifest::{Boot, Compute, DesiredState, Metadata};
+    use std::{path::PathBuf, sync::OnceLock};
     use ulid::Ulid;
 
     fn minimal() -> VmManifest {
@@ -162,9 +219,17 @@ mod tests {
         }
     }
 
+    fn convert(manifest: &VmManifest) -> Result<VmConfig> {
+        static TEST_RUNTIME: OnceLock<PathBuf> = OnceLock::new();
+        let root = TEST_RUNTIME.get_or_init(|| {
+            std::env::temp_dir().join(format!("odorobo-manifest-test-{}", Ulid::generate()))
+        });
+        to_vm_config(manifest, &root.join(manifest.id.to_string()))
+    }
+
     #[test]
     fn converts_compute_and_defaults() {
-        let config = to_vm_config(&minimal()).expect("minimal manifest converts");
+        let config = convert(&minimal()).expect("minimal manifest converts");
         assert_eq!(config.cpus.expect("cpus").boot_vcpus, 2);
         assert_eq!(config.memory.expect("memory").size, 1024);
         assert_eq!(
@@ -176,7 +241,7 @@ mod tests {
     #[test]
     fn firmware_default_only_for_firmware_boot() {
         // No kernel, no explicit firmware -> defaults to the firmware.
-        let config = to_vm_config(&minimal()).expect("minimal manifest converts");
+        let config = convert(&minimal()).expect("minimal manifest converts");
         assert_eq!(
             config.payload.firmware.as_deref(),
             Some("/var/lib/odorobo/CLOUDHV.fd")
@@ -185,7 +250,7 @@ mod tests {
         // Kernel set, no explicit firmware -> no firmware (direct kernel boot).
         let mut manifest = minimal();
         manifest.desired.boot.kernel = Some("/tmp/vmlinuz".to_owned());
-        let config = to_vm_config(&manifest).expect("kernel manifest converts");
+        let config = convert(&manifest).expect("kernel manifest converts");
         assert_eq!(config.payload.firmware, None);
         assert_eq!(config.payload.kernel.as_deref(), Some("/tmp/vmlinuz"));
 
@@ -193,7 +258,7 @@ mod tests {
         let mut manifest = minimal();
         manifest.desired.boot.kernel = Some("/tmp/vmlinuz".to_owned());
         manifest.desired.boot.firmware = Some("/custom/fw.fd".to_owned());
-        let config = to_vm_config(&manifest).expect("explicit firmware manifest converts");
+        let config = convert(&manifest).expect("explicit firmware manifest converts");
         assert_eq!(config.payload.firmware.as_deref(), Some("/custom/fw.fd"));
     }
 
@@ -204,7 +269,7 @@ mod tests {
             id: "private".to_owned(),
             mac_address: Some("02:00:00:00:00:01".to_owned()),
         });
-        let config = to_vm_config(&manifest).expect("network manifest converts");
+        let config = convert(&manifest).expect("network manifest converts");
         let network = &config.net.expect("network config")[0];
         assert_eq!(network.id.as_deref(), Some("net://private"));
         assert_eq!(network.mac.as_deref(), Some("02:00:00:00:00:01"));
@@ -226,7 +291,7 @@ mod tests {
             },
         ];
 
-        let config = to_vm_config(&manifest).expect("ordered storage manifest converts");
+        let config = convert(&manifest).expect("ordered storage manifest converts");
         let disks = config.disks.as_ref().expect("disk configs");
         let serialized = serde_json::to_value(&config).expect("config serializes");
 
@@ -257,7 +322,7 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let config = to_vm_config(&manifest).expect("storage manifest converts");
+        let config = convert(&manifest).expect("storage manifest converts");
         let disks = config.disks.expect("disk configs");
         assert_eq!(disks.len(), 2);
         assert_eq!(disks[0].id.as_deref(), Some("root"));
@@ -270,10 +335,10 @@ mod tests {
     fn converts_vsock_configuration() {
         let mut manifest = minimal();
         manifest.desired.vsock = Some(crate::manifest::Vsock {
-            guest_cid: 42,
+            guest_cid: Some(42),
             socket: "/run/odorobo/vsock.sock".to_owned(),
         });
-        let config = to_vm_config(&manifest).expect("vsock manifest converts");
+        let config = convert(&manifest).expect("vsock manifest converts");
         let vsock = config.vsock.expect("vsock config");
         assert_eq!(vsock.cid, 42);
         assert_eq!(vsock.socket, "/run/odorobo/vsock.sock");
@@ -281,13 +346,107 @@ mod tests {
     }
 
     #[test]
-    fn rejects_cloud_init_without_a_transport_contract() {
+    fn converts_cloud_init_to_read_only_nocloud_seed_disk() {
         let mut manifest = minimal();
         manifest.desired.cloud_init = Some(crate::manifest::CloudInit {
             user_data: Some("#cloud-config\n".to_owned()),
             meta_data: Some("instance-id: test\n".to_owned()),
+            vendor_data: Some("#cloud-config\npackages: [curl]\n".to_owned()),
         });
-        let error = to_vm_config(&manifest).expect_err("cloud-init transport is not defined");
-        assert!(error.to_string().contains("cloud-init"));
+        let config = convert(&manifest).expect("cloud-init manifest converts");
+        let disks = config.disks.expect("seed disk config");
+        let seed = disks
+            .last()
+            .expect("seed disk is appended after boot disks");
+        assert_eq!(seed.id.as_deref(), Some("cloud-init"));
+        assert_eq!(seed.readonly, Some(true));
+        assert!(seed.path.as_deref().unwrap().ends_with("cloud-init.img"));
+        assert_eq!(seed.image_type, Some(ImageType::Raw));
+    }
+
+    #[test]
+    fn rejects_cloud_init_storage_id_before_creating_seed_artifacts() {
+        let mut manifest = minimal();
+        manifest.desired.storage.push(Storage {
+            id: "cloud-init".to_owned(),
+            uri: Some("file:///var/lib/cloud-init.img".to_owned()),
+            ..Default::default()
+        });
+        manifest.desired.cloud_init = Some(crate::manifest::CloudInit {
+            user_data: Some("#cloud-config\n".to_owned()),
+            meta_data: Some("instance-id: test\n".to_owned()),
+            ..Default::default()
+        });
+        let runtime_dir = std::env::temp_dir().join(format!(
+            "odorobo-cloud-init-id-conflict-{}",
+            Ulid::generate()
+        ));
+
+        let error = to_vm_config(&manifest, &runtime_dir)
+            .expect_err("generated cloud-init ID must not collide with storage");
+        let message = error.to_string();
+        assert!(message.contains("cloud-init"));
+        assert!(message.contains("different storage ID or disable cloud-init"));
+        assert!(
+            !runtime_dir.exists(),
+            "seed runtime artifacts must not be created"
+        );
+    }
+
+    #[test]
+    fn rejects_vsock_storage_id_conflict() {
+        let mut manifest = minimal();
+        manifest.desired.storage.push(Storage {
+            id: "odorobo-vsock".to_owned(),
+            uri: Some("file:///var/lib/vsock.img".to_owned()),
+            ..Default::default()
+        });
+        manifest.desired.vsock = Some(crate::manifest::Vsock {
+            guest_cid: Some(42),
+            socket: "/run/odorobo/vsock.sock".to_owned(),
+        });
+
+        let error =
+            convert(&manifest).expect_err("generated vsock ID must not collide with storage");
+        let message = error.to_string();
+        assert!(message.contains("odorobo-vsock"));
+        assert!(message.contains("different storage ID or disable vsock"));
+    }
+
+    #[test]
+    fn permits_generated_device_names_when_features_are_disabled() {
+        let mut manifest = minimal();
+        manifest.desired.storage = vec![
+            Storage {
+                id: "cloud-init".to_owned(),
+                uri: Some("file:///var/lib/cloud-init.img".to_owned()),
+                ..Default::default()
+            },
+            Storage {
+                id: "odorobo-vsock".to_owned(),
+                uri: Some("file:///var/lib/vsock.img".to_owned()),
+                ..Default::default()
+            },
+        ];
+
+        let config = convert(&manifest).expect("disabled features do not generate colliding IDs");
+        let disk_ids = config
+            .disks
+            .expect("storage disks")
+            .into_iter()
+            .filter_map(|disk| disk.id)
+            .collect::<Vec<_>>();
+        assert_eq!(disk_ids, ["cloud-init", "odorobo-vsock"]);
+    }
+
+    #[test]
+    fn rejects_vsock_without_allocated_cid() {
+        let mut manifest = minimal();
+        manifest.desired.vsock = Some(crate::manifest::Vsock {
+            guest_cid: None,
+            socket: "/run/odorobo/vsock.sock".to_owned(),
+        });
+        let error = convert(&manifest).expect_err("unallocated CID must not reach CH");
+        assert!(error.to_string().contains("not allocated"));
     }
 }
