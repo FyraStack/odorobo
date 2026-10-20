@@ -32,6 +32,7 @@ Odorobo should provision. It contains:
   Cloud Hypervisor has no per-disk boot index, so providers must preserve this order when
   translating the manifest. The control plane owns attachment identity and ordering; the
   provider driver/storage transform resolves the URI or volume ID to a node-local device path.
+  Current URI support and attachment lifecycle are documented in [the storage contract](storage.md).
 - `networks`: stable network IDs and optional guest MAC addresses. The control plane owns
   the attachment identity and requested MAC; the provider networking transform resolves
   the network to a host interface or tap device.
