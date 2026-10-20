@@ -3,7 +3,7 @@
 //! as if we're simply just stripping the prefix
 //! e.g. `file:///path/to/disk.img` -> `/path/to/disk.img`
 
-use super::StorageDriver;
+use super::{StorageAcquisition, StorageDriver};
 use async_trait::async_trait;
 use stable_eyre::{Result, eyre::eyre};
 use std::path::PathBuf;
@@ -30,6 +30,11 @@ pub struct FileStorage;
 impl StorageDriver for FileStorage {
     fn scheme(&self) -> &'static str {
         "file"
+    }
+
+    async fn acquire(&self, uri: &Url) -> Result<StorageAcquisition> {
+        FileTarget::try_from(uri)?;
+        Ok(StorageAcquisition::borrowed())
     }
 
     async fn resolve(&self, uri: &Url) -> Result<PathBuf> {
