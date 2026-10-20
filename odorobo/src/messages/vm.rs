@@ -62,7 +62,11 @@ pub struct MigrateVMReceiveReply {
     pub error: Option<String>,
 }
 
-/// Message to delete a VM
+/// Permanently delete a VM.
+///
+/// The VM actor's teardown stops the VMM, removes its runtime directory, and
+/// releases resources acquired by configuration transforms. Agents and the
+/// scheduler also remove the VM from their caches and desired state.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DeleteVM {
     pub vmid: Ulid,
@@ -71,7 +75,11 @@ pub struct DeleteVM {
 #[derive(Serialize, Deserialize, Reply, Debug, Clone)]
 pub struct DeleteVMReply;
 
-/// Shuts down a VM temporarily
+/// Power off the guest without deleting the VM.
+///
+/// The VM actor, Cloud Hypervisor process, runtime state, agent membership, and
+/// scheduler intent are retained. Use deletion to remove the VM and release
+/// its resources.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ShutdownVM {
     pub vmid: Ulid,

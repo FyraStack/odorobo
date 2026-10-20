@@ -409,7 +409,7 @@ fn failed_create_keeps_state_if_actor_exists() {
 }
 
 #[test]
-fn explicit_stop_removes_vm_intent_and_actor_mapping() {
+fn delete_removes_vm_intent_and_actor_mapping() {
     let vmid = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("valid ulid");
     let vm_actor_id = super::ActorId::new(2);
     let agent_id = super::ActorId::new(1);
@@ -427,13 +427,47 @@ fn explicit_stop_removes_vm_intent_and_actor_mapping() {
         cache_actor_finder: None,
     };
 
-    scheduler.remove_vm_intent(vmid);
+    scheduler.apply_vm_lifecycle_command(vmid, super::VmLifecycleCommand::Delete);
 
     assert!(!scheduler.vm_manifests.contains_key(&vmid));
     assert!(!scheduler.vm_placements.contains_key(&vmid));
     assert!(!scheduler.vm_data_cache.contains_key(&vmid));
     assert!(!scheduler.vm_actorid_ulid_map.contains_key(&vm_actor_id));
     assert!(!scheduler.agent_vm_index[&agent_id].contains(&vmid));
+}
+
+#[test]
+fn shutdown_retains_vm_intent_placement_and_actor_mappings() {
+    let vmid = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("valid ulid");
+    let vm_actor_id = super::ActorId::new(2);
+    let agent_id = super::ActorId::new(1);
+    let placement = VmPlacement {
+        agent_id,
+        lifecycle: VmLifecycle::Running,
+        created_at: Instant::now(),
+        last_confirmed_at: Some(Instant::now()),
+    };
+    let mut scheduler = SchedulerActor {
+        agent_data_cache: AHashMap::new(),
+        agent_keepalive_tasks: AHashMap::new(),
+        vm_actorid_ulid_map: AHashMap::from([(vm_actor_id, vmid)]),
+        vm_manifests: AHashMap::from([(vmid, test_manifest(1, 1))]),
+        vm_placements: AHashMap::from([(vmid, vec![placement])]),
+        vm_data_cache: AHashMap::from([(vmid, vec![CachedVMActor { actor_ref: None }])]),
+        vm_keepalive_tasks: AHashMap::new(),
+        pending_resources_cache: None,
+        agent_vm_index: AHashMap::from([(agent_id, AHashSet::from([vmid]))]),
+        actor_kinds: AHashMap::new(),
+        cache_actor_finder: None,
+    };
+
+    scheduler.apply_vm_lifecycle_command(vmid, super::VmLifecycleCommand::Shutdown);
+
+    assert!(scheduler.vm_manifests.contains_key(&vmid));
+    assert!(scheduler.vm_placements.contains_key(&vmid));
+    assert!(scheduler.vm_data_cache.contains_key(&vmid));
+    assert!(scheduler.vm_actorid_ulid_map.contains_key(&vm_actor_id));
+    assert!(scheduler.agent_vm_index[&agent_id].contains(&vmid));
 }
 
 #[test]

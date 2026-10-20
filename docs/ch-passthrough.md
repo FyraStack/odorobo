@@ -1,5 +1,9 @@
 # Cloud Hypervisor Passthrough API
 
+> **Not currently implemented:** the routes below describe the planned interface.
+> The current manager HTTP router does not expose CH passthrough endpoints.
+> Host-local CH API calls can instead use `/run/odorobo/vms/<vmid>/ch.sock`.
+
 The agent exposes a passthrough route for the local Cloud Hypervisor API at:
 
 `/{vmid}/ch/{*path}`
