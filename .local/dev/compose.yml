@@ -50,6 +50,8 @@ services:
     pid: container:odorobo-ceph
     volumes:
       - ../../:/workspace
+      - /var/lib/odorobo:/var/lib/odorobo
+      - /run/odorobo:/run/odorobo
       - ceph_creds:/generated:ro
       - /dev:/dev
       # The rbd CLI runs `modprobe rbd` before mapping; the container's own

@@ -38,6 +38,8 @@ pub enum ManifestError {
     InvalidStorageSource(String),
     #[error("storage attachment {0} has a duplicate id")]
     DuplicateStorageId(String),
+    #[error("rootfs must define a non-empty OCI image reference")]
+    EmptyRootfsOci,
 
     #[error("network {0} must define an id")]
     NetworkWithoutId(usize),
@@ -118,6 +120,12 @@ pub struct DesiredState {
     /// The order of this array determines boot device order.
     #[serde(default)]
     pub storage: Vec<Storage>,
+    /// Container root filesystem: an OCI image materialized on the node and
+    /// served to the guest over virtiofs. The agent supervises virtiofsd and
+    /// boots the microVM kernel directly with `root=rootfs rootfstype=virtiofs`
+    /// (issues #112/#113). Storage-backed VMs leave this unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rootfs: Option<Rootfs>,
     #[serde(default)]
     pub networks: Vec<Network>,
     #[serde(default)]
@@ -174,6 +182,15 @@ impl DesiredState {
             if network.id.trim().is_empty() {
                 return Err(ManifestError::NetworkWithoutId(index));
             }
+        }
+        // A virtiofs rootfs needs an image to serve; an empty reference would
+        // only fail later at pull time with a worse error.
+        if self
+            .rootfs
+            .as_ref()
+            .is_some_and(|rootfs| rootfs.oci.trim().is_empty())
+        {
+            return Err(ManifestError::EmptyRootfsOci);
         }
         for rule in &self.placement.affinity {
             for requirement in &rule.requirements {
@@ -252,6 +269,78 @@ pub struct Storage {
     pub volume_id: Option<Ulid>,
     #[serde(default)]
     pub read_only: bool,
+}
+
+/// OCI image used as the guest root filesystem over virtiofs.
+/// The immutable composefs base is shared; all writable state is private per VM.
+#[derive(Clone, Debug, Default, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Rootfs {
+    /// OCI image reference understood by `skopeo copy`.
+    pub oci: String,
+    /// Write and lifecycle policy for this VM's root filesystem.
+    #[serde(default)]
+    pub mode: RootfsMode,
+}
+
+impl<'de> Deserialize<'de> for Rootfs {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        fn deserialize_mode<'de, D>(deserializer: D) -> Result<Option<RootfsMode>, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            RootfsMode::deserialize(deserializer).map(Some)
+        }
+        fn deserialize_read_only<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            bool::deserialize(deserializer).map(Some)
+        }
+
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WireRootfs {
+            oci: String,
+            #[serde(default, deserialize_with = "deserialize_mode")]
+            mode: Option<RootfsMode>,
+            #[serde(default, deserialize_with = "deserialize_read_only")]
+            read_only: Option<bool>,
+        }
+
+        let wire = WireRootfs::deserialize(deserializer)?;
+        let mode = match (wire.mode, wire.read_only) {
+            (Some(_), Some(_)) => {
+                return Err(D::Error::custom(
+                    "rootfs cannot specify both mode and legacy read_only",
+                ));
+            }
+            (Some(mode), None) => mode,
+            (None, Some(true)) => RootfsMode::ReadOnly,
+            (None, Some(false)) => RootfsMode::Ephemeral,
+            (None, None) => RootfsMode::default(),
+        };
+        Ok(Self {
+            oci: wire.oci,
+            mode,
+        })
+    }
+}
+
+/// Root filesystem write policy. Omitted mode defaults to an ephemeral writable overlay.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RootfsMode {
+    /// Read-only image root with bounded writable scratch mounts.
+    ReadOnly,
+    /// Private writable upper removed when the VM is stopped (default).
+    #[default]
+    Ephemeral,
+    /// Private writable upper retained across stop/restart until explicit deletion.
+    Persistent,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -333,6 +422,8 @@ pub struct Boot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kernel: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initramfs: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cmdline: Option<String>,
 }
 
@@ -398,6 +489,7 @@ mod tests {
             include_str!("../../docs/fixtures/manifest/networked.json"),
             include_str!("../../docs/fixtures/manifest/cloud-init.json"),
             include_str!("../../docs/fixtures/manifest/vsock.json"),
+            include_str!("../../docs/fixtures/manifest/oci-rootfs.json"),
         ];
 
         for json in fixtures {
@@ -550,6 +642,54 @@ mod tests {
             manifest.validate(),
             Err(ManifestError::EmptyStorageId)
         ));
+    }
+
+    #[test]
+    fn accepts_and_rejects_oci_rootfs() {
+        let mut manifest = minimal_manifest();
+        manifest.desired.rootfs = Some(crate::manifest::Rootfs {
+            oci: "docker://registry.fedoraproject.org/fedora:latest".to_owned(),
+            mode: RootfsMode::ReadOnly,
+        });
+        assert_eq!(manifest.validate(), Ok(()));
+
+        manifest.desired.rootfs = Some(crate::manifest::Rootfs {
+            oci: "   ".to_owned(),
+            mode: RootfsMode::Ephemeral,
+        });
+        assert_eq!(manifest.validate(), Err(ManifestError::EmptyRootfsOci));
+
+        let fixture = include_str!("../../docs/fixtures/manifest/oci-rootfs.json");
+        let manifest: VmManifest =
+            serde_json::from_str(fixture).expect("oci-rootfs fixture is valid");
+        assert_eq!(manifest.validate(), Ok(()));
+        assert_eq!(manifest.desired.rootfs.unwrap().mode, RootfsMode::ReadOnly);
+        let omitted = fixture.replace(",\n      \"mode\": \"read_only\"", "");
+        let omitted: VmManifest = serde_json::from_str(&omitted).expect("mode defaults");
+        assert_eq!(omitted.desired.rootfs.unwrap().mode, RootfsMode::Ephemeral);
+        let legacy = fixture.replace("\"mode\": \"read_only\"", "\"read_only\": true");
+        let legacy: VmManifest = serde_json::from_str(&legacy).expect("legacy read_only accepted");
+        assert_eq!(legacy.desired.rootfs.unwrap().mode, RootfsMode::ReadOnly);
+        let legacy = fixture.replace("\"mode\": \"read_only\"", "\"read_only\": false");
+        let legacy: VmManifest = serde_json::from_str(&legacy).expect("legacy false accepted");
+        let encoded = serde_json::to_value(&legacy).expect("canonical serialize");
+        assert_eq!(encoded["desired"]["rootfs"]["mode"], "ephemeral");
+        assert!(encoded["desired"]["rootfs"].get("read_only").is_none());
+        let conflict = fixture.replace(
+            "\"mode\": \"read_only\"",
+            "\"mode\": \"read_only\", \"read_only\": true",
+        );
+        serde_json::from_str::<VmManifest>(&conflict)
+            .expect_err("conflicting rootfs fields reject");
+        let null_mode = fixture.replace("\"mode\": \"read_only\"", "\"mode\": null");
+        serde_json::from_str::<VmManifest>(&null_mode).expect_err("null is not an omitted mode");
+        let null_legacy = fixture.replace("\"mode\": \"read_only\"", "\"read_only\": null");
+        serde_json::from_str::<VmManifest>(&null_legacy).expect_err("legacy field must be boolean");
+        let bad = fixture.replace(
+            "\"mode\": \"read_only\"",
+            "\"mode\": \"read_only\",\n      \"backend\": \"dir\"",
+        );
+        serde_json::from_str::<VmManifest>(&bad).expect_err("unknown rootfs fields must reject");
     }
 
     #[test]
