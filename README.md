@@ -29,25 +29,41 @@ Build the Agent binary with `cargo build --release` and run it on the host machi
 
 ```bash
 # Install dependencies (fedora)
-sudo dnf in -y clang-devel nftables cloud-hypervisor
+sudo dnf in -y clang-devel nftables cloud-hypervisor protobuf-compiler
 
 # Build the Agent
 cargo build --release
 
 # Run the Agent & Manager (requires write permissions to /run/odorobo)
-sudo ./target/release/odorobo --manager-enabled # or set ODOROBO_MANAGER_ENABLED=true
+sudo ./target/release/odorobo --manager-enabled true # or set ODOROBO_MANAGER_ENABLED=true
 
 # Run on other boxes
 sudo ./target/release/odorobo
 ```
+
+Agent startup requires a reachable etcd v3 endpoint for durable cluster
+state. The default is `http://127.0.0.1:2379`; configure another endpoint with
+`ODOROBO_ETCD_ENDPOINTS` (comma-separated for multiple endpoints). All nodes in
+a cluster must use the same etcd store. Set a stable, unique `ODOROBO_HOSTNAME`
+for each node sharing that store and retain it across restarts. For systemd,
+put both values in `/etc/odorobo/config.env`, loaded by the service:
+
+```ini
+ODOROBO_ETCD_ENDPOINTS=http://etcd.example.net:2379
+ODOROBO_HOSTNAME=node-1
+```
+
+The [local development stack](.local/dev/README.md) includes persistent etcd.
+`protobuf-compiler` is required at build time by `etcd-client`. This is the
+persistence foundation (issue #100), not automatic VM restart or HA: run only
+one active mutation manager until runtime fencing and recovery are implemented
+(issue #101).
 
 ### Sentry error reporting
 
 Sentry is initialized with the project DSN from the `sentry_dsn` field in
 `odorobo/config.json`. Odorobo does not send default PII to Sentry, including
 user IPs or potentially sensitive HTTP headers.
-
-You can run multiple managers for load balancing and HA, but it is not required.
 
 Install the CLI helper
 

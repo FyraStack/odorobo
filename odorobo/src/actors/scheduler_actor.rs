@@ -23,8 +23,9 @@ mod scheduling;
 #[cfg(test)]
 mod tests;
 
-use std::time::Instant;
+use std::{sync::Arc, time::Instant};
 
+use crate::cluster_state::{PlacementRecord, StateStore};
 use ahash::{AHashMap, AHashSet};
 use kameo::prelude::*;
 use tokio::task::JoinHandle;
@@ -146,6 +147,8 @@ pub struct SchedulerActor {
     pub vm_manifests: AHashMap<Ulid, VmManifest>,
     /// Desired and observed VM placements; multiple entries allow migration.
     pub vm_placements: AHashMap<Ulid, Vec<VmPlacement>>,
+    /// Durable manager-owned host assignments; observations never rewrite them.
+    pub durable_placements: AHashMap<Ulid, PlacementRecord>,
     /// VM actor references. `None` marks a placement awaiting discovery.
     pub vm_data_cache: AHashMap<Ulid, Vec<CachedVMActor>>,
     /// Polling tasks that refresh corresponding VM actor cache entries.
@@ -158,6 +161,8 @@ pub struct SchedulerActor {
     agent_vm_index: AHashMap<ActorId, AHashSet<Ulid>>,
     /// Classifies linked actors so link-death cleanup affects the owning cache only.
     actor_kinds: AHashMap<ActorId, CachedActorKind>,
-    /// Background discovery and reconciliation task.
+    /// Background actor-observation task; it does not recreate durable VMs.
     pub cache_actor_finder: Option<JoinHandle<()>>,
+    /// Durable cluster state shared with agents for VM placement recovery.
+    pub state_store: Arc<StateStore>,
 }

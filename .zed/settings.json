@@ -23,7 +23,7 @@
           "extraArgs": ["--"],
         },
         "diagnostics": {
-          "disabled": ["macro-error"],
+          // "disabled": ["macro-error"],
         },
         "procMacro": {
           "enable": true,
