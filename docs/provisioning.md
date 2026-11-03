@@ -60,9 +60,12 @@ signal exits immediately. The shipped systemd unit uses `KillMode=mixed` so
 only the agent gets the SIGTERM (the VMMs run in its cgroup), and a 90 second
 `TimeoutStopSec` so systemd doesn't SIGKILL it mid-shutdown. If you write your
 own unit, keep both. The single-instance lockfile (`/var/lock/odorobo.lock`) is
-an flock, so an agent that was killed outright doesn't block the next start. The registry also records each lease's VMM process
-(PID plus kernel start time), so after an unclean agent exit a restarted agent
-treats a lease as stopped once that exact process is gone. An explicit delete
+an flock, so an agent that was killed outright doesn't block the next start.
+
+The registry also records each lease's VMM process by PID, kernel start time,
+and boot ID, so a process from before a reboot is never mistaken for a new one.
+After an unclean agent exit, a restarted agent treats a lease as stopped once
+that exact process is gone, meaning every one of its threads has exited. An explicit delete
 of a VM whose VMM is still running with no actor left (for example after the
 agent was killed) SIGKILLs that exact process before releasing its lease and
 runtime files. A lease that never had its process recorded (the agent died

@@ -17,11 +17,16 @@ use stable_eyre::{
 };
 use ulid::Ulid;
 
-use crate::vmm_process::ProcessIdentity;
+use crate::vmm_process::{BootId, ProcessIdentity};
 
 const FIRST_GUEST_CID: u32 = 3;
 const MAX_GUEST_CID: u32 = u32::MAX - 1;
-const REGISTRY_VERSION: u32 = 1;
+/// bump this for any change an older agent can't read. older agents refuse a
+/// newer version instead of rewriting the file without the fields they don't
+/// know. 2 added the boot ID to recorded processes
+const REGISTRY_VERSION: u32 = 2;
+/// oldest version we can still read and upgrade in place
+const OLDEST_REGISTRY_VERSION: u32 = 1;
 const REGISTRY_ENV: &str = "ODOROBO_VSOCK_CID_REGISTRY";
 const DEFAULT_REGISTRY: &str = "/var/lib/odorobo/vsock-cids.json";
 static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
@@ -87,8 +92,51 @@ struct Registry {
     lease_tokens: BTreeMap<String, VsockLeaseToken>,
     /// the VMM holding each active lease, so a restarted agent can tell whether
     /// it's still running instead of blocking the ID forever
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_processes")]
     processes: BTreeMap<String, ProcessIdentity>,
+}
+
+/// just enough to check the version before the strict parse, so a newer file
+/// gets a clear error instead of a complaint about fields we don't know
+#[derive(Deserialize)]
+struct RegistryVersion {
+    version: u32,
+}
+
+/// a recorded process as any version wrote it. version 1 had no boot ID
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredProcess {
+    pid: u32,
+    start_time: u64,
+    #[serde(default)]
+    boot_id: Option<BootId>,
+}
+
+/// drops processes recorded without a boot ID. we can't tell which boot they
+/// came from, so they can't safely be checked or killed. their leases go back
+/// to needing a manual cleanup, like before processes were recorded at all
+fn deserialize_processes<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<String, ProcessIdentity>, D::Error> {
+    let stored = BTreeMap::<String, StoredProcess>::deserialize(deserializer)?;
+    Ok(stored
+        .into_iter()
+        .filter_map(|(vmid, process)| {
+            let Some(boot_id) = process.boot_id else {
+                tracing::warn!(%vmid, pid = process.pid, "forgetting a VMM recorded without a boot ID");
+                return None;
+            };
+            Some((
+                vmid,
+                ProcessIdentity {
+                    pid: process.pid,
+                    start_time: process.start_time,
+                    boot_id,
+                },
+            ))
+        })
+        .collect())
 }
 
 impl Registry {
@@ -411,9 +459,23 @@ impl VsockCidAllocator {
     }
 
     fn read_registry(&self) -> Result<Registry> {
-        let registry = match fs::read(&self.registry_path) {
-            Ok(contents) => serde_json::from_slice::<Registry>(&contents)
-                .wrap_err("vsock CID registry is invalid JSON")?,
+        let mut registry = match fs::read(&self.registry_path) {
+            Ok(contents) => {
+                let version = serde_json::from_slice::<RegistryVersion>(&contents)
+                    .wrap_err("vsock CID registry is invalid JSON")?
+                    .version;
+                if version > REGISTRY_VERSION {
+                    return Err(eyre!(
+                        "vsock CID registry is version {version}, written by a newer odorobo. \
+                         this one only supports up to version {REGISTRY_VERSION}"
+                    ));
+                }
+                if version < OLDEST_REGISTRY_VERSION {
+                    return Err(eyre!("unsupported vsock CID registry version {version}"));
+                }
+                serde_json::from_slice::<Registry>(&contents)
+                    .wrap_err("vsock CID registry is invalid JSON")?
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Registry {
                 version: REGISTRY_VERSION,
                 assignments: BTreeMap::new(),
@@ -423,12 +485,8 @@ impl VsockCidAllocator {
             },
             Err(error) => return Err(error).wrap_err("failed to read vsock CID registry"),
         };
-        if registry.version != REGISTRY_VERSION {
-            return Err(eyre!(
-                "unsupported vsock CID registry version {}",
-                registry.version
-            ));
-        }
+        // older versions upgrade in place. the next write saves the new version
+        registry.version = REGISTRY_VERSION;
         let mut seen = HashSet::new();
         for (vmid, cid) in &registry.assignments {
             if !(FIRST_GUEST_CID..=MAX_GUEST_CID).contains(cid) {
@@ -832,6 +890,72 @@ mod tests {
     }
 
     #[test]
+    fn version_1_registries_upgrade_and_drop_processes_without_a_boot_id() {
+        let (allocator, directory) = allocator();
+        fs::create_dir_all(&directory).unwrap();
+        let vmid = Ulid::generate();
+        let token = VsockLeaseToken(Ulid::generate());
+        let legacy = serde_json::json!({
+            "version": 1,
+            "assignments": { vmid.to_string(): 42 },
+            "lease_tokens": { vmid.to_string(): token },
+            "processes": { vmid.to_string(): { "pid": 1, "start_time": 1 } },
+        });
+        fs::write(
+            &allocator.registry_path,
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+
+        // we can't tell which boot that process came from, so it's not used
+        assert_eq!(allocator.recorded_process(vmid).unwrap(), None);
+        assert!(!allocator.reconcile_exited(vmid).unwrap());
+
+        // the next write saves it as the current version with a boot ID
+        let process = ProcessIdentity::of(std::process::id()).unwrap();
+        allocator
+            .record_process_owned(vmid, token, process)
+            .unwrap();
+        let written: serde_json::Value =
+            serde_json::from_slice(&fs::read(&allocator.registry_path).unwrap()).unwrap();
+        assert_eq!(written["version"], REGISTRY_VERSION);
+        assert_eq!(
+            written["processes"][vmid.to_string()]["boot_id"],
+            BootId::current().unwrap().to_string()
+        );
+        assert_eq!(allocator.recorded_process(vmid).unwrap(), Some(process));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn newer_registry_versions_are_refused_with_a_clear_error() {
+        let (allocator, directory) = allocator();
+        fs::create_dir_all(&directory).unwrap();
+        let newer = serde_json::json!({
+            "version": REGISTRY_VERSION + 1,
+            "assignments": {},
+            "something_new": true,
+        });
+        fs::write(
+            &allocator.registry_path,
+            serde_json::to_vec(&newer).unwrap(),
+        )
+        .unwrap();
+        let error = allocator.leased_vms().unwrap_err().to_string();
+        assert!(error.contains("written by a newer odorobo"), "{error}");
+        // and nothing gets rewritten over it
+        drop(
+            allocator
+                .reserve_with_previous(Ulid::generate(), None)
+                .unwrap_err(),
+        );
+        let on_disk: serde_json::Value =
+            serde_json::from_slice(&fs::read(&allocator.registry_path).unwrap()).unwrap();
+        assert_eq!(on_disk, newer);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn rejects_wildcard_cid() {
         let (allocator, directory) = allocator();
         drop(
@@ -892,6 +1016,7 @@ mod tests {
         let process = ProcessIdentity {
             pid: std::process::id(),
             start_time: 1,
+            boot_id: BootId::current().unwrap(),
         };
         allocator
             .record_process_owned(vmid, old.token, process)
