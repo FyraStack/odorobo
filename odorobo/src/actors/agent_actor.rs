@@ -255,6 +255,8 @@ impl Message<DeleteVM> for AgentActor {
         msg: DeleteVM,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
+        // Deletion removes the agent's membership and resource accounting before
+        // actor teardown; shutdown intentionally leaves these intact.
         match self.remove_vm(msg.vmid) {
             Some(cache_data) => {
                 let res = cache_data.actor_ref.tell(msg.clone()).await;
@@ -282,18 +284,21 @@ impl Message<ShutdownVM> for AgentActor {
         msg: ShutdownVM,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        if let Some(actor_ref) = Self::lookup_vm_actor(msg.vmid).await {
-            trace!(?msg, "Telling VM to shut down");
-            let res = actor_ref.tell(msg.clone()).await;
-            if let Err(err) = res {
-                warn!(vm_id = %msg.vmid, ?err, "failed to shutdown VM actor");
-            }
-        } else {
+        // Keep the VM in `self.vms`: shutdown powers off its guest but retains
+        // the actor/runtime, membership status, and resource reservation.
+        let Some(actor_ref) = Self::lookup_vm_actor(msg.vmid).await else {
             warn!(vm_id = %msg.vmid, "VM actor not found for shutdown");
             return Err("VM actor not found for shutdown".to_owned());
-        }
+        };
 
-        Ok(ShutdownVMReply)
+        trace!(?msg, "Asking VM guest to shut down");
+        match actor_ref.ask(msg.clone()).await {
+            Ok(reply) => Ok(reply),
+            Err(error) => {
+                warn!(vm_id = %msg.vmid, ?error, "failed to shut down VM guest");
+                Err(error.to_string())
+            }
+        }
     }
 }
 // forward GetVMInfo to VM actor

@@ -16,6 +16,27 @@ use stable_eyre::Report;
 use stable_eyre::eyre::{Context as EyreContext, eyre};
 use tracing::info;
 
+fn link_is_absent(error: &NetlinkError) -> bool {
+    matches!(error, NetlinkError::NetlinkError(error) if error.raw_code() == -libc::ENODEV)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NetlinkError, link_is_absent};
+
+    #[test]
+    fn only_missing_interfaces_are_ignored_during_detach() {
+        for code in [libc::ENODEV, libc::EPERM, libc::EIO, libc::EINVAL] {
+            let mut error = rtnetlink::packet_core::ErrorMessage::default();
+            error.code = std::num::NonZeroI32::new(-code);
+            assert_eq!(
+                link_is_absent(&NetlinkError::NetlinkError(error)),
+                code == libc::ENODEV
+            );
+        }
+    }
+}
+
 pub struct DhcpActor {
     pub config: DhcpConfig,
     bridge: String,
@@ -154,19 +175,33 @@ pub struct NetworkAgentActor {
 }
 
 impl NetworkAgentActor {
-    async fn lookup_link_by_name(
+    async fn find_link_by_name(
         &self,
         link_name: &str,
-    ) -> Result<rtnetlink::packet_route::link::LinkMessage, Report> {
-        self.netlink_handle
+    ) -> Result<Option<rtnetlink::packet_route::link::LinkMessage>, Report> {
+        let result = self
+            .netlink_handle
             .link()
             .get()
             .match_name(link_name.to_owned())
             .execute()
-            .next()
-            .await
-            .ok_or_else(|| eyre!("link {} not found", link_name))?
-            .wrap_err_with(|| format!("failed to query link {link_name}"))
+            .try_next()
+            .await;
+        match result {
+            // A named RTM_GETLINK lookup returns ENODEV, not an empty stream,
+            // when Cloud Hypervisor has already removed its nonpersistent TAP.
+            Err(ref error) if link_is_absent(error) => Ok(None),
+            other => other.wrap_err_with(|| format!("failed to query link {link_name}")),
+        }
+    }
+
+    async fn lookup_link_by_name(
+        &self,
+        link_name: &str,
+    ) -> Result<rtnetlink::packet_route::link::LinkMessage, Report> {
+        self.find_link_by_name(link_name)
+            .await?
+            .ok_or_else(|| eyre!("link {} not found", link_name))
     }
 
     fn nft_table_exists(objects: &[NfObject<'_>], table: &str) -> bool {
@@ -630,15 +665,14 @@ impl Message<DetachTap> for NetworkAgentActor {
         msg: DetachTap,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        let tap = self
-            .lookup_link_by_name(&msg.tap_name)
-            .await
-            .wrap_err_with(|| {
-                format!(
-                    "failed to resolve tap {} for detach on vm {}",
-                    msg.tap_name, msg.vmid
-                )
-            })?;
+        let Some(tap) = self.find_link_by_name(&msg.tap_name).await? else {
+            info!(
+                vmid = %msg.vmid,
+                tap = %msg.tap_name,
+                "TAP is already absent; treating detach as complete"
+            );
+            return Ok(());
+        };
 
         info!(
             vmid = %msg.vmid,
@@ -647,7 +681,8 @@ impl Message<DetachTap> for NetworkAgentActor {
             "detaching tap from bridge"
         );
 
-        self.netlink_handle
+        let result = self
+            .netlink_handle
             .link()
             .set(
                 LinkUnspec::new_with_index(tap.header.index)
@@ -655,13 +690,17 @@ impl Message<DetachTap> for NetworkAgentActor {
                     .build(),
             )
             .execute()
-            .await
-            .wrap_err_with(|| {
+            .await;
+        match result {
+            // The TAP can disappear between lookup and detach as well.
+            Err(ref error) if link_is_absent(error) => return Ok(()),
+            other => other.wrap_err_with(|| {
                 format!(
                     "failed to detach tap {} from bridge {}",
                     msg.tap_name, self.common.bridge
                 )
-            })?;
+            })?,
+        }
 
         info!(
             vmid = %msg.vmid,

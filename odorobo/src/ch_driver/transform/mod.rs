@@ -1,6 +1,9 @@
 use cloud_hypervisor_client::models::VmConfig;
 use stable_eyre::Result;
 
+#[cfg(test)]
+mod tests;
+
 pub trait ConfigTransform: Send + Sync {
     fn transform(&self, vmid: &str, config: &mut VmConfig) -> Result<()>;
 
@@ -48,10 +51,15 @@ impl ConfigTransform for TransformChain {
 
     fn teardown(&self, vmid: &str, config: &mut VmConfig) -> Result<()> {
         trace!("Teardown transform chain with {} transforms", self.0.len());
+        let mut first_error = None;
         for t in self.0.iter().rev() {
-            t.teardown(vmid, config)?;
+            if let Err(error) = t.teardown(vmid, config)
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
         }
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 }
 

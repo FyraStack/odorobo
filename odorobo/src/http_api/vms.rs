@@ -70,6 +70,7 @@ async fn create_vm(
     Ok(Json(response))
 }
 
+/// Permanently removes the VM, including its agent membership and runtime resources.
 async fn delete_vm(
     State(state): State<ActorRef<HTTPActor>>,
     Path(VmId(vmid)): Path<VmId>,
@@ -79,6 +80,7 @@ async fn delete_vm(
     Ok(Json(()))
 }
 
+/// Powers off the guest while keeping the VM actor, configuration, and allocation.
 async fn shutdown_vm(
     State(state): State<ActorRef<HTTPActor>>,
     Path(VmId(vmid)): Path<VmId>,

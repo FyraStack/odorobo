@@ -53,12 +53,22 @@ impl ISCSITarget {
             .output()
             .await
             .map_err(|e| eyre!("Failed to execute iscsiadm command: {e}"))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(eyre!("iscsiadm logout failed: {stderr}"));
-        }
-        Ok(())
+        check_logout_status(
+            output.status.success(),
+            output.status.code(),
+            &output.stderr,
+        )
     }
+}
+
+fn check_logout_status(success: bool, exit_code: Option<i32>, stderr: &[u8]) -> Result<()> {
+    const ISCSI_ERR_NO_OBJS_FOUND: i32 = 21;
+    if success || exit_code == Some(ISCSI_ERR_NO_OBJS_FOUND) {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(stderr);
+    Err(eyre!("iscsiadm logout failed: {stderr}"))
 }
 
 impl From<ISCSITarget> for PathBuf {
@@ -155,6 +165,28 @@ impl StorageDriver for ISCSIStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn logout_succeeds_when_no_matching_iscsi_session_exists() {
+        let stderr = b"iscsiadm: No matching sessions found\n";
+
+        // A second LUN for the same target can log out after the first LUN has
+        // already logged out the shared session.
+        assert!(check_logout_status(false, Some(21), stderr).is_ok());
+    }
+
+    #[test]
+    fn logout_preserves_unexpected_iscsi_errors() {
+        let stderr = b"iscsiadm: Could not logout of session: connection failure\n";
+
+        let error = check_logout_status(false, Some(15), stderr).unwrap_err();
+        assert!(error.to_string().contains("connection failure"));
+    }
+
+    #[test]
+    fn logout_accepts_successful_iscsi_command() {
+        assert!(check_logout_status(true, Some(0), b"").is_ok());
+    }
 
     #[test]
     fn test_iscsi_target_parsing_from_path() {
