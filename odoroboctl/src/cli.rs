@@ -215,7 +215,7 @@ mod tests {
                 vmid: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
             },
         })
-        .await;
+            .await;
 
         server.await??;
         let error = result
@@ -224,6 +224,7 @@ mod tests {
         assert!(error.to_string().contains("500"));
 
         Ok(())
+    }
 
     #[test]
     fn create_options_default_to_current_vm_settings() {
