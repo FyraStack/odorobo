@@ -8,8 +8,10 @@ use tokio::{
     process::{Child, Command},
 };
 
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
-const REAP_TIMEOUT: Duration = Duration::from_secs(2);
+pub(in crate::ch_driver::transform::storage) const COMMAND_TIMEOUT: Duration =
+    Duration::from_secs(30);
+// a killed CLI gets this long to be reaped before we stop waiting on it
+pub(in crate::ch_driver::transform::storage) const REAP_TIMEOUT: Duration = Duration::from_secs(2);
 const OUTPUT_LIMIT: usize = 64 * 1024;
 
 pub(in crate::ch_driver::transform::storage) enum CommandFailure {

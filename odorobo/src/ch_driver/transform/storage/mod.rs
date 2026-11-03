@@ -143,8 +143,23 @@ pub trait StorageDriver: Send + Sync {
 
 // wait deadlines only limit how long the caller waits, not the backend future.
 // so block_in_place/Handle::block_on callers get control back without cancelling
-// a map/logout command whose subprocess or daemon might still be doing stuff
-const OPERATION_WAIT: Duration = Duration::from_secs(30);
+// a map/logout command whose subprocess or daemon might still be doing stuff.
+// it still has to cover the slowest work that can actually succeed, or a slow
+// but fine create gets reported as failed and torn down. worst cases per op:
+// - RBD resolve: `device list` + `device map` + `device list` to acquire, then
+//   the udev wait and one more `device list`. that's the most commands, 4
+// - RBD release: `device list` + `device unmap` + `device list`
+// - iSCSI: one login/logout, but each sysfs scan can do a DNS lookup (canonical
+//   lookup, pre-login check, post-login check, resolve/logout check)
+// a stuck command gets its timeout plus reap grace before we give up on it.
+// adding the RBD and iSCSI extras together over-counts a bit, which is fine
+const MAX_COMMANDS_PER_OPERATION: u32 = 4;
+const MAX_DNS_LOOKUPS_PER_OPERATION: u32 = 4;
+const OPERATION_WAIT: Duration = iscsi::command::COMMAND_TIMEOUT
+    .saturating_add(iscsi::command::REAP_TIMEOUT)
+    .saturating_mul(MAX_COMMANDS_PER_OPERATION)
+    .saturating_add(rbd::UDEV_WAIT)
+    .saturating_add(iscsi::DNS_TIMEOUT.saturating_mul(MAX_DNS_LOOKUPS_PER_OPERATION));
 
 struct Operation<T: Clone> {
     result: watch::Sender<Option<std::result::Result<T, String>>>,
@@ -455,6 +470,7 @@ impl StorageDriverTransformer {
     /// their leases so they can be retried, even from a fresh default transformer
     pub async fn release_vm(&self, vmid: &str) -> Result<()> {
         let mut registry = self.registry.lock().await;
+        let deadline = self.cleanup_wait(&registry, vmid);
         let operation = if let Some(operation) = registry.cleaning.get(vmid) {
             Arc::clone(operation)
         } else {
@@ -489,7 +505,19 @@ impl StorageDriverTransformer {
             operation
         };
         drop(registry);
-        operation.wait_bounded(self.operation_wait).await
+        operation.wait_bounded(deadline).await
+    }
+
+    /// cleanup goes through a VM's disks one at a time, so give it one operation
+    /// budget per step instead of squeezing every disk into one. a pending
+    /// resolve has to finish first and can add a lease of its own, so it counts
+    /// twice. joining an in-flight cleanup only has what's left to wait on
+    fn cleanup_wait(&self, registry: &StorageRegistry, vmid: &str) -> Duration {
+        let leases = registry.leases.get(vmid).map_or(0, Vec::len);
+        let pending = registry.resolving.get(vmid).map_or(0, Vec::len);
+        let steps = leases.saturating_add(pending.saturating_mul(2)).max(1);
+        self.operation_wait
+            .saturating_mul(u32::try_from(steps).unwrap_or(u32::MAX))
     }
 
     async fn release_owned(registry: Arc<Mutex<StorageRegistry>>, vmid: &str) -> Result<()> {
@@ -895,6 +923,42 @@ mod tests {
         transform
             .resolve_disk(vmid, &uri, transform.find_backend(&uri).unwrap())
             .await
+    }
+
+    #[test]
+    fn default_deadline_covers_worst_case_backend_work() {
+        let command = iscsi::command::COMMAND_TIMEOUT + iscsi::command::REAP_TIMEOUT;
+        // RBD acquire + resolve is the slowest path that can still succeed
+        assert!(OPERATION_WAIT >= command * 4 + rbd::UDEV_WAIT);
+        assert!(OPERATION_WAIT >= command + iscsi::DNS_TIMEOUT * 4);
+    }
+
+    #[test]
+    fn cleanup_deadline_scales_with_serial_steps() {
+        let transform = StorageDriverTransformer {
+            registry: Arc::default(),
+            operation_wait: Duration::from_secs(10),
+            ..StorageDriverTransformer::new()
+        };
+        let mut registry = StorageRegistry::default();
+        assert_eq!(
+            transform.cleanup_wait(&registry, "vm"),
+            Duration::from_secs(10)
+        );
+        registry
+            .leases
+            .insert("vm".to_owned(), vec!["a".to_owned(), "b".to_owned()]);
+        registry
+            .resolving
+            .insert("vm".to_owned(), vec![Operation::new()]);
+        assert_eq!(
+            transform.cleanup_wait(&registry, "vm"),
+            Duration::from_secs(40)
+        );
+        assert_eq!(
+            transform.cleanup_wait(&registry, "other"),
+            Duration::from_secs(10)
+        );
     }
 
     #[test]

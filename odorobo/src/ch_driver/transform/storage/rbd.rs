@@ -4,7 +4,7 @@ use stable_eyre::{
     Result,
     eyre::{ensure, eyre},
 };
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 use tokio::process::Command;
 use tracing::{info, trace};
 use url::Url;
@@ -13,6 +13,10 @@ const CEPH_ID_ENV: &str = "CEPH_ID";
 const CEPH_KEYFILE_ENV: &str = "CEPH_KEYFILE";
 const CEPH_CLUSTER_ENV: &str = "CEPH_CLUSTER";
 const CEPH_CONFIG_ENV: &str = "CEPH_CONFIG";
+
+const UDEV_POLL: Duration = Duration::from_millis(100);
+/// how long resolve waits for the udev stable path before falling back
+pub(super) const UDEV_WAIT: Duration = Duration::from_secs(10);
 
 fn rbd_extra_args() -> Vec<String> {
     let mut args = Vec::new();
@@ -314,19 +318,20 @@ impl StorageDriver for RbdStorage {
 
     async fn resolve(&self, uri: &Url) -> Result<PathBuf> {
         let image = RbdImage::try_from(uri)?;
-        // map() uses `--options noudev`: with udev enabled, the rbd CLI waits
+        // map() uses `--options noudev`. with udev enabled, the rbd CLI waits
         // for a udev event in its own network namespace, but rbd devices are
         // created in the host's namespace, so that wait never completes in a
-        // container. The kernel uevent still reaches the host's udevd, so the
-        // stable path appears shortly after the map. Wait up to 10s (100 x
-        // 100ms steps) for it, and fall back to the kernel device name (e.g.
-        // /dev/rbd0) when the host has no ceph udev rule.
+        // container. the kernel uevent still reaches the host's udevd, so the
+        // stable path appears shortly after the map. wait up to UDEV_WAIT for
+        // it, and fall back to the kernel device name (e.g. /dev/rbd0) when the
+        // host has no ceph udev rule
         let udev_path = image.device_path();
-        for _ in 0..100 {
+        let started = tokio::time::Instant::now();
+        while started.elapsed() < UDEV_WAIT {
             if udev_path.exists() {
                 return Ok(udev_path);
             }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            tokio::time::sleep(UDEV_POLL).await;
         }
         let device = rbd_map_list()
             .await?

@@ -134,6 +134,27 @@ running. The in-memory lease ledger is not persisted across agent restarts, so
 inventory and reconcile outstanding RBD mappings before restarting an agent
 that has active or uncertain storage operations.
 
+### Operation deadlines
+
+Storage work runs in background tasks; callers (VM create and delete) only
+wait for it up to a deadline. The deadline is derived from the storage command
+limits rather than picked by hand: each `rbd`/`iscsiadm` invocation gets 30
+seconds plus a 2-second reap grace, and one disk resolution can run up to four
+of them (RBD `device list`, `device map`, `device list`, then another
+`device list` after up to 10 seconds of waiting for the udev path), plus up to
+four 5-second iSCSI DNS lookups. That gives a per-operation budget of about
+158 seconds. VM create applies it to each disk separately. VM delete releases
+disks one after another, so its deadline is one budget per lease (and two per
+still-pending resolution, which must finish and may add a lease).
+
+A "Storage operation deadline exceeded" error does not mean the operation
+failed or was cancelled. The work is still running and the agent keeps the VM's
+leases and any quarantine while it does. Retrying the delete (or the teardown
+after a failed create) joins the in-flight cleanup instead of starting a second
+one, and a new create for the same VM is refused until the earlier work
+finishes. Do not reuse or manually unmap/log out the storage while it is still
+in flight.
+
 VM shutdown/deletion releases VM attachments according to the VM lifecycle,
 but does not delete backing images. A VM's configured disk order is preserved;
 the first manifest storage entry is the preferred boot disk.

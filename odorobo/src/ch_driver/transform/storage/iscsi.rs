@@ -291,7 +291,7 @@ fn confirms_login(stdout: &[u8], iqn: &str) -> bool {
         == 1
 }
 
-const DNS_TIMEOUT: Duration = Duration::from_secs(5);
+pub(super) const DNS_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn split_portal(portal: &str) -> Result<(&str, u16)> {
     let (host, port) = portal
