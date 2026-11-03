@@ -1,4 +1,5 @@
 pub mod actor;
+pub mod http_relay;
 
 #[cfg(target_os = "linux")]
 mod actor_linux;

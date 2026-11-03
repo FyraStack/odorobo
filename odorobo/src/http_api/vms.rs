@@ -16,9 +16,9 @@ use axum::{
     http::header,
     response::IntoResponse,
 };
-use kameo::actor::ActorRef;
+use kameo::actor::RemoteActorRef;
 
-pub fn router() -> ApiRouter<ActorRef<HTTPActor>> {
+pub fn router() -> ApiRouter<RemoteActorRef<HTTPActor>> {
     ApiRouter::new()
         .api_route("/", get(list_vms))
         .api_route("/", post(create_vm))
@@ -30,9 +30,9 @@ pub fn router() -> ApiRouter<ActorRef<HTTPActor>> {
 }
 
 async fn list_vms(
-    State(state): State<ActorRef<HTTPActor>>,
+    State(state): State<RemoteActorRef<HTTPActor>>,
 ) -> Result<impl IntoApiResponse, OdoroboError> {
-    let reply = state.ask(AgentListVMs).await?;
+    let reply = state.ask(&AgentListVMs).await?;
 
     Ok(Json(VMListResponse {
         vms: reply.vms.into_iter().map(VmId).collect(),
@@ -41,10 +41,10 @@ async fn list_vms(
 
 /// Get detailed information about a specific VM
 async fn vm_info(
-    State(state): State<ActorRef<HTTPActor>>,
+    State(state): State<RemoteActorRef<HTTPActor>>,
     Path(VmId(vmid)): Path<VmId>,
 ) -> Result<impl IntoApiResponse, OdoroboError> {
-    let reply = state.ask(GetVMInfo { vmid: Some(vmid) }).await?;
+    let reply = state.ask(&GetVMInfo { vmid: Some(vmid) }).await?;
     if reply.config.is_none() {
         return Err(OdoroboError::NotFound(format!("VM {vmid} not found")));
     }
@@ -55,7 +55,7 @@ async fn vm_info(
 }
 
 async fn create_vm(
-    State(state): State<ActorRef<HTTPActor>>,
+    State(state): State<RemoteActorRef<HTTPActor>>,
     Json(request): Json<CreateVMRequest>,
 ) -> Result<Json<serde_json::Value>, OdoroboError> {
     let message = CreateVM {
@@ -63,7 +63,7 @@ async fn create_vm(
         config: request.vm,
     };
 
-    let reply = state.ask(message).await?;
+    let reply = state.ask(&message).await?;
 
     let response = serde_json::to_value(reply)
         .map_err(|error| OdoroboError::Report(stable_eyre::Report::from(error)))?;
@@ -71,28 +71,28 @@ async fn create_vm(
 }
 
 async fn delete_vm(
-    State(state): State<ActorRef<HTTPActor>>,
+    State(state): State<RemoteActorRef<HTTPActor>>,
     Path(VmId(vmid)): Path<VmId>,
 ) -> Result<impl IntoApiResponse, OdoroboError> {
-    let _reply = state.ask(DeleteVM { vmid }).await?;
+    let _reply = state.ask(&DeleteVM { vmid }).await?;
 
     Ok(Json(()))
 }
 
 async fn shutdown_vm(
-    State(state): State<ActorRef<HTTPActor>>,
+    State(state): State<RemoteActorRef<HTTPActor>>,
     Path(VmId(vmid)): Path<VmId>,
 ) -> Result<impl IntoApiResponse, OdoroboError> {
-    let _reply = state.ask(ShutdownVM { vmid }).await?;
+    let _reply = state.ask(&ShutdownVM { vmid }).await?;
 
     Ok(Json(()))
 }
 
 async fn console_history(
-    State(state): State<ActorRef<HTTPActor>>,
+    State(state): State<RemoteActorRef<HTTPActor>>,
     Path(VmId(vmid)): Path<VmId>,
 ) -> Result<impl IntoApiResponse, OdoroboError> {
-    let reply = state.ask(GetConsoleHistory { vmid }).await?;
+    let reply = state.ask(&GetConsoleHistory { vmid }).await?;
 
     Ok((
         [(header::CONTENT_TYPE, "application/octet-stream")],
@@ -100,6 +100,10 @@ async fn console_history(
     ))
 }
 
+/// Update an existing VM's configuration (e.g. resize, change resources, etc.)
+///
+/// todo: make new schema for update request that allows partial updates
+///
 /// VM configuration updates are not supported by the scheduler yet.
 async fn update_vm(Path(VmId(_vmid)): Path<VmId>) -> axum::response::Response {
     (

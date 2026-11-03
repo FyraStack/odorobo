@@ -87,6 +87,9 @@ async fn inner_main(config: Config) -> Result<()> {
 
         scheduler_actor.wait_for_shutdown().await;
         http_actor.wait_for_shutdown().await;
+    } else {
+        // #154: Slave nodes run HTTP service redirecting to manager
+        networking::http_relay::relay_main_loop().await;
     }
 
     agent_actor.wait_for_shutdown().await;

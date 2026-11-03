@@ -12,9 +12,9 @@ use axum::{
     Json,
     extract::{Path, State},
 };
-use kameo::actor::ActorRef;
+use kameo::actor::RemoteActorRef;
 
-pub fn router() -> ApiRouter<ActorRef<HTTPActor>> {
+pub fn router() -> ApiRouter<RemoteActorRef<HTTPActor>> {
     ApiRouter::new()
         .api_route("/", put(create_volume))
         .api_route("/{volid}", get(volume_info))
@@ -32,7 +32,7 @@ async fn volume_info(
 
 /// Create a new volume with the specified parameters
 async fn create_volume(
-    State(_state): State<ActorRef<HTTPActor>>,
+    State(_state): State<RemoteActorRef<HTTPActor>>,
     Json(_request): Json<CreateVolumeRequest>,
 ) -> Result<impl IntoApiResponse, OdoroboError> {
     // stub
@@ -40,7 +40,7 @@ async fn create_volume(
 }
 /// Delete an existing volume by ID
 async fn delete_volume(
-    State(_state): State<ActorRef<HTTPActor>>,
+    State(_state): State<RemoteActorRef<HTTPActor>>,
     Path(VolumeId(_volid)): Path<VolumeId>,
 ) -> Result<impl IntoApiResponse, OdoroboError> {
     // stub
@@ -49,7 +49,7 @@ async fn delete_volume(
 
 /// Resize an existing volume to a new size
 async fn resize_volume(
-    State(_state): State<ActorRef<HTTPActor>>,
+    State(_state): State<RemoteActorRef<HTTPActor>>,
     Path(VolumeId(_volid)): Path<VolumeId>,
     Json(_request): Json<CreateVolumeRequest>,
 ) -> Result<impl IntoApiResponse, OdoroboError> {

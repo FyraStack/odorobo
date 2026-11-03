@@ -27,6 +27,10 @@ pub struct CreateVMReply {
     pub actor_id: Option<Vec<u8>>,
 }
 
+#[derive(Debug, thiserror::Error, Deserialize, Serialize)]
+#[error("failed to create VM via scheduler")]
+pub struct CreateVMError(pub String);
+
 /// Message to delete a VM's config from the agent, shutting it down
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CloudHypervisorDeleteVMConfig {
@@ -71,6 +75,10 @@ pub struct DeleteVM {
 #[derive(Serialize, Deserialize, Reply, Debug, Clone)]
 pub struct DeleteVMReply;
 
+#[derive(Debug, thiserror::Error, Deserialize, Serialize)]
+#[error("failed to delete VM via scheduler")]
+pub struct DeleteVMError(pub String);
+
 /// Shuts down a VM temporarily
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ShutdownVM {
@@ -79,6 +87,10 @@ pub struct ShutdownVM {
 
 #[derive(Serialize, Deserialize, Reply, Debug)]
 pub struct ShutdownVMReply;
+
+#[derive(Debug, thiserror::Error, Deserialize, Serialize)]
+#[error("failed to shutdown VM via scheduler")]
+pub struct ShutdownVMError(pub String);
 
 /// List VMs on an agent
 #[derive(Serialize, Deserialize, Debug)]
@@ -89,6 +101,10 @@ pub struct AgentListVMsReply {
     // list VMs
     pub vms: Vec<Ulid>,
 }
+
+#[derive(Debug, thiserror::Error, Deserialize, Serialize)]
+#[error("failed to list VMs via scheduler")]
+pub struct AgentListVMsError(pub String);
 
 /// Get VM info
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -101,6 +117,10 @@ pub struct GetVMInfoReply {
     pub vmid: Ulid,
     pub config: Option<VmManifest>,
 }
+
+#[derive(Debug, thiserror::Error, Deserialize, Serialize)]
+#[error("failed to get VM info via scheduler")]
+pub struct GetVMInfoError(pub String);
 
 /// Lightweight VM liveness check used by the scheduler heartbeat.
 #[derive(Serialize, Deserialize, Debug)]
@@ -121,6 +141,10 @@ pub struct GetConsoleHistory {
 pub struct GetConsoleHistoryReply {
     pub history: Vec<u8>,
 }
+
+#[derive(Debug, thiserror::Error, Deserialize, Serialize)]
+#[error("failed to get console history via scheduler")]
+pub struct GetConsoleHistoryError(pub String);
 
 /// Send raw input bytes to a VM's serial console.
 #[derive(Serialize, Deserialize, Debug, Clone)]

@@ -8,16 +8,17 @@ use axum::{
     Json,
     extract::{Path, State},
 };
-use kameo::actor::ActorRef;
+use kameo::actor::RemoteActorRef;
 
-pub fn router() -> ApiRouter<ActorRef<HTTPActor>> {
+pub fn router() -> ApiRouter<RemoteActorRef<HTTPActor>> {
     ApiRouter::new()
         .api_route("/drain", put(drain))
         .api_route("/{nodeid}", get(node_info))
 }
+
 /// Drain a node of all VMs, migrating them away or shutting them down as needed. This is used for maintenance mode.
 async fn drain(
-    State(_state): State<ActorRef<HTTPActor>>,
+    State(_state): State<RemoteActorRef<HTTPActor>>,
 ) -> Result<impl IntoApiResponse, OdoroboError> {
     // stub
     Ok(Json("Draining...".to_owned()))
@@ -25,7 +26,7 @@ async fn drain(
 
 /// Get detailed information about a specific node, including its current VMs and resource usage.
 async fn node_info(
-    State(_state): State<ActorRef<HTTPActor>>,
+    State(_state): State<RemoteActorRef<HTTPActor>>,
     Path(_node_id): Path<String>,
 ) -> Result<impl IntoApiResponse, OdoroboError> {
     // stub,
