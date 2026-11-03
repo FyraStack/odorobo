@@ -15,6 +15,7 @@ use crate::messages::vm::{
 use crate::{
     ch_driver::{VMInstance, manifest::to_vm_config},
     manifest::VmManifest,
+    vmm_process::ProcessIdentity,
     vsock_cid::{PublishedRegistryUpdate, VsockCidAllocator, VsockCidReservation, VsockLeaseToken},
 };
 use kameo::prelude::*;
@@ -65,6 +66,8 @@ pub struct FailedStartupCleanup(pub String);
 pub struct VMCleanupProof {
     process_exit_confirmed: AtomicBool,
     lease_token: std::sync::Mutex<Option<VsockLeaseToken>>,
+    /// lets a delete retry kill or confirm the VMM after the watcher is gone
+    process: std::sync::Mutex<Option<ProcessIdentity>>,
 }
 
 impl VMCleanupProof {
@@ -72,6 +75,7 @@ impl VMCleanupProof {
         Self {
             process_exit_confirmed: AtomicBool::new(process_exit_confirmed),
             lease_token: std::sync::Mutex::new(None),
+            process: std::sync::Mutex::new(None),
         }
     }
 
@@ -96,6 +100,25 @@ impl VMCleanupProof {
             .lease_token
             .lock()
             .expect("cleanup proof lock poisoned") = Some(token);
+    }
+
+    pub fn process(&self) -> Option<ProcessIdentity> {
+        *self.process.lock().expect("cleanup proof lock poisoned")
+    }
+
+    fn set_process(&self, process: ProcessIdentity) {
+        *self.process.lock().expect("cleanup proof lock poisoned") = Some(process);
+    }
+
+    /// write the VMM down next to its lease so a restarted agent can check on it.
+    /// this is best effort, without it the lease just needs a manual cleanup
+    fn record_process(&self, vmid: ulid::Ulid) {
+        if let (Some(token), Some(process)) = (self.lease_token(), self.process())
+            && let Err(error) =
+                VsockCidAllocator::from_environment().record_process_owned(vmid, token, process)
+        {
+            warn!(%vmid, ?error, "failed to record VMM process for its vsock lease");
+        }
     }
 }
 
@@ -530,6 +553,14 @@ impl Actor for VMActor {
         // Take the child process out so we can watch for unexpected death.
         // destroy() handles a missing child_process gracefully.
         let process_watcher = if let Some(mut child_process) = vminstance.take_child_process() {
+            match child_process.id().map(ProcessIdentity::of) {
+                Some(Ok(process)) => {
+                    cleanup_proof.set_process(process);
+                    cleanup_proof.record_process(vmid);
+                }
+                Some(Err(error)) => warn!(%vmid, ?error, "failed to identify VMM process"),
+                None => warn!(%vmid, "VMM process exited before we could identify it"),
+            }
             let (kill_sender, kill_receiver) = tokio::sync::oneshot::channel();
             let actor_ref = actor_ref.clone();
             let watcher = tokio::spawn(async move {
@@ -828,6 +859,8 @@ impl Message<MigrateVMReceive> for VMActor {
                     };
                 }
             };
+
+        self.cleanup_proof.record_process(self.vmid);
 
         // the actor holds onto this reservation until the process exits. if
         // anything below fails, we tear down the receiver and on_stop rolls it

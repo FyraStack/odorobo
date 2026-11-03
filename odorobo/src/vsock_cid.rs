@@ -17,6 +17,8 @@ use stable_eyre::{
 };
 use ulid::Ulid;
 
+use crate::vmm_process::ProcessIdentity;
+
 const FIRST_GUEST_CID: u32 = 3;
 const MAX_GUEST_CID: u32 = u32::MAX - 1;
 const REGISTRY_VERSION: u32 = 1;
@@ -83,6 +85,10 @@ struct Registry {
     /// there's a stopped record on disk. every new reservation gets a fresh token
     #[serde(default)]
     lease_tokens: BTreeMap<String, VsockLeaseToken>,
+    /// the VMM holding each active lease, so a restarted agent can tell whether
+    /// it's still running instead of blocking the ID forever
+    #[serde(default)]
+    processes: BTreeMap<String, ProcessIdentity>,
 }
 
 impl Registry {
@@ -100,6 +106,7 @@ impl Registry {
         self.assignments.remove(vmid);
         self.process_exited.remove(vmid);
         self.lease_tokens.remove(vmid);
+        self.processes.remove(vmid);
     }
 }
 
@@ -168,6 +175,7 @@ impl VsockCidAllocator {
                 registry.assignments.insert(vmid.clone(), cid);
             }
             registry.process_exited.remove(&vmid);
+            registry.processes.remove(&vmid);
             registry.lease_tokens.insert(vmid, token);
             let reservation = VsockCidReservation {
                 cid,
@@ -206,6 +214,8 @@ impl VsockCidAllocator {
                     ));
                 }
                 registry.assignments.insert(vmid.clone(), previous_cid);
+                // rollback only happens after our VMM exited, so its PID is stale
+                registry.processes.remove(&vmid);
                 // keep this reservation's token. restoring the stopped CID
                 // shouldn't let an older token act on the lease again
                 if reservation.previous_process_exited {
@@ -229,6 +239,49 @@ impl VsockCidAllocator {
             return Err(stable_eyre::Report::new(ActiveVsockLease(vmid)));
         }
         Ok(())
+    }
+
+    /// remember which VMM holds this reservation. a stale token can't attach a
+    /// process to a newer run of the same VM
+    pub fn record_process_owned(
+        &self,
+        vmid: Ulid,
+        token: VsockLeaseToken,
+        process: ProcessIdentity,
+    ) -> Result<()> {
+        self.with_registry(|registry| {
+            let vmid = vmid.to_string();
+            if registry.owns_lease(&vmid, token)? {
+                registry.processes.insert(vmid, process);
+            }
+            Ok(())
+        })
+    }
+
+    /// mark an active lease stopped if its recorded VMM is gone. this is how a
+    /// restarted agent gets past leases it lost track of. returns whether the
+    /// lease is now stopped (or there wasn't an active one)
+    pub fn reconcile_exited(&self, vmid: Ulid) -> Result<bool> {
+        let key = vmid.to_string();
+        let registry = self.read_registry()?;
+        if !registry.assignments.contains_key(&key) || registry.process_exited.contains(&key) {
+            return Ok(true);
+        }
+        let Some(process) = registry.processes.get(&key).copied() else {
+            return Ok(false);
+        };
+        if process.is_running()? {
+            return Ok(false);
+        }
+        self.with_registry(|registry| {
+            // only trust the check if nobody swapped the lease while we weren't holding the lock
+            if registry.assignments.contains_key(&key)
+                && registry.processes.get(&key) == Some(&process)
+            {
+                registry.process_exited.insert(key.clone());
+            }
+            Ok(!registry.assignments.contains_key(&key) || registry.process_exited.contains(&key))
+        })
     }
 
     /// mark exit only for the exact reservation this VMM owns. a stale token
@@ -346,6 +399,7 @@ impl VsockCidAllocator {
                 assignments: BTreeMap::new(),
                 process_exited: BTreeSet::new(),
                 lease_tokens: BTreeMap::new(),
+                processes: BTreeMap::new(),
             },
             Err(error) => return Err(error).wrap_err("failed to read vsock CID registry"),
         };
@@ -764,6 +818,71 @@ mod tests {
             allocator
                 .reserve_with_previous(Ulid::generate(), Some(u32::MAX))
                 .unwrap_err(),
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn restarted_agent_reconciles_a_lease_only_once_its_vmm_is_gone() {
+        let (allocator, directory) = allocator();
+        let vmid = Ulid::generate();
+        let reservation = allocator.reserve_with_previous(vmid, Some(42)).unwrap();
+        let mut vmm = tokio::process::Command::new("sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let process = ProcessIdentity::of(vmm.id().unwrap()).unwrap();
+        allocator
+            .record_process_owned(vmid, reservation.token, process)
+            .unwrap();
+
+        // a fresh allocator has no token, like an agent after a restart
+        let restarted = VsockCidAllocator::new(allocator.registry_path.clone());
+        assert!(!restarted.reconcile_exited(vmid).unwrap());
+        assert!(restarted.ensure_no_active_lease(vmid).is_err());
+
+        vmm.kill().await.unwrap();
+        assert!(restarted.reconcile_exited(vmid).unwrap());
+        restarted.ensure_no_active_lease(vmid).unwrap();
+        assert!(restarted.release_stopped(vmid).unwrap());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn lease_without_a_recorded_vmm_stays_active() {
+        let (allocator, directory) = allocator();
+        let vmid = Ulid::generate();
+        reserve(&allocator, vmid, Some(42)).unwrap();
+        assert!(!allocator.reconcile_exited(vmid).unwrap());
+        assert!(allocator.ensure_no_active_lease(vmid).is_err());
+        // nothing to reconcile when there's no lease at all
+        assert!(allocator.reconcile_exited(Ulid::generate()).unwrap());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn stale_token_cant_attach_a_process_and_new_reservations_forget_the_old_one() {
+        let (allocator, directory) = allocator();
+        let vmid = Ulid::generate();
+        let old = allocator.reserve_with_previous(vmid, Some(42)).unwrap();
+        let process = ProcessIdentity {
+            pid: std::process::id(),
+            start_time: 1,
+        };
+        allocator
+            .record_process_owned(vmid, old.token, process)
+            .unwrap();
+        allocator
+            .mark_process_exited_owned(vmid, old.token)
+            .unwrap();
+
+        let new = allocator.reserve_with_previous(vmid, None).unwrap();
+        assert_eq!(new.cid, 42);
+        assert!(
+            allocator
+                .record_process_owned(vmid, old.token, process)
+                .is_err()
         );
         std::fs::remove_dir_all(directory).unwrap();
     }

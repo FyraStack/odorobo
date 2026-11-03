@@ -103,7 +103,12 @@ fn release_cleanup_lease(
 
 impl AgentActor {
     fn verify_no_active_lease(&mut self, vmid: Ulid) -> Result<()> {
-        let result = VsockCidAllocator::from_environment().ensure_no_active_lease(vmid);
+        let allocator = VsockCidAllocator::from_environment();
+        // a lease left over from before an agent restart is fine once its VMM is gone
+        if let Err(error) = allocator.reconcile_exited(vmid) {
+            warn!(%vmid, ?error, "failed to check the VMM behind an old vsock lease");
+        }
+        let result = allocator.ensure_no_active_lease(vmid);
         if result
             .as_ref()
             .is_err_and(|error| error.downcast_ref::<ActiveVsockLease>().is_some())

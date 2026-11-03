@@ -10,6 +10,7 @@ pub mod messages;
 pub mod networking;
 pub mod types;
 mod utils;
+mod vmm_process;
 mod vsock_cid;
 
 use std::sync::Arc;
