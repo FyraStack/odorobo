@@ -11,7 +11,9 @@ use ulid::Ulid;
 use crate::actors::agent_actor::AgentActor;
 use crate::manifest::VmManifest;
 
-use super::{CachedVMActor, SchedulerActor, VmLifecycle, VmPlacement};
+use super::{
+    CachedVMActor, SchedulerActor, VmDeleteOwner, VmDeleteTarget, VmLifecycle, VmPlacement,
+};
 
 // Pending creates are given time to appear in an agent status update.
 const UNRESOLVED_VM_CACHE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -142,20 +144,190 @@ impl SchedulerActor {
     pub(super) fn remove_vm_state(
         vmid: Ulid,
         manifests: &mut AHashMap<Ulid, VmManifest>,
+        effective_manifests: &mut AHashMap<Ulid, VmManifest>,
         placements: &mut AHashMap<Ulid, Vec<VmPlacement>>,
         data_cache: &mut AHashMap<Ulid, Vec<CachedVMActor>>,
     ) {
         manifests.remove(&vmid);
+        effective_manifests.remove(&vmid);
         placements.remove(&vmid);
         data_cache.remove(&vmid);
     }
 
+    /// remembers a node that might still have a VM process or stopped CID lease.
+    /// A VM dropping out of status or a placement expiring doesn't mean the CID
+    /// was released
+    pub(super) fn remember_vm_delete_owner(&mut self, vmid: Ulid, owner: VmDeleteOwner) {
+        let agent = self.known_agent_refs.get(&owner).cloned();
+        let target = self
+            .vm_delete_targets
+            .entry(vmid)
+            .or_default()
+            .entry(owner)
+            .or_insert(VmDeleteTarget {
+                actor_ref: None,
+                confirmed: false,
+            });
+        if target.actor_ref.is_none() {
+            target.actor_ref = agent;
+        }
+    }
+
+    /// updates the agent ref we route to without changing which node owns cleanup
+    pub(super) fn remember_agent_ref(&mut self, agent: &RemoteActorRef<AgentActor>) {
+        let owner = VmDeleteOwner::agent(agent.id());
+        if self
+            .known_agent_refs
+            .get(&owner)
+            .is_some_and(|known| known.id() == agent.id())
+        {
+            return;
+        }
+        self.known_agent_refs.insert(owner, agent.clone());
+        for targets in self.vm_delete_targets.values_mut() {
+            if let Some(target) = targets.get_mut(&owner) {
+                target.actor_ref = Some(agent.clone());
+            }
+        }
+    }
+
+    /// grabs every possible owner before stop/delete or eviction wipes that info.
+    /// Old per-VM owners stick around even once status stops reporting the VM
+    pub(super) fn capture_vm_delete_owners(&mut self, vmid: Ulid) {
+        if self.vm_tombstones.contains_key(&vmid) {
+            // we already captured everything. Only explicit late discovery can
+            // add owners now, not stale cache/index data
+            return;
+        }
+        let mut owners = AHashSet::new();
+        if let Some(placements) = self.vm_placements.get(&vmid) {
+            owners.extend(
+                placements
+                    .iter()
+                    .map(|entry| VmDeleteOwner::agent(entry.agent_id)),
+            );
+        }
+        owners.extend(
+            self.vm_actorid_ulid_map
+                .iter()
+                .filter(|(_, mapped)| **mapped == vmid)
+                .map(|(actor_id, _)| VmDeleteOwner::vm(*actor_id)),
+        );
+        if let Some(entries) = self.vm_data_cache.get(&vmid) {
+            owners.extend(entries.iter().filter_map(|entry| {
+                entry
+                    .actor_ref
+                    .as_ref()
+                    .map(|actor| VmDeleteOwner::vm(actor.id()))
+            }));
+        }
+        owners.extend(
+            self.agent_vm_index
+                .iter()
+                .filter(|(_, vms)| vms.contains(&vmid))
+                .map(|(agent_id, _)| VmDeleteOwner::agent(*agent_id)),
+        );
+        for agent in self.agent_data_cache.values() {
+            if agent.data.vms.contains(&vmid) {
+                owners.insert(VmDeleteOwner::agent(agent.actor_ref.id()));
+            }
+            // remember every agent's ref so we can resolve placements even if no
+            // full status has reported the VM yet
+            self.known_agent_refs
+                .entry(VmDeleteOwner::agent(agent.actor_ref.id()))
+                .or_insert_with(|| agent.actor_ref.clone());
+        }
+        for owner in owners {
+            self.remember_vm_delete_owner(vmid, owner);
+        }
+    }
+
+    /// only counts a create retry as confirmed if we recorded the agent accepting
+    /// it or discovered the actor. A pending placeholder on its own could be a
+    /// request where we don't know if it ever made it
+    pub(super) fn create_is_confirmed(&self, vmid: Ulid) -> bool {
+        self.vm_effective_manifests.contains_key(&vmid)
+            || self
+                .vm_actorid_ulid_map
+                .values()
+                .any(|mapped| *mapped == vmid)
+            || self
+                .vm_data_cache
+                .get(&vmid)
+                .is_some_and(|entries| entries.iter().any(|entry| entry.actor_ref.is_some()))
+            || self.vm_placements.get(&vmid).is_some_and(|entries| {
+                entries
+                    .iter()
+                    .any(|entry| entry.lifecycle == VmLifecycle::Running)
+            })
+    }
+
+    /// sorts out cleanup owners after the agent explicitly rejected a create and
+    /// a lookup found no VM actor. If cleanup wasn't acked, it stays a delete
+    /// target and blocks recreating the VM until a later delete retry works
+    pub(super) fn settle_failed_create_cleanup(
+        &mut self,
+        vmid: Ulid,
+        owner: VmDeleteOwner,
+        owner_was_new: bool,
+        cleanup_confirmed: bool,
+    ) {
+        if !cleanup_confirmed {
+            self.vm_tombstones.insert(vmid, true);
+            return;
+        }
+
+        if owner_was_new {
+            if let Some(targets) = self.vm_delete_targets.get_mut(&vmid) {
+                targets.remove(&owner);
+                if targets.is_empty() {
+                    self.vm_delete_targets.remove(&vmid);
+                }
+            }
+        } else {
+            self.acknowledge_vm_delete_owner(vmid, owner);
+        }
+
+        if !self.finish_vm_delete(vmid) && self.vm_delete_targets.contains_key(&vmid) {
+            self.vm_tombstones.insert(vmid, true);
+        }
+    }
+
+    /// only marks an owner that actually acked. Failures and missing routes stay
+    /// pending across retries, no matter what other agents reply
+    pub(super) fn acknowledge_vm_delete_owner(&mut self, vmid: Ulid, owner: VmDeleteOwner) {
+        if let Some(target) = self
+            .vm_delete_targets
+            .get_mut(&vmid)
+            .and_then(|targets| targets.get_mut(&owner))
+        {
+            target.confirmed = true;
+        }
+    }
+
+    /// deletion only finishes once every known owner has replied with a success
+    pub(super) fn finish_vm_delete(&mut self, vmid: Ulid) -> bool {
+        if self.vm_delete_targets.get(&vmid).is_some_and(|targets| {
+            !targets.is_empty() && targets.values().all(|target| target.confirmed)
+        }) {
+            self.vm_delete_targets.remove(&vmid);
+            self.vm_tombstones.insert(vmid, false);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Removes VM intent and every actor-ID association so reconciliation cannot
-    /// recreate a VM after an explicit stop or delete request.
+    /// recreate a VM after an explicit stop or delete request. We still keep
+    /// the cleanup owners around on purpose, including for shutdown's stopped CID leases
     pub(super) fn remove_vm_intent(&mut self, vmid: Ulid) {
+        self.capture_vm_delete_owners(vmid);
+        self.vm_tombstones.entry(vmid).or_insert(false);
         Self::remove_vm_state(
             vmid,
             &mut self.vm_manifests,
+            &mut self.vm_effective_manifests,
             &mut self.vm_placements,
             &mut self.vm_data_cache,
         );
@@ -207,12 +379,17 @@ impl SchedulerActor {
     ///
     /// An actor may exist even if the create request failed or its reply was lost;
     /// retaining the state in that case lets normal discovery reconcile it.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "updates correlated scheduler caches atomically"
+    )]
     pub(super) fn rollback_failed_create(
         vmid: Ulid,
         actor_exists: bool,
         actor_id: Option<ActorId>,
         actor_map: &mut AHashMap<ActorId, Ulid>,
         manifests: &mut AHashMap<Ulid, VmManifest>,
+        effective_manifests: &mut AHashMap<Ulid, VmManifest>,
         placements: &mut AHashMap<Ulid, Vec<VmPlacement>>,
         data_cache: &mut AHashMap<Ulid, Vec<CachedVMActor>>,
     ) {
@@ -222,7 +399,7 @@ impl SchedulerActor {
             {
                 actor_map.remove(&actor_id);
             }
-            Self::remove_vm_state(vmid, manifests, placements, data_cache);
+            Self::remove_vm_state(vmid, manifests, effective_manifests, placements, data_cache);
         }
     }
 
@@ -244,6 +421,17 @@ impl SchedulerActor {
             })
             .copied()
             .collect();
+        let vmids = Self::placement_vm_ids(
+            &self.vm_placements,
+            self.agent_vm_index.get(&actor_id),
+            actor_id,
+            self.agent_data_cache
+                .get(&actor_id)
+                .map_or(&[], |cached| cached.data.vms.as_slice()),
+        );
+        for vmid in vmids {
+            self.capture_vm_delete_owners(vmid);
+        }
         self.agent_data_cache.remove(&actor_id);
         self.agent_vm_index.remove(&actor_id);
         self.invalidate_pending_resources();
@@ -261,6 +449,9 @@ impl SchedulerActor {
         if let Some(keepalive_task) = self.vm_keepalive_tasks.remove(&actor_id) {
             trace!(?actor_id, "Aborting VM keepalive task");
             keepalive_task.abort();
+        }
+        if let Some(vmid) = self.vm_actorid_ulid_map.get(&actor_id).copied() {
+            self.capture_vm_delete_owners(vmid);
         }
         let vmid = self.vm_actorid_ulid_map.remove(&actor_id);
         self.invalidate_pending_resources();

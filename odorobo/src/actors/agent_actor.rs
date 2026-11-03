@@ -1,7 +1,10 @@
 use crate::{
-    ch_driver::actor::VMActor,
+    ch_driver::{
+        actor::{VMActor, VMCleanupProof},
+        transform::{ConfigTransform, storage::StorageDriverTransformer},
+    },
     config::Config,
-    manifest::VmManifest,
+    manifest::{VmManifest, same_create_intent},
     messages::{
         Ping, Pong,
         agent::{
@@ -18,12 +21,13 @@ use crate::{
     networking::actor::NetworkAgentActor,
     types::ObjectMetadata,
     utils::actor_names::{NETWORK, VM, vm_actor_id},
+    vsock_cid::{ActiveVsockLease, VsockCidAllocator},
 };
 use ahash::AHashMap;
 use bytesize::ByteSize;
 use kameo::prelude::*;
 use stable_eyre::{Report, Result};
-use std::ops::ControlFlow;
+use std::{ops::ControlFlow, sync::Arc};
 use sysinfo::System;
 use tracing::{error, info, trace, warn};
 use ulid::Ulid;
@@ -35,6 +39,7 @@ pub struct VMCacheData {
     config: VmManifest,
     vcpus: u32,
     memory_bytes: u64,
+    cleanup_proof: Arc<VMCleanupProof>,
 }
 
 #[derive(RemoteActor)]
@@ -47,11 +52,69 @@ pub struct AgentActor {
     status_history: StatusChangeHistory,
     pub config: Config,
     pub vms: AHashMap<Ulid, VMCacheData>,
+    /// VM IDs whose actor teardown failed. We don't let these get recreated until
+    /// an explicit delete confirms any leftover CID lease is safe to release
+    blocked_vm_ids: AHashMap<Ulid, Arc<VMCleanupProof>>,
     // pub network_actor: ActorRef<NetworkAgentActor>,
     pub metadata: ObjectMetadata,
 }
 
+fn startup_cleanup_failed(result: &Result<(), kameo::error::HookError<&Report>>) -> bool {
+    match result {
+        Err(kameo::error::HookError::Error(error)) => error
+            .downcast_ref::<crate::ch_driver::actor::FailedStartupCleanup>()
+            .is_some(),
+        _ => false,
+    }
+}
+
+/// a VM without vsock exiting doesn't tell us anything about a lease someone
+/// else grabbed. We only release it once there's a stopped record on disk
+fn persist_cleanup_exit(
+    allocator: &VsockCidAllocator,
+    vmid: Ulid,
+    proof: &VMCleanupProof,
+) -> Result<()> {
+    if !proof.process_exit_confirmed() {
+        return Err(Report::msg("VM process exit was not confirmed"));
+    }
+    proof.lease_token().map_or_else(
+        || allocator.ensure_no_active_lease(vmid),
+        |token| allocator.mark_process_exited_owned(vmid, token),
+    )
+}
+
+fn release_cleanup_lease(
+    allocator: &VsockCidAllocator,
+    vmid: Ulid,
+    proof: Option<&VMCleanupProof>,
+) -> Result<bool> {
+    if let Some(token) = proof.and_then(VMCleanupProof::lease_token) {
+        if !proof.is_some_and(VMCleanupProof::process_exit_confirmed) {
+            return Err(Report::msg(
+                "VM process exit was not confirmed for the owned vsock lease",
+            ));
+        }
+        allocator.release_owned(vmid, token).map(|()| true)
+    } else {
+        allocator.release_stopped(vmid)
+    }
+}
+
 impl AgentActor {
+    fn verify_no_active_lease(&mut self, vmid: Ulid) -> Result<()> {
+        let result = VsockCidAllocator::from_environment().ensure_no_active_lease(vmid);
+        if result
+            .as_ref()
+            .is_err_and(|error| error.downcast_ref::<ActiveVsockLease>().is_some())
+        {
+            // not being in the cache after a restart doesn't mean an older VMM exited
+            self.blocked_vm_ids
+                .insert(vmid, Arc::new(VMCleanupProof::new(false)));
+        }
+        result
+    }
+
     fn record_membership_change(&mut self, vmid: Ulid, added: bool) {
         self.membership_revision = self.membership_revision.saturating_add(1);
         self.status_history.push_back(MembershipChange {
@@ -115,6 +178,7 @@ impl Actor for AgentActor {
             memory: ByteSize::b(sys.total_memory()),
             config: args,
             vms: AHashMap::new(),
+            blocked_vm_ids: AHashMap::new(),
             used_vcpus: 0,
             used_memory_bytes: 0,
             membership_revision: 0,
@@ -150,6 +214,22 @@ impl Actor for AgentActor {
             .map(|(vmid, _)| *vmid)
             .collect();
         for vmid in removed {
+            // link death shows up before the child's on_stop finishes.
+            // Keep the ID taken until teardown is done, or a new VM could race us
+            // while we're still deleting its runtime files and CID lease
+            let Some(actor_ref) = self.vms.get(&vmid).map(|vm| vm.actor_ref.clone()) else {
+                continue;
+            };
+            let shutdown_result = actor_ref
+                .wait_for_shutdown_with_result(|result| {
+                    result.map(|_| ()).map_err(|error| error.to_string())
+                })
+                .await;
+            if let Err(error) = shutdown_result {
+                warn!(?vmid, %error, "VM teardown failed; blocking ID reuse until explicit deletion");
+                let proof = Arc::clone(&self.vms[&vmid].cleanup_proof);
+                self.blocked_vm_ids.insert(vmid, proof);
+            }
             self.remove_vm(vmid);
         }
 
@@ -161,23 +241,96 @@ impl Actor for AgentActor {
 impl Message<CreateVM> for AgentActor {
     type Reply = CreateVMReply;
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "keeps creation, cleanup proof and cache updates ordered"
+    )]
     async fn handle(&mut self, msg: CreateVM, ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
         let vmid = msg.vmid;
+        if self.blocked_vm_ids.contains_key(&vmid) {
+            return CreateVMReply {
+                config: None,
+                actor_id: None,
+                error: Some("VM ID is blocked because its previous actor teardown failed; delete it before recreating".to_owned()),
+            };
+        }
         if let Some(existing) = self.vms.get(&vmid) {
-            if existing.config == msg.config {
-                info!(?vmid, actor_id = ?existing.actor_ref.id(), "VM already exists; treating create as idempotent");
-            } else {
-                warn!(?vmid, actor_id = ?existing.actor_ref.id(), "Ignoring conflicting create for existing VM");
+            if !same_create_intent(&existing.config, &msg.config) {
+                warn!(?vmid, actor_id = ?existing.actor_ref.id(), "Rejecting conflicting create for existing VM");
+                return CreateVMReply {
+                    config: None,
+                    actor_id: None,
+                    error: Some("conflicting create request for existing VM ID".to_owned()),
+                };
             }
+            // a failed teardown can leave a dead actor in the cache. Make sure
+            // the VM is actually alive before treating the retry as idempotent,
+            // so we don't claim a stopped VM still exists
+            if let Err(error) = existing.actor_ref.ask(GetVMInfo { vmid: Some(vmid) }).await {
+                return CreateVMReply {
+                    config: None,
+                    actor_id: None,
+                    error: Some(format!(
+                        "VM ID is retained because its previous actor is not running: {error}"
+                    )),
+                };
+            }
+            info!(?vmid, actor_id = ?existing.actor_ref.id(), "VM already exists; treating create as idempotent");
             return CreateVMReply {
                 config: Some(existing.config.clone()),
                 actor_id: Some(existing.actor_ref.id().to_bytes()),
+                error: None,
             };
         }
 
-        // Spawn and link at the same time.
-        let actor_ref =
-            VMActor::spawn_link(ctx.actor_ref(), (vmid, Some(msg.config.clone()))).await;
+        if let Err(error) = self.verify_no_active_lease(vmid) {
+            return CreateVMReply {
+                config: None,
+                actor_id: None,
+                error: Some(error.to_string()),
+            };
+        }
+
+        // spawn and link at the same time. Hold onto the exit and lease info
+        // even if startup never gives us a usable actor
+        let cleanup_proof = Arc::new(VMCleanupProof::new(true));
+        let actor_ref = VMActor::spawn_link(
+            ctx.actor_ref(),
+            (vmid, Some(msg.config.clone()), Arc::clone(&cleanup_proof)),
+        )
+        .await;
+
+        // wait for on_start to finish before we say the VM was created. That way
+        // conversion failures (like vsock CID collisions) go back to the
+        // scheduler instead of us caching a dead VM actor as a success
+        let effective_config = match actor_ref.ask(GetVMInfo { vmid: Some(vmid) }).await {
+            Ok(info) => info.config,
+            Err(error) => {
+                actor_ref.kill();
+                let shutdown_result = actor_ref
+                    .wait_for_shutdown_with_result(|result| {
+                        result.map(|_| ()).map_err(|error| error.to_string())
+                    })
+                    .await;
+                let startup_cleanup_failed = actor_ref
+                    .with_startup_result(|result| startup_cleanup_failed(&result))
+                    .unwrap_or(false);
+                if startup_cleanup_failed
+                    || !cleanup_proof.process_exit_confirmed()
+                    || shutdown_result.is_err()
+                        && actor_ref
+                            .with_startup_result(|result| result.is_ok())
+                            .unwrap_or(false)
+                {
+                    self.blocked_vm_ids.insert(vmid, Arc::clone(&cleanup_proof));
+                }
+                return CreateVMReply {
+                    config: None,
+                    actor_id: None,
+                    error: Some(format!("VM startup failed: {error}")),
+                };
+            }
+        };
 
         _ = actor_ref.register(vm_actor_id(vmid)).await;
         _ = actor_ref.register(VM).await;
@@ -185,16 +338,20 @@ impl Message<CreateVM> for AgentActor {
             vmid,
             VMCacheData {
                 actor_ref: actor_ref.clone(),
-                config: msg.config.clone(),
+                config: effective_config
+                    .clone()
+                    .unwrap_or_else(|| msg.config.clone()),
                 vcpus: msg.config.desired.compute.vcpus,
                 memory_bytes: msg.config.desired.compute.memory_bytes,
+                cleanup_proof: Arc::clone(&cleanup_proof),
             },
         );
 
         info!(?vmid, "VM Spawned successfully");
         CreateVMReply {
-            config: Some(msg.config),
+            config: effective_config,
             actor_id: Some(actor_ref.id().to_bytes()),
+            error: None,
         }
     }
 }
@@ -209,7 +366,23 @@ impl Message<MigrateVMReceive> for AgentActor {
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         let vmid = msg.vmid;
-        let actor_ref = VMActor::spawn_link(ctx.actor_ref(), (vmid, None)).await;
+        // don't ever replace a live VM in the cache with a second receiver that
+        // would use the same runtime paths and CID lease
+        if self.vms.contains_key(&vmid) || self.blocked_vm_ids.contains_key(&vmid) {
+            return MigrateVMReceiveReply {
+                listening_address: String::new(),
+                error: Some("VM already exists on this agent".to_owned()),
+            };
+        }
+        if let Err(error) = self.verify_no_active_lease(vmid) {
+            return MigrateVMReceiveReply {
+                listening_address: String::new(),
+                error: Some(error.to_string()),
+            };
+        }
+        let cleanup_proof = Arc::new(VMCleanupProof::new(true));
+        let actor_ref =
+            VMActor::spawn_link(ctx.actor_ref(), (vmid, None, Arc::clone(&cleanup_proof))).await;
 
         _ = actor_ref.register(vm_actor_id(vmid)).await;
         _ = actor_ref.register(VM).await;
@@ -220,6 +393,7 @@ impl Message<MigrateVMReceive> for AgentActor {
                 config: msg.config.clone(),
                 vcpus: msg.config.desired.compute.vcpus,
                 memory_bytes: msg.config.desired.compute.memory_bytes,
+                cleanup_proof: Arc::clone(&cleanup_proof),
             },
         );
 
@@ -232,14 +406,14 @@ impl Message<MigrateVMReceive> for AgentActor {
         };
 
         if reply.error.is_some() {
-            if self
-                .vms
-                .get(&vmid)
-                .is_some_and(|cache| cache.actor_ref.id() == actor_ref.id())
-            {
-                self.remove_vm(vmid);
-            }
             actor_ref.kill();
+            let failed = actor_ref
+                .wait_for_shutdown_with_result(|result| result.is_err())
+                .await;
+            if failed || !cleanup_proof.process_exit_confirmed() {
+                self.blocked_vm_ids.insert(vmid, Arc::clone(&cleanup_proof));
+            }
+            self.remove_vm(vmid);
         }
 
         reply
@@ -255,21 +429,99 @@ impl Message<DeleteVM> for AgentActor {
         msg: DeleteVM,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        match self.remove_vm(msg.vmid) {
-            Some(cache_data) => {
-                let res = cache_data.actor_ref.tell(msg.clone()).await;
-                if let Err(err) = res {
-                    // probably a bad way to do this
-                    warn!(vm_id = %msg.vmid, ?err, "failed to stop VM actor gracefully, killing");
-                    cache_data.actor_ref.kill();
-                }
+        let cached_actor = self
+            .vms
+            .get(&msg.vmid)
+            .map(|cache_data| cache_data.actor_ref.clone());
+        let actor = match cached_actor {
+            Some(actor) => Some(actor),
+            None => Self::lookup_vm_actor(msg.vmid).await,
+        };
+
+        if let Some(actor) = actor {
+            if let Err(error) = actor.ask(msg.clone()).await {
+                warn!(vm_id = %msg.vmid, ?error, "failed to stop VM actor for delete");
+                return DeleteVMReply {
+                    error: Some(format!("failed to stop VM actor: {error}")),
+                };
             }
-            None => {
-                warn!(vm_id = %msg.vmid, "VM actor not found for delete");
+            // don't ack the delete (or let it get recreated) until on_stop has
+            // reaped the old process and finished releasing its CID
+            let shutdown_result = actor
+                .wait_for_shutdown_with_result(|result| {
+                    result.map(|_| ()).map_err(|error| error.to_string())
+                })
+                .await;
+            if let Err(error) = shutdown_result {
+                let proof = self.vms.get(&msg.vmid).map_or_else(
+                    || Arc::new(VMCleanupProof::new(false)),
+                    |vm| Arc::clone(&vm.cleanup_proof),
+                );
+                self.blocked_vm_ids.insert(msg.vmid, proof);
+                self.remove_vm(msg.vmid);
+                return DeleteVMReply {
+                    error: Some(format!("VM teardown failed: {error}")),
+                };
             }
+            self.remove_vm(msg.vmid);
+            self.blocked_vm_ids.remove(&msg.vmid);
+            return DeleteVMReply { error: None };
         }
 
-        DeleteVMReply
+        // shutdown removes the VM actor on purpose but keeps its node-local CID.
+        // Only release it if the VM actor saw the process actually exit before
+        // it went away
+        let proof = self.blocked_vm_ids.get(&msg.vmid);
+        let exit_unconfirmed = proof.is_some_and(|proof| !proof.process_exit_confirmed());
+        let allocator = VsockCidAllocator::from_environment();
+        if let Some(proof) = proof.filter(|proof| proof.process_exit_confirmed()) {
+            if let Err(error) = persist_cleanup_exit(&allocator, msg.vmid, proof) {
+                return DeleteVMReply {
+                    error: Some(format!(
+                        "failed to persist confirmed VM process exit: {error}"
+                    )),
+                };
+            }
+            // leftover storage leases are process-global, so we can still retry
+            // after the failed VM actor/transformer is gone. Don't detach
+            // anything until we know for sure the VMM exited
+            if let Err(error) = StorageDriverTransformer::default().teardown(
+                &msg.vmid.to_string(),
+                &mut cloud_hypervisor_client::models::VmConfig::default(),
+            ) {
+                return DeleteVMReply {
+                    error: Some(format!("failed to retry VM storage cleanup: {error}")),
+                };
+            }
+            // the old process exited but runtime cleanup failed. Retry it before
+            // we ack the delete and let the paths get reused
+            let runtime_dir = crate::ch_driver::VMInstance::runtime_dir_for(&msg.vmid.to_string());
+            if let Err(error) = std::fs::remove_dir_all(runtime_dir)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                return DeleteVMReply {
+                    error: Some(format!("failed to retry VM runtime cleanup: {error}")),
+                };
+            }
+        }
+        // don't fall back to release_stopped when we have a token. Someone else
+        // might've grabbed a new lease since we marked it (or since an earlier
+        // delete failed), so removal has to check this exact token under the lock
+        match release_cleanup_lease(&allocator, msg.vmid, proof.map(Arc::as_ref)) {
+            Ok(had_cid_lease) if exit_unconfirmed && !had_cid_lease => DeleteVMReply {
+                error: Some("VM teardown failed and no confirmed VMM-exit record exists; refusing to unblock its ID".to_owned()),
+            },
+            Ok(_) => {
+                self.blocked_vm_ids.remove(&msg.vmid);
+                DeleteVMReply { error: None }
+            }
+            Err(error) => {
+                warn!(vm_id = %msg.vmid, ?error, "failed to release stopped VM CID");
+                DeleteVMReply {
+                    error: Some(format!("failed to release stopped VM CID: {error}")),
+                }
+            }
+        }
     }
 }
 
@@ -440,5 +692,82 @@ impl Message<GetAgentStatus> for AgentActor {
             used_vcpus,
             used_ram,
         }
+    }
+}
+
+#[cfg(test)]
+mod startup_cleanup_tests {
+    use super::{persist_cleanup_exit, release_cleanup_lease, startup_cleanup_failed};
+    use crate::ch_driver::actor::FailedStartupCleanup;
+    use kameo::error::HookError;
+    use stable_eyre::Report;
+
+    #[test]
+    fn no_vsock_blocked_retry_cannot_mark_or_delete_newly_active_lease() {
+        use crate::{ch_driver::actor::VMCleanupProof, vsock_cid::VsockCidAllocator};
+        let directory =
+            std::env::temp_dir().join(format!("odorobo-no-vsock-retry-{}", ulid::Ulid::generate()));
+        let allocator = VsockCidAllocator::new(directory.join("registry.json"));
+        let vmid = ulid::Ulid::generate();
+        // this is the shared `VMCleanupProof` a blocked no-vsock actor keeps when
+        // the process was reaped but storage/runtime cleanup failed
+        let proof = std::sync::Arc::new(VMCleanupProof::new(true));
+        allocator.ensure_no_active_lease(vmid).unwrap();
+        let reservation = allocator.reserve_with_previous(vmid, Some(42)).unwrap();
+        drop(persist_cleanup_exit(&allocator, vmid, &proof).unwrap_err());
+        drop(release_cleanup_lease(&allocator, vmid, Some(&proof)).unwrap_err());
+        drop(allocator.ensure_no_active_lease(vmid).unwrap_err());
+        // it's only safe once the real lease owner writes down that it exited
+        allocator
+            .mark_process_exited_owned(vmid, reservation.token)
+            .unwrap();
+        persist_cleanup_exit(&allocator, vmid, &proof).unwrap();
+        assert!(release_cleanup_lease(&allocator, vmid, Some(&proof)).unwrap());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn blocked_owned_retry_rechecks_generation_between_exit_mark_and_release() {
+        use crate::{ch_driver::actor::VMCleanupProof, vsock_cid::VsockCidAllocator};
+        let directory =
+            std::env::temp_dir().join(format!("odorobo-owned-retry-{}", ulid::Ulid::generate()));
+        let allocator = VsockCidAllocator::new(directory.join("registry.json"));
+        let vmid = ulid::Ulid::generate();
+        let initial = allocator.reserve_with_previous(vmid, Some(42)).unwrap();
+        let proof = VMCleanupProof::new(true);
+        proof.own_lease(initial.token);
+        persist_cleanup_exit(&allocator, vmid, &proof).unwrap();
+        // someone else grabs the same CID while we're cleaning up or retrying
+        let newer = allocator.reserve_with_previous(vmid, Some(42)).unwrap();
+        drop(release_cleanup_lease(&allocator, vmid, Some(&proof)).unwrap_err());
+        drop(persist_cleanup_exit(&allocator, vmid, &proof).unwrap_err());
+        drop(allocator.ensure_no_active_lease(vmid).unwrap_err());
+        // even after the newer VMM exits, an old retry can't delete its lease by
+        // falling back to a stopped record from a different generation
+        allocator
+            .mark_process_exited_owned(vmid, newer.token)
+            .unwrap();
+        drop(release_cleanup_lease(&allocator, vmid, Some(&proof)).unwrap_err());
+        allocator.release_owned(vmid, newer.token).unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn failed_console_cleanup_preserves_quarantine_even_when_startup_failed() {
+        let cleanup_error = Report::new(FailedStartupCleanup(
+            "cleanup after confirmed reap failed".to_owned(),
+        ));
+        assert!(startup_cleanup_failed(&Err(HookError::Error(
+            &cleanup_error
+        ))));
+        let wrapped_cleanup_error = cleanup_error.wrap_err("original startup error");
+        assert!(startup_cleanup_failed(&Err(HookError::Error(
+            &wrapped_cleanup_error
+        ))));
+        let validation_error = Report::msg("invalid manifest before VMM spawn");
+        assert!(!startup_cleanup_failed(&Err(HookError::Error(
+            &validation_error
+        ))));
+        assert!(!startup_cleanup_failed(&Ok(())));
     }
 }

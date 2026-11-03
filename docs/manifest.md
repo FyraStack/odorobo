@@ -13,12 +13,11 @@ an image, volumes, and network IDs, while `VirtualMachine` adds node, status,
 metadata, and affinity. The manifest separates those concerns so the control
 plane can provide stable intent without depending on the legacy shape.
 
-The current Cloud Hypervisor conversion in `odorobo/src/ch_driver/actor.rs`
-consumes vCPUs, maximum vCPUs, memory, and the image as a disk. Firmware and
-serial/platform defaults are currently driver-owned. Network, volume-to-disk,
-cloud-init, and vsock conversion remain provider integration work; their
-manifest fields are defined here so those later conversions have a stable
-contract and explicit ownership boundary.
+The Cloud Hypervisor driver consumes compute and boot settings, resolves
+network and storage references through node-local transforms, and translates
+cloud-init into a NoCloud seed disk. Firmware and serial/platform defaults are
+driver-owned. Vsock is passed to Cloud Hypervisor directly after the node-local
+agent allocates or reserves its guest CID.
 
 ## State ownership
 
@@ -42,13 +41,24 @@ Odorobo should provision. It contains:
   label/annotation requirements.
 - `boot`: whether to start after provisioning and optional firmware/kernel/
   command-line intent.
-- `cloud_init`: paired NoCloud user-data and meta-data.
-- `vsock`: guest CID and the desired host-side socket location.
+- `cloud_init`: paired NoCloud user-data and meta-data, plus optional
+  vendor-data. The Cloud Hypervisor driver writes these files to a FAT seed
+  image labelled `CIDATA` and attaches it as a read-only raw disk. The image is
+  kept in the VM runtime directory and removed when the VM is deleted or shut
+  down; keep credentials in these fields private accordingly.
+- `vsock`: optional guest CID and the desired host-side socket location. When
+  omitted, the node-local agent allocates a stable CID; explicitly requested
+  CIDs are reserved and checked for conflicts on that node. An automatically
+  assigned CID is reported under `observed.vsock_guest_cid`, while
+  `desired.vsock.guest_cid` remains unset so another node can allocate its own
+  local CID. See [guest provisioning](provisioning.md)
+  for the guest kernel, host proxy socket, restart, and migration requirements.
 
 `observed` is reported by Odorobo and is never used as desired input. It records
-status, the node currently running the VM, the provider's runtime state, and an
-error message when applicable. Cloud Hypervisor configuration and generated
-paths are observed/driver-owned implementation details, not manifest fields.
+status, the node currently running the VM, the provider's runtime state, an
+error message when applicable, and the effective node-local vsock guest CID.
+Cloud Hypervisor configuration and generated paths are observed/driver-owned
+implementation details, not manifest fields.
 
 Providers may reject a valid manifest field when they cannot implement it, but
 must report that explicitly. They must not silently discard storage, network,
@@ -66,9 +76,14 @@ non-zero vCPUs and memory, and satisfy these relationships:
   their strictness, and `inverse` negates a rule's result. `lt` and `gt` comparisons require exactly one
   finite numeric value.
 - Every network must have a non-empty, non-whitespace ID.
-- Cloud-init must provide non-empty configuration with user-data and meta-data
-  supplied together.
-- A vsock guest CID must be non-zero and its socket must be an absolute path.
+- Cloud-init must provide non-empty user-data and meta-data together. Optional
+  vendor-data must not be empty. The seed-image builder caps images at 64 MiB;
+  this is not an API payload allowance. Distributed actor requests are limited
+  to 1 MiB and HTTP JSON bodies to 2 MiB, including the rest of the manifest
+  and serialization overhead. Keep provisioning snippets well below 1 MiB.
+- An explicitly supplied vsock guest CID must be between 3 and 4294967294
+  (CIDs 0-2 and `u32::MAX` are reserved); an omitted CID is allocated by the
+  node. The socket must be an absolute path.
 
 Invalid field combinations are rejected during deserialization, as are unknown
 fields, rather than silently interpreted. New fields should be added in a future manifest version when they

@@ -5,9 +5,17 @@ use aide::OperationIo;
 use api_error::ApiError;
 use kameo::prelude::*;
 use libp2p::futures::StreamExt;
+use libp2p::identity::Keypair;
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::{PeerId, mdns, noise, tcp, yamux};
-use stable_eyre::{Report, Result};
+use stable_eyre::{
+    Report, Result,
+    eyre::{WrapErr, eyre},
+};
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::Path;
 use thiserror::Error;
 use tracing::level_filters::LevelFilter;
 use tracing::{debug, error, info, trace, warn};
@@ -43,6 +51,20 @@ mod tests {
     use axum::{Router, body::Body, http::Request, http::StatusCode, routing::get};
     use http_body_util::BodyExt;
     use tower::ServiceExt;
+
+    #[test]
+    fn identity_persists_across_restarts() {
+        let directory =
+            std::env::temp_dir().join(format!("odorobo-peer-key-{}", ulid::Ulid::generate()));
+        let path = directory.join("peer-key");
+        let first = load_or_create_identity(&path).unwrap();
+        let second = load_or_create_identity(&path).unwrap();
+        assert_eq!(first.public().to_peer_id(), second.public().to_peer_id());
+
+        fs::write(&path, b"garbage").unwrap();
+        drop(load_or_create_identity(&path).unwrap_err());
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     async fn handler() -> Result<(), OdoroboError> {
         Err(OdoroboError::Report(Report::msg("error!")))
@@ -140,22 +162,67 @@ pub struct ProductionBehaviour {
 // based on:
 // https://github.com/tqwewe/kameo/blob/main/examples/custom_swarm.rs
 // https://docs.page/tqwewe/kameo/distributed-actors/custom-swarm-configuration
-pub fn connect_to_swarm() -> Result<PeerId> {
-    let mut swarm = libp2p::SwarmBuilder::with_new_identity()
-        .with_tokio()
-        .with_tcp(
-            tcp::Config::default(),
-            noise::Config::new,
-            yamux::Config::default,
-        )?
-        .with_behaviour(|key| {
-            let local_peer_id = key.public().to_peer_id();
+/// load this node's libp2p identity, or make and save one on first start.
+/// The scheduler tracks which node has to clean up a VM by peer ID, so a new
+/// identity on every restart would leave it waiting on a peer that's gone
+fn load_or_create_identity(path: &Path) -> Result<Keypair> {
+    match fs::read(path) {
+        Ok(bytes) => {
+            return Keypair::from_protobuf_encoding(&bytes)
+                .wrap_err_with(|| format!("invalid libp2p key at {}", path.display()));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .wrap_err_with(|| format!("failed to read libp2p key at {}", path.display()));
+        }
+    }
 
-            let kameo = remote::Behaviour::new(local_peer_id, remote::messaging::Config::default());
-            let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id)?;
-            Ok(ProductionBehaviour { kameo, mdns })
-        })?
-        .build();
+    let keypair = Keypair::generate_ed25519();
+    let encoded = keypair.to_protobuf_encoding()?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| eyre!("libp2p key path {} has no parent", path.display()))?;
+    fs::create_dir_all(parent).wrap_err("failed to create libp2p key directory")?;
+    // write to a temp file and rename it in, so a crash can't leave a half-written key
+    let temp_path = path.with_extension(format!("tmp-{}", std::process::id()));
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(&temp_path)
+        .wrap_err("failed to create libp2p key")?;
+    file.write_all(&encoded)
+        .and_then(|()| file.sync_all())
+        .and_then(|()| fs::rename(&temp_path, path))
+        .and_then(|()| File::open(parent)?.sync_all())
+        .wrap_err_with(|| format!("failed to save libp2p key to {}", path.display()))?;
+    info!(path = %path.display(), "generated new libp2p identity");
+    Ok(keypair)
+}
+
+pub fn connect_to_swarm(peer_key_path: &Path) -> Result<PeerId> {
+    let mut swarm =
+        libp2p::SwarmBuilder::with_existing_identity(load_or_create_identity(peer_key_path)?)
+            .with_tokio()
+            .with_tcp(
+                tcp::Config::default(),
+                noise::Config::new,
+                yamux::Config::default,
+            )?
+            .with_behaviour(|key| {
+                let local_peer_id = key.public().to_peer_id();
+
+                let kameo = remote::Behaviour::new(
+                    local_peer_id,
+                    remote::messaging::Config::default()
+                        .with_request_timeout(std::time::Duration::from_secs(120)),
+                );
+                let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id)?;
+                Ok(ProductionBehaviour { kameo, mdns })
+            })?
+            .build();
 
     // Initialize Kameo's global registry
     swarm.behaviour().kameo.init_global();

@@ -151,6 +151,11 @@ pub struct Config {
     /// Ignore lockfiles and do not create a lockfile
     #[clap(long, action = clap::ArgAction::SetTrue)]
     pub no_lockfile: Option<bool>,
+
+    /// Where to keep this node's libp2p identity key. Defaults to
+    /// /var/lib/odorobo/peer-key. Each instance on a host needs its own
+    #[clap(long)]
+    pub peer_key_path: Option<String>,
 }
 
 impl Config {
@@ -197,6 +202,12 @@ impl Config {
     #[must_use]
     pub fn get_reserved_vcpus(&self) -> u32 {
         self.reserved_vcpus.unwrap_or(2)
+    }
+    #[must_use]
+    pub fn get_peer_key_path(&self) -> &str {
+        self.peer_key_path
+            .as_deref()
+            .unwrap_or("/var/lib/odorobo/peer-key")
     }
 }
 
