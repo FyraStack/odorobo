@@ -391,12 +391,15 @@ impl VMInstance {
     /// separate `boot` flag preserves the manifest's desired start behavior;
     /// callers can create a stopped VM without changing its provider config.
     /// The socket is polled for up to roughly 30 seconds before failing.
+    /// `on_spawned` gets the VMM's PID as soon as the process exists, before
+    /// any of that waiting, so callers can record it in case we die mid-startup
     #[tracing::instrument(skip_all)]
-    pub async fn spawn(
+    pub async fn spawn<F: FnOnce(Option<u32>)>(
         id: &str,
         vm_config: Option<VmConfig>,
         boot: bool,
         transformer: Option<TransformChain>,
+        on_spawned: F,
     ) -> Result<Self> {
         let ch_socket_path = Self::runtime_dir_for(id).join(SOCKET_FILE_NAME);
         info!(?ch_socket_path, "Spawning VM");
@@ -409,6 +412,7 @@ impl VMInstance {
             .arg(&ch_socket_path)
             .kill_on_drop(true)
             .spawn()?;
+        on_spawned(ch_process.id());
         let mut instance = Self::new(id, ch_socket_path, transformer, Some(ch_process));
 
         const MAX_ATTEMPTS: u32 = 31;

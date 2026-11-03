@@ -110,12 +110,31 @@ impl VMCleanupProof {
         *self.process.lock().expect("cleanup proof lock poisoned") = Some(process);
     }
 
+    /// identifies a freshly spawned VMM and writes it down right away. startup
+    /// can take a minute or more after the spawn, and if the agent dies in that
+    /// window a lease with no recorded process can't be cleaned up, even by
+    /// force delete
+    fn record_spawned_process(
+        &self,
+        allocator: &VsockCidAllocator,
+        vmid: ulid::Ulid,
+        pid: Option<u32>,
+    ) {
+        match pid.map(ProcessIdentity::of) {
+            Some(Ok(process)) => {
+                self.set_process(process);
+                self.record_process(allocator, vmid);
+            }
+            Some(Err(error)) => warn!(%vmid, ?error, "failed to identify VMM process"),
+            None => warn!(%vmid, "VMM process exited before we could identify it"),
+        }
+    }
+
     /// write the VMM down next to its lease so a restarted agent can check on it.
     /// this is best effort, without it the lease just needs a manual cleanup
-    fn record_process(&self, vmid: ulid::Ulid) {
+    fn record_process(&self, allocator: &VsockCidAllocator, vmid: ulid::Ulid) {
         if let (Some(token), Some(process)) = (self.lease_token(), self.process())
-            && let Err(error) =
-                VsockCidAllocator::from_environment().record_process_owned(vmid, token, process)
+            && let Err(error) = allocator.record_process_owned(vmid, token, process)
         {
             warn!(%vmid, ?error, "failed to record VMM process for its vsock lease");
         }
@@ -479,6 +498,13 @@ impl Actor for VMActor {
             vm_config_for_ch,
             boot,
             None,
+            |pid| {
+                cleanup_proof.record_spawned_process(
+                    &VsockCidAllocator::from_environment(),
+                    vmid,
+                    pid,
+                );
+            },
         )
         .await
         {
@@ -557,13 +583,13 @@ impl Actor for VMActor {
         // Take the child process out so we can watch for unexpected death.
         // destroy() handles a missing child_process gracefully.
         let process_watcher = if let Some(mut child_process) = vminstance.take_child_process() {
-            match child_process.id().map(ProcessIdentity::of) {
-                Some(Ok(process)) => {
-                    cleanup_proof.set_process(process);
-                    cleanup_proof.record_process(vmid);
-                }
-                Some(Err(error)) => warn!(%vmid, ?error, "failed to identify VMM process"),
-                None => warn!(%vmid, "VMM process exited before we could identify it"),
+            // normally already recorded at spawn. try again if that failed
+            if cleanup_proof.process().is_none() {
+                cleanup_proof.record_spawned_process(
+                    &VsockCidAllocator::from_environment(),
+                    vmid,
+                    child_process.id(),
+                );
             }
             let (kill_sender, kill_receiver) = tokio::sync::oneshot::channel();
             let actor_ref = actor_ref.clone();
@@ -873,7 +899,8 @@ impl Message<MigrateVMReceive> for VMActor {
                 }
             };
 
-        self.cleanup_proof.record_process(self.vmid);
+        self.cleanup_proof
+            .record_process(&VsockCidAllocator::from_environment(), self.vmid);
 
         // the actor holds onto this reservation until the process exits. if
         // anything below fails, we tear down the receiver and on_stop rolls it
@@ -1088,6 +1115,33 @@ mod vsock_manifest_tests {
         finish_vsock_lease(&allocator, vmid, Some(reservation.token), false).unwrap();
         allocator.ensure_no_active_lease(vmid).unwrap();
         assert!(allocator.release_stopped(vmid).unwrap());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn spawned_vmm_is_recorded_against_its_lease_right_away() {
+        let directory =
+            std::env::temp_dir().join(format!("odorobo-spawn-record-{}", ulid::Ulid::generate()));
+        let allocator = VsockCidAllocator::new(directory.join("registry.json"));
+        let vmid = ulid::Ulid::generate();
+        let reservation = allocator.reserve_with_previous(vmid, Some(48)).unwrap();
+        let proof = VMCleanupProof::new(true);
+        proof.own_lease(reservation.token);
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+
+        proof.record_spawned_process(&allocator, vmid, child.id());
+
+        // a restarted agent can now find and kill it, even if we die before
+        // startup finishes
+        let recorded = allocator.recorded_process(vmid).unwrap().unwrap();
+        assert_eq!(Some(recorded), proof.process());
+        assert!(recorded.is_running().unwrap());
+        child.kill().await.unwrap();
+        assert!(!recorded.is_running().unwrap());
         std::fs::remove_dir_all(directory).unwrap();
     }
 
