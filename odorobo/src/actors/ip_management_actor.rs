@@ -8,6 +8,7 @@ pub const FYRA_OUI: [u8; 3] = [0x46, 0x59, 0x52];
 /// Calculates a MAC address for a given IP address using the FYRA OUI prefix.
 ///
 /// Takes the last 3 bytes of the IP address and combines them with the FYRA OUI prefix.
+#[must_use]
 pub fn calculate_mac_address(ip: [u8; 4]) -> [u8; 6] {
     let mut mac = [0u8; 6];
     mac[0..3].copy_from_slice(&FYRA_OUI);
@@ -15,17 +16,11 @@ pub fn calculate_mac_address(ip: [u8; 4]) -> [u8; 6] {
     mac
 }
 
-#[test]
-fn test_calculate_mac_address() {
-    let ip = [192, 168, 1, 1];
-    let mac = calculate_mac_address(ip);
-    assert_eq!(mac, [0x46, 0x59, 0x52, 168, 0x01, 0x01]);
-}
-
 /// HTTP REST API service
 #[derive(RemoteActor)]
 pub struct IPManagementActor;
 
+#[allow(clippy::unused_async_trait_impl)]
 impl Actor for IPManagementActor {
     type Args = ();
     type Error = Report;
@@ -34,5 +29,17 @@ impl Actor for IPManagementActor {
         // if we need to like prep the router stuff
 
         Ok(Self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_calculate_mac_address() {
+        let ip = [192, 168, 1, 1];
+        let mac = calculate_mac_address(ip);
+        assert_eq!(mac, [0x46, 0x59, 0x52, 168, 0x01, 0x01]);
     }
 }

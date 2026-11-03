@@ -1,5 +1,5 @@
-pub mod actor_cache;
 pub mod actor_names;
+pub mod lockfile;
 
 use aide::OperationIo;
 use api_error::ApiError;
@@ -11,12 +11,15 @@ use stable_eyre::{Report, Result};
 use thiserror::Error;
 use tracing::level_filters::LevelFilter;
 use tracing::{debug, error, info, trace, warn};
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
-// todo: wrap with axum-responses, return this type on request failure
+/// Application error returned by request handlers.
 #[derive(Error, Debug, ApiError, OperationIo)]
 #[aide(output)]
 pub enum OdoroboError {
+    #[error("{0}")]
+    #[api_error(status_code = 404, message = "{0}")]
+    NotFound(String),
     #[error("{0}")]
     #[api_error(status_code = 500, message = "{0}")]
     Report(#[from] Report),
@@ -43,13 +46,20 @@ macro_rules! generate_odorobo_remote_error {
     }};
 }
 
-generate_odorobo_remote_error![AgentListVMs, CreateVM, DeleteVM, ShutdownVM];
+generate_odorobo_remote_error![
+    AgentListVMs,
+    CreateVM,
+    DeleteVM,
+    ShutdownVM,
+    GetVMInfo,
+    GetConsoleHistory
+];
 
 impl<M> From<kameo::error::SendError<M, Report>> for OdoroboError {
     fn from(value: kameo::error::SendError<M, Report>) -> Self {
         let kameo_error = value.to_string();
         error!(?value);
-        OdoroboError::Report(
+        Self::Report(
             value.err().unwrap_or_else(|| {
                 Report::msg(format!("could not unwrap kameo error: {kameo_error}"))
             }),
@@ -68,6 +78,10 @@ mod tests {
         Err(OdoroboError::Report(Report::msg("error!")))
     }
 
+    async fn not_found_handler() -> Result<(), OdoroboError> {
+        Err(OdoroboError::NotFound("missing".to_owned()))
+    }
+
     #[tokio::test]
     async fn test_error() {
         let response = Router::new()
@@ -83,10 +97,21 @@ mod tests {
 
         assert_eq!(html, "{\"message\":\"error!\"}");
     }
+
+    #[tokio::test]
+    async fn test_not_found_error() {
+        let response = Router::new()
+            .route("/", get(not_found_handler))
+            .oneshot(Request::get("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
 }
 
 pub fn env_filter(debug_target: Option<&str>) -> EnvFilter {
-    let env = std::env::var("ODOROBO_LOG").unwrap_or_else(|_| "".into());
+    let env = std::env::var("ODOROBO_LOG").unwrap_or_else(|_| String::new());
 
     let base = EnvFilter::builder()
         .with_default_directive(LevelFilter::INFO.into())
@@ -112,16 +137,18 @@ pub fn env_filter(debug_target: Option<&str>) -> EnvFilter {
 
 pub fn init(debug_target: Option<&str>) -> Result<()> {
     stable_eyre::install()?;
-    let fmt = tracing_subscriber::fmt().with_env_filter(env_filter(debug_target));
+    let fmt = tracing_subscriber::fmt::layer();
     #[cfg(debug_assertions)]
-    let fmt = {
-        fmt.pretty()
-            .with_file(true)
-            .with_line_number(true)
-            .with_ansi(true)
-    };
+    let fmt = fmt
+        .pretty()
+        .with_file(true)
+        .with_line_number(true)
+        .with_ansi(true);
 
-    fmt.init();
+    tracing_subscriber::registry()
+        .with(sentry::integrations::tracing::layer())
+        .with(fmt.with_filter(env_filter(debug_target)))
+        .init();
 
     Ok(())
 }
@@ -188,7 +215,7 @@ pub fn connect_to_swarm() -> Result<PeerId> {
                 ))) => {
                     for (peer_id, _) in list {
                         warn!("mDNS peer expired: {peer_id}");
-                        let _ = swarm.disconnect_peer_id(peer_id);
+                        _ = swarm.disconnect_peer_id(peer_id);
                     }
                 }
                 // Handle Kameo events (optional - for monitoring)

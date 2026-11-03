@@ -1,0 +1,14 @@
+{
+  "api_version": 1,
+  "id": "01J00000000000000000000003",
+  "desired": {
+    "metadata": { "name": "networked", "labels": {}, "annotations": {} },
+    "compute": { "vcpus": 2, "memory_bytes": 2147483648 },
+    "storage": [],
+    "networks": [
+      { "id": "net://private", "mac_address": "02:00:00:00:00:01" }
+    ],
+    "placement": { "node": "compute-a" },
+    "boot": { "start": false }
+  }
+}

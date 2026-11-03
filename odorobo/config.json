@@ -1,6 +1,7 @@
 {
   "datacenter": "Dev",
   "region": "Dev",
+  "sentry_dsn": "https://d59168172bd8827b19a9b8700cc56582@o271654.ingest.us.sentry.io/4512154284785664",
   "network": {
     "dhcp_config": {
       "range": ["10.10.100.100", "10.10.100.200"],

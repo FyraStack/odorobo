@@ -1,6 +1,9 @@
 use bytesize::ByteSize;
 use clap::{Parser, Subcommand};
-use odorobo::types::{CreateVMRequest, VMData, VirtualMachine};
+use odorobo::{
+    manifest::{Boot, Compute, DesiredState, Metadata, Storage, VmManifest},
+    types::CreateVMRequest,
+};
 use reqwest::{Client, Response};
 use serde::Deserialize;
 use stable_eyre::Result;
@@ -12,7 +15,7 @@ use ulid::Ulid;
     about = "Command-line interface for odorobo manager"
 )]
 pub struct Cli {
-    /// Address of the odorobo manager scheduler API server, e.g. "http://localhost:3000"
+    /// Address of the odorobo manager scheduler API server, e.g. "<http://localhost:3000>"
     #[arg(
         long,
         env = "ODOROBO_MANAGER_ADDR",
@@ -26,9 +29,12 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Create a VM via the scheduler endpoint,
-    /// optionally also booting it immediately after creation (if `--boot` is specified).
-    Create,
+    /// Create a VM via the scheduler endpoint.
+    Create {
+        /// Path or URI of the VM disk image.
+        #[arg(long, env = "ODOROBO_VM_IMAGE")]
+        image: String,
+    },
 
     /// List VMs currently known by the manager/agent.
     List,
@@ -96,24 +102,37 @@ pub async fn run_command(cli: Cli) -> Result<()> {
     let base_url = cli.manager_addr;
 
     match cli.command {
-        Command::Create => {
-            // TODO: setup actual cli args for these parameters. or just take in arbitrary json and serialize it into a VirtualMachine.
-            let vm = VirtualMachine {
-                data: VMData {
-                    id: Ulid::new(),
-                    name: "test_vm".to_string(),
-                    vcpus: 4,
-                    max_vcpus: None,
-                    memory: ByteSize::gib(4),
-                    image: "/var/lib/odorobo/f43.raw".to_string(),
+        Command::Create { image } => {
+            let vm = VmManifest {
+                api_version: odorobo::manifest::MANIFEST_VERSION,
+                id: Ulid::generate(),
+                desired: DesiredState {
+                    metadata: Metadata {
+                        name: "test_vm".to_owned(),
+                        ..Default::default()
+                    },
+                    compute: Compute {
+                        vcpus: 4,
+                        memory_bytes: ByteSize::gib(4).as_u64(),
+                        ..Default::default()
+                    },
+                    storage: vec![Storage {
+                        id: "root".to_owned(),
+                        uri: Some(image),
+                        ..Default::default()
+                    }],
+                    boot: Boot {
+                        start: true,
+                        ..Default::default()
+                    },
                     ..Default::default()
                 },
-                ..Default::default()
+                observed: None,
             };
 
-            let request = CreateVMRequest { vm, boot: true };
+            let request = CreateVMRequest { vm };
 
-            let url = format!("{}/vms", base_url);
+            let url = format!("{base_url}/vms");
             let response = client.post(&url).json(&request).send().await?;
 
             println!("{:?}", response.url());
@@ -121,7 +140,7 @@ pub async fn run_command(cli: Cli) -> Result<()> {
             print_message_response(response, "VM create request sent successfully").await?;
         }
         Command::List => {
-            let url = format!("{}/vms", base_url);
+            let url = format!("{base_url}/vms");
             let response = client.get(&url).send().await?;
 
             if response.status().is_success() {
@@ -134,13 +153,13 @@ pub async fn run_command(cli: Cli) -> Result<()> {
             }
         }
         Command::Delete { vmid } => {
-            let url = format!("{}/vms/{}", base_url, vmid);
+            let url = format!("{base_url}/vms/{vmid}");
             let response = client.delete(&url).send().await?;
 
             print_message_response(response, "VM delete request sent successfully").await?;
         }
         Command::Shutdown { vmid } => {
-            let url = format!("{}/vms/{}/shutdown", base_url, vmid);
+            let url = format!("{base_url}/vms/{vmid}/shutdown");
             let response = client.put(&url).send().await?;
 
             print_message_response(response, "VM shutdown request sent successfully").await?;

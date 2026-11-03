@@ -28,6 +28,7 @@ pub struct NetworkConfigCommon {
     pub upstream_iface: Option<String>,
 }
 
+#[allow(clippy::unused_async_trait_impl)]
 impl Actor for DhcpActor {
     type Args = (DhcpConfig, String);
     type Error = Report;
@@ -77,7 +78,7 @@ impl Actor for DhcpActor {
                 .start_kill()
                 .wrap_err_with(|| format!("failed to stop dnsmasq on bridge {}", self.bridge))?;
 
-            let _ = dnsmasq_process.wait().await;
+            _ = dnsmasq_process.wait().await;
         }
 
         Ok(())
@@ -160,12 +161,12 @@ impl NetworkAgentActor {
         self.netlink_handle
             .link()
             .get()
-            .match_name(link_name.to_string())
+            .match_name(link_name.to_owned())
             .execute()
             .next()
             .await
             .ok_or_else(|| eyre!("link {} not found", link_name))?
-            .wrap_err_with(|| format!("failed to query link {}", link_name))
+            .wrap_err_with(|| format!("failed to query link {link_name}"))
     }
 
     fn nft_table_exists(objects: &[NfObject<'_>], table: &str) -> bool {
@@ -214,30 +215,6 @@ impl NetworkAgentActor {
         })
     }
 
-    // todo: IPv6, refer to libvirt's impl:
-    // ```nft
-    // table ip6 libvirt_network {
-    //         chain forward {
-    //                 type filter hook forward priority filter; policy accept;
-    //                 counter packets 0 bytes 0 jump guest_cross
-    //                 counter packets 0 bytes 0 jump guest_input
-    //                 counter packets 0 bytes 0 jump guest_output
-    //         }
-
-    //         chain guest_output {
-    //         }
-
-    //         chain guest_input {
-    //         }
-
-    //         chain guest_cross {
-    //         }
-
-    //         chain guest_nat {
-    //                 type nat hook postrouting priority srcnat; policy accept;
-    //         }
-    // }
-    // ```
     /// Ensures the host-only NAT masquerade rule exists for the configured
     /// upstream interface.
     ///
@@ -352,29 +329,29 @@ impl NetworkAgentActor {
 impl Actor for NetworkAgentActor {
     type Args = NetworkConfig;
     type Error = Report;
+    #[expect(
+        clippy::too_many_lines,
+        reason = "startup orchestration is kept together to preserve network setup ordering"
+    )]
     async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
         // do some netlink fuckery here
 
         let (connection, handle, _) = rtnetlink::new_connection()?;
         let netlink_thread = tokio::spawn(connection);
 
-        let common = match args.network_mode.clone() {
+        let common = match &args.network_mode {
             NetworkMode::HostonlyNat {
                 bridge,
                 subnet,
-                gateway: _,
                 upstream_iface,
+                ..
             } => NetworkConfigCommon {
-                bridge,
+                bridge: bridge.clone(),
                 subnet: subnet.to_string(),
-                upstream_iface: Some(upstream_iface),
+                upstream_iface: Some(upstream_iface.clone()),
             },
-            NetworkMode::Bridged {
-                bridge,
-                subnet,
-                gateway: _,
-            } => NetworkConfigCommon {
-                bridge,
+            NetworkMode::Bridged { bridge, subnet, .. } => NetworkConfigCommon {
+                bridge: bridge.clone(),
                 subnet: subnet.to_string(),
                 upstream_iface: None,
             },
@@ -472,10 +449,7 @@ impl Actor for NetworkAgentActor {
 
         match actor.config.network_mode.clone() {
             NetworkMode::HostonlyNat {
-                bridge: _,
-                subnet,
-                gateway,
-                upstream_iface: _,
+                subnet, gateway, ..
             } => {
                 info!(
                     bridge = %actor.common.bridge,
@@ -515,15 +489,12 @@ impl Actor for NetworkAgentActor {
                 Self::ensure_nat_rules(&common_bridge, &common_subnet, upstream_iface)
                     .wrap_err_with(|| {
                         format!(
-                            "failed to ensure nftables NAT rules for bridge {} and upstream {}",
-                            common_bridge, upstream_iface
+                            "failed to ensure nftables NAT rules for bridge {common_bridge} and upstream {upstream_iface}"
                         )
                     })?;
             }
             NetworkMode::Bridged {
-                bridge: _,
-                subnet,
-                gateway,
+                subnet, gateway, ..
             } => {
                 info!(
                     bridge = %actor.common.bridge,
@@ -579,7 +550,7 @@ impl Actor for NetworkAgentActor {
         }
 
         self.netlink_thread.abort();
-        let _ = (&mut self.netlink_thread).await;
+        _ = (&mut self.netlink_thread).await;
 
         Ok(())
     }

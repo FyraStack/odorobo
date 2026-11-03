@@ -21,7 +21,7 @@ async fn drain(
     State(_state): State<RemoteActorRef<HTTPActor>>,
 ) -> Result<impl IntoApiResponse, OdoroboError> {
     // stub
-    Ok(Json("Draining...".to_string()))
+    Ok(Json("Draining...".to_owned()))
 }
 
 /// Get detailed information about a specific node, including its current VMs and resource usage.

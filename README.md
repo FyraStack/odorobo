@@ -41,6 +41,12 @@ sudo ./target/release/odorobo --manager-enabled # or set ODOROBO_MANAGER_ENABLED
 sudo ./target/release/odorobo
 ```
 
+### Sentry error reporting
+
+Sentry is initialized with the project DSN from the `sentry_dsn` field in
+`odorobo/config.json`. Odorobo does not send default PII to Sentry, including
+user IPs or potentially sensitive HTTP headers.
+
 You can run multiple managers for load balancing and HA, but it is not required.
 
 Install the CLI helper
@@ -74,6 +80,9 @@ See [docs/console.md](docs/console.md) for direct serial socket access, WebSocke
 For more advanced usage, Odorobo Agent also exposes a passthrough route for the local Cloud Hypervisor API, allowing you to call the full Cloud Hypervisor API directly through the agent's REST API
 
 See `docs/ch-passthrough.md` for Cloud Hypervisor API passthrough usage.
+
+See [docs/future-work.md](docs/future-work.md) for planned scheduler,
+migration, and high-availability work that is not implemented yet.
 
 ## Note about CI Tests
 

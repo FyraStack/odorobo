@@ -2,15 +2,17 @@ use std::collections::BTreeMap;
 
 use aide::OperationIo;
 use bytesize::ByteSize;
-use cloud_hypervisor_client::models::VmConfig;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
+
+use crate::manifest::VmManifest;
 
 mod bytesize_as_u64 {
     use bytesize::ByteSize;
     use serde::{Deserialize, Deserializer, Serializer};
 
+    #[allow(clippy::trivially_copy_pass_by_ref)]
     pub fn serialize<S: Serializer>(size: &ByteSize, s: S) -> Result<S::Ok, S::Error> {
         s.serialize_u64(size.as_u64())
     }
@@ -24,6 +26,7 @@ mod opt_bytesize_as_u64 {
     use bytesize::ByteSize;
     use serde::{Deserialize, Deserializer, Serializer};
 
+    #[allow(clippy::ref_option)]
     pub fn serialize<S: Serializer>(size: &Option<ByteSize>, s: S) -> Result<S::Ok, S::Error> {
         match size {
             Some(b) => s.serialize_some(&b.as_u64()),
@@ -59,29 +62,14 @@ pub struct StorageUri(#[schemars(with = "String")] pub url::Url);
 
 impl Default for StorageUri {
     fn default() -> Self {
-        StorageUri(url::Url::parse("file:///tmp").unwrap())
+        Self(url::Url::parse("file:///tmp").unwrap())
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, JsonSchema, Default, Clone)]
+#[derive(Serialize, Deserialize, Debug, JsonSchema, OperationIo, Clone)]
 pub struct CreateVMRequest {
-    /// Data of the VM to create
-    pub vm: VirtualMachine,
-    /// Whether to boot the VM immediately after creation
-    pub boot: bool,
-}
-
-/// An internal, debug-only request for creating a VM.
-///
-/// please don't use this in production, this is for debugging
-///
-/// PUT /vms/
-#[derive(Serialize, Deserialize, Debug, OperationIo, Default, Clone)]
-pub struct DebugCreateVMRequest {
-    /// Data of the VM to create
-    pub vm_config: VmConfig,
-    /// Whether to boot the VM immediately after creation
-    pub boot: bool,
+    /// Provider-neutral VM intent to create.
+    pub vm: VmManifest,
 }
 
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Default, Clone)]
@@ -165,7 +153,7 @@ pub struct VirtualMachine {
     /// Metadata
     pub metadata: Option<ObjectMetadata>,
 
-    /// List of Affinity rules for scheduling. These are ANDed / summed together depending on the strictness.
+    /// List of Affinity rules for scheduling. These are `ANDed` / summed together depending on the strictness.
     pub affinity: Option<Vec<AffinityRule>>,
 }
 
@@ -173,12 +161,15 @@ pub struct VirtualMachine {
 pub struct AffinityRule {
     pub strictness: AffinityStrictness,
     pub affinity_type: AffinityType,
-    pub direction: AffinityDirection,
-    /// ORed together
+    /// If true, the outcome of the requirements is inverted.
+    #[serde(default)]
+    pub inverse: bool,
+
+    /// `ORed` together
     pub requirements: Vec<AffinityRequirement>,
 }
 
-#[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
+#[derive(Serialize, Deserialize, Debug, JsonSchema, Clone, Copy)]
 pub enum AffinityStrictness {
     Required,
     Preferred { weight: i64 },
@@ -190,12 +181,8 @@ pub enum AffinityType {
     Agent,
 }
 
-#[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
-pub enum AffinityDirection {
-    Normal,
-    Anti,
-}
-
+/// If there are several metadata tables, their results will be `ANDed` together
+/// EX: if a requirement is checked against several VMs, it must pass all VMs for the requirement to be fulfilled.
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
 pub struct AffinityRequirement {
     pub key: String,
@@ -210,8 +197,7 @@ pub enum MetadataTable {
     Annotation,
 }
 
-// todo: possibly replace with std::ops
-#[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
+#[derive(Serialize, Deserialize, Debug, JsonSchema, Clone, PartialEq, Eq)]
 pub enum Operator {
     In,
     NotIn,

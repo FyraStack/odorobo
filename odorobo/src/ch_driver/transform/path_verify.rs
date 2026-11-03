@@ -14,8 +14,8 @@ pub struct PathVerify;
 
 impl ConfigTransform for PathVerify {
     #[tracing::instrument(skip(config))]
-    fn transform(&self, _vmid: &str, config: &mut VmConfig) -> Result<()> {
-        trace!("Verifying paths");
+    fn transform(&self, vmid: &str, config: &mut VmConfig) -> Result<()> {
+        trace!(%vmid, "Verifying paths");
         let config = config.clone();
         // payload path verification
         if let Some(kernel_path) = config.payload.kernel
@@ -38,7 +38,7 @@ impl ConfigTransform for PathVerify {
         if let Some(disk_configs) = config.disks {
             for disk in disk_configs {
                 if let Some(path) = disk.path {
-                    let disk_id = disk.id.unwrap_or("<unknown>".into());
+                    let disk_id = disk.id.unwrap_or_else(|| "<unknown>".into());
                     if !Path::new(&path).is_absolute() {
                         return Err(eyre!("disk path for {disk_id} must be an absolute path"));
                     }

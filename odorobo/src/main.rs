@@ -1,29 +1,75 @@
+#![allow(unknown_lints)] // Supports Clippy releases before `unused_async_trait_impl` was introduced.
+#![allow(clippy::unused_async_trait_impl)] // Kameo requires async trait methods even when a handler has no await points.
+
 pub mod actors;
 mod ch_driver;
 pub mod config;
 pub mod http_api;
+mod manifest;
 pub mod messages;
 pub mod networking;
 pub mod types;
 mod utils;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use kameo::actor::Spawn;
-use stable_eyre::Result;
+use stable_eyre::{Result, eyre::eyre};
 
 use crate::actors::agent_actor::AgentActor;
 use crate::actors::http_actor::HTTPActor;
 use crate::actors::scheduler_actor::SchedulerActor;
 use crate::config::Config;
-use crate::utils::actor_names::{HTTP_API_SERVER, SCHEDULER};
-use crate::utils::{actor_names::AGENT, connect_to_swarm, init};
+use crate::utils::actor_names::{AGENT, HTTP_API_SERVER, SCHEDULER};
+use crate::utils::{connect_to_swarm, init};
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let config = Config::init();
+    let _sentry_guard = init_sentry(config.sentry_dsn.as_deref());
 
     init(Some("odorobo"))?;
+    let term = utils::lockfile::register_termsigs()?;
+    let _lock = utils::lockfile::init_lockfile(&config).map_err(|e| {
+        eyre!("init lockfile failed (note: the `no_lockfile` option can skip this)").wrap_err(e)
+    })?;
 
-    tracing::info!(?config, "Starting odorobo");
+    mainloop(&term, config)
+}
+
+fn init_sentry(dsn: Option<&str>) -> Option<sentry::ClientInitGuard> {
+    let dsn = dsn?;
+    let mut options = sentry::ClientOptions::default();
+    options.release = sentry::release_name!();
+    options.send_default_pii = false;
+
+    let guard = sentry::init((dsn, options));
+    tracing::info!("Sentry error reporting enabled");
+    Some(guard)
+}
+
+fn mainloop(term: &Arc<AtomicBool>, config: Config) -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| eyre!("can't build tokio: {err}"))?;
+    let handle = runtime.spawn(inner_main(config));
+
+    loop {
+        if handle.is_finished() {
+            break runtime
+                .block_on(handle)
+                .map_err(|err| eyre!("cannot join main thread: {err}"))?;
+        }
+        if term.load(Ordering::Relaxed) {
+            handle.abort();
+            stable_eyre::eyre::bail!("Exit due to termination signal");
+        }
+    }
+}
+
+async fn inner_main(config: Config) -> Result<()> {
+    tracing::info!("Starting odorobo");
 
     let local_peer_id = connect_to_swarm().unwrap();
     tracing::info!(?local_peer_id, "Peer ID");

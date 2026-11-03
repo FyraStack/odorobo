@@ -9,7 +9,9 @@ use stable_eyre::{
     eyre::{Context, eyre},
 };
 use std::{
-    env, fs,
+    env,
+    fs::{self, File},
+    io::BufWriter,
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
 };
@@ -48,7 +50,7 @@ impl std::fmt::Debug for VMInstance {
             .field("id", &self.id)
             .field("ch_socket_path", &self.ch_socket_path)
             .field("vm_config", &self.vm_config)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -84,7 +86,7 @@ impl VMInstance {
         child_process: Option<tokio::process::Child>,
     ) -> Self {
         Self {
-            id: id.to_string(),
+            id: id.to_owned(),
             ch_socket_path,
             transformer: transformer.unwrap_or_default(),
             hook_manager: HookManager::default(),
@@ -96,7 +98,7 @@ impl VMInstance {
     /// Takes the child process out of this instance, transferring ownership to the caller.
     /// Useful for watching the process lifecycle externally (e.g. in an actor watcher task).
     /// After calling this, `destroy()` will skip the child-kill step.
-    pub fn take_child_process(&mut self) -> Option<tokio::process::Child> {
+    pub const fn take_child_process(&mut self) -> Option<tokio::process::Child> {
         self.child_process.take()
     }
 
@@ -162,7 +164,7 @@ impl VMInstance {
     /// Initiates a migration from this VM to the specified destination URI.
     ///
     /// Options:
-    /// - `dest`: the destination URI to migrate to, in the format expected by CH (e.g. "tcp:<IP_ADDRESS>:12345")
+    /// - `dest`: the destination URI to migrate to, in the format expected by CH (e.g. "tcp:<`IP_ADDRESS>:12345`")
     /// - `local`: if true, indicates that the migration is local (e.g. within the same host, for renaming a VM). This is passed to CH and may affect how the migration is performed.
     #[tracing::instrument]
     pub async fn send_migration(&mut self, dest: &str, local: bool) -> Result<()> {
@@ -170,7 +172,7 @@ impl VMInstance {
         trace!(destination = dest, "Sending migration command to VM");
 
         let send_migration_data = models::SendMigrationData {
-            destination_url: dest.to_string(),
+            destination_url: dest.to_owned(),
             local: Some(local),
             ..Default::default()
         };
@@ -207,13 +209,13 @@ impl VMInstance {
 
         trace!(port = rand_port, "Selected random port for migration");
 
-        let receiver_uri = format!("tcp:0.0.0.0:{}", rand_port);
+        let receiver_uri = format!("tcp:0.0.0.0:{rand_port}");
 
         let receive_migration_data = models::ReceiveMigrationData {
             receiver_url: receiver_uri.clone(),
         };
 
-        let vm_id = self.vm_id().to_string();
+        let vm_id = self.vm_id().to_owned();
         info!(
             vm_id,
             port = rand_port,
@@ -227,7 +229,7 @@ impl VMInstance {
                 .map_err(ChApiError::from)
                 .wrap_err(eyre!("Failed to prepare VM for migration {}", vm_id))
             {
-                Ok(_) => {
+                Ok(()) => {
                     info!(vm_id, "Migration receiver completed successfully");
                     // shut down vm
                     if let Err(e) = conn.shutdown_vmm().await {
@@ -275,8 +277,7 @@ impl VMInstance {
 
     pub fn configured_runtime_root() -> PathBuf {
         env::var_os(RUNTIME_ROOT_ENV_VAR)
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_RUNTIME_ROOT_DIR))
+            .map_or_else(|| PathBuf::from(DEFAULT_RUNTIME_ROOT_DIR), PathBuf::from)
     }
 
     pub fn conn(&self) -> SocketBasedApiClient {
@@ -287,16 +288,28 @@ impl VMInstance {
         &self.id
     }
 
-    /// Returns the PTY path for this VM's serial console by querying the CH API.
+    /// Returns the configured PTY/file path for this VM's serial console.
     #[tracing::instrument]
     pub async fn console_path(&self) -> Result<PathBuf> {
-        trace!("Getting console PTY path from CH API");
-        let info = self.info().await?;
-        let path =
-            info.config.serial.and_then(|s| s.file).ok_or_else(|| {
-                eyre!("No serial console PTY path available for {}", self.vm_id())
-            })?;
+        trace!("Getting console file path from CH API");
+        let serial = self
+            .info()
+            .await?
+            .config
+            .serial
+            .ok_or_else(|| eyre!("No serial console configured for {}", self.vm_id()))?;
+        let path = serial.file.ok_or_else(|| {
+            eyre!(
+                "Serial console is not configured as a file for {}",
+                self.vm_id()
+            )
+        })?;
         Ok(PathBuf::from(path))
+    }
+
+    /// Returns the configured UNIX socket path for this VM's serial console.
+    pub fn console_socket_path(&self) -> PathBuf {
+        self.runtime_dir().join("console.sock")
     }
 
     /// Opens the PTY console device for this VM and returns a connected stream.
@@ -320,6 +333,13 @@ impl VMInstance {
 
     pub fn ch_socket_path(&self) -> &Path {
         &self.ch_socket_path
+    }
+
+    async fn stop_child_after_failed_start(&mut self) {
+        if let Some(mut child) = self.child_process.take() {
+            _ = child.start_kill();
+            _ = child.wait().await;
+        }
     }
 
     pub async fn info(&self) -> Result<VmInfo> {
@@ -357,14 +377,17 @@ impl VMInstance {
             .wrap_err(eyre!("Failed to ping VM {}", self.vm_id()))
     }
 
-    /// Spawn a new CH process and create a VMInstance for it.
+    /// Spawn a Cloud Hypervisor process and optionally create/boot its VM.
     ///
-    /// Waits for the socket to become available (polls up to ~30 seconds).
-    /// Calls a backend to handle the actual CH process spawning - typically a systemd unit
+    /// `vm_config` is already translated by the CH manifest boundary. The
+    /// separate `boot` flag preserves the manifest's desired start behavior;
+    /// callers can create a stopped VM without changing its provider config.
+    /// The socket is polled for up to roughly 30 seconds before failing.
     #[tracing::instrument(skip_all)]
     pub async fn spawn(
         id: &str,
         vm_config: Option<VmConfig>,
+        boot: bool,
         transformer: Option<TransformChain>,
     ) -> Result<Self> {
         let ch_socket_path = Self::runtime_dir_for(id).join(SOCKET_FILE_NAME);
@@ -385,17 +408,21 @@ impl VMInstance {
             if instance.conn().vmm_ping_get().await.is_ok() {
                 info!(vm_id = id, "CH socket available");
                 if let Some(vm_config) = vm_config {
-                    info!(?vm_config, "Creating VM config and booting");
-                    instance.create_config(vm_config, true).await?;
+                    info!(boot, ?vm_config, "Creating VM config");
+                    if let Err(error) = instance.create_config(vm_config, boot).await {
+                        instance.stop_child_after_failed_start().await;
+                        return Err(error);
+                    }
                 }
                 return Ok(instance);
             }
 
             if attempt < MAX_ATTEMPTS - 1 {
-                tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
             }
         }
 
+        instance.stop_child_after_failed_start().await;
         Err(eyre!(
             "CH socket not available after {} attempts for VM {}",
             MAX_ATTEMPTS,
@@ -426,7 +453,7 @@ impl VMInstance {
             );
         }
 
-        if let Ok(()) = self.conn().shutdown_vmm().await {
+        if matches!(self.conn().shutdown_vmm().await, Ok(())) {
             debug!(vm_id = self.vm_id(), "VMM shutdown successfully");
         } else {
             warn!(
@@ -437,7 +464,7 @@ impl VMInstance {
         let vm_config = self.vm_config.clone().unwrap_or_default();
         if let Some(mut child) = self.child_process.take() {
             trace!("VMM stopped... checking child process");
-            let _ = child.start_kill();
+            _ = child.start_kill();
             if let Err(err) = child.wait().await {
                 warn!(
                     vm_id = self.vm_id(),
@@ -480,19 +507,18 @@ impl VMInstance {
 
     /// Load desired VM config from disk.
     pub fn load_config(&self) -> Result<models::VmConfig> {
-        let config_data = fs::read_to_string(self.config_path())
-            .wrap_err(eyre!("Failed to read config file for {}", self.vm_id()))?;
-
-        serde_json::from_str(&config_data)
-            .wrap_err(eyre!("Failed to parse config JSON for {}", self.vm_id()))
+        serde_json::from_reader(
+            File::open(self.config_path())
+                .wrap_err(eyre!("Failed to read config file for {}", self.vm_id()))?,
+        )
+        .wrap_err(eyre!("Failed to parse config JSON for {}", self.vm_id()))
     }
 
     /// Save desired VM config to disk.
     pub fn save_config(&self, config: &models::VmConfig) -> Result<()> {
-        let config_data =
-            serde_json::to_string_pretty(config).wrap_err("Failed to serialize config to JSON")?;
-
-        fs::write(self.config_path(), config_data)
+        let file = File::create(self.config_path())
+            .wrap_err(eyre!("Failed to open config file for {}", self.vm_id()))?;
+        serde_json::to_writer_pretty(BufWriter::new(file), config)
             .wrap_err(eyre!("Failed to write config file for {}", self.vm_id()))
     }
 
@@ -505,7 +531,7 @@ impl VMInstance {
         trace!(vm_id = self.vm_id(), "Creating VM with provided config");
 
         trace!(vm_id = self.vm_id(), "Applying config transforms");
-        let mut transformed_config = config.clone();
+        let mut transformed_config = config;
         self.transformer
             .transform(self.vm_id(), &mut transformed_config)
             .wrap_err(eyre!(
@@ -548,9 +574,7 @@ impl VMInstance {
                 self.vm_id()
             ))?;
 
-        self.hook_manager
-            .before_boot(self.vm_id(), &config.clone())
-            .await?;
+        self.hook_manager.before_boot(self.vm_id(), &config).await?;
 
         Ok(())
     }

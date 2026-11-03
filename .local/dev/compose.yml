@@ -1,0 +1,77 @@
+services:
+  ceph:
+    build:
+      context: ./ceph
+      dockerfile: Containerfile
+      args:
+        CEPH_IMAGE: ${CEPH_IMAGE:-quay.io/ceph/ceph:v20.2.3}
+    image: odorobo-ceph:local
+    container_name: odorobo-ceph
+    hostname: ceph
+    privileged: true
+    # Bootstrap errors must leave the container stopped so `init.sh` can report
+    # them instead of silently repeating a failed initialization.
+    restart: "no"
+    environment:
+      CEPH_MON_IP: ${CEPH_MON_IP:-127.0.0.1}
+      CEPH_POOL: ${CEPH_POOL:-odorobo-blockpool}
+      CEPH_CLIENT: ${CEPH_CLIENT:-odorobo}
+      CEPH_IMAGE_NAME: ${CEPH_IMAGE_NAME:-dev-disk}
+      CEPH_IMAGE_SIZE: ${CEPH_IMAGE_SIZE:-1G}
+      CEPH_OSD_SIZE: ${CEPH_OSD_SIZE:-10G}
+    volumes:
+      - ceph_etc:/etc/ceph
+      - ceph_lib:/var/lib/ceph
+      - ceph_log:/var/log/ceph
+      - ceph_run:/run/ceph
+      - ceph_osd:/var/lib/odorobo-ceph
+      - ceph_creds:/generated
+      # Direct BlueStore initialization uses a host loop-backed block device.
+      - /dev:/dev
+
+    healthcheck:
+      test: ["CMD", "ceph", "-s"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  odorobo:
+    build:
+      context: ./odorobo
+      dockerfile: Containerfile
+    container_name: odorobo
+    privileged: true
+    depends_on:
+      ceph:
+        condition: service_healthy
+    # podman-compose supports container namespace targets, but not the
+    # Compose `service:ceph` shorthand.
+    network_mode: container:odorobo-ceph
+    pid: container:odorobo-ceph
+    volumes:
+      - ../../:/workspace
+      - ceph_creds:/generated:ro
+      - /dev:/dev
+      # The rbd CLI runs `modprobe rbd` before mapping; the container's own
+      # /lib/modules won't match the host's running kernel, so bind the host's
+      # module tree in. modprobe finds rbd, sees it's already loaded on the
+      # shared kernel, and skips the insmod.
+      - /lib/modules:/lib/modules:ro
+    working_dir: /workspace
+    environment:
+      CEPH_CONFIG: /generated/ceph.conf
+      CEPH_ID: ${CEPH_CLIENT:-odorobo}
+      CEPH_KEYFILE: /generated/client.${CEPH_CLIENT:-odorobo}.key
+      CEPH_CLUSTER: ceph
+      # Release compilation is memory-intensive; keep the default usable on
+      # development laptops while allowing an override for faster machines.
+      CARGO_BUILD_JOBS: ${CARGO_BUILD_JOBS:-2}
+    command: ["cargo", "run", "--release", "-p", "odorobo", "--", "--manager-enabled", "true"]
+
+volumes:
+  ceph_etc:
+  ceph_lib:
+  ceph_log:
+  ceph_run:
+  ceph_osd:
+  ceph_creds:

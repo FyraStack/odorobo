@@ -21,17 +21,27 @@ fn default_gateway() -> Ipv4Addr {
 }
 /// Infers the default upstream interface from the system's default route
 fn default_upstream_iface() -> String {
-    // ip route
-    let out = std::process::Command::new("ip")
-        .arg("route")
-        .output()
-        .unwrap();
-    let output = String::from_utf8(out.stdout).unwrap();
+    let Ok(output) = std::process::Command::new("ip").arg("route").output() else {
+        warn!("cannot inspect routes; defaulting upstream interface to eth0");
+        return "eth0".to_owned();
+    };
 
-    let default_route = output.lines().find(|l| l.starts_with("default")).unwrap();
-    let iface = default_route.split_whitespace().nth(4).unwrap();
+    let Ok(output) = String::from_utf8(output.stdout) else {
+        warn!("route output is not valid UTF-8; defaulting upstream interface to eth0");
+        return "eth0".to_owned();
+    };
+
+    let Some(iface) = output
+        .lines()
+        .find(|line| line.starts_with("default"))
+        .and_then(|line| line.split_whitespace().nth(4))
+    else {
+        warn!("no default route found; defaulting upstream interface to eth0");
+        return "eth0".to_owned();
+    };
+
     info!("inferring default upstream interface: {}", iface);
-    iface.into()
+    iface.to_owned()
 }
 
 /// DHCP server config
@@ -50,7 +60,6 @@ pub struct DhcpConfig {
     pub lease_time: String,
 }
 
-// TODO: move config into a separate module
 #[derive(Serialize, Deserialize, Default, Clone, Debug)]
 pub struct NetworkConfig {
     pub dhcp_config: Option<DhcpConfig>,
@@ -118,6 +127,10 @@ pub struct Config {
     /// The region the agent is running in.
     #[clap(long)]
     pub region: Option<String>,
+    /// Sentry DSN used for error reporting.
+    #[clap(skip)]
+    #[serde(default)]
+    pub sentry_dsn: Option<String>,
     /// The number of VCPUs reserved for the agent. Defaults to 2.
     #[clap(long)]
     pub reserved_vcpus: Option<u32>,
@@ -134,9 +147,14 @@ pub struct Config {
     #[clap(skip)]
     #[serde(default)]
     pub network: NetworkConfig,
+
+    /// Ignore lockfiles and do not create a lockfile
+    #[clap(long, action = clap::ArgAction::SetTrue)]
+    pub no_lockfile: Option<bool>,
 }
 
 impl Config {
+    #[must_use]
     pub fn init() -> Self {
         let mut result = Self::parse();
         if let Ok(fd) =
@@ -151,13 +169,16 @@ impl Config {
         }
         result
     }
+    #[must_use]
     pub fn get_manager_enabled(&self) -> bool {
         self.manager_enabled.unwrap_or(false)
     }
+    #[must_use]
     pub fn get_hostname(&self) -> &str {
         static HOSTNAME: LazyLock<Option<String>> = LazyLock::new(System::host_name);
         (self.hostname.as_deref()).unwrap_or_else(|| HOSTNAME.as_deref().unwrap_or("odorobo"))
     }
+    #[must_use]
     pub fn get_datacenter(&self) -> &str {
         static DEFAULT_DATACENTER: LazyLock<&'static str> = LazyLock::new(|| {
             warn!("No datacenter specified, defaulting to Dev");
@@ -165,6 +186,7 @@ impl Config {
         });
         (self.datacenter.as_deref()).unwrap_or_else(|| *DEFAULT_DATACENTER)
     }
+    #[must_use]
     pub fn get_region(&self) -> &str {
         static DEFAULT_REGION: LazyLock<&'static str> = LazyLock::new(|| {
             warn!("No region specified, defaulting to Local");
@@ -172,6 +194,7 @@ impl Config {
         });
         (self.region.as_deref()).unwrap_or_else(|| *DEFAULT_REGION)
     }
+    #[must_use]
     pub fn get_reserved_vcpus(&self) -> u32 {
         self.reserved_vcpus.unwrap_or(2)
     }
@@ -187,13 +210,13 @@ mod tests {
                 dhcp_config: Some(DhcpConfig {
                     range: (Ipv4Addr::new(10, 10, 1, 100), Ipv4Addr::new(10, 10, 1, 200)),
                     subnet: Ipv4Net::new(Ipv4Addr::new(10, 10, 1, 0), 24).unwrap(),
-                    lease_time: "12h".to_string(),
+                    lease_time: "12h".to_owned(),
                 }),
                 network_mode: NetworkMode::HostonlyNat {
-                    bridge: "vmbr0".to_string(),
+                    bridge: "vmbr0".to_owned(),
                     gateway: Ipv4Addr::new(10, 10, 100, 1),
                     subnet: Ipv4Net::new(Ipv4Addr::new(10, 10, 100, 0), 24).unwrap(),
-                    upstream_iface: default_upstream_iface(),
+                    upstream_iface: "test0".to_owned(),
                 },
             },
             ..Default::default()
@@ -201,6 +224,6 @@ mod tests {
 
         let json = serde_json::to_string_pretty(&config).unwrap();
         // assert_eq!(json, )
-        println!("{}", json);
+        println!("{json}");
     }
 }

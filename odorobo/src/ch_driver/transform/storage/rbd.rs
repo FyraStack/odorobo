@@ -51,21 +51,28 @@ async fn rbd_map_list() -> Result<Vec<(String, String)>> {
 fn rbd_lines_list(input: &str) -> Result<Vec<(String, String)>> {
     let mut mappings = Vec::new();
     for line in input.lines().skip(1) {
-        let parts: Vec<&str> = line.split_whitespace().collect();
+        let mut parts = line.split_whitespace();
+        let _id = parts.next();
+        let Some(pool) = parts.next() else {
+            continue;
+        };
+        let Some(field) = parts.next() else {
+            continue;
+        };
+        let Some(next) = parts.next() else {
+            continue;
+        };
+        let Some(fifth) = parts.next() else {
+            continue;
+        };
+
         // id  pool               namespace  image    snap  device
         // 0   pool               foo        testimg    -   /dev/rbd0
-        if parts.len() == 6 {
-            let rbd_path = format!("{}/{}", parts[1], parts[3]);
-            let device_path = parts[5].to_string();
-            mappings.push((rbd_path, device_path));
-        }
-        if parts.len() == 5 {
-            // if namespace is empty, it might be omitted from the output, so we need to handle that case as well
-            // id  pool               image    snap  device
-            // 0   pool               testimg    -   /dev/rbd0
-            let rbd_path = format!("{}/{}", parts[1], parts[2]);
-            let device_path = parts[4].to_string();
-            mappings.push((rbd_path, device_path));
+        if let Some(device) = parts.next() {
+            mappings.push((format!("{pool}/{next}"), device.to_owned()));
+        } else if fifth.starts_with("/dev/") {
+            // If namespace is empty, it may be omitted from the output.
+            mappings.push((format!("{pool}/{field}"), fifth.to_owned()));
         }
     }
 
@@ -105,6 +112,8 @@ impl RbdImage {
             .args(rbd_extra_args())
             .arg("device")
             .arg("map")
+            .arg("--options")
+            .arg("noudev")
             .arg(&rbd_path)
             .output()
             .await
@@ -125,6 +134,8 @@ impl RbdImage {
             .args(rbd_extra_args())
             .arg("device")
             .arg("unmap")
+            .arg("--options")
+            .arg("noudev")
             .arg(&rbd_path)
             .output()
             .await
@@ -144,13 +155,13 @@ impl TryFrom<&Url> for RbdImage {
         let pool = uri
             .host_str()
             .ok_or_else(|| eyre!("RBD URI must have a host (pool name)"))?
-            .to_string();
+            .to_owned();
         let path = uri.path();
         if path.is_empty() || path == "/" {
             return Err(eyre!("RBD URI must have a path (image name)"));
         }
-        let image = path.trim_start_matches('/').to_string();
-        Ok(RbdImage { pool, image })
+        let image = path.trim_start_matches('/').to_owned();
+        Ok(Self { pool, image })
     }
 }
 
@@ -165,7 +176,33 @@ impl StorageDriver for RbdStorage {
     async fn resolve(&self, uri: &Url) -> Result<PathBuf> {
         let image = RbdImage::try_from(uri)?;
         image.map().await?;
-        Ok(image.device_path())
+        // map() uses `--options noudev`: with udev enabled, the rbd CLI waits
+        // for a udev event in its own network namespace, but rbd devices are
+        // created in the host's namespace, so that wait never completes in a
+        // container. The kernel uevent still reaches the host's udevd, so the
+        // stable path appears shortly after the map. Wait up to 10s (100 x
+        // 100ms steps) for it, and fall back to the kernel device name (e.g.
+        // /dev/rbd0) when the host has no ceph udev rule.
+        let udev_path = image.device_path();
+        for _ in 0..100 {
+            if udev_path.exists() {
+                return Ok(udev_path);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let device = rbd_map_list()
+            .await?
+            .into_iter()
+            .find(|(path, _)| path == &image.rbd_path())
+            .map(|(_, device)| device)
+            .ok_or_else(|| {
+                eyre!(
+                    "RBD image {} is mapped but no device name was found",
+                    image.rbd_path()
+                )
+            })?;
+        info!(?device, "udev path not available, using kernel device name");
+        Ok(PathBuf::from(device))
     }
 
     async fn release(&self, uri: &Url) -> Result<()> {
@@ -174,26 +211,31 @@ impl StorageDriver for RbdStorage {
     }
 }
 
-#[test]
-fn test_rbd_image_from_uri() {
-    let uri = Url::parse("rbd://my-pool/my-image").unwrap();
-    let image = RbdImage::try_from(&uri).unwrap();
-    assert_eq!(image.pool, "my-pool");
-    assert_eq!(image.image, "my-image");
-    assert_eq!(image.rbd_path(), "my-pool/my-image");
-    assert_eq!(
-        image.device_path(),
-        std::path::PathBuf::from("/dev/rbd/my-pool/my-image")
-    );
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-#[test]
-fn test_rbd_lines_list() {
-    let input = "\
+    #[test]
+    fn test_rbd_image_from_uri() {
+        let uri = Url::parse("rbd://my-pool/my-image").unwrap();
+        let image = RbdImage::try_from(&uri).unwrap();
+        assert_eq!(image.pool, "my-pool");
+        assert_eq!(image.image, "my-image");
+        assert_eq!(image.rbd_path(), "my-pool/my-image");
+        assert_eq!(
+            image.device_path(),
+            std::path::PathBuf::from("/dev/rbd/my-pool/my-image")
+        );
+    }
+
+    #[test]
+    fn test_rbd_lines_list() {
+        let input = "\
 id  pool               namespace  image    snap  device
 0   kessoku-blockpool             testimg  -     /dev/rbd0";
-    let mappings = rbd_lines_list(input).unwrap();
-    assert_eq!(mappings.len(), 1);
-    assert_eq!(mappings[0].0, "kessoku-blockpool/testimg");
-    assert_eq!(mappings[0].1, "/dev/rbd0");
+        let mappings = rbd_lines_list(input).unwrap();
+        assert_eq!(mappings.len(), 1);
+        assert_eq!(mappings[0].0, "kessoku-blockpool/testimg");
+        assert_eq!(mappings[0].1, "/dev/rbd0");
+    }
 }
