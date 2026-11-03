@@ -31,7 +31,7 @@ pub struct Cli {
 pub enum Command {
     /// Create a VM via the scheduler endpoint.
     Create {
-        /// Storage URI: file://, rbd://, or iscsi:// (local files use file:///absolute/path).
+        /// Storage URI: file://, rbd://, or iscsi:// (local files use <file:///absolute/path>).
         #[arg(long, env = "ODOROBO_VM_IMAGE")]
         image: String,
         /// Name to assign to the VM.
