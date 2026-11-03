@@ -990,7 +990,15 @@ impl Message<MigrationFinished> for VMActor {
         msg: MigrationFinished,
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        if msg.succeeded {
+        // only the receive operation's own flag commits the CID, not whoever sent this
+        let succeeded = self
+            .migration_state
+            .as_ref()
+            .is_some_and(|state| state.receive_succeeded.load(Ordering::SeqCst));
+        if msg.succeeded != succeeded && self.migration_state.is_some() {
+            warn!(vmid = %self.vmid, reported = msg.succeeded, succeeded, "migration finished notice disagrees with the receive result");
+        }
+        if succeeded {
             if let Some(mut state) = self.migration_state.take() {
                 if let Some(task) = state.console_attach_task.take() {
                     task.abort();
@@ -1006,6 +1014,9 @@ impl Message<MigrationFinished> for VMActor {
             } else {
                 warn!(vmid = %self.vmid, "received migration finished notification with no active migration state");
             }
+        } else if msg.succeeded {
+            // claims success the receive never recorded, so don't commit or tear anything down
+            warn!(vmid = %self.vmid, "ignoring migration success notice without a successful receive");
         } else if let Some(state) = self.migration_state.as_ref() {
             self.manifest.clone_from(&state.previous_manifest);
             warn!(vmid = %self.vmid, "migration failed; stopping receiver before rolling back CID reservation");
