@@ -236,6 +236,13 @@ pub struct SchedulerActor {
     vm_tombstones: AHashMap<Ulid, VmTombstone>,
     /// background deletes for `Deleted` VMs that an agent still reports
     vm_auto_deletes: AHashMap<(Ulid, ActorId), AutoDeleteState>,
+    /// nodes that might still run a deleted VM: owners a force delete gave up
+    /// on, and agents caught still reporting one. while any are left the ID
+    /// can't be recreated and its `Deleted` tombstone isn't pruned, so when the
+    /// node comes back its copy gets deleted instead of adopted as the new VM.
+    /// an entry goes away once that node acks a delete or reports a full status
+    /// without the VM
+    vm_leftover_owners: AHashMap<Ulid, AHashSet<VmDeleteOwner>>,
     /// last discovered agent per owner, kept even after reachability-cache eviction.
     /// these are just for finding known VM owners, not a list to broadcast to
     known_agent_refs: AHashMap<VmDeleteOwner, RemoteActorRef<AgentActor>>,

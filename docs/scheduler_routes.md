@@ -12,7 +12,7 @@ MACs for VMs need to be stored somewhere. it can be either in the DHT or in the 
 
 `DELETE /vms/{vmid}` only succeeds once every node that might still hold something for the VM (a running process, a stopped vsock CID lease, storage mappings) confirms cleanup. if one of those nodes is unreachable, the delete fails and the ID can't be recreated until a retry works.
 
-`DELETE /vms/{vmid}?force=true` is for when a node is gone for good. owners whose agent can't be reached at all (no route, or the request fails in transport) are dropped with a warning instead of failing the delete. an agent that answers and says cleanup failed still fails the delete, force or not, since it's alive and something is actually wrong. whatever a dropped node still holds is leaked, but if it ever comes back and reports the VM, the scheduler deletes it there in the background.
+`DELETE /vms/{vmid}?force=true` is for when a node is gone for good. owners whose agent can't be reached at all (no route, or the request fails in transport) are dropped with a warning instead of failing the delete. an agent that answers and says cleanup failed still fails the delete, force or not, since it's alive and something is actually wrong. whatever a dropped node still holds is leaked, but if it ever comes back and reports the VM, the scheduler deletes it there in the background. until then `POST /vms` with the same ID is refused, since the old copy might still be running on the same storage. use a new VM ID if the node is gone for good.
 
 ## volumes
 

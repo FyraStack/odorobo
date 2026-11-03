@@ -47,6 +47,7 @@ impl Actor for SchedulerActor {
             vm_effective_manifests: AHashMap::new(),
             vm_tombstones: AHashMap::new(),
             vm_auto_deletes: AHashMap::new(),
+            vm_leftover_owners: AHashMap::new(),
             known_agent_refs: AHashMap::new(),
             vm_delete_targets: AHashMap::new(),
             vm_placements: AHashMap::new(),
@@ -102,17 +103,8 @@ impl Message<CreateVM> for SchedulerActor {
         msg: CreateVM,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        if self.vm_tombstone_state(msg.vmid) == Some(VmTombstoneState::DeletePending) {
-            return Err(eyre!(
-                "VM deletion cleanup is pending; retry deletion before recreating it"
-            ));
-        }
-        // a background delete of the old VM could land after the new one starts
-        if self.auto_delete_in_flight(msg.vmid) {
-            return Err(eyre!(
-                "leftover cleanup for a deleted VM with this ID is still running; retry shortly"
-            ));
-        }
+        self.check_create_allowed(msg.vmid)
+            .map_err(|error| eyre!(error))?;
         if let Some(existing) = self.vm_manifests.get(&msg.vmid) {
             let matches_intent = same_create_intent(existing, &msg.config)
                 || self

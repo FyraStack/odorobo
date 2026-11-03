@@ -94,9 +94,13 @@ recovering failed agents.
 
 If an agent reports a VM the scheduler already finished deleting (like a node
 skipped by a forced delete coming back), the scheduler deletes it there in the
-background. Stopped VMs are never cleaned up this way. Stop/delete tombstones
-are kept in scheduler memory only: stopped ones for an hour, deleted ones for a
-day, and pending deletes until they finish.
+background. Stopped VMs are never cleaned up this way. Until that node acks a
+delete or reports a full status without the VM, the ID can't be recreated, since
+the old copy could still be running on the same storage. Use a new VM ID if the
+node isn't coming back. Stop/delete tombstones are kept in scheduler memory
+only: stopped ones for an hour, deleted ones for a day (longer while a node
+might still hold the VM), and pending deletes until they finish. A scheduler
+restart forgets all of this.
 
 Storage teardown releases only resources acquired by Odorobo. Shared mappings
 are reference-counted within the agent process; pre-existing external mappings

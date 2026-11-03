@@ -399,6 +399,9 @@ impl SchedulerActor {
             .chain(&cached.data.retained_vms)
             .copied()
             .collect();
+        // the cached snapshot is complete even after a delta, so anything it
+        // doesn't list isn't on this node anymore
+        self.forget_unreported_leftovers(agent_id, &reported.iter().copied().collect());
         for vmid in self.take_auto_delete_vmids(agent_id, reported, Instant::now()) {
             info!(%vmid, ?agent_id, "agent still holds a deleted VM, deleting it in the background");
             let scheduler = scheduler.clone();

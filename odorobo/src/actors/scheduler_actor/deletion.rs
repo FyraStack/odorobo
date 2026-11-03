@@ -3,6 +3,8 @@
 
 use std::time::{Duration, Instant};
 
+use ahash::AHashSet;
+
 use kameo::prelude::*;
 use tracing::warn;
 use ulid::Ulid;
@@ -190,8 +192,9 @@ impl SchedulerActor {
         !self.vm_is_stopped_or_deleted(vmid) || self.vm_delete_targets.contains_key(&vmid)
     }
 
-    /// forgets an owner force let us give up on. if it comes back and still
-    /// reports the VM, the status handler deletes it in the background
+    /// forgets an owner force let us give up on. the caller records it as a
+    /// leftover owner, so if it comes back and still reports the VM, the status
+    /// handler deletes it in the background
     pub(super) fn drop_vm_delete_owner(&mut self, vmid: Ulid, owner: VmDeleteOwner) {
         if let Some(targets) = self.vm_delete_targets.get_mut(&vmid) {
             targets.remove(&owner);
@@ -223,6 +226,7 @@ impl SchedulerActor {
     ) -> Result<(), String> {
         for owner in settlement.acked {
             self.acknowledge_vm_delete_owner(vmid, owner);
+            self.forget_leftover_owner(vmid, owner);
         }
         for (owner, reason) in settlement.dropped {
             warn!(
@@ -232,6 +236,12 @@ impl SchedulerActor {
                 "force delete is dropping an unreachable cleanup owner, its node-local state might leak"
             );
             self.drop_vm_delete_owner(vmid, owner);
+            // it might still be running the VM. remember it so recreating the
+            // ID waits for that copy to get cleaned up
+            self.vm_leftover_owners
+                .entry(vmid)
+                .or_default()
+                .insert(owner);
         }
         if !settlement.failures.is_empty() {
             return Err(format!(
@@ -265,6 +275,12 @@ impl SchedulerActor {
             if self.vm_tombstone_state(vmid) != Some(VmTombstoneState::Deleted) {
                 continue;
             }
+            // it still has a copy. block recreating the ID until that's gone,
+            // even if this background delete fails or times out
+            self.vm_leftover_owners
+                .entry(vmid)
+                .or_default()
+                .insert(VmDeleteOwner::agent(agent_id));
             let ready = match self.vm_auto_deletes.get(&(vmid, agent_id)) {
                 None => true,
                 Some(AutoDeleteState::InFlight) => false,
@@ -296,7 +312,61 @@ impl SchedulerActor {
                 .insert((vmid, agent_id), AutoDeleteState::Failed(now));
         } else {
             self.vm_auto_deletes.remove(&(vmid, agent_id));
+            self.forget_leftover_owner(vmid, VmDeleteOwner::agent(agent_id));
         }
+    }
+
+    /// clears a leftover owner once it's known not to hold the VM anymore
+    pub(super) fn forget_leftover_owner(&mut self, vmid: Ulid, owner: VmDeleteOwner) {
+        if let Some(owners) = self.vm_leftover_owners.get_mut(&vmid) {
+            owners.remove(&owner);
+            if owners.is_empty() {
+                self.vm_leftover_owners.remove(&vmid);
+            }
+        }
+    }
+
+    /// clears this agent as a leftover owner of every VM its full status no
+    /// longer lists as running or retained. that's how a node that came back
+    /// without the VM (say its VMMs died with it) stops blocking the ID
+    pub(super) fn forget_unreported_leftovers(
+        &mut self,
+        agent_id: ActorId,
+        reported: &AHashSet<Ulid>,
+    ) {
+        self.vm_leftover_owners.retain(|vmid, owners| {
+            if !reported.contains(vmid) {
+                owners.retain(|owner| !owner.matches_agent(agent_id));
+            }
+            !owners.is_empty()
+        });
+    }
+
+    /// refuses to recreate a VM ID while something from its last life could
+    /// still be around
+    pub(super) fn check_create_allowed(&self, vmid: Ulid) -> Result<(), String> {
+        if self.vm_tombstone_state(vmid) == Some(VmTombstoneState::DeletePending) {
+            return Err(
+                "VM deletion cleanup is pending; retry deletion before recreating it".to_owned(),
+            );
+        }
+        // a background delete of the old VM could land after the new one starts
+        if self.auto_delete_in_flight(vmid) {
+            return Err(
+                "leftover cleanup for a deleted VM with this ID is still running; retry shortly"
+                    .to_owned(),
+            );
+        }
+        // a node force delete gave up on might still run the old VM on the same
+        // storage. recreating now would run two copies
+        if let Some(owners) = self.vm_leftover_owners.get(&vmid) {
+            return Err(format!(
+                "{} node(s) may still be running a deleted VM with this ID ({owners:?}); \
+                 it can be recreated once they come back and get cleaned up, or use a new VM ID",
+                owners.len()
+            ));
+        }
+        Ok(())
     }
 
     /// whether a background delete for this VM could still be running on some agent
@@ -307,10 +377,11 @@ impl SchedulerActor {
     }
 
     /// drops old `Stopped`/`Deleted` tombstones and expired retry markers.
-    /// `DeletePending` and anything we still track owners for are kept no
-    /// matter how old
+    /// `DeletePending`, anything we still track owners for, and deleted VMs a
+    /// node might still be running are kept no matter how old
     pub(super) fn prune_vm_tombstones(&mut self, now: Instant) {
         let delete_targets = &self.vm_delete_targets;
+        let leftover_owners = &self.vm_leftover_owners;
         self.vm_tombstones.retain(|vmid, tombstone| {
             let ttl = match tombstone.state {
                 VmTombstoneState::DeletePending => return true,
@@ -318,6 +389,7 @@ impl SchedulerActor {
                 VmTombstoneState::Deleted => DELETED_TOMBSTONE_TTL,
             };
             delete_targets.contains_key(vmid)
+                || leftover_owners.contains_key(vmid)
                 || now.saturating_duration_since(tombstone.since) < ttl
         });
         self.vm_auto_deletes.retain(|_, state| match state {
