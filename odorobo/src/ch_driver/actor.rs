@@ -313,7 +313,8 @@ fn allocate_vsock_cid(
 fn classify_cid_reservation_error(error: Report, cleanup_proof: &VMCleanupProof) -> Report {
     if let Some(token) = error
         .downcast_ref::<PublishedRegistryUpdate>()
-        .and_then(|published| published.reservation_token)
+        .and_then(|published| published.reservation)
+        .map(|reservation| reservation.token)
     {
         cleanup_proof.own_lease(token);
         error.wrap_err(FailedStartupCleanup(
@@ -803,7 +804,24 @@ impl Message<MigrateVMReceive> for VMActor {
                 Err(error) => {
                     // allocate_vsock_cid only keeps the token if it actually got
                     // published. getting rejected over another instance's lease
-                    // never makes it ours
+                    // never makes it ours. a published one still needs its
+                    // previous CID put back, so hand it to on_stop for rollback
+                    if let Some(reservation) = error
+                        .downcast_ref::<PublishedRegistryUpdate>()
+                        .and_then(|published| published.reservation)
+                    {
+                        self.migration_state = Some(MigrationState {
+                            migration_task: None,
+                            receive_succeeded: Arc::new(AtomicBool::new(false)),
+                            completion_task: None,
+                            receive_abort: None,
+                            console_attach_task: None,
+                            listening_address: String::new(),
+                            cid_reservation: Some(reservation),
+                            previous_manifest: self.manifest.clone(),
+                        });
+                        ctx.stop();
+                    }
                     return MigrateVMReceiveReply {
                         listening_address: String::new(),
                         error: Some(error.to_string()),
@@ -1038,7 +1056,7 @@ mod vsock_manifest_tests {
         let error = classify_cid_reservation_error(
             stable_eyre::Report::new(crate::vsock_cid::PublishedRegistryUpdate {
                 source: std::io::Error::other("directory sync failed"),
-                reservation_token: Some(reservation.token),
+                reservation: Some(reservation),
             })
             .wrap_err("reserve failed"),
             &proof,

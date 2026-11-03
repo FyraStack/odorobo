@@ -44,8 +44,9 @@ pub struct PublishedRegistryUpdate {
     #[source]
     pub source: std::io::Error,
     /// set for a reservation even if the directory sync failed after the rename.
-    /// only this token can show that reservation's process exited
-    pub reservation_token: Option<VsockLeaseToken>,
+    /// only its token can show that reservation's process exited, and its
+    /// previous CID is what a rollback has to restore
+    pub reservation: Option<VsockCidReservation>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -120,14 +121,15 @@ impl VsockCidAllocator {
     /// reserve a CID and keep enough info to undo it if VM startup fails. CIDs
     /// 0-2 and `u32::MAX` are reserved by the transport. if the error has a
     /// [`PublishedRegistryUpdate`] in it, this reservation did get written, and
-    /// the error carries its token
+    /// the error carries it
     pub fn reserve_with_previous(
         &self,
         vmid: Ulid,
         requested: Option<u32>,
     ) -> Result<VsockCidReservation> {
         let token = VsockLeaseToken(Ulid::generate());
-        self.with_registry_token(Some(token), |registry| {
+        let mut made = None;
+        let result = self.with_registry(|registry| {
             let lease_owner = vmid;
             let vmid = vmid.to_string();
             let existing = registry.assignments.get(&vmid).copied();
@@ -167,12 +169,21 @@ impl VsockCidAllocator {
             }
             registry.process_exited.remove(&vmid);
             registry.lease_tokens.insert(vmid, token);
-            Ok(VsockCidReservation {
+            let reservation = VsockCidReservation {
                 cid,
                 token,
                 previous_cid: existing,
                 previous_process_exited,
-            })
+            };
+            made = Some(reservation);
+            Ok(reservation)
+        });
+        result.map_err(|error| match error.downcast::<PublishedRegistryUpdate>() {
+            Ok(mut published) => {
+                published.reservation = made;
+                stable_eyre::Report::new(published)
+            }
+            Err(error) => error,
         })
     }
 
@@ -299,14 +310,6 @@ impl VsockCidAllocator {
     }
 
     fn with_registry<T>(&self, update: impl FnOnce(&mut Registry) -> Result<T>) -> Result<T> {
-        self.with_registry_token(None, update)
-    }
-
-    fn with_registry_token<T>(
-        &self,
-        reservation_token: Option<VsockLeaseToken>,
-        update: impl FnOnce(&mut Registry) -> Result<T>,
-    ) -> Result<T> {
         let parent = self
             .registry_path
             .parent()
@@ -327,7 +330,7 @@ impl VsockCidAllocator {
 
         let mut registry = self.read_registry()?;
         let result = update(&mut registry)?;
-        self.write_registry(&registry, reservation_token)?;
+        self.write_registry(&registry)?;
         // just drop the file to unlock. an explicit unlock can fail, and then an
         // update that already went through would come back as an error
         drop(lock);
@@ -366,11 +369,7 @@ impl VsockCidAllocator {
         Ok(registry)
     }
 
-    fn write_registry(
-        &self,
-        registry: &Registry,
-        reservation_token: Option<VsockLeaseToken>,
-    ) -> Result<()> {
+    fn write_registry(&self, registry: &Registry) -> Result<()> {
         let parent = self
             .registry_path
             .parent()
@@ -397,7 +396,7 @@ impl VsockCidAllocator {
             self.sync_registry_directory(parent)
                 .map_err(|source| PublishedRegistryUpdate {
                     source,
-                    reservation_token,
+                    reservation: None,
                 })?;
             Ok(())
         })();
@@ -552,7 +551,8 @@ mod tests {
         assert_eq!(registry.assignments.get(&vmid.to_string()), Some(&42));
         assert!(!registry.process_exited.contains(&vmid.to_string()));
         let token = published
-            .reservation_token
+            .reservation
+            .map(|reservation| reservation.token)
             .expect("published reservation carries ownership");
         assert_eq!(registry.lease_tokens.get(&vmid.to_string()), Some(&token));
 
@@ -579,7 +579,8 @@ mod tests {
         let token = error
             .downcast_ref::<PublishedRegistryUpdate>()
             .unwrap()
-            .reservation_token
+            .reservation
+            .map(|reservation| reservation.token)
             .expect("published replacement carries ownership");
         let registry = allocator.read_registry().unwrap();
         assert_eq!(registry.assignments.get(&vmid.to_string()), Some(&43));
@@ -764,6 +765,29 @@ mod tests {
                 .reserve_with_previous(Ulid::generate(), Some(u32::MAX))
                 .unwrap_err(),
         );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn published_reservation_error_carries_rollback_info() {
+        let (mut allocator, directory) = allocator();
+        let vmid = Ulid::generate();
+        reserve(&allocator, vmid, Some(42)).unwrap();
+        allocator.mark_process_exited(vmid).unwrap();
+        allocator.sync_fault = Some(RegistrySyncFault::Directory);
+
+        let error = allocator.reserve_with_previous(vmid, Some(43)).unwrap_err();
+        let reservation = error
+            .downcast_ref::<PublishedRegistryUpdate>()
+            .and_then(|published| published.reservation)
+            .expect("published reservation");
+        assert_eq!(reservation.cid, 43);
+
+        allocator.sync_fault = None;
+        allocator.rollback(vmid, reservation).unwrap();
+        let registry = allocator.read_registry().unwrap();
+        assert_eq!(registry.assignments.get(&vmid.to_string()), Some(&42));
+        assert!(registry.process_exited.contains(&vmid.to_string()));
         std::fs::remove_dir_all(directory).unwrap();
     }
 }
