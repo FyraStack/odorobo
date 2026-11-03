@@ -79,9 +79,20 @@ a host need distinct key paths.
 
 Deletion is acknowledged only after the known VM-owning agents confirm process
 exit and node-local cleanup. Missing owners keep deletion pending; retry after
-those agents become reachable. Cleanup ownership survives discovery-cache
-eviction in scheduler memory, but is not a durable cluster inventory across
-scheduler restarts. Keep node identities stable when recovering failed agents.
+those agents become reachable, or delete with `?force=true` to drop owners whose
+agent can't be reached at all (an agent that answers with an error still fails
+the delete). Cleanup ownership survives discovery-cache eviction in scheduler
+memory, and after a scheduler restart it is rebuilt from agent status: each
+agent reports running VMs and `retained_vms` (IDs that still hold node-local
+state, like a stopped CID lease). An agent that was unreachable since the
+restart can't be known as an owner, so keep node identities stable when
+recovering failed agents.
+
+If an agent reports a VM the scheduler already finished deleting (like a node
+skipped by a forced delete coming back), the scheduler deletes it there in the
+background. Stopped VMs are never cleaned up this way. Stop/delete tombstones
+are kept in scheduler memory only: stopped ones for an hour, deleted ones for a
+day, and pending deletes until they finish.
 
 Storage teardown releases only resources acquired by Odorobo. Shared mappings
 are reference-counted within the agent process; pre-existing external mappings

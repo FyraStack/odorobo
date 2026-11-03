@@ -6,17 +6,25 @@ use crate::{
     types::{CreateVMRequest, VMListResponse, VmId},
     utils::OdoroboError,
 };
-use aide::axum::{
-    ApiRouter, IntoApiResponse,
-    routing::{delete, get, patch, post, put},
+use aide::{
+    OperationInput,
+    axum::{
+        ApiRouter, IntoApiResponse,
+        routing::{delete, get, patch, post, put},
+    },
+    generate::GenContext,
+    openapi::Operation,
+    operation::{ParamLocation, add_parameters, parameters_from_schema},
 };
 use axum::{
     Json,
-    extract::{Path, State},
-    http::header,
+    extract::{FromRequestParts, Path, Query, State},
+    http::{header, request::Parts},
     response::IntoResponse,
 };
 use kameo::actor::ActorRef;
+use schemars::JsonSchema;
+use serde::Deserialize;
 
 pub fn router() -> ApiRouter<ActorRef<HTTPActor>> {
     ApiRouter::new()
@@ -70,11 +78,48 @@ async fn create_vm(
     Ok(Json(response))
 }
 
+/// query params for `DELETE /vms/{vmid}`
+#[derive(Deserialize, JsonSchema, Debug, Default)]
+struct DeleteVmQuery {
+    /// give up on cleanup owners whose agent can't be reached instead of
+    /// failing the delete. an agent that answers with an error still fails it.
+    /// whatever an unreachable node still holds is leaked until it comes back
+    #[serde(default)]
+    force: bool,
+}
+
+/// `Query<DeleteVmQuery>` with docs. aide only documents `Query` with its
+/// `axum-query` feature, so this does the same thing by hand
+struct DeleteVmParams(DeleteVmQuery);
+
+impl<S: Send + Sync> FromRequestParts<S> for DeleteVmParams {
+    type Rejection = <Query<DeleteVmQuery> as FromRequestParts<S>>::Rejection;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let Query(query) = Query::from_request_parts(parts, state).await?;
+        Ok(Self(query))
+    }
+}
+
+impl OperationInput for DeleteVmParams {
+    fn operation_input(ctx: &mut GenContext, operation: &mut Operation) {
+        let schema = ctx.schema.subschema_for::<DeleteVmQuery>();
+        let params = parameters_from_schema(ctx, schema, ParamLocation::Query);
+        add_parameters(ctx, operation, params);
+    }
+}
+
 async fn delete_vm(
     State(state): State<ActorRef<HTTPActor>>,
     Path(VmId(vmid)): Path<VmId>,
+    DeleteVmParams(query): DeleteVmParams,
 ) -> Result<impl IntoApiResponse, OdoroboError> {
-    let _reply = state.ask(DeleteVM { vmid }).await?;
+    let _reply = state
+        .ask(DeleteVM {
+            vmid,
+            force: query.force,
+        })
+        .await?;
 
     Ok(Json(()))
 }

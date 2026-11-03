@@ -69,6 +69,12 @@ pub struct MigrateVMReceiveReply {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DeleteVM {
     pub vmid: Ulid,
+    /// scheduler only, agents ignore this. drops cleanup owners whose agent
+    /// can't be reached instead of failing the delete, so a node that's gone for
+    /// good doesn't make its VMs undeletable. anything that node still holds is
+    /// leaked until it comes back and gets cleaned up in the background
+    #[serde(default)]
+    pub force: bool,
 }
 
 #[derive(Serialize, Deserialize, Reply, Debug, Clone)]

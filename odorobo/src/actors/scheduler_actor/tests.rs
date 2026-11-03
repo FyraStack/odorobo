@@ -1,5 +1,5 @@
 use super::{
-    CachedActorKind, CachedVMActor, SchedulerActor, VmLifecycle, VmPlacement,
+    CachedActorKind, CachedVMActor, SchedulerActor, VmLifecycle, VmPlacement, VmTombstoneState,
     scheduling::{
         affinity_delta, evaluate_affinity_rule, evaluate_table_value, has_capacity,
         pending_resources_for_agent,
@@ -339,6 +339,7 @@ fn vm_cleanup_unplaces_vm_without_another_discovered_actor() {
         vm_manifests: AHashMap::from([(vmid, test_manifest(1, 1))]),
         vm_effective_manifests: AHashMap::new(),
         vm_tombstones: AHashMap::new(),
+        vm_auto_deletes: AHashMap::new(),
         known_agent_refs: AHashMap::new(),
         vm_delete_targets: AHashMap::new(),
         vm_placements: AHashMap::from([(
@@ -408,7 +409,10 @@ fn settled_failed_create_cleanup_allows_corrected_recreate() {
     scheduler.settle_failed_create_cleanup(vmid, owner, true, true);
 
     assert!(!scheduler.vm_delete_targets.contains_key(&vmid));
-    assert_ne!(scheduler.vm_tombstones.get(&vmid), Some(&true));
+    assert_ne!(
+        scheduler.vm_tombstone_state(vmid),
+        Some(VmTombstoneState::DeletePending)
+    );
     assert!(!scheduler.create_is_confirmed(vmid));
 }
 
@@ -422,7 +426,10 @@ fn uncertain_failed_create_cleanup_retains_owner_and_blocks_recreate() {
     scheduler.settle_failed_create_cleanup(vmid, owner, true, false);
 
     assert!(scheduler.vm_delete_targets[&vmid].contains_key(&owner));
-    assert_eq!(scheduler.vm_tombstones.get(&vmid), Some(&true));
+    assert_eq!(
+        scheduler.vm_tombstone_state(vmid),
+        Some(VmTombstoneState::DeletePending)
+    );
 }
 
 #[test]
@@ -499,6 +506,7 @@ fn explicit_stop_removes_vm_intent_and_actor_mapping() {
         vm_manifests: AHashMap::from([(vmid, test_manifest(1, 1))]),
         vm_effective_manifests: AHashMap::new(),
         vm_tombstones: AHashMap::new(),
+        vm_auto_deletes: AHashMap::new(),
         known_agent_refs: AHashMap::new(),
         vm_delete_targets: AHashMap::new(),
         vm_placements: AHashMap::from([(vmid, Vec::new())]),
@@ -533,6 +541,7 @@ fn agent_cleanup_does_not_remove_unrelated_vm_state() {
         vm_manifests: AHashMap::from([(vmid, test_manifest(1, 1))]),
         vm_effective_manifests: AHashMap::new(),
         vm_tombstones: AHashMap::new(),
+        vm_auto_deletes: AHashMap::new(),
         known_agent_refs: AHashMap::new(),
         vm_delete_targets: AHashMap::new(),
         vm_placements: AHashMap::from([(
@@ -572,6 +581,7 @@ fn vm_cleanup_does_not_remove_unrelated_agent_state() {
         vm_manifests: AHashMap::from([(vmid, test_manifest(1, 1))]),
         vm_effective_manifests: AHashMap::new(),
         vm_tombstones: AHashMap::new(),
+        vm_auto_deletes: AHashMap::new(),
         known_agent_refs: AHashMap::new(),
         vm_delete_targets: AHashMap::new(),
         vm_placements: AHashMap::new(),
@@ -598,6 +608,7 @@ fn empty_scheduler() -> SchedulerActor {
         vm_manifests: AHashMap::new(),
         vm_effective_manifests: AHashMap::new(),
         vm_tombstones: AHashMap::new(),
+        vm_auto_deletes: AHashMap::new(),
         known_agent_refs: AHashMap::new(),
         vm_delete_targets: AHashMap::new(),
         vm_placements: AHashMap::new(),
@@ -687,7 +698,7 @@ fn unrelated_success_cannot_complete_delete_and_failures_survive_retries() {
     scheduler.remember_vm_delete_owner(vmid, source);
     scheduler.remember_vm_delete_owner(vmid, destination);
     scheduler.remove_vm_intent(vmid);
-    scheduler.vm_tombstones.insert(vmid, true);
+    scheduler.set_vm_tombstone(vmid, VmTombstoneState::DeletePending);
     scheduler.acknowledge_vm_delete_owner(vmid, unrelated);
     assert!(!scheduler.finish_vm_delete(vmid));
     assert_eq!(scheduler.vm_delete_targets[&vmid].len(), 2);
@@ -699,11 +710,17 @@ fn unrelated_success_cannot_complete_delete_and_failures_survive_retries() {
     assert!(scheduler.vm_delete_targets[&vmid][&source].confirmed);
     assert!(!scheduler.vm_delete_targets[&vmid][&destination].confirmed);
     assert!(!scheduler.finish_vm_delete(vmid));
-    assert_eq!(scheduler.vm_tombstones.get(&vmid), Some(&true));
+    assert_eq!(
+        scheduler.vm_tombstone_state(vmid),
+        Some(VmTombstoneState::DeletePending)
+    );
     scheduler.acknowledge_vm_delete_owner(vmid, destination);
     assert!(scheduler.finish_vm_delete(vmid));
     assert!(!scheduler.vm_delete_targets.contains_key(&vmid));
-    assert_eq!(scheduler.vm_tombstones.get(&vmid), Some(&false));
+    assert_eq!(
+        scheduler.vm_tombstone_state(vmid),
+        Some(VmTombstoneState::Deleted)
+    );
 }
 
 #[test]
@@ -880,4 +897,504 @@ fn evaluates_required_preferred_and_capacity_rules() {
     assert!(has_capacity(8, 2, 2, 16, 12, 4));
     assert!(!has_capacity(8, 7, 2, 16, 4, 4));
     assert!(!has_capacity(8, 2, 2, 16, 13, 4));
+}
+
+fn ago(duration: Duration) -> Instant {
+    Instant::now()
+        .checked_sub(duration)
+        .expect("test timestamp should be representable")
+}
+
+fn status_with(vms: Vec<Ulid>, retained_vms: Vec<Ulid>) -> AgentStatus {
+    AgentStatus {
+        hostname: "agent".to_owned(),
+        vcpus: 1,
+        ram: ByteSize::b(1),
+        used_vcpus: 0,
+        used_ram: ByteSize::b(0),
+        vms,
+        retained_vms,
+        metadata: ObjectMetadata::default(),
+    }
+}
+
+#[test]
+fn any_ack_wins_and_explicit_agent_errors_beat_unreachable_routes() {
+    use super::deletion::{DeleteAttempt, DeleteOwnerOutcome, delete_owner_outcome};
+
+    assert_eq!(
+        delete_owner_outcome(vec![
+            DeleteAttempt::Unreachable("stale route".to_owned()),
+            DeleteAttempt::Acked,
+        ]),
+        DeleteOwnerOutcome::Acked
+    );
+    // a live replacement saying no matters more than a dead old route
+    assert_eq!(
+        delete_owner_outcome(vec![
+            DeleteAttempt::Unreachable("stale route".to_owned()),
+            DeleteAttempt::AgentError("teardown failed".to_owned()),
+        ]),
+        DeleteOwnerOutcome::Rejected(vec!["teardown failed".to_owned()])
+    );
+    assert_eq!(
+        delete_owner_outcome(vec![DeleteAttempt::Unreachable("timeout".to_owned())]),
+        DeleteOwnerOutcome::Unreachable(vec!["timeout".to_owned()])
+    );
+    assert_eq!(
+        delete_owner_outcome(Vec::new()),
+        DeleteOwnerOutcome::Unreachable(Vec::new())
+    );
+}
+
+#[test]
+fn force_drops_unreachable_owners_but_not_explicit_agent_errors() {
+    use super::deletion::{DeleteOwnerOutcome, plan_delete_settlement};
+
+    let acked = super::VmDeleteOwner::agent(super::ActorId::new(1));
+    let no_route = super::VmDeleteOwner::agent(super::ActorId::new(2));
+    let transport = super::VmDeleteOwner::agent(super::ActorId::new(3));
+    let rejected = super::VmDeleteOwner::agent(super::ActorId::new(4));
+    let outcomes = || {
+        vec![
+            (acked, DeleteOwnerOutcome::Acked),
+            (no_route, DeleteOwnerOutcome::Unreachable(Vec::new())),
+            (
+                transport,
+                DeleteOwnerOutcome::Unreachable(vec!["timeout".to_owned()]),
+            ),
+            (
+                rejected,
+                DeleteOwnerOutcome::Rejected(vec!["teardown failed".to_owned()]),
+            ),
+        ]
+    };
+
+    let forced = plan_delete_settlement(outcomes(), true);
+    assert_eq!(forced.acked, vec![acked]);
+    assert_eq!(
+        forced
+            .dropped
+            .iter()
+            .map(|(owner, _)| *owner)
+            .collect::<Vec<_>>(),
+        vec![no_route, transport]
+    );
+    assert_eq!(forced.failures.len(), 1);
+    assert!(forced.failures[0].contains("teardown failed"));
+
+    let unforced = plan_delete_settlement(outcomes(), false);
+    assert_eq!(unforced.acked, vec![acked]);
+    assert_eq!(unforced.dropped, Vec::new());
+    assert_eq!(unforced.failures.len(), 3);
+    assert!(
+        unforced
+            .failures
+            .iter()
+            .any(|failure| failure.contains("missing agent for known VM owner"))
+    );
+}
+
+#[test]
+fn forced_delete_finishes_once_unreachable_owners_are_dropped() {
+    use super::deletion::{DeleteOwnerOutcome, plan_delete_settlement};
+
+    let vmid = Ulid::generate();
+    let alive = super::VmDeleteOwner::agent(super::ActorId::new(1));
+    let dead = super::VmDeleteOwner::agent(super::ActorId::new(2));
+    let mut scheduler = empty_scheduler();
+    scheduler.remember_vm_delete_owner(vmid, alive);
+    scheduler.remember_vm_delete_owner(vmid, dead);
+    scheduler.remove_vm_intent(vmid);
+    scheduler.set_vm_tombstone(vmid, VmTombstoneState::DeletePending);
+    let outcomes = || {
+        vec![
+            (alive, DeleteOwnerOutcome::Acked),
+            (dead, DeleteOwnerOutcome::Unreachable(Vec::new())),
+        ]
+    };
+
+    // without force the dead node keeps the delete pending, but the ack sticks
+    let settlement = plan_delete_settlement(outcomes(), false);
+    assert!(
+        scheduler
+            .apply_delete_settlement(vmid, settlement, false)
+            .is_err()
+    );
+    assert!(scheduler.vm_delete_targets[&vmid][&alive].confirmed);
+    assert!(scheduler.vm_delete_targets[&vmid].contains_key(&dead));
+    assert_eq!(
+        scheduler.vm_tombstone_state(vmid),
+        Some(VmTombstoneState::DeletePending)
+    );
+
+    let settlement = plan_delete_settlement(outcomes(), true);
+    assert_eq!(
+        scheduler.apply_delete_settlement(vmid, settlement, true),
+        Ok(())
+    );
+    assert!(!scheduler.vm_delete_targets.contains_key(&vmid));
+    assert_eq!(
+        scheduler.vm_tombstone_state(vmid),
+        Some(VmTombstoneState::Deleted)
+    );
+}
+
+#[test]
+fn forced_delete_still_fails_when_a_live_agent_rejects_it() {
+    use super::deletion::{DeleteOwnerOutcome, plan_delete_settlement};
+
+    let vmid = Ulid::generate();
+    let dead = super::VmDeleteOwner::agent(super::ActorId::new(1));
+    let rejecting = super::VmDeleteOwner::agent(super::ActorId::new(2));
+    let mut scheduler = empty_scheduler();
+    scheduler.remember_vm_delete_owner(vmid, dead);
+    scheduler.remember_vm_delete_owner(vmid, rejecting);
+    scheduler.remove_vm_intent(vmid);
+    scheduler.set_vm_tombstone(vmid, VmTombstoneState::DeletePending);
+
+    let settlement = plan_delete_settlement(
+        vec![
+            (dead, DeleteOwnerOutcome::Unreachable(Vec::new())),
+            (
+                rejecting,
+                DeleteOwnerOutcome::Rejected(vec!["teardown failed".to_owned()]),
+            ),
+        ],
+        true,
+    );
+    let error = scheduler
+        .apply_delete_settlement(vmid, settlement, true)
+        .expect_err("a live rejection fails even a forced delete");
+    assert!(error.contains("teardown failed"));
+    // the dead owner is gone, but the rejecting one still blocks recreate
+    assert!(!scheduler.vm_delete_targets[&vmid].contains_key(&dead));
+    assert!(!scheduler.vm_delete_targets[&vmid][&rejecting].confirmed);
+    assert_eq!(
+        scheduler.vm_tombstone_state(vmid),
+        Some(VmTombstoneState::DeletePending)
+    );
+}
+
+#[test]
+fn forced_delete_without_any_owners_finishes_but_unforced_does_not() {
+    use super::deletion::DeleteSettlement;
+
+    let vmid = Ulid::generate();
+    let mut scheduler = empty_scheduler();
+    scheduler.remove_vm_intent(vmid);
+    scheduler.set_vm_tombstone(vmid, VmTombstoneState::DeletePending);
+
+    assert!(
+        scheduler
+            .apply_delete_settlement(vmid, DeleteSettlement::default(), false)
+            .is_err()
+    );
+    assert_eq!(
+        scheduler.vm_tombstone_state(vmid),
+        Some(VmTombstoneState::DeletePending)
+    );
+    assert_eq!(
+        scheduler.apply_delete_settlement(vmid, DeleteSettlement::default(), true),
+        Ok(())
+    );
+    assert_eq!(
+        scheduler.vm_tombstone_state(vmid),
+        Some(VmTombstoneState::Deleted)
+    );
+}
+
+#[test]
+fn shutdown_tombstones_as_stopped_and_delete_goes_pending_then_deleted() {
+    let vmid = Ulid::generate();
+    let owner = super::VmDeleteOwner::agent(super::ActorId::new(1));
+    let mut scheduler = empty_scheduler();
+    scheduler.vm_manifests.insert(vmid, test_manifest(1, 1));
+    scheduler.remember_vm_delete_owner(vmid, owner);
+
+    // shutdown only removes intent
+    scheduler.remove_vm_intent(vmid);
+    assert_eq!(
+        scheduler.vm_tombstone_state(vmid),
+        Some(VmTombstoneState::Stopped)
+    );
+    assert!(scheduler.vm_is_stopped_or_deleted(vmid));
+
+    // delete does the same, then marks cleanup pending until owners ack
+    scheduler.remove_vm_intent(vmid);
+    scheduler.set_vm_tombstone(vmid, VmTombstoneState::DeletePending);
+    assert!(!scheduler.vm_is_stopped_or_deleted(vmid));
+    scheduler.acknowledge_vm_delete_owner(vmid, owner);
+    assert!(scheduler.finish_vm_delete(vmid));
+    assert_eq!(
+        scheduler.vm_tombstone_state(vmid),
+        Some(VmTombstoneState::Deleted)
+    );
+
+    // shutting down again doesn't downgrade a finished delete
+    scheduler.remove_vm_intent(vmid);
+    assert_eq!(
+        scheduler.vm_tombstone_state(vmid),
+        Some(VmTombstoneState::Deleted)
+    );
+}
+
+#[test]
+fn auto_delete_only_fires_for_deleted_vms() {
+    let agent = super::ActorId::new(1);
+    let stopped = Ulid::generate();
+    let pending = Ulid::generate();
+    let deleted = Ulid::generate();
+    let live = Ulid::generate();
+    let mut scheduler = empty_scheduler();
+    scheduler.set_vm_tombstone(stopped, VmTombstoneState::Stopped);
+    scheduler.set_vm_tombstone(pending, VmTombstoneState::DeletePending);
+    scheduler.set_vm_tombstone(deleted, VmTombstoneState::Deleted);
+
+    let picked =
+        scheduler.take_auto_delete_vmids(agent, [stopped, pending, deleted, live], Instant::now());
+    assert_eq!(picked, vec![deleted]);
+    assert!(scheduler.auto_delete_in_flight(deleted));
+    assert!(!scheduler.auto_delete_in_flight(stopped));
+}
+
+#[test]
+fn auto_delete_is_rate_limited_per_vm_and_agent() {
+    use super::deletion::AUTO_DELETE_RETRY_INTERVAL;
+
+    let agent = super::ActorId::new(1);
+    let other_agent = super::ActorId::new(2);
+    let vmid = Ulid::generate();
+    let mut scheduler = empty_scheduler();
+    scheduler.set_vm_tombstone(vmid, VmTombstoneState::Deleted);
+    let now = Instant::now();
+
+    assert_eq!(
+        scheduler.take_auto_delete_vmids(agent, [vmid], now),
+        vec![vmid]
+    );
+    // still in flight, so the next status poll doesn't send another
+    assert_eq!(
+        scheduler.take_auto_delete_vmids(agent, [vmid], now),
+        Vec::new()
+    );
+    // a different agent holding the same VM gets its own
+    assert_eq!(
+        scheduler.take_auto_delete_vmids(other_agent, [vmid], now),
+        vec![vmid]
+    );
+
+    scheduler.settle_auto_delete(vmid, agent, Some("busy".to_owned()), now);
+    assert_eq!(
+        scheduler.take_auto_delete_vmids(agent, [vmid], now),
+        Vec::new()
+    );
+    let later = now
+        .checked_add(AUTO_DELETE_RETRY_INTERVAL)
+        .expect("test timestamp should be representable");
+    assert_eq!(
+        scheduler.take_auto_delete_vmids(agent, [vmid], later),
+        vec![vmid]
+    );
+
+    scheduler.settle_auto_delete(vmid, agent, None, later);
+    scheduler.settle_auto_delete(vmid, other_agent, None, later);
+    assert!(!scheduler.auto_delete_in_flight(vmid));
+    assert_eq!(scheduler.vm_auto_deletes.len(), 0);
+}
+
+#[test]
+fn retained_vms_rebuild_delete_owners_after_scheduler_restart() {
+    use super::deletion::status_update_held_vmids;
+    use crate::messages::agent::AgentStatusUpdate;
+
+    let agent = super::ActorId::new_with_peer_id(1, libp2p::PeerId::random());
+    let running = Ulid::generate();
+    let stopped_lease = Ulid::generate();
+    let full = AgentStatusUpdate::Full {
+        revision: 1,
+        status: status_with(vec![running], vec![stopped_lease]),
+    };
+    let held = status_update_held_vmids(&full, None).expect("first full snapshot is accepted");
+
+    // a fresh scheduler has no tombstones or owners for either VM
+    let mut scheduler = empty_scheduler();
+    scheduler.record_status_delete_owners(agent, held);
+    let owner = super::VmDeleteOwner::agent(agent);
+    assert!(scheduler.vm_delete_targets[&running].contains_key(&owner));
+    assert!(scheduler.vm_delete_targets[&stopped_lease].contains_key(&owner));
+
+    // so a later delete has to wait for this agent instead of acking without it
+    scheduler.remove_vm_intent(stopped_lease);
+    scheduler.set_vm_tombstone(stopped_lease, VmTombstoneState::DeletePending);
+    assert!(!scheduler.finish_vm_delete(stopped_lease));
+}
+
+#[test]
+fn status_deltas_carry_retained_vms_even_without_a_revision_bump() {
+    use super::deletion::status_update_held_vmids;
+    use crate::messages::agent::AgentStatusUpdate;
+
+    let added = Ulid::generate();
+    let retained = Ulid::generate();
+    let delta = |revision, added: Vec<Ulid>| AgentStatusUpdate::Delta {
+        revision,
+        added,
+        removed: Vec::new(),
+        retained_vms: vec![retained],
+        used_vcpus: 0,
+        used_ram: ByteSize::b(0),
+    };
+
+    assert_eq!(
+        status_update_held_vmids(&delta(3, vec![added]), Some(2)),
+        Some(vec![added, retained])
+    );
+    // same revision, nothing added, still refreshes retained state
+    assert_eq!(
+        status_update_held_vmids(&delta(2, Vec::new()), Some(2)),
+        Some(vec![retained])
+    );
+    // stale ones and deltas before any full snapshot are ignored
+    assert_eq!(
+        status_update_held_vmids(&delta(1, Vec::new()), Some(2)),
+        None
+    );
+    assert_eq!(status_update_held_vmids(&delta(3, Vec::new()), None), None);
+    let stale_full = AgentStatusUpdate::Full {
+        revision: 2,
+        status: status_with(vec![added], vec![retained]),
+    };
+    assert_eq!(status_update_held_vmids(&stale_full, Some(2)), None);
+}
+
+#[test]
+fn status_does_not_re_add_owners_for_finished_deletes_or_untracked_stops() {
+    let agent = super::ActorId::new(1);
+    let owner = super::VmDeleteOwner::agent(agent);
+    let deleted = Ulid::generate();
+    let stopped_tracked = Ulid::generate();
+    let pending = Ulid::generate();
+    let mut scheduler = empty_scheduler();
+    scheduler.set_vm_tombstone(deleted, VmTombstoneState::Deleted);
+    scheduler.set_vm_tombstone(pending, VmTombstoneState::DeletePending);
+    scheduler.remember_vm_delete_owner(
+        stopped_tracked,
+        super::VmDeleteOwner::agent(super::ActorId::new(9)),
+    );
+    scheduler.set_vm_tombstone(stopped_tracked, VmTombstoneState::Stopped);
+
+    scheduler.record_status_delete_owners(agent, [deleted, stopped_tracked, pending]);
+
+    // finished deletes get cleaned up in the background instead
+    assert!(!scheduler.vm_delete_targets.contains_key(&deleted));
+    assert!(scheduler.vm_delete_targets[&stopped_tracked].contains_key(&owner));
+    assert!(scheduler.vm_delete_targets[&pending].contains_key(&owner));
+}
+
+#[test]
+fn prunes_old_stopped_and_deleted_tombstones_but_never_pending_or_tracked_ones() {
+    use super::deletion::{
+        AUTO_DELETE_RETRY_INTERVAL, DELETED_TOMBSTONE_TTL, STOPPED_TOMBSTONE_TTL,
+    };
+    use super::{AutoDeleteState, VmTombstone};
+
+    let tombstone = |state, since| VmTombstone { state, since };
+    let old_stopped = Ulid::generate();
+    let fresh_stopped = Ulid::generate();
+    let old_deleted = Ulid::generate();
+    let fresh_deleted = Ulid::generate();
+    let ancient_pending = Ulid::generate();
+    let old_stopped_with_owner = Ulid::generate();
+    let mut scheduler = empty_scheduler();
+    let past_stopped_ttl = ago(STOPPED_TOMBSTONE_TTL.saturating_add(Duration::from_secs(1)));
+    let past_deleted_ttl = ago(DELETED_TOMBSTONE_TTL.saturating_add(Duration::from_secs(1)));
+    scheduler.vm_tombstones.extend([
+        (
+            old_stopped,
+            tombstone(VmTombstoneState::Stopped, past_stopped_ttl),
+        ),
+        (
+            fresh_stopped,
+            tombstone(VmTombstoneState::Stopped, Instant::now()),
+        ),
+        (
+            old_deleted,
+            tombstone(VmTombstoneState::Deleted, past_deleted_ttl),
+        ),
+        // older than the stopped TTL, but deleted ones live longer
+        (
+            fresh_deleted,
+            tombstone(VmTombstoneState::Deleted, past_stopped_ttl),
+        ),
+        (
+            ancient_pending,
+            tombstone(VmTombstoneState::DeletePending, past_deleted_ttl),
+        ),
+        (
+            old_stopped_with_owner,
+            tombstone(VmTombstoneState::Stopped, past_deleted_ttl),
+        ),
+    ]);
+    scheduler.remember_vm_delete_owner(
+        old_stopped_with_owner,
+        super::VmDeleteOwner::agent(super::ActorId::new(1)),
+    );
+    let agent = super::ActorId::new(2);
+    scheduler
+        .vm_auto_deletes
+        .insert((old_deleted, agent), AutoDeleteState::InFlight);
+    scheduler.vm_auto_deletes.insert(
+        (fresh_deleted, agent),
+        AutoDeleteState::Failed(ago(AUTO_DELETE_RETRY_INTERVAL)),
+    );
+
+    scheduler.prune_vm_tombstones(Instant::now());
+
+    assert!(!scheduler.vm_tombstones.contains_key(&old_stopped));
+    assert!(scheduler.vm_tombstones.contains_key(&fresh_stopped));
+    assert!(!scheduler.vm_tombstones.contains_key(&old_deleted));
+    assert!(scheduler.vm_tombstones.contains_key(&fresh_deleted));
+    assert!(scheduler.vm_tombstones.contains_key(&ancient_pending));
+    assert!(
+        scheduler
+            .vm_tombstones
+            .contains_key(&old_stopped_with_owner)
+    );
+    // in-flight deletes stay until they report back, expired failures go
+    assert!(
+        scheduler
+            .vm_auto_deletes
+            .contains_key(&(old_deleted, agent))
+    );
+    assert!(
+        !scheduler
+            .vm_auto_deletes
+            .contains_key(&(fresh_deleted, agent))
+    );
+}
+
+#[test]
+fn delete_of_an_unknown_vm_ends_up_prunable() {
+    use super::deletion::DELETED_TOMBSTONE_TTL;
+
+    let vmid = Ulid::generate();
+    let agent = super::VmDeleteOwner::agent(super::ActorId::new(1));
+    let mut scheduler = empty_scheduler();
+    // the handler falls back to asking every reachable agent, which all ack
+    scheduler.remove_vm_intent(vmid);
+    scheduler.set_vm_tombstone(vmid, VmTombstoneState::DeletePending);
+    scheduler.remember_vm_delete_owner(vmid, agent);
+    scheduler.acknowledge_vm_delete_owner(vmid, agent);
+    assert!(scheduler.finish_vm_delete(vmid));
+
+    scheduler.prune_vm_tombstones(Instant::now());
+    assert!(scheduler.vm_tombstones.contains_key(&vmid));
+    scheduler.prune_vm_tombstones(
+        Instant::now()
+            .checked_add(DELETED_TOMBSTONE_TTL)
+            .expect("test timestamp should be representable"),
+    );
+    assert!(!scheduler.vm_tombstones.contains_key(&vmid));
+    assert!(!scheduler.vm_delete_targets.contains_key(&vmid));
 }

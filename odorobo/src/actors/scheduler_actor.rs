@@ -16,6 +16,7 @@
 //! discovery/polling, scheduling policy, and actor message handlers.
 
 mod cache;
+mod deletion;
 mod discovery;
 mod handlers;
 mod scheduling;
@@ -85,6 +86,14 @@ struct AgentUpdaterStopped {
 /// Periodic maintenance trigger for expiring unresolved VM placements.
 #[derive(Debug)]
 struct ReconcileVmPlacements;
+
+/// a background delete for a VM we already deleted came back from an agent
+#[derive(Debug)]
+struct AutoDeleteFinished {
+    vmid: Ulid,
+    agent_id: ActorId,
+    error: Option<String>,
+}
 
 /// The latest scheduler-approved status snapshot for an agent.
 ///
@@ -166,6 +175,44 @@ struct VmDeleteTarget {
     confirmed: bool,
 }
 
+/// what an explicit stop or delete left behind for a VM ID
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VmTombstoneState {
+    /// shut down on purpose. late discovery is ignored, but the node can keep
+    /// its stopped CID lease since the VM might come back
+    Stopped,
+    /// delete was asked for but some owner hasn't acked yet. blocks recreating
+    /// the ID until a retry works
+    DeletePending,
+    /// every owner acked (or got force-dropped). anything an agent still reports
+    /// for this ID is a leftover and gets deleted in the background
+    Deleted,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct VmTombstone {
+    state: VmTombstoneState,
+    /// when the tombstone last changed state, used for pruning
+    since: Instant,
+}
+
+impl VmTombstone {
+    fn new(state: VmTombstoneState) -> Self {
+        Self {
+            state,
+            since: Instant::now(),
+        }
+    }
+}
+
+/// rate limit for background deletes, one per (VM, agent)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoDeleteState {
+    InFlight,
+    /// the last attempt failed at this time, so wait before trying again
+    Failed(Instant),
+}
+
 /// An eventually consistent, in-memory VM scheduler.
 ///
 /// Public caches are exposed for inspection, but correlated maps must be
@@ -183,9 +230,12 @@ pub struct SchedulerActor {
     pub vm_manifests: AHashMap<Ulid, VmManifest>,
     /// last effective manifest a VM actor reported, including node-local values
     pub vm_effective_manifests: AHashMap<Ulid, VmManifest>,
-    /// ignores late discovery after an explicit stop/delete. `true` means delete
-    /// cleanup is still pending, so recreating has to wait for a retry to succeed
-    vm_tombstones: AHashMap<Ulid, bool>,
+    /// ignores late discovery after an explicit stop/delete. `DeletePending`
+    /// blocks recreating until a retry succeeds. `Stopped` and `Deleted` get
+    /// pruned after a while during placement maintenance
+    vm_tombstones: AHashMap<Ulid, VmTombstone>,
+    /// background deletes for `Deleted` VMs that an agent still reports
+    vm_auto_deletes: AHashMap<(Ulid, ActorId), AutoDeleteState>,
     /// last discovered agent per owner, kept even after reachability-cache eviction.
     /// these are just for finding known VM owners, not a list to broadcast to
     known_agent_refs: AHashMap<VmDeleteOwner, RemoteActorRef<AgentActor>>,

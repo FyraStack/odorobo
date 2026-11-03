@@ -13,6 +13,7 @@ use crate::manifest::VmManifest;
 
 use super::{
     CachedVMActor, SchedulerActor, VmDeleteOwner, VmDeleteTarget, VmLifecycle, VmPlacement,
+    VmTombstone, VmTombstoneState,
 };
 
 // Pending creates are given time to appear in an agent status update.
@@ -273,7 +274,7 @@ impl SchedulerActor {
         cleanup_confirmed: bool,
     ) {
         if !cleanup_confirmed {
-            self.vm_tombstones.insert(vmid, true);
+            self.set_vm_tombstone(vmid, VmTombstoneState::DeletePending);
             return;
         }
 
@@ -289,7 +290,7 @@ impl SchedulerActor {
         }
 
         if !self.finish_vm_delete(vmid) && self.vm_delete_targets.contains_key(&vmid) {
-            self.vm_tombstones.insert(vmid, true);
+            self.set_vm_tombstone(vmid, VmTombstoneState::DeletePending);
         }
     }
 
@@ -311,7 +312,7 @@ impl SchedulerActor {
             !targets.is_empty() && targets.values().all(|target| target.confirmed)
         }) {
             self.vm_delete_targets.remove(&vmid);
-            self.vm_tombstones.insert(vmid, false);
+            self.set_vm_tombstone(vmid, VmTombstoneState::Deleted);
             true
         } else {
             false
@@ -320,10 +321,14 @@ impl SchedulerActor {
 
     /// Removes VM intent and every actor-ID association so reconciliation cannot
     /// recreate a VM after an explicit stop or delete request. we still keep
-    /// the cleanup owners around on purpose, including for shutdown's stopped CID leases
+    /// the cleanup owners around on purpose, including for shutdown's stopped CID leases.
+    /// a fresh tombstone is `Stopped`, never `Deleted`, so a stopped VM's lease
+    /// is never deleted in the background. delete upgrades it afterwards
     pub(super) fn remove_vm_intent(&mut self, vmid: Ulid) {
         self.capture_vm_delete_owners(vmid);
-        self.vm_tombstones.entry(vmid).or_insert(false);
+        self.vm_tombstones
+            .entry(vmid)
+            .or_insert_with(|| VmTombstone::new(VmTombstoneState::Stopped));
         Self::remove_vm_state(
             vmid,
             &mut self.vm_manifests,
