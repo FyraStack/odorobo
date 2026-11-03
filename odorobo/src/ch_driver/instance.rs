@@ -535,10 +535,15 @@ impl VMInstance {
     /// remove resources, but only once the owner has confirmed the VMM process exited
     pub async fn cleanup_after_stop(&mut self) -> Result<()> {
         let vm_config = self.vm_config.clone().unwrap_or_default();
-        self.hook_manager
-            .after_stop(self.vm_id(), &vm_config)
-            .await?;
-        self.purge_instance_data()
+        // still tear down storage/network if a hook fails, or we'd leak them
+        let hook_result = self.hook_manager.after_stop(self.vm_id(), &vm_config).await;
+        let purge_result = self.purge_instance_data();
+        match (hook_result, purge_result) {
+            (Err(hook_error), Err(purge_error)) => Err(hook_error.wrap_err(format!(
+                "also failed to purge instance data: {purge_error:#}"
+            ))),
+            (hook_result, purge_result) => hook_result.and(purge_result),
+        }
     }
 
     /// Purge the runtime data for this VM instance.
@@ -636,12 +641,13 @@ impl VMInstance {
             .await
             .map_err(ChApiError::from)
             .wrap_err(eyre!("Failed to delete VM {}", self.vm_id()))?;
-        let config_path = self.config_path();
-        if config_path.exists() {
-            fs::remove_file(config_path)
-                .wrap_err(eyre!("Failed to remove config file for {}", self.vm_id()))?;
+        match fs::remove_file(self.config_path()) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => {
+                Err(error).wrap_err(eyre!("Failed to remove config file for {}", self.vm_id()))
+            }
         }
-        Ok(())
     }
 
     /// Proxy a raw HTTP request to the CH API socket.

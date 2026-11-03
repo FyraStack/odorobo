@@ -4,7 +4,10 @@
 use super::{StorageAcquisition, StorageDriver};
 use async_trait::async_trait;
 use serde::Deserialize;
-use stable_eyre::{Result, eyre::eyre};
+use stable_eyre::{
+    Result,
+    eyre::{WrapErr, eyre},
+};
 use std::{
     net::IpAddr,
     path::{Path, PathBuf},
@@ -62,7 +65,11 @@ impl ISCSITarget {
         let (host, port) = split_portal(&self.host)?;
         let mut matched: Option<(String, Self)> = None;
         while let Some(session) = sessions.next_entry().await? {
-            let target = tokio::fs::read_to_string(session.path().join("targetname")).await?;
+            // sessions can log out while we're scanning, so a missing file just
+            // means that session's gone, not that the whole scan failed
+            let Some(target) = read_sysfs(&session.path().join("targetname")).await? else {
+                continue;
+            };
             if target.trim() != self.iqn {
                 continue;
             }
@@ -74,7 +81,11 @@ impl ISCSITarget {
             let prefix = format!("connection{id}:");
             let mut session_portal = None;
             let mut inconsistent_portals = false;
-            let mut connections = tokio::fs::read_dir(root.join("iscsi_connection")).await?;
+            let mut connections = match tokio::fs::read_dir(root.join("iscsi_connection")).await {
+                Ok(connections) => connections,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
             while let Some(connection) = connections.next_entry().await? {
                 if !connection
                     .file_name()
@@ -83,10 +94,12 @@ impl ISCSITarget {
                 {
                     continue;
                 }
-                let address =
-                    tokio::fs::read_to_string(connection.path().join("persistent_address")).await?;
-                let connection_port =
-                    tokio::fs::read_to_string(connection.path().join("persistent_port")).await?;
+                let (Some(address), Some(connection_port)) = (
+                    read_sysfs(&connection.path().join("persistent_address")).await?,
+                    read_sysfs(&connection.path().join("persistent_port")).await?,
+                ) else {
+                    continue;
+                };
                 let connection_port = connection_port.trim().parse::<u16>()?;
                 let persistent_portal =
                     normalized_portal(&format_portal(address.trim(), connection_port))?;
@@ -98,12 +111,7 @@ impl ISCSITarget {
                 if connection_port != port {
                     continue;
                 }
-                let runtime_address =
-                    match tokio::fs::read_to_string(connection.path().join("address")).await {
-                        Ok(address) => Some(address),
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-                        Err(error) => return Err(error.into()),
-                    };
+                let runtime_address = read_sysfs(&connection.path().join("address")).await?;
                 if portal_matches(host, port, address.trim(), runtime_address.as_deref()).await? {
                     let actual = Self {
                         host: format_portal(address.trim(), connection_port),
@@ -233,7 +241,7 @@ impl ISCSITarget {
         self.ensure_session_identity(&session)?;
         info!(?session, "Detaching iSCSI target");
         let output = command::run(
-            Command::new("iscsiadm").args([
+            Command::new("iscsiadm").env("LC_ALL", "C").args([
                 "-m",
                 "node",
                 "-T",
@@ -248,11 +256,25 @@ impl ISCSITarget {
         .map_err(command::CommandFailure::into_release_report)?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            if self.session_exists().await? {
+            // keep logout's stderr around even if the session check itself fails
+            if self
+                .session_exists()
+                .await
+                .wrap_err_with(|| format!("iscsiadm logout failed: {stderr}"))?
+            {
                 return Err(eyre!("iscsiadm logout failed: {stderr}"));
             }
         }
         Ok(())
+    }
+}
+
+/// read a sysfs attribute, treating a missing file as `None`
+async fn read_sysfs(path: &Path) -> Result<Option<String>> {
+    match tokio::fs::read_to_string(path).await {
+        Ok(contents) => Ok(Some(contents)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
     }
 }
 

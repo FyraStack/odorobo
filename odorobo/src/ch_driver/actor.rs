@@ -608,16 +608,27 @@ impl Actor for VMActor {
         {
             task.abort();
         }
-        let stop_result = self.vm_instance.stop().await;
+        // collect every failure instead of bailing early, so one error doesn't hide another
+        let mut errors = Vec::new();
+        if let Err(error) = self.vm_instance.stop().await {
+            errors.push(error);
+        }
         let process_exited = if let Some((kill_sender, watcher)) = self.process_watcher.take() {
             let _send_result: std::result::Result<(), ()> = kill_sender.send(());
-            watcher
-                .await
-                .map_err(|error| Report::msg(format!("VM process watcher failed: {error}")))?
-                .map_err(|error| {
-                    Report::msg(format!("failed to confirm VM process exit: {error}"))
-                })?;
-            true
+            match watcher.await {
+                Ok(Ok(_)) => true,
+                // we don't know if it exited, so keep the reservations and runtime files
+                Ok(Err(error)) => {
+                    errors.push(Report::msg(format!(
+                        "failed to confirm VM process exit: {error}"
+                    )));
+                    false
+                }
+                Err(error) => {
+                    errors.push(Report::msg(format!("VM process watcher failed: {error}")));
+                    false
+                }
+            }
         } else {
             // without a watcher we can't tell if the VMM process exited, so keep
             // the reservations instead of risking giving a live guest's CID away
@@ -643,29 +654,41 @@ impl Actor for VMActor {
             drop(task.await);
         }
 
-        let cleanup_result = if process_exited {
-            self.cleanup_proof.set_process_exit_confirmed(true);
-            self.vm_instance.cleanup_after_stop().await
-        } else {
-            Ok(())
-        };
-
         if process_exited {
+            self.cleanup_proof.set_process_exit_confirmed(true);
+            if let Err(error) = self.vm_instance.cleanup_after_stop().await {
+                errors.push(error);
+            }
+
             let allocator = VsockCidAllocator::from_environment();
-            let rollback_result = self.migration_state.take().map_or(Ok(()), |mut state| {
-                rollback_vsock_cid(&allocator, self.vmid, state.uncommitted_reservation())
-            });
-            finish_vsock_lease(
+            if let Some(mut state) = self.migration_state.take()
+                && let Err(error) =
+                    rollback_vsock_cid(&allocator, self.vmid, state.uncommitted_reservation())
+            {
+                errors.push(error);
+            }
+            if let Err(error) = finish_vsock_lease(
                 &allocator,
                 self.vmid,
                 self.cleanup_proof.lease_token(),
                 self.release_vsock_cid,
-            )?;
-            rollback_result?;
+            ) {
+                errors.push(error);
+            }
         }
 
-        stop_result?;
-        cleanup_result
+        match errors.len() {
+            0 => Ok(()),
+            1 => Err(errors.remove(0)),
+            _ => Err(Report::msg(format!(
+                "VM teardown failed: {}",
+                errors
+                    .iter()
+                    .map(|error| format!("{error:#}"))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ))),
+        }
     }
 }
 

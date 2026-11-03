@@ -163,21 +163,28 @@ impl Message<CreateVM> for SchedulerActor {
             .push(CachedVMActor { actor_ref: None });
 
         let mut startup_outcome_unknown = false;
+        // keep the actor ID from a rejection too, so rollback can drop its mapping
+        let mut rejected_actor_id = None;
         let reply: Result<CreateVMReply, Report> = match target_agent.ask(&msg).await {
             Ok(CreateVMReply {
                 config,
                 actor_id,
-                error,
-            }) => error.map_or_else(
-                || {
-                    Ok(CreateVMReply {
-                        config,
-                        actor_id,
-                        error: None,
-                    })
-                },
-                |error| Err(eyre!("agent failed to create VM: {error}")),
-            ),
+                error: None,
+            }) => Ok(CreateVMReply {
+                config,
+                actor_id,
+                error: None,
+            }),
+            Ok(CreateVMReply {
+                actor_id,
+                error: Some(error),
+                ..
+            }) => {
+                rejected_actor_id = actor_id
+                    .as_deref()
+                    .and_then(|bytes| ActorId::from_bytes(bytes).ok());
+                Err(eyre!("agent failed to create VM: {error}"))
+            }
             Err(error) => {
                 startup_outcome_unknown = true;
                 Err(eyre!(error.to_string()))
@@ -205,12 +212,7 @@ impl Message<CreateVM> for SchedulerActor {
             Self::rollback_failed_create(
                 msg.vmid,
                 false,
-                reply.as_ref().ok().and_then(|reply| {
-                    reply
-                        .actor_id
-                        .as_deref()
-                        .and_then(|bytes| ActorId::from_bytes(bytes).ok())
-                }),
+                rejected_actor_id,
                 &mut self.vm_actorid_ulid_map,
                 &mut self.vm_manifests,
                 &mut self.vm_effective_manifests,

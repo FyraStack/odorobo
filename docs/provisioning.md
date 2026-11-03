@@ -59,6 +59,12 @@ a different CID. `GetVMInfo` returns the effective VM manifest, including the
 allocated CID in `observed.vsock_guest_cid` and the desired socket path;
 automatic allocation leaves `desired.vsock.guest_cid` omitted.
 
+The scheduler tracks which node must clean up a VM and its CID lease by libp2p
+peer ID. Each node therefore keeps a persistent identity key at
+`/var/lib/odorobo/peer-key` (`--peer-key-path` or `ODOROBO_PEER_KEY_PATH`), so
+a restarted agent can still confirm deletes for VMs it owned. Instances sharing
+a host need distinct key paths.
+
 ## Runtime and migration limits
 
 Deletion is acknowledged only after the known VM-owning agents confirm process

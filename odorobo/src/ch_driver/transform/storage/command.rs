@@ -92,14 +92,16 @@ impl Drop for RunningCommand {
     }
 }
 
-async fn capture(mut reader: impl AsyncRead + Unpin) -> std::io::Result<Vec<u8>> {
+/// `strict` makes going over the limit an error. Only stdout gets parsed, so a
+/// chatty stderr just gets cut off instead of making the outcome uncertain
+async fn capture(mut reader: impl AsyncRead + Unpin, strict: bool) -> std::io::Result<Vec<u8>> {
     let mut output = Vec::new();
     let mut truncated = false;
     let mut buffer = vec![0; 8192];
     loop {
         let count = reader.read(&mut buffer).await?;
         if count == 0 {
-            return if truncated {
+            return if truncated && strict {
                 // like, a truncated `rbd device list` could hide an existing mapping
                 // and make us think we own it when we don't
                 Err(std::io::Error::other("storage CLI output exceeded limit"))
@@ -146,7 +148,7 @@ async fn run_with_timeout(
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
     let output = tokio::time::timeout(timeout, async {
-        let (stdout, stderr) = tokio::try_join!(capture(stdout), capture(stderr))?;
+        let (stdout, stderr) = tokio::try_join!(capture(stdout, true), capture(stderr, false))?;
         // reap after draining the pipes. If a helper inherited them, we hold on to
         // the leader's PID until the group is killed so the PID/group id can't get reused
         let status = child.wait().await?;
