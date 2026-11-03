@@ -197,7 +197,10 @@ impl Message<CreateVM> for SchedulerActor {
         // lookup confirming no VM actor is present.
         if reply.is_err()
             && !startup_outcome_unknown
-            && matches!(RemoteActorRef::<VMActor>::lookup(vm_actor_id(msg.vmid)).await, Ok(None))
+            && matches!(
+                RemoteActorRef::<VMActor>::lookup(vm_actor_id(msg.vmid)).await,
+                Ok(None)
+            )
         {
             Self::rollback_failed_create(
                 msg.vmid,
