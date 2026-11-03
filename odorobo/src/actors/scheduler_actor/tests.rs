@@ -117,6 +117,7 @@ fn reconciling_source_agent_preserves_destination_migration_placement() {
         used_vcpus: 0,
         used_ram: ByteSize::b(0),
         vms: vec![vmid],
+        retained_vms: Vec::new(),
         metadata: ObjectMetadata::default(),
     };
     SchedulerActor::reconcile_agent_placements(
@@ -134,6 +135,7 @@ fn reconciling_source_agent_preserves_destination_migration_placement() {
         used_vcpus: 0,
         used_ram: ByteSize::b(0),
         vms: Vec::new(),
+        retained_vms: Vec::new(),
         metadata: ObjectMetadata::default(),
     };
 
@@ -272,6 +274,7 @@ fn pending_placement_survives_full_snapshot_until_pending_timeout() {
         used_vcpus: 0,
         used_ram: ByteSize::b(0),
         vms: Vec::new(),
+        retained_vms: Vec::new(),
         metadata: ObjectMetadata::default(),
     };
 
@@ -310,6 +313,7 @@ fn stale_running_placement_is_expired_by_full_snapshot() {
         used_vcpus: 0,
         used_ram: ByteSize::b(0),
         vms: Vec::new(),
+        retained_vms: Vec::new(),
         metadata: ObjectMetadata::default(),
     };
 

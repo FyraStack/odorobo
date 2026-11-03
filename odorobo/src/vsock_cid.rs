@@ -294,6 +294,16 @@ impl VsockCidAllocator {
         })
     }
 
+    /// every VM with a lease on this node, running or not
+    pub fn leased_vms(&self) -> Result<Vec<Ulid>> {
+        Ok(self
+            .read_registry()?
+            .assignments
+            .keys()
+            .filter_map(|vmid| vmid.parse().ok())
+            .collect())
+    }
+
     /// mark exit only for the exact reservation this VMM owns. a stale token
     /// can't mark a newer run of the same VM as exited
     pub fn mark_process_exited_owned(&self, vmid: Ulid, token: VsockLeaseToken) -> Result<()> {
@@ -846,6 +856,7 @@ mod tests {
         allocator
             .record_process_owned(vmid, reservation.token, process)
             .unwrap();
+        assert_eq!(allocator.leased_vms().unwrap(), vec![vmid]);
 
         // a fresh allocator has no token, like an agent after a restart
         let restarted = VsockCidAllocator::new(allocator.registry_path.clone());

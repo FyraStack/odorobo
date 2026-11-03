@@ -18,6 +18,7 @@ fn status(vm_count: usize) -> AgentStatus {
             vms.sort_unstable();
             vms
         },
+        retained_vms: Vec::new(),
         metadata: ObjectMetadata::default(),
     }
 }
@@ -44,6 +45,7 @@ fn main() {
             revision: 1,
             added,
             removed,
+            retained_vms: Vec::new(),
             used_vcpus: base.used_vcpus,
             used_ram: base.used_ram,
         };

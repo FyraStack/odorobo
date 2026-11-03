@@ -210,6 +210,20 @@ impl AgentActor {
         }
     }
 
+    fn retained_vms(&self) -> Vec<Ulid> {
+        let mut retained = VsockCidAllocator::from_environment()
+            .leased_vms()
+            .unwrap_or_else(|error| {
+                warn!(?error, "failed to read vsock CID leases for agent status");
+                Vec::new()
+            });
+        retained.extend(self.blocked_vm_ids.keys().copied());
+        retained.retain(|vmid| !self.vms.contains_key(vmid));
+        retained.sort_unstable();
+        retained.dedup();
+        retained
+    }
+
     /// cleanup for a VM whose actor is already gone, like after a failed
     /// teardown, a shutdown, or an agent restart
     async fn retry_detached_cleanup(&mut self, vmid: Ulid) -> DeleteVMReply {
@@ -771,6 +785,7 @@ impl Message<GetAgentStatus> for AgentActor {
                 vms.sort_unstable();
                 vms
             },
+            retained_vms: self.retained_vms(),
             used_vcpus,
             used_ram,
             metadata: self.metadata.clone(),
@@ -812,6 +827,7 @@ impl Message<GetAgentStatus> for AgentActor {
             revision: self.membership_revision,
             added,
             removed,
+            retained_vms: self.retained_vms(),
             used_vcpus,
             used_ram,
         }

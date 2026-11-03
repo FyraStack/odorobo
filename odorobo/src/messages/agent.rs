@@ -25,6 +25,11 @@ pub struct AgentStatus {
     pub used_vcpus: u32,
     pub used_ram: ByteSize,
     pub vms: Vec<Ulid>,
+    /// VM IDs that aren't running here but still hold node-local state, like a
+    /// stopped vsock CID lease or a blocked ID from a failed teardown. the
+    /// scheduler uses this to rebuild delete owners it lost across a restart
+    #[serde(default)]
+    pub retained_vms: Vec<Ulid>,
     pub metadata: ObjectMetadata,
 }
 
@@ -38,6 +43,9 @@ pub enum AgentStatusUpdate {
         revision: u64,
         added: Vec<Ulid>,
         removed: Vec<Ulid>,
+        /// always the full sorted set, since it's small and changes outside VM membership
+        #[serde(default)]
+        retained_vms: Vec<Ulid>,
         used_vcpus: u32,
         used_ram: ByteSize,
     },
@@ -67,6 +75,7 @@ pub fn apply_status_update(status: &mut AgentStatus, update: AgentStatusUpdate) 
             revision,
             added,
             removed,
+            retained_vms,
             used_vcpus,
             used_ram,
         } => {
@@ -81,6 +90,7 @@ pub fn apply_status_update(status: &mut AgentStatus, update: AgentStatusUpdate) 
                     Err(index) => status.vms.insert(index, vmid),
                 }
             }
+            status.retained_vms = retained_vms;
             status.used_vcpus = used_vcpus;
             status.used_ram = used_ram;
             revision
