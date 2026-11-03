@@ -591,23 +591,23 @@ impl Default for StorageDriverTransformer {
 
 fn raw_uri_scheme(path: &str) -> Option<String> {
     // The URL parser ignores these characters in parts of its input and trims
-    // leading/trailing C0 controls and spaces. Mirror only that preprocessing
-    // to recognize malformed supported URIs; validation still uses `path` as-is.
-    let without_ignored_controls = path
+    // leading C0 controls and spaces. Mirror only that preprocessing to
+    // recognize malformed supported URIs. Validation still uses `path` as-is.
+    // Trailing trimming is skipped since it can never change the scheme.
+    let normalized: String = path
         .chars()
-        .filter(|character| !matches!(character, '\t' | '\n' | '\r'))
-        .collect::<String>();
-    let normalized = without_ignored_controls.trim_matches(|character: char| character <= '\u{20}');
+        .filter(|&character| !matches!(character, '\t' | '\n' | '\r'))
+        .skip_while(|&character| character <= '\u{20}')
+        .collect();
+
     let (scheme, _) = normalized.split_once(':')?;
     let mut characters = scheme.chars();
-    if !characters.next()?.is_ascii_alphabetic()
-        || !characters.all(|character| {
+    // the parser lowercases schemes, so match that to catch e.g. `RBD://`
+    (characters.next()?.is_ascii_alphabetic()
+        && characters.all(|character| {
             character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.')
-        })
-    {
-        return None;
-    }
-    Some(scheme.to_ascii_lowercase())
+        }))
+    .then(|| scheme.to_ascii_lowercase())
 }
 
 fn parse_storage_uri(path: &str) -> Result<Option<Url>> {
@@ -629,7 +629,19 @@ fn parse_storage_uri(path: &str) -> Result<Option<Url>> {
         {
             Err(eyre!("Invalid supported storage URI: {error}"))
         }
-        Err(_) => Ok(None),
+        // plain local paths like `/var/lib/disk.img` are expected to land here
+        // and are left unchanged. Only warn when the input looks like a URI.
+        Err(error) => {
+            if let Some(scheme) = raw_uri_scheme(path) {
+                warn!(
+                    scheme,
+                    path,
+                    %error,
+                    "Disk path looks like a URI but failed to parse, leaving disk path unchanged"
+                );
+            }
+            Ok(None)
+        }
     }
 }
 
@@ -908,6 +920,11 @@ mod tests {
                 .is_some()
         );
         assert!(parse_storage_uri("rbd://pool/image").unwrap().is_some());
+        assert!(
+            parse_storage_uri("rbd://rbd-pool_1.ssd/image")
+                .unwrap()
+                .is_some()
+        );
         assert!(
             parse_storage_uri("rbd://UPPER/image")
                 .unwrap_err()

@@ -1,6 +1,9 @@
 use super::{StorageAcquisition, StorageDriver, iscsi::command};
 use async_trait::async_trait;
-use stable_eyre::{Result, eyre::eyre};
+use stable_eyre::{
+    Result,
+    eyre::{ensure, eyre},
+};
 use std::path::PathBuf;
 use tokio::process::Command;
 use tracing::{info, trace};
@@ -204,27 +207,26 @@ impl RbdImage {
         let (pool, image) = resource
             .split_once('/')
             .ok_or_else(|| eyre!("RBD URI must have a pool and one image path segment"))?;
-        if pool != pool.to_ascii_lowercase() {
-            return Err(eyre!("RBD pool names in the URI must be lowercase"));
-        }
+        ensure!(
+            !pool.chars().any(|character| character.is_ascii_uppercase()),
+            "RBD pool names in the URI must be lowercase"
+        );
         validate_rbd_component(pool, "pool")?;
-        if image.contains('/') {
-            return Err(eyre!(
-                "RBD URI supports only rbd://<pool>/<image>; namespaces and nested image paths are not supported"
-            ));
-        }
+        ensure!(
+            !image.contains('/'),
+            "RBD URI supports only rbd://<pool>/<image>; namespaces and nested image paths are not supported"
+        );
         validate_rbd_component(image, "image")?;
 
         let parsed =
             Url::parse(value).map_err(|error| eyre!("Invalid RBD storage URI: {error}"))?;
         let parsed_image = Self::try_from(&parsed)?;
-        if parsed_image.pool != pool || parsed_image.image != image {
-            // Refusing any parser rewrite avoids silently selecting a different
-            // pool or image than the original URI named.
-            return Err(eyre!(
-                "RBD URI components must not change during URL normalization"
-            ));
-        }
+        // Refusing any parser rewrite avoids silently selecting a different
+        // pool or image than the original URI named.
+        ensure!(
+            parsed_image.pool == pool && parsed_image.image == image,
+            "RBD URI components must not change during URL normalization"
+        );
         Ok(parsed_image)
     }
 }
@@ -233,19 +235,18 @@ impl TryFrom<&Url> for RbdImage {
     type Error = stable_eyre::Report;
 
     fn try_from(uri: &Url) -> Result<Self, Self::Error> {
-        if uri.scheme() != "rbd" {
-            return Err(eyre!("RBD storage URI must use the rbd:// scheme"));
-        }
-        if !uri.username().is_empty()
-            || uri.password().is_some()
-            || uri.port().is_some()
-            || uri.query().is_some()
-            || uri.fragment().is_some()
-        {
-            return Err(eyre!(
-                "RBD storage URI must not include credentials, a port, query, or fragment"
-            ));
-        }
+        ensure!(
+            uri.scheme() == "rbd",
+            "RBD storage URI must use the rbd:// scheme"
+        );
+        ensure!(
+            uri.username().is_empty()
+                && uri.password().is_none()
+                && uri.port().is_none()
+                && uri.query().is_none()
+                && uri.fragment().is_none(),
+            "RBD storage URI must not include credentials, a port, query, or fragment"
+        );
 
         let pool = uri
             .host_str()
@@ -257,11 +258,10 @@ impl TryFrom<&Url> for RbdImage {
             .path()
             .strip_prefix('/')
             .ok_or_else(|| eyre!("RBD URI must have exactly one image path segment"))?;
-        if image.contains('/') {
-            return Err(eyre!(
-                "RBD URI supports only rbd://<pool>/<image>; namespaces and nested image paths are not supported"
-            ));
-        }
+        ensure!(
+            !image.contains('/'),
+            "RBD URI supports only rbd://<pool>/<image>; namespaces and nested image paths are not supported"
+        );
         validate_rbd_component(image, "image")?;
 
         Ok(Self {
