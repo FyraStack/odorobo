@@ -276,7 +276,7 @@ impl Message<VmUpdated> for SchedulerActor {
         if let Some(manifest) = msg.data.config {
             self.vm_effective_manifests.insert(vmid, manifest.clone());
             // if we only found this manifest after the scheduler started, it's the
-            // only intent we've got. Otherwise keep the original request. Effective
+            // only intent we've got. otherwise keep the original request. effective
             // values like an agent-assigned vsock CID are node-local and shouldn't
             // turn into hard requirements during failover
             self.vm_manifests.entry(vmid).or_insert(manifest);
@@ -311,7 +311,7 @@ impl Message<AgentUpdated> for SchedulerActor {
     type Reply = ();
 
     async fn handle(&mut self, msg: AgentUpdated, _ctx: &mut Context<Self, Self::Reply>) {
-        // only accepted snapshots/additions count as owning the VM. A removal
+        // only accepted snapshots/additions count as owning the VM. a removal
         // doesn't tell us anything about a stopped node-local CID lease
         let observed = match &msg.update {
             AgentStatusUpdate::Full { revision, status }

@@ -54,7 +54,7 @@ impl ISCSITarget {
     }
 
     /// open-iscsi keeps the node record's hostname in `persistent_address` even
-    /// when login used an IP. We use that persistent portal as the resource key,
+    /// when login used an IP. we use that persistent portal as the resource key,
     /// and it's also what udev by-path lookup and node logout actually go by
     async fn session_target_at(&self, root: &Path) -> Result<Option<Self>> {
         let mut sessions = match tokio::fs::read_dir(root.join("iscsi_session")).await {
@@ -171,9 +171,9 @@ impl ISCSITarget {
         };
         if output.status.success() {
             // iscsiadm can exit zero without actually logging in (like if the
-            // session showed up after our absence check). We only count it as
+            // session showed up after our absence check). we only count it as
             // ours if it says the login worked and there's exactly one matching
-            // session. Just seeing a session could be someone else racing us
+            // session. just seeing a session could be someone else racing us
             if !confirms_login(&output.stdout, &self.iqn) {
                 return Ok(StorageAcquisition::uncertain(eyre!(
                     "iscsiadm exited successfully without confirming a new login"
@@ -195,9 +195,9 @@ impl ISCSITarget {
         let Some(session) = self.session_target_at(root).await? else {
             return Ok(None);
         };
-        // canonicalization happens before the registry reserves its key. If a
+        // canonicalization happens before the registry reserves its key. if a
         // session shows up in that gap, don't borrow it under a different key.
-        // Retrying resolution will find its persistent key
+        // retrying resolution will find its persistent key
         self.ensure_session_identity(&session)?;
         Ok(Some(StorageAcquisition::borrowed()))
     }
@@ -207,7 +207,7 @@ impl ISCSITarget {
             Ok(Some(session)) => match self.ensure_session_identity(&session) {
                 Ok(()) => StorageAcquisition::owned(),
                 // login might've used an existing hostname node record or
-                // raced an alias acquisition. Never release a session under a
+                // raced an alias acquisition. never release a session under a
                 // different key than the one we reserved before login
                 Err(error) => StorageAcquisition::uncertain(error),
             },
@@ -353,7 +353,7 @@ async fn portal_matches(
         return Ok(true);
     }
     // a hostname node's current DNS doesn't tell us which peer it's actually
-    // connected to. Its exact name still works even if DNS changes or lookup fails
+    // connected to. its exact name still works even if DNS changes or lookup fails
     if let Some(runtime) =
         runtime.and_then(|value| value.trim().trim_matches(['[', ']']).parse::<IpAddr>().ok())
     {
@@ -453,7 +453,7 @@ impl ISCSIStorage {
             return Err(eyre!("iSCSI URI must have a portal host"));
         }
         // the persistent portal stays the same across redirects and reconnects,
-        // unlike runtime addresses or a hostname's current DNS. Before login we
+        // unlike runtime addresses or a hostname's current DNS. before login we
         // keep the requested portal, and acquisition has to check that this exact
         // key is still the session's identity before reporting owned/borrowed
         let session = target.session_target_at(root).await?;
@@ -809,7 +809,7 @@ mod tests {
 
     #[tokio::test]
     async fn hostname_owner_and_connected_alias_keep_the_prelogin_hostname_key() {
-        // this name has no DNS record on purpose. Alias lookup and final cleanup
+        // this name has no DNS record on purpose. alias lookup and final cleanup
         // should go by the node identity in sysfs, not a fresh DNS lookup
         let state = SyntheticStorage::new("missing-odorobo-node.invalid", "192.0.2.18", false);
         let transform = synthetic_transformer(&state);
@@ -860,7 +860,7 @@ mod tests {
             .await
             .unwrap();
         // an existing node can keep a hostname even though we asked to log in by
-        // IP. We don't track aliases, so this isn't the key we reserved
+        // IP. we don't track aliases, so this isn't the key we reserved
         synthetic_session(
             &root,
             17,
@@ -940,7 +940,7 @@ mod tests {
         let new = ISCSITarget::from(&Url::parse("iscsi://127.0.0.1/iqn.test/0").unwrap());
         assert!(!new.session_exists_at(&root).await.unwrap());
         // even with the DNS record gone, we should still resolve and log out via
-        // the exact node portal. We don't need to look up this .invalid hostname
+        // the exact node portal. we don't need to look up this .invalid hostname
         tokio::fs::write(
             root.join("iscsi_connection/connection17:0/persistent_address"),
             "missing-odorobo-node.invalid\n",

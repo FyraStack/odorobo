@@ -163,7 +163,7 @@ pub struct ProductionBehaviour {
 // https://github.com/tqwewe/kameo/blob/main/examples/custom_swarm.rs
 // https://docs.page/tqwewe/kameo/distributed-actors/custom-swarm-configuration
 /// load this node's libp2p identity, or make and save one on first start.
-/// The scheduler tracks which node has to clean up a VM by peer ID, so a new
+/// the scheduler tracks which node has to clean up a VM by peer ID, so a new
 /// identity on every restart would leave it waiting on a peer that's gone
 fn load_or_create_identity(path: &Path) -> Result<Keypair> {
     match fs::read(path) {

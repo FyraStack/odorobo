@@ -34,7 +34,7 @@ pub struct MigrationState {
     /// The task handle for the migration process.
     pub migration_task: Option<JoinHandle<Result<()>>>,
     /// set by the receive operation itself, before it sends the completion notice.
-    /// Teardown has to commit a successful receive even if the mailbox is closed
+    /// teardown has to commit a successful receive even if the mailbox is closed
     receive_succeeded: Arc<AtomicBool>,
     completion_task: Option<JoinHandle<()>>,
     receive_abort: Option<tokio::task::AbortHandle>,
@@ -60,7 +60,7 @@ impl MigrationState {
 pub struct FailedStartupCleanup(pub String);
 
 /// shared with the agent, even if startup/teardown fails and there's no actor left.
-/// A process exiting doesn't let us touch a lease some other VMM grabbed
+/// a process exiting doesn't let us touch a lease some other VMM grabbed
 #[derive(Debug)]
 pub struct VMCleanupProof {
     process_exit_confirmed: AtomicBool,
@@ -305,7 +305,7 @@ fn allocate_vsock_cid(
         return Ok(Some(reservation));
     }
     // turning off vsock doesn't let us skip an older run's active lease after an
-    // agent restart. Stopping this new VMM wouldn't tell us the old one exited
+    // agent restart. stopping this new VMM wouldn't tell us the old one exited
     VsockCidAllocator::from_environment().ensure_no_active_lease(vmid)?;
     Ok(None)
 }
@@ -321,7 +321,7 @@ fn classify_cid_reservation_error(error: Report, cleanup_proof: &VMCleanupProof)
         ))
     } else {
         // validation or pre-publish failures might be about another running
-        // instance's lease. Don't give the agent anything that'd let it release it
+        // instance's lease. don't give the agent anything that'd let it release it
         error
     }
 }
@@ -635,7 +635,7 @@ impl Actor for VMActor {
             false
         };
 
-        // reaping closes the receive connection. Let its task see the final
+        // reaping closes the receive connection. let its task see the final
         // response before we decide whether to roll back the reservation
         if let Some(state) = self.migration_state.as_mut()
             && let Some(mut task) = state.completion_task.take()
@@ -802,7 +802,7 @@ impl Message<MigrateVMReceive> for VMActor {
                 Ok(reservation) => reservation,
                 Err(error) => {
                     // allocate_vsock_cid only keeps the token if it actually got
-                    // published. Getting rejected over another instance's lease
+                    // published. getting rejected over another instance's lease
                     // never makes it ours
                     return MigrateVMReceiveReply {
                         listening_address: String::new(),
@@ -811,7 +811,7 @@ impl Message<MigrateVMReceive> for VMActor {
                 }
             };
 
-        // the actor holds onto this reservation until the process exits. If
+        // the actor holds onto this reservation until the process exits. if
         // anything below fails, we tear down the receiver and on_stop rolls it
         // back once the process watcher confirms exit
         let receive_succeeded = Arc::new(AtomicBool::new(false));
@@ -841,7 +841,7 @@ impl Message<MigrateVMReceive> for VMActor {
             }
         };
 
-        // do everything that can fail before opening the receiver. If something
+        // do everything that can fail before opening the receiver. if something
         // fails, stop the actor so on_stop rolls back after the process exits
         if let Err(error) = self.vm_instance.prep_config(config.clone()).await {
             ctx.stop();
@@ -977,7 +977,7 @@ mod vsock_manifest_tests {
         let vmid = ulid::Ulid::generate();
         let reservation = allocator.reserve_with_previous(vmid, Some(42)).unwrap();
         let registry = std::fs::read(&registry_path).unwrap();
-        // write garbage to the registry so rollback fails. Unlike permissions,
+        // write garbage to the registry so rollback fails. unlike permissions,
         // this works the same whether tests run as root or not
         std::fs::write(&registry_path, b"invalid registry").unwrap();
         let error = rollback_vsock_cid(&allocator, vmid, Some(reservation)).unwrap_err();

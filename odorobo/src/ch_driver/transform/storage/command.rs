@@ -1,4 +1,4 @@
-//! runs storage CLIs with a time limit. A CLI we killed might've already handed
+//! runs storage CLIs with a time limit. a CLI we killed might've already handed
 //! work off to a daemon/kernel, so any error after spawn is always uncertain
 use super::super::StorageAcquisition;
 use stable_eyre::{Report, Result, eyre::eyre};
@@ -36,7 +36,7 @@ impl CommandFailure {
     ) -> Result<StorageAcquisition> {
         match self {
             Self::BeforeSpawn(error) => Err(error),
-            // checking that it's not there right away isn't enough. A daemon or
+            // checking that it's not there right away isn't enough. a daemon or
             // kernel request could still finish after we killed/reaped the CLI
             Self::Uncertain(error) => Ok(StorageAcquisition::uncertain(error)),
         }
@@ -53,7 +53,7 @@ impl RunningCommand {
         // the CLI's helpers might inherit its output pipes, so kill the whole
         // process group, not just the leader, before we try to reap it.
         // SAFETY: spawn put the child in a new group whose id is its PID.
-        // That id is always positive, so this can't hit our own process group
+        // that id is always positive, so this can't hit our own process group
         unsafe {
             libc::kill(
                 self.group.checked_neg().expect("positive child PID"),
@@ -72,7 +72,7 @@ impl RunningCommand {
             self.child.take();
         } else {
             // a process stuck in an uninterruptible kernel call might not get
-            // reaped quickly. Leave a waiter in the background instead of blocking
+            // reaped quickly. leave a waiter in the background instead of blocking
             // storage forever. kill_on_drop also handles runtime shutdown/cancellation
             let mut child = self.child.take().expect("running child");
             tokio::spawn(async move {
@@ -92,7 +92,7 @@ impl Drop for RunningCommand {
     }
 }
 
-/// `strict` makes going over the limit an error. Only stdout gets parsed, so a
+/// `strict` makes going over the limit an error. only stdout gets parsed, so a
 /// chatty stderr just gets cut off instead of making the outcome uncertain
 async fn capture(mut reader: impl AsyncRead + Unpin, strict: bool) -> std::io::Result<Vec<u8>> {
     let mut output = Vec::new();
@@ -149,7 +149,7 @@ async fn run_with_timeout(
     let stderr = child.stderr.take().expect("piped stderr");
     let output = tokio::time::timeout(timeout, async {
         let (stdout, stderr) = tokio::try_join!(capture(stdout, true), capture(stderr, false))?;
-        // reap after draining the pipes. If a helper inherited them, we hold on to
+        // reap after draining the pipes. if a helper inherited them, we hold on to
         // the leader's PID until the group is killed so the PID/group id can't get reused
         let status = child.wait().await?;
         Ok::<_, std::io::Error>(Output {

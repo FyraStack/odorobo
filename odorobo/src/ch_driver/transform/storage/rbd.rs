@@ -116,7 +116,7 @@ impl RbdImage {
         PathBuf::from(format!("/dev/rbd/{}/{}", self.pool, self.image))
     }
 
-    /// maps the RBD image. If it's already mapped we borrow it instead of owning it
+    /// maps the RBD image. if it's already mapped we borrow it instead of owning it
     #[tracing::instrument(skip(self))]
     pub async fn map(&self) -> Result<StorageAcquisition> {
         let rbd_path = self.rbd_path();
@@ -151,7 +151,7 @@ impl RbdImage {
             String::from_utf8_lossy(&output.stderr)
         );
         // it not being there before we ran the command doesn't mean a mapping now
-        // is ours. Something else could've mapped it while our command failed
+        // is ours. something else could've mapped it while our command failed
         let exists = rbd_map_list()
             .await
             .map(|mappings| mappings.iter().any(|(path, _)| path == &rbd_path));
@@ -197,9 +197,9 @@ impl RbdImage {
 }
 
 impl RbdImage {
-    /// Validate the original URI before URL parsing can normalize dot segments or
-    /// strip URL whitespace/control characters. The raw lowercase contract is
-    /// enforced here; the `rbd` URL parser does not normalize pool-name casing.
+    /// validate the original URI before URL parsing can normalize dot segments or
+    /// strip URL whitespace/control characters. the raw lowercase rule gets
+    /// enforced here, since the `rbd` URL parser doesn't normalize pool-name casing
     pub(super) fn parse_uri(value: &str) -> Result<Self> {
         let resource = value
             .strip_prefix("rbd://")
@@ -221,8 +221,8 @@ impl RbdImage {
         let parsed =
             Url::parse(value).map_err(|error| eyre!("Invalid RBD storage URI: {error}"))?;
         let parsed_image = Self::try_from(&parsed)?;
-        // Refusing any parser rewrite avoids silently selecting a different
-        // pool or image than the original URI named.
+        // refusing any parser rewrite means we can't quietly pick a different
+        // pool or image than the one the original URI named
         ensure!(
             parsed_image.pool == pool && parsed_image.image == image,
             "RBD URI components must not change during URL normalization"
@@ -297,9 +297,9 @@ impl StorageDriver for RbdStorage {
     }
 
     async fn canonical_uri(&self, uri: &Url) -> Result<Url> {
-        // Unlike generic URI options, RBD query/fragment data is not meaningful
-        // to the backend. Reject it instead of silently dropping it and mapping
-        // a different image than the manifest requested.
+        // unlike generic URI options, RBD query/fragment data doesn't mean anything
+        // to the backend. reject it instead of quietly dropping it and mapping
+        // a different image than the manifest asked for
         RbdImage::try_from(uri)?;
         Ok(uri.clone())
     }

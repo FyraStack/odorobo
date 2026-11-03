@@ -200,7 +200,7 @@ impl Message<CreateVM> for SchedulerActor {
         }
 
         // a transport or discovery failure doesn't mean startup actually failed.
-        // Only roll back if the agent explicitly rejected it and a lookup worked
+        // only roll back if the agent explicitly rejected it and a lookup worked
         // and found no VM actor
         if reply.is_err()
             && !startup_outcome_unknown
@@ -299,7 +299,7 @@ impl Message<DeleteVM> for SchedulerActor {
         self.remove_vm_intent(msg.vmid);
         self.vm_tombstones.insert(msg.vmid, true);
         // the unique VM name can show us a migration owner before its agent status
-        // shows up. Don't ask the VM actors directly though, since they can't ack
+        // shows up. don't ask the VM actors directly though, since they can't ack
         // the agent's stopped lease cleanup
         let mut vms = RemoteActorRef::<VMActor>::lookup_all(vm_actor_id(msg.vmid));
         while let Some(vm) = vms.try_next().await? {
@@ -309,7 +309,7 @@ impl Message<DeleteVM> for SchedulerActor {
             self.vm_tombstones.insert(msg.vmid, false);
             return Ok(DeleteVMReply { error: None });
         }
-        // we still need discovery even with cached targets. An agent that restarted
+        // we still need discovery even with cached targets. an agent that restarted
         // on the same peer has a new actor ID, and that has to replace the old route
         let mut discovered = RemoteActorRef::<AgentActor>::lookup_all(AGENT);
         let mut available = AHashMap::new();
@@ -352,7 +352,7 @@ impl Message<DeleteVM> for SchedulerActor {
         let mut failures = Vec::new();
         for (owner, retained) in targets {
             // the registry can return both the old and the replacement actor on
-            // one peer. Don't let a stale route hide a working one forever
+            // one peer. don't let a stale route hide a working one forever
             let mut candidates: AHashMap<_, _> = available
                 .iter()
                 .filter(|(id, _)| owner.matches_agent(**id))

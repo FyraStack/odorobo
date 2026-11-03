@@ -555,7 +555,7 @@ impl VMInstance {
 
     fn purge_instance_data_at(&mut self, runtime_dir: &Path) -> Result<()> {
         // keep the original config and runtime files until all cleanup succeeds.
-        // A failed teardown might still need its disk IDs/paths on a later retry
+        // a failed teardown might still need its disk IDs/paths on a later retry
         let mut vm_config = self.vm_config.clone().unwrap_or_default();
         self.transformer.teardown(self.vm_id(), &mut vm_config)?;
         remove_runtime_directory(runtime_dir, self.vm_id())?;
@@ -704,7 +704,7 @@ fn startup_failure_error(startup_error: Report, cleanup_result: Result<()>) -> R
 
 fn remove_runtime_directory(runtime_dir: &Path, vmid: &str) -> Result<()> {
     // don't use exists(), a metadata error there would turn failed credential
-    // cleanup into success. Only an already-missing directory is fine
+    // cleanup into success. only an already-missing directory is fine
     match fs::remove_dir_all(runtime_dir) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
