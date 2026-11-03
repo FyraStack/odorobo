@@ -330,6 +330,10 @@ fn allocate_vsock_cid(
     // turning off vsock doesn't let us skip an older run's active lease after an
     // agent restart. stopping this new VMM wouldn't tell us the old one exited
     VsockCidAllocator::from_environment().ensure_no_active_lease(vmid)?;
+    // a CID observed somewhere else isn't in use here, so don't report it
+    if let Some(observed) = manifest.observed.as_mut() {
+        observed.vsock_guest_cid = None;
+    }
     Ok(None)
 }
 
