@@ -56,7 +56,11 @@ incarnation cannot release a newer incarnation's lease.
 
 On SIGTERM/SIGINT the agent stops its VMs before exiting (waiting up to 60
 seconds), so each VMM is reaped and its lease is marked stopped. A second
-signal exits immediately. The registry also records each lease's VMM process
+signal exits immediately. The shipped systemd unit uses `KillMode=mixed` so
+only the agent gets the SIGTERM (the VMMs run in its cgroup), and a 90 second
+`TimeoutStopSec` so systemd doesn't SIGKILL it mid-shutdown. If you write your
+own unit, keep both. The single-instance lockfile (`/var/lock/odorobo.lock`) is
+an flock, so an agent that was killed outright doesn't block the next start. The registry also records each lease's VMM process
 (PID plus kernel start time), so after an unclean agent exit a restarted agent
 treats a lease as stopped once that exact process is gone. An explicit delete
 of a VM whose VMM is still running with no actor left (for example after the

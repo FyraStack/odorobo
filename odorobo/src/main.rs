@@ -51,8 +51,12 @@ fn init_sentry(dsn: Option<&str>) -> Option<sentry::ClientInitGuard> {
     Some(guard)
 }
 
-/// a little longer than the agent's own VM shutdown timeout, so it gets to finish
+/// a little longer than the agent's own VM shutdown timeout, so it gets to finish.
+/// the `TimeoutStopSec` in `systemd/odorobo.service` has to cover this plus
+/// `RUNTIME_SHUTDOWN_GRACE`, or systemd SIGKILLs us mid-teardown
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(75);
+/// how long stray tasks get once the actors are done
+const RUNTIME_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 fn mainloop(term: &Arc<AtomicBool>, config: Config) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -61,7 +65,7 @@ fn mainloop(term: &Arc<AtomicBool>, config: Config) -> Result<()> {
         .map_err(|err| eyre!("can't build tokio: {err}"))?;
     let result = runtime.block_on(inner_main(config, Arc::clone(term)));
     // don't hang on stray tasks once the actors are done
-    runtime.shutdown_timeout(Duration::from_secs(5));
+    runtime.shutdown_timeout(RUNTIME_SHUTDOWN_GRACE);
     if term.load(Ordering::Relaxed) {
         stable_eyre::eyre::bail!("Exit due to termination signal");
     }
@@ -127,4 +131,43 @@ async fn inner_main(config: Config, term: Arc<AtomicBool>) -> Result<()> {
         tracing::warn!("timed out waiting for the agent to stop");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unit_stop_timeout() -> Duration {
+        let unit = include_str!("../../systemd/odorobo.service");
+        let value = unit
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("TimeoutStopSec="))
+            .expect("the unit sets TimeoutStopSec");
+        let secs = value
+            .strip_suffix('s')
+            .unwrap_or(value)
+            .parse()
+            .expect("TimeoutStopSec is a plain number of seconds");
+        Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn systemd_stop_timeout_covers_graceful_shutdown() {
+        // if systemd SIGKILLs us first, VMs are torn down without recording
+        // their leases stopped
+        assert!(
+            unit_stop_timeout() > SHUTDOWN_TIMEOUT + RUNTIME_SHUTDOWN_GRACE,
+            "TimeoutStopSec in systemd/odorobo.service must exceed {:?}",
+            SHUTDOWN_TIMEOUT + RUNTIME_SHUTDOWN_GRACE
+        );
+    }
+
+    #[test]
+    fn systemd_only_signals_the_agent_on_stop() {
+        let unit = include_str!("../../systemd/odorobo.service");
+        assert!(
+            unit.lines().any(|line| line.trim() == "KillMode=mixed"),
+            "the VMMs share the agent's cgroup, so the unit needs KillMode=mixed"
+        );
+    }
 }

@@ -16,7 +16,9 @@ ExecStart=/usr/bin/odorobo
 Restart=always
 RestartSec=3s
 RestartPreventExitStatus=0
-TimeoutStopSec=30s
+KillMode=mixed
+# longer than the agent's own shutdown time (SHUTDOWN_TIMEOUT plus the runtime grace in main.rs)
+TimeoutStopSec=90s
 
 [Install]
 WantedBy=multi-user.target
