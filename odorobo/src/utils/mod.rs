@@ -20,7 +20,30 @@ pub enum OdoroboError {
     #[error("{0}")]
     #[api_error(status_code = 500, message = "{0}")]
     Report(#[from] Report),
+    #[error("remote: {0}")]
+    Remote(#[from] OdoroboRemoteError),
 }
+
+macro_rules! generate_odorobo_remote_error {
+    ($($act:ident),+$(,)?) => { preinterpret::preinterpret! {
+        #[derive(Error, Debug, ApiError, OperationIo)]
+        #[aide(output)]
+        pub enum OdoroboRemoteError { $(
+            #[error("{0}")]
+            $act(kameo::error::RemoteSendError<crate::messages::vm::[!ident! $act Error]>),
+        )+ }
+
+        $(
+            impl From<kameo::error::RemoteSendError<crate::messages::vm::[!ident! $act Error]>> for OdoroboError {
+                fn from(value: kameo::error::RemoteSendError<crate::messages::vm::[!ident! $act Error]>) -> Self {
+                    OdoroboError::Remote(OdoroboRemoteError::$act(value))
+                }
+            }
+        )+
+    }};
+}
+
+generate_odorobo_remote_error![AgentListVMs, CreateVM, DeleteVM, ShutdownVM];
 
 impl<M> From<kameo::error::SendError<M, Report>> for OdoroboError {
     fn from(value: kameo::error::SendError<M, Report>) -> Self {

@@ -14,9 +14,9 @@ use axum::{
     Json,
     extract::{Path, State},
 };
-use kameo::actor::ActorRef;
+use kameo::actor::RemoteActorRef;
 
-pub fn router() -> ApiRouter<ActorRef<HTTPActor>> {
+pub fn router() -> ApiRouter<RemoteActorRef<HTTPActor>> {
     ApiRouter::new()
         .api_route("/", get(list_vms))
         .api_route("/", post(create_vm))
@@ -27,9 +27,9 @@ pub fn router() -> ApiRouter<ActorRef<HTTPActor>> {
 }
 
 async fn list_vms(
-    State(state): State<ActorRef<HTTPActor>>,
+    State(state): State<RemoteActorRef<HTTPActor>>,
 ) -> Result<impl IntoApiResponse, OdoroboError> {
-    let reply = state.ask(AgentListVMs).await?;
+    let reply = state.ask(&AgentListVMs).await?;
 
     Ok(Json(VMListResponse {
         vms: reply.vms.into_iter().map(VmId).collect(),
@@ -38,7 +38,7 @@ async fn list_vms(
 
 /// Get detailed information about a specific VM
 async fn vm_info(
-    State(_state): State<ActorRef<HTTPActor>>,
+    State(_state): State<RemoteActorRef<HTTPActor>>,
     Path(VmId(_vmid)): Path<VmId>,
 ) -> Result<impl IntoApiResponse, OdoroboError> {
     // stub,
@@ -46,7 +46,7 @@ async fn vm_info(
 }
 
 async fn create_vm(
-    State(state): State<ActorRef<HTTPActor>>,
+    State(state): State<RemoteActorRef<HTTPActor>>,
     Json(request): Json<CreateVMRequest>,
 ) -> Result<impl IntoApiResponse, OdoroboError> {
     let message = CreateVM {
@@ -54,25 +54,25 @@ async fn create_vm(
         config: request.vm,
     };
 
-    let reply = state.ask(message).await?;
+    let reply = state.ask(&message).await?;
 
     Ok(Json(reply))
 }
 
 async fn delete_vm(
-    State(state): State<ActorRef<HTTPActor>>,
+    State(state): State<RemoteActorRef<HTTPActor>>,
     Path(VmId(vmid)): Path<VmId>,
 ) -> Result<impl IntoApiResponse, OdoroboError> {
-    let _reply = state.ask(DeleteVM { vmid }).await?;
+    let _reply = state.ask(&DeleteVM { vmid }).await?;
 
     Ok(Json(()))
 }
 
 async fn shutdown_vm(
-    State(state): State<ActorRef<HTTPActor>>,
+    State(state): State<RemoteActorRef<HTTPActor>>,
     Path(VmId(vmid)): Path<VmId>,
 ) -> Result<impl IntoApiResponse, OdoroboError> {
-    let _reply = state.ask(ShutdownVM { vmid }).await?;
+    let _reply = state.ask(&ShutdownVM { vmid }).await?;
 
     Ok(Json(()))
 }
@@ -81,7 +81,7 @@ async fn shutdown_vm(
 ///
 /// todo: make new schema for update request that allows partial updates
 async fn update_vm(
-    State(_state): State<ActorRef<HTTPActor>>,
+    State(_state): State<RemoteActorRef<HTTPActor>>,
     Path(VmId(_vmid)): Path<VmId>,
     Json(_request): Json<UpdateVMRequest>,
 ) -> Result<impl IntoApiResponse, OdoroboError> {

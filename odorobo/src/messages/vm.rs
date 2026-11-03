@@ -31,6 +31,11 @@ pub struct CreateVMReply {
     pub config: Option<VirtualMachine>,
 }
 
+#[derive(Debug, thiserror::Error, Deserialize, Serialize)]
+#[error("failed to create VM via scheduler")]
+pub struct CreateVMError(pub String);
+pub type SendCreateVMError = SendError<CreateVM, CreateVMError>;
+
 /// Message to delete a VM's config from the agent, shutting it down
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CloudHypervisorDeleteVMConfig {
@@ -71,6 +76,11 @@ pub struct DeleteVM {
 #[derive(Serialize, Deserialize, Reply, Debug, Clone)]
 pub struct DeleteVMReply;
 
+#[derive(Debug, thiserror::Error, Deserialize, Serialize)]
+#[error("failed to delete VM via scheduler")]
+pub struct DeleteVMError(pub String);
+pub type SendDeleteVMError = SendError<DeleteVM, DeleteVMError>;
+
 /// Shuts down a VM temporarily
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ShutdownVM {
@@ -79,6 +89,11 @@ pub struct ShutdownVM {
 
 #[derive(Serialize, Deserialize, Reply, Debug)]
 pub struct ShutdownVMReply;
+
+#[derive(Debug, thiserror::Error, Deserialize, Serialize)]
+#[error("failed to shutdown VM via scheduler")]
+pub struct ShutdownVMError(pub String);
+pub type SendShutdownVMError = SendError<ShutdownVM, ShutdownVMError>;
 
 /// List VMs on an agent
 #[derive(Serialize, Deserialize, Debug)]
@@ -89,6 +104,11 @@ pub struct AgentListVMsReply {
     // list VMs
     pub vms: Vec<Ulid>,
 }
+
+#[derive(Debug, thiserror::Error, Deserialize, Serialize)]
+#[error("failed to list VMs via scheduler")]
+pub struct AgentListVMsError(pub String);
+pub type SendAgentListVMsError = SendError<AgentListVMs, AgentListVMsError>;
 
 /// Get VM info
 #[derive(Serialize, Deserialize, Debug)]

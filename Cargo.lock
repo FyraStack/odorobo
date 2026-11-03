@@ -2907,6 +2907,7 @@ dependencies = [
  "libc",
  "libp2p",
  "nftables",
+ "preinterpret",
  "rand 0.10.2",
  "random-port",
  "reqwest",
@@ -3143,6 +3144,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "85eae3c4ed2f50dcfe72643da4befc30deadb458a9b590d720cde2f2b1e97da9"
 dependencies = [
  "zerocopy",
+]
+
+[[package]]
+name = "preinterpret"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4961bbd9cb921c326a3c2c288448f3e6da4074ba4f7eff122cbc6ccac6c5751d"
+dependencies = [
+ "proc-macro2",
+ "syn 2.0.118",
 ]
 
 [[package]]

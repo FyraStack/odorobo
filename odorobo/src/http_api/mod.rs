@@ -7,12 +7,12 @@ use aide::{
     swagger::Swagger,
 };
 use axum::{Extension, Json, Router};
-use kameo::actor::ActorRef;
+use kameo::actor::RemoteActorRef;
 
 use crate::{actors::http_actor::HTTPActor, utils::OdoroboError};
 
 /// Build the full app: finalizes the OpenAPI spec and attaches it as an extension.
-pub fn build(state: ActorRef<HTTPActor>) -> Router {
+pub fn build(state: RemoteActorRef<HTTPActor>) -> Router {
     aide::generate::on_error(|error| {
         tracing::warn!("aide schema gen error: {error}");
     });
@@ -32,11 +32,11 @@ pub fn build(state: ActorRef<HTTPActor>) -> Router {
 }
 
 /// Main router for the API
-fn router<S>(state: ActorRef<HTTPActor>) -> ApiRouter<S>
+fn router<S>(state: RemoteActorRef<HTTPActor>) -> ApiRouter<S>
 where
     S: Clone + Send + Sync + 'static,
 {
-    ApiRouter::<ActorRef<HTTPActor>>::new()
+    ApiRouter::<RemoteActorRef<HTTPActor>>::new()
         .api_route("/health", get(health))
         .api_route("/swagger", Swagger::new("/openapi.json").axum_route())
         .api_route("/openapi.json", get(serve_api))
