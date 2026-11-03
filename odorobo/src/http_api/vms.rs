@@ -69,6 +69,7 @@ async fn create_vm(
     let message = CreateVM {
         vmid: request.vm.id,
         config: request.vm,
+        generation: None,
     };
 
     let reply = state.ask(message).await?;
@@ -118,6 +119,7 @@ async fn delete_vm(
         .ask(DeleteVM {
             vmid,
             force: query.force,
+            issued_at: None,
         })
         .await?;
 

@@ -45,6 +45,9 @@ pub struct VMCacheData {
     vcpus: u32,
     memory_bytes: u64,
     cleanup_proof: Arc<VMCleanupProof>,
+    /// the scheduler's stamp for this incarnation, if it sent one. a delete
+    /// stamped before it was meant for an older VM with the same ID
+    generation: Option<Ulid>,
 }
 
 #[derive(RemoteActor)]
@@ -526,6 +529,7 @@ impl Message<CreateVM> for AgentActor {
                 vcpus: msg.config.desired.compute.vcpus,
                 memory_bytes: msg.config.desired.compute.memory_bytes,
                 cleanup_proof: Arc::clone(&cleanup_proof),
+                generation: msg.generation,
             },
         );
 
@@ -576,6 +580,8 @@ impl Message<MigrateVMReceive> for AgentActor {
                 vcpus: msg.config.desired.compute.vcpus,
                 memory_bytes: msg.config.desired.compute.memory_bytes,
                 cleanup_proof: Arc::clone(&cleanup_proof),
+                // a migrated VM has no create stamp, so any delete still applies
+                generation: None,
             },
         );
 
@@ -613,6 +619,14 @@ impl Message<DeleteVM> for AgentActor {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         let vmid = msg.vmid;
+        // the ID got recreated after this delete was sent, so whatever it was
+        // meant for is already gone. a VM only exists once per agent
+        if let Some(vm) = self.vms.get(&vmid)
+            && msg.predates(vm.generation)
+        {
+            info!(%vmid, ?msg.issued_at, generation = ?vm.generation, "ignoring a delete sent before this VM was created");
+            return DeleteVMReply { error: None };
+        }
         // a blocked VM's actor is already gone, even if we kept it listed
         // because its exit couldn't be confirmed
         if !self.blocked_vm_ids.contains_key(&vmid) {

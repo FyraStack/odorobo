@@ -87,8 +87,11 @@ a host need distinct key paths.
 Deletion is acknowledged only after the known VM-owning agents confirm process
 exit and node-local cleanup. Missing owners keep deletion pending; retry after
 those agents become reachable, or delete with `?force=true` to drop owners whose
-agent can't be reached at all (an agent that answers with an error still fails
-the delete). Cleanup ownership survives discovery-cache eviction in scheduler
+agent can't be reached at all (an agent that answers with an error, or that
+might have gotten the request but timed out, still fails the delete). Every
+create and delete the scheduler sends carries a time-ordered stamp, so a delete
+that arrives after its VM ID was recreated is acked without touching the new
+VM. Cleanup ownership survives discovery-cache eviction in scheduler
 memory, and after a scheduler restart it is rebuilt from agent status: each
 agent reports running VMs and `retained_vms` (IDs that still hold node-local
 state, like a stopped CID lease). An agent that was unreachable since the

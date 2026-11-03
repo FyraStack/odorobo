@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use ahash::AHashSet;
 
+use kameo::error::RemoteSendError;
 use kameo::prelude::*;
 use tracing::warn;
 use ulid::Ulid;
@@ -29,8 +30,42 @@ pub(super) enum DeleteAttempt {
     Acked,
     /// the agent is alive and explicitly said cleanup failed
     AgentError(String),
-    /// transport or ask failure, so we don't know if the agent is even there
+    /// the request never got to a running agent: no route, dial failure, no
+    /// such actor. the only kind of failure force is allowed to skip
     Unreachable(String),
+    /// the agent might have gotten the request and might still be working on
+    /// it, like a timeout or a connection that closed mid-request. a slow
+    /// teardown looks exactly like this, so even force can't skip it
+    Unknown(String),
+}
+
+impl DeleteAttempt {
+    /// sorts a failed ask by whether the agent could have seen the request
+    pub(super) fn from_send_error<E: std::fmt::Debug>(error: &RemoteSendError<E>) -> Self {
+        let message = format!("{error:?}");
+        match error {
+            RemoteSendError::ActorNotRunning
+            | RemoteSendError::UnknownActor { .. }
+            | RemoteSendError::BadActorType
+            | RemoteSendError::SwarmNotBootstrapped
+            | RemoteSendError::DialFailure
+            | RemoteSendError::UnsupportedProtocols
+            | RemoteSendError::SerializeMessage(_) => Self::Unreachable(message),
+            // everything else either reached a live agent or might have
+            RemoteSendError::ActorStopped
+            | RemoteSendError::UnknownMessage { .. }
+            | RemoteSendError::MailboxFull
+            | RemoteSendError::ReplyTimeout
+            | RemoteSendError::HandlerError(_)
+            | RemoteSendError::DeserializeMessage(_)
+            | RemoteSendError::SerializeReply(_)
+            | RemoteSendError::SerializeHandlerError(_)
+            | RemoteSendError::DeserializeHandlerError(_)
+            | RemoteSendError::NetworkTimeout
+            | RemoteSendError::ConnectionClosed
+            | RemoteSendError::Io(_) => Self::Unknown(message),
+        }
+    }
 }
 
 /// what all of an owner's routes added up to
@@ -39,6 +74,9 @@ pub(super) enum DeleteOwnerOutcome {
     Acked,
     /// at least one live agent rejected the delete. even force can't skip this
     Rejected(Vec<String>),
+    /// no ack or rejection, but the agent might still be working on it. even
+    /// force can't skip this, a retry finds out how it went
+    Unknown(Vec<String>),
     /// nothing answered. empty means we didn't even have a route
     Unreachable(Vec<String>),
 }
@@ -53,28 +91,34 @@ pub(super) struct DeleteSettlement {
 }
 
 /// folds an owner's per-route attempts into one outcome. any ack wins, then
-/// any explicit agent error, since a stale route failing doesn't matter if a
-/// live replacement on the same peer answered
+/// any explicit agent error, then any route that might have gotten through,
+/// since a stale route failing doesn't matter if a live replacement on the same
+/// peer answered
 pub(super) fn delete_owner_outcome(attempts: Vec<DeleteAttempt>) -> DeleteOwnerOutcome {
     let mut rejected = Vec::new();
+    let mut unknown = Vec::new();
     let mut unreachable = Vec::new();
     for attempt in attempts {
         match attempt {
             DeleteAttempt::Acked => return DeleteOwnerOutcome::Acked,
             DeleteAttempt::AgentError(error) => rejected.push(error),
+            DeleteAttempt::Unknown(error) => unknown.push(error),
             DeleteAttempt::Unreachable(error) => unreachable.push(error),
         }
     }
-    if rejected.is_empty() {
-        DeleteOwnerOutcome::Unreachable(unreachable)
-    } else {
+    if !rejected.is_empty() {
         DeleteOwnerOutcome::Rejected(rejected)
+    } else if !unknown.is_empty() {
+        DeleteOwnerOutcome::Unknown(unknown)
+    } else {
+        DeleteOwnerOutcome::Unreachable(unreachable)
     }
 }
 
 /// decides which owners count as done. without force, anything short of an
-/// ack fails the delete. with force, owners we couldn't reach get dropped, but
-/// an agent that answered with an error still fails it
+/// ack fails the delete. with force, owners we couldn't reach at all get
+/// dropped, but an agent that answered with an error, or might still be
+/// working on it, still fails it
 pub(super) fn plan_delete_settlement(
     outcomes: Vec<(VmDeleteOwner, DeleteOwnerOutcome)>,
     force: bool,
@@ -86,6 +130,10 @@ pub(super) fn plan_delete_settlement(
             DeleteOwnerOutcome::Rejected(errors) => settlement
                 .failures
                 .push(format!("{owner:?}: {}", errors.join("; "))),
+            DeleteOwnerOutcome::Unknown(errors) => settlement.failures.push(format!(
+                "{owner:?}: no answer, it might still be deleting; retry: {}",
+                errors.join("; ")
+            )),
             DeleteOwnerOutcome::Unreachable(errors) => {
                 let reason = if errors.is_empty() {
                     "missing agent for known VM owner".to_owned()
@@ -199,6 +247,19 @@ impl SchedulerActor {
         if let Some(targets) = self.vm_delete_targets.get_mut(&vmid) {
             targets.remove(&owner);
         }
+    }
+
+    /// a time-ordered stamp for a create or delete we send to an agent. always
+    /// moves forward, even if two land in the same millisecond or the clock
+    /// steps back
+    pub(super) fn next_stamp(&mut self) -> Ulid {
+        let now = Ulid::generate();
+        self.last_stamp = if now > self.last_stamp {
+            now
+        } else {
+            self.last_stamp.increment().unwrap_or(now)
+        };
+        self.last_stamp
     }
 
     /// like `finish_vm_delete`, but also finishes when force dropped every

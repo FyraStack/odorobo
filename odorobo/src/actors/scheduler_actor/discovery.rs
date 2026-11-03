@@ -406,8 +406,12 @@ impl SchedulerActor {
             info!(%vmid, ?agent_id, "agent still holds a deleted VM, deleting it in the background");
             let scheduler = scheduler.clone();
             let agent = agent.clone();
+            let request = DeleteVM {
+                vmid,
+                force: false,
+                issued_at: Some(self.next_stamp()),
+            };
             tokio::spawn(async move {
-                let request = DeleteVM { vmid, force: false };
                 let error =
                     match tokio::time::timeout(AUTO_DELETE_TIMEOUT, agent.ask(&request)).await {
                         Ok(Ok(DeleteVMReply { error })) => error,
@@ -483,7 +487,11 @@ impl Message<ReconcileVmPlacements> for SchedulerActor {
             .collect();
 
         for (vmid, config) in unplaced_vms {
-            let request = crate::messages::vm::CreateVM { vmid, config };
+            let request = crate::messages::vm::CreateVM {
+                vmid,
+                config,
+                generation: Some(self.next_stamp()),
+            };
             match self.schedule_agent(&request) {
                 Ok(agent) => {
                     self.remember_agent_ref(&agent);

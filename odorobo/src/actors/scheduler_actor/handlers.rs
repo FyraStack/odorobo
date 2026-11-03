@@ -48,6 +48,7 @@ impl Actor for SchedulerActor {
             vm_tombstones: AHashMap::new(),
             vm_auto_deletes: AHashMap::new(),
             vm_leftover_owners: AHashMap::new(),
+            last_stamp: ulid::Ulid::nil(),
             known_agent_refs: AHashMap::new(),
             vm_delete_targets: AHashMap::new(),
             vm_placements: AHashMap::new(),
@@ -105,6 +106,10 @@ impl Message<CreateVM> for SchedulerActor {
     ) -> Self::Reply {
         self.check_create_allowed(msg.vmid)
             .map_err(|error| eyre!(error))?;
+        let msg = CreateVM {
+            generation: Some(self.next_stamp()),
+            ..msg
+        };
         if let Some(existing) = self.vm_manifests.get(&msg.vmid) {
             let matches_intent = same_create_intent(existing, &msg.config)
                 || self
@@ -226,6 +231,7 @@ impl Message<CreateVM> for SchedulerActor {
                     .ask(&DeleteVM {
                         vmid: msg.vmid,
                         force: false,
+                        issued_at: Some(self.next_stamp()),
                     })
                     .await,
                 Ok(DeleteVMReply { error: None })
@@ -302,6 +308,12 @@ impl Message<DeleteVM> for SchedulerActor {
         msg: DeleteVM,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
+        // stamp it so a copy that's still in flight when the ID gets recreated
+        // can't take the new VM down with it
+        let msg = DeleteVM {
+            issued_at: Some(self.next_stamp()),
+            ..msg
+        };
         let already_deleted = self.vm_tombstone_state(msg.vmid) == Some(VmTombstoneState::Deleted)
             && !self.vm_delete_targets.contains_key(&msg.vmid);
         self.remove_vm_intent(msg.vmid);
@@ -369,7 +381,7 @@ impl Message<DeleteVM> for SchedulerActor {
                 let attempt = match agent.ask(&msg).await {
                     Ok(DeleteVMReply { error: None }) => DeleteAttempt::Acked,
                     Ok(DeleteVMReply { error: Some(error) }) => DeleteAttempt::AgentError(error),
-                    Err(error) => DeleteAttempt::Unreachable(error.to_string()),
+                    Err(error) => DeleteAttempt::from_send_error(&error),
                 };
                 let acked = attempt == DeleteAttempt::Acked;
                 attempts.push(attempt);

@@ -341,6 +341,7 @@ fn vm_cleanup_unplaces_vm_without_another_discovered_actor() {
         vm_tombstones: AHashMap::new(),
         vm_auto_deletes: AHashMap::new(),
         vm_leftover_owners: AHashMap::new(),
+        last_stamp: Ulid::nil(),
         known_agent_refs: AHashMap::new(),
         vm_delete_targets: AHashMap::new(),
         vm_placements: AHashMap::from([(
@@ -509,6 +510,7 @@ fn explicit_stop_removes_vm_intent_and_actor_mapping() {
         vm_tombstones: AHashMap::new(),
         vm_auto_deletes: AHashMap::new(),
         vm_leftover_owners: AHashMap::new(),
+        last_stamp: Ulid::nil(),
         known_agent_refs: AHashMap::new(),
         vm_delete_targets: AHashMap::new(),
         vm_placements: AHashMap::from([(vmid, Vec::new())]),
@@ -545,6 +547,7 @@ fn agent_cleanup_does_not_remove_unrelated_vm_state() {
         vm_tombstones: AHashMap::new(),
         vm_auto_deletes: AHashMap::new(),
         vm_leftover_owners: AHashMap::new(),
+        last_stamp: Ulid::nil(),
         known_agent_refs: AHashMap::new(),
         vm_delete_targets: AHashMap::new(),
         vm_placements: AHashMap::from([(
@@ -586,6 +589,7 @@ fn vm_cleanup_does_not_remove_unrelated_agent_state() {
         vm_tombstones: AHashMap::new(),
         vm_auto_deletes: AHashMap::new(),
         vm_leftover_owners: AHashMap::new(),
+        last_stamp: Ulid::nil(),
         known_agent_refs: AHashMap::new(),
         vm_delete_targets: AHashMap::new(),
         vm_placements: AHashMap::new(),
@@ -614,6 +618,7 @@ fn empty_scheduler() -> SchedulerActor {
         vm_tombstones: AHashMap::new(),
         vm_auto_deletes: AHashMap::new(),
         vm_leftover_owners: AHashMap::new(),
+        last_stamp: Ulid::nil(),
         known_agent_refs: AHashMap::new(),
         vm_delete_targets: AHashMap::new(),
         vm_placements: AHashMap::new(),
@@ -1524,4 +1529,86 @@ fn leftover_owner_is_cleared_when_it_reports_without_the_vm_or_acks_a_delete() {
         Ok(())
     );
     assert_eq!(scheduler.check_create_allowed(acked), Ok(()));
+}
+
+#[test]
+fn only_undelivered_asks_count_as_unreachable() {
+    use super::deletion::DeleteAttempt;
+    use kameo::error::RemoteSendError;
+
+    let classify =
+        |error: RemoteSendError<std::convert::Infallible>| DeleteAttempt::from_send_error(&error);
+    for never_delivered in [
+        RemoteSendError::DialFailure,
+        RemoteSendError::ActorNotRunning,
+        RemoteSendError::SwarmNotBootstrapped,
+    ] {
+        assert!(
+            matches!(classify(never_delivered), DeleteAttempt::Unreachable(_)),
+            "never delivered"
+        );
+    }
+    // a slow teardown on a live agent looks like these, so force can't skip them
+    for maybe_delivered in [
+        RemoteSendError::NetworkTimeout,
+        RemoteSendError::ConnectionClosed,
+        RemoteSendError::ReplyTimeout,
+        RemoteSendError::ActorStopped,
+        RemoteSendError::MailboxFull,
+    ] {
+        assert!(
+            matches!(classify(maybe_delivered), DeleteAttempt::Unknown(_)),
+            "might have been delivered"
+        );
+    }
+}
+
+#[test]
+fn force_never_drops_an_owner_that_might_still_be_deleting() {
+    use super::deletion::{
+        DeleteAttempt, DeleteOwnerOutcome, delete_owner_outcome, plan_delete_settlement,
+    };
+
+    // a dead old route doesn't hide that the live one timed out
+    let outcome = delete_owner_outcome(vec![
+        DeleteAttempt::Unreachable("dial failure".to_owned()),
+        DeleteAttempt::Unknown("network timeout".to_owned()),
+    ]);
+    assert_eq!(
+        outcome,
+        DeleteOwnerOutcome::Unknown(vec!["network timeout".to_owned()])
+    );
+    // but an explicit rejection or an ack still wins
+    assert!(matches!(
+        delete_owner_outcome(vec![
+            DeleteAttempt::Unknown("timeout".to_owned()),
+            DeleteAttempt::AgentError("teardown failed".to_owned()),
+        ]),
+        DeleteOwnerOutcome::Rejected(_)
+    ));
+    assert_eq!(
+        delete_owner_outcome(vec![
+            DeleteAttempt::Unknown("timeout".to_owned()),
+            DeleteAttempt::Acked,
+        ]),
+        DeleteOwnerOutcome::Acked
+    );
+
+    let slow = super::VmDeleteOwner::agent(super::ActorId::new(1));
+    let settlement = plan_delete_settlement(vec![(slow, outcome)], true);
+    assert_eq!(settlement.dropped, Vec::new());
+    assert_eq!(settlement.failures.len(), 1);
+    assert!(settlement.failures[0].contains("might still be deleting"));
+}
+
+#[test]
+fn stamps_always_move_forward() {
+    let mut scheduler = empty_scheduler();
+    let first = scheduler.next_stamp();
+    let second = scheduler.next_stamp();
+    assert!(second > first);
+    // even if the clock steps back behind what we already handed out
+    scheduler.last_stamp = Ulid::from_parts(u64::MAX >> 16, 0);
+    let after_clock_skew = scheduler.next_stamp();
+    assert!(after_clock_skew > Ulid::from_parts(u64::MAX >> 16, 0));
 }

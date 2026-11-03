@@ -243,6 +243,8 @@ pub struct SchedulerActor {
     /// an entry goes away once that node acks a delete or reports a full status
     /// without the VM
     vm_leftover_owners: AHashMap<Ulid, AHashSet<VmDeleteOwner>>,
+    /// last stamp handed out by `next_stamp`
+    last_stamp: Ulid,
     /// last discovered agent per owner, kept even after reachability-cache eviction.
     /// these are just for finding known VM owners, not a list to broadcast to
     known_agent_refs: AHashMap<VmDeleteOwner, RemoteActorRef<AgentActor>>,
