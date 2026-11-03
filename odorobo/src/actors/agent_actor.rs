@@ -34,6 +34,8 @@ use ulid::Ulid;
 
 use kameo::error::PanicError;
 
+/// how long the agent waits for its VMs to shut down and reap before exiting
+const SHUTDOWN_VM_TIMEOUT: Duration = Duration::from_secs(60);
 /// how long a delete waits for a leftover VMM to die after SIGKILL
 const LEFTOVER_VMM_KILL_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -328,6 +330,43 @@ impl Actor for AgentActor {
             "Agent actor panicked; stopping because its state cannot be safely rebuilt here"
         );
         Ok(ControlFlow::Break(ActorStopReason::Panicked(err)))
+    }
+
+    async fn on_stop(
+        &mut self,
+        _actor_ref: WeakActorRef<Self>,
+        reason: ActorStopReason,
+    ) -> Result<()> {
+        // stop the VMs ourselves so each one reaps its VMM and marks its lease
+        // stopped. otherwise a restart leaves every lease looking active
+        let actors: Vec<_> = self.vms.values().map(|vm| vm.actor_ref.clone()).collect();
+        if actors.is_empty() {
+            return Ok(());
+        }
+        info!(
+            count = actors.len(),
+            ?reason,
+            "stopping VMs before the agent exits"
+        );
+        let mut stops = tokio::task::JoinSet::new();
+        for actor in actors {
+            stops.spawn(async move {
+                if actor.is_alive()
+                    && let Err(error) = actor.stop_gracefully().await
+                {
+                    warn!(?error, "failed to ask VM actor to stop");
+                }
+                actor.wait_for_shutdown().await;
+            });
+        }
+        let all_stopped = async { while stops.join_next().await.is_some() {} };
+        if tokio::time::timeout(SHUTDOWN_VM_TIMEOUT, all_stopped)
+            .await
+            .is_err()
+        {
+            warn!("timed out stopping VMs, their vsock leases stay active until they're deleted");
+        }
+        Ok(())
     }
 
     async fn on_link_died(

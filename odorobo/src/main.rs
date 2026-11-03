@@ -15,6 +15,7 @@ mod vsock_cid;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use kameo::actor::Spawn;
 use stable_eyre::{Result, eyre::eyre};
@@ -50,27 +51,30 @@ fn init_sentry(dsn: Option<&str>) -> Option<sentry::ClientInitGuard> {
     Some(guard)
 }
 
+/// a little longer than the agent's own VM shutdown timeout, so it gets to finish
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(75);
+
 fn mainloop(term: &Arc<AtomicBool>, config: Config) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|err| eyre!("can't build tokio: {err}"))?;
-    let handle = runtime.spawn(inner_main(config));
+    let result = runtime.block_on(inner_main(config, Arc::clone(term)));
+    // don't hang on stray tasks once the actors are done
+    runtime.shutdown_timeout(Duration::from_secs(5));
+    if term.load(Ordering::Relaxed) {
+        stable_eyre::eyre::bail!("Exit due to termination signal");
+    }
+    result
+}
 
-    loop {
-        if handle.is_finished() {
-            break runtime
-                .block_on(handle)
-                .map_err(|err| eyre!("cannot join main thread: {err}"))?;
-        }
-        if term.load(Ordering::Relaxed) {
-            handle.abort();
-            stable_eyre::eyre::bail!("Exit due to termination signal");
-        }
+async fn wait_for_term(term: &AtomicBool) {
+    while !term.load(Ordering::Relaxed) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
-async fn inner_main(config: Config) -> Result<()> {
+async fn inner_main(config: Config, term: Arc<AtomicBool>) -> Result<()> {
     tracing::info!("Starting odorobo");
 
     let local_peer_id = connect_to_swarm(std::path::Path::new(config.get_peer_key_path()))?;
@@ -80,18 +84,47 @@ async fn inner_main(config: Config) -> Result<()> {
     let agent_actor = AgentActor::spawn(config.clone());
     agent_actor.register(AGENT).await?;
 
-    if config.get_manager_enabled() {
+    let manager = if config.get_manager_enabled() {
         let scheduler_actor = SchedulerActor::spawn(());
         let http_actor = HTTPActor::spawn(scheduler_actor.clone());
 
         scheduler_actor.register(SCHEDULER).await?;
         http_actor.register(HTTP_API_SERVER).await?;
+        Some((scheduler_actor, http_actor))
+    } else {
+        None
+    };
 
-        scheduler_actor.wait_for_shutdown().await;
-        http_actor.wait_for_shutdown().await;
+    let run = async {
+        if let Some((scheduler_actor, http_actor)) = &manager {
+            scheduler_actor.wait_for_shutdown().await;
+            http_actor.wait_for_shutdown().await;
+        }
+        agent_actor.wait_for_shutdown().await;
+    };
+    tokio::select! {
+        () = run => return Ok(()),
+        () = wait_for_term(&term) => {}
     }
 
-    agent_actor.wait_for_shutdown().await;
-
+    // stop gracefully so the agent reaps its VMMs and marks their vsock leases
+    // stopped. just dropping the runtime kills them without recording that
+    tracing::info!("termination signal received, shutting down");
+    let shutdown = async {
+        if let Some((scheduler_actor, http_actor)) = &manager {
+            _ = http_actor.stop_gracefully().await;
+            _ = scheduler_actor.stop_gracefully().await;
+        }
+        if let Err(error) = agent_actor.stop_gracefully().await {
+            tracing::warn!(?error, "failed to stop agent actor");
+        }
+        agent_actor.wait_for_shutdown().await;
+    };
+    if tokio::time::timeout(SHUTDOWN_TIMEOUT, shutdown)
+        .await
+        .is_err()
+    {
+        tracing::warn!("timed out waiting for the agent to stop");
+    }
     Ok(())
 }

@@ -52,8 +52,18 @@ reservations from failed startup attempts are rolled back only after confirmed
 process exit. An active lease cannot be reused—even for the same VM ID—until
 exit is confirmed. Every reservation has a distinct persisted lease token;
 startup rollback, exit recording, and deletion retries use that token so one
-incarnation cannot release a newer incarnation's lease. After an unclean agent/host failure, stale active leases may
-need manual recovery rather than assuming the old VMM is gone. A requested CID is
+incarnation cannot release a newer incarnation's lease.
+
+On SIGTERM/SIGINT the agent stops its VMs before exiting (waiting up to 60
+seconds), so each VMM is reaped and its lease is marked stopped. A second
+signal exits immediately. The registry also records each lease's VMM process
+(PID plus kernel start time), so after an unclean agent exit a restarted agent
+treats a lease as stopped once that exact process is gone. An explicit delete
+of a VM whose VMM is still running with no actor left (for example after the
+agent was killed) SIGKILLs that exact process before releasing its lease and
+runtime files. A lease that never had its process recorded (the agent died
+between reserving the CID and spawning the VMM, or recording failed) still
+needs manual recovery. A requested CID is
 reserved if free; a conflict fails VM creation rather than silently assigning
 a different CID. `GetVMInfo` returns the effective VM manifest, including the
 allocated CID in `observed.vsock_guest_cid` and the desired socket path;
