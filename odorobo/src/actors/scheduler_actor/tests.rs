@@ -441,8 +441,8 @@ fn unknown_create_retry_waits_for_acceptance_or_discovery() {
 
     assert!(!scheduler.create_is_confirmed(vmid));
 
-    // A successful agent reply records its effective configuration even before
-    // status discovery observes the new VM.
+    // a successful agent reply saves the effective config even before status
+    // discovery sees the new VM
     scheduler
         .vm_effective_manifests
         .insert(vmid, test_manifest(1, 1));
@@ -689,7 +689,7 @@ fn unrelated_success_cannot_complete_delete_and_failures_survive_retries() {
     assert_eq!(scheduler.vm_delete_targets[&vmid].len(), 2);
 
     scheduler.acknowledge_vm_delete_owner(vmid, source);
-    // Stale discovery and retry must not undo partial progress.
+    // stale discovery and retries shouldn't undo progress we already made
     scheduler.remember_vm_delete_owner(vmid, source);
     scheduler.remove_vm_intent(vmid);
     assert!(scheduler.vm_delete_targets[&vmid][&source].confirmed);
@@ -713,7 +713,7 @@ fn delete_owner_routes_to_replacement_actor_on_same_peer_only() {
     assert_eq!(owner, super::VmDeleteOwner::vm(vm));
     assert!(owner.matches_agent(replacement));
     assert!(!owner.matches_agent(unrelated));
-    // A VM without peer evidence must not guess an unrelated local agent.
+    // a VM with no peer info shouldn't get matched to some unrelated local agent
     assert!(
         !super::VmDeleteOwner::vm(super::ActorId::new(3)).matches_agent(super::ActorId::new(1))
     );

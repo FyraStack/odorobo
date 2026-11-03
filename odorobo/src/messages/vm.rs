@@ -25,7 +25,7 @@ pub struct CreateVMReply {
     pub config: Option<VmManifest>,
     /// Serialized ID of the VM actor created by the agent.
     pub actor_id: Option<Vec<u8>>,
-    /// VM startup failure reported by the destination agent, if any.
+    /// VM startup error from the destination agent, if there was one
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }

@@ -112,14 +112,14 @@ impl VmManifest {
     }
 }
 
-/// Compare create intent without node-local observations. An omitted desired
-/// CID means automatic allocation and is distinct from an explicit CID.
+/// compares create intent while ignoring node-local observed values. Leaving out
+/// the desired CID means "allocate one for me", which isn't the same as an explicit CID
 #[must_use]
 pub fn same_create_intent(existing: &VmManifest, requested: &VmManifest) -> bool {
     let mut existing = existing.clone();
     let mut requested = requested.clone();
-    // Observed state contains node-assigned values (including an automatically
-    // allocated vsock CID) and must not make a retry look like a new request.
+    // observed state has node-assigned values (like an auto-allocated vsock CID),
+    // so it shouldn't make a retry look like a new request
     existing.observed = None;
     requested.observed = None;
     existing == requested
@@ -372,7 +372,7 @@ pub struct CloudInit {
     pub user_data: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub meta_data: Option<String>,
-    /// Optional `NoCloud` vendor-data interpreted by cloud-init.
+    /// optional `NoCloud` vendor-data for cloud-init
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vendor_data: Option<String>,
 }
@@ -380,7 +380,7 @@ pub struct CloudInit {
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Vsock {
-    /// Optional guest CID. The agent allocates and persists one when omitted.
+    /// optional guest CID. If it's left out, the agent picks one and saves it
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guest_cid: Option<u32>,
     pub socket: String,
@@ -402,8 +402,8 @@ pub struct ObservedState {
     /// Actionable failure detail when the observed status is `error`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// Effective node-local guest CID for vsock. This is reported for runtime
-    /// inspection and migration, but is not a hard placement requirement.
+    /// the node-local guest CID vsock is actually using. It's reported for runtime
+    /// inspection and migration, but it isn't a hard placement requirement
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vsock_guest_cid: Option<u32>,
 }

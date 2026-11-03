@@ -238,12 +238,12 @@ impl VMInstance {
                 .await
                 .map_err(ChApiError::from)
                 .wrap_err(eyre!("Failed to prepare VM for migration {}", vm_id))?;
-            // Publish success before returning: actor shutdown can race with
-            // the completion notification and must not roll back this guest's CID.
+            // mark success before returning, since actor shutdown can race the
+            // completion notification and we don't want it rolling back the guest's CID
             succeeded.store(true, Ordering::SeqCst);
             info!(vm_id, "Migration receiver completed successfully");
-            // This is the destination VMM: it now owns the running guest and
-            // must remain alive after a successful receive.
+            // we're the destination VMM, so we own the running guest now and
+            // have to stay alive after a successful receive
             Ok(())
         });
 
@@ -456,7 +456,7 @@ impl VMInstance {
         ))
     }
 
-    /// Request shutdown without removing resources still used by the VMM.
+    /// ask for shutdown without removing resources the VMM is still using
     pub async fn stop(&self) -> Result<()> {
         self.stop_with_timeouts(
             std::time::Duration::from_secs(10),
@@ -499,8 +499,8 @@ impl VMInstance {
             Ok(())
         });
 
-        // Attempt VMM shutdown even if a hook or guest shutdown failed, but
-        // never let an unresponsive API prevent the caller from killing it.
+        // try shutting down the VMM even if a hook or guest shutdown failed, but
+        // don't let a hung API stop the caller from killing it
         if matches!(
             tokio::time::timeout(vmm_timeout, self.conn().shutdown_vmm()).await,
             Ok(Ok(()))
@@ -515,13 +515,14 @@ impl VMInstance {
         stop_result
     }
 
-    /// Gracefully shutdown the VM and VMM, confirm exit, then clean up runtime state.
+    /// gracefully shut down the VM and VMM, make sure it exited, then clean up runtime state
     pub async fn destroy(&mut self) -> Result<()> {
         let stop_result = self.stop().await;
         if let Some(mut child) = self.child_process.take() {
             trace!("VMM stopped... checking child process");
-            // start_kill can fail when the process has already exited; wait is
-            // authoritative and must succeed before callers can release leases.
+            // start_kill can fail if the process already exited, that's fine.
+            // wait() is the real check, and it has to succeed before callers can
+            // release leases
             _ = child.start_kill();
             child.wait().await.map_err(UnconfirmedProcessExit)?;
         }
@@ -531,7 +532,7 @@ impl VMInstance {
         cleanup_result
     }
 
-    /// Remove resources only after the owner has confirmed VMM process exit.
+    /// remove resources, but only once the owner has confirmed the VMM process exited
     pub async fn cleanup_after_stop(&mut self) -> Result<()> {
         let vm_config = self.vm_config.clone().unwrap_or_default();
         self.hook_manager
@@ -548,8 +549,8 @@ impl VMInstance {
     }
 
     fn purge_instance_data_at(&mut self, runtime_dir: &Path) -> Result<()> {
-        // Keep the original config and runtime files until all cleanup succeeds.
-        // A failed teardown may still need its disk IDs/paths on a later retry.
+        // keep the original config and runtime files until all cleanup succeeds.
+        // A failed teardown might still need its disk IDs/paths on a later retry
         let mut vm_config = self.vm_config.clone().unwrap_or_default();
         self.transformer.teardown(self.vm_id(), &mut vm_config)?;
         remove_runtime_directory(runtime_dir, self.vm_id())?;
@@ -614,8 +615,8 @@ impl VMInstance {
     /// allowing for live migration of the VM.
     pub async fn prep_config(&mut self, mut config: models::VmConfig) -> Result<()> {
         info!(vm_id = self.vm_id(), "Preparing VM config for migration");
-        // Preserve even partial transforms so teardown can release everything
-        // provisioned before an error.
+        // keep even partial transforms so teardown can release everything that
+        // got provisioned before the error
         let transform_result = self.transformer.transform(self.vm_id(), &mut config);
         self.vm_config = Some(config.clone());
         transform_result.wrap_err(eyre!(
@@ -678,8 +679,8 @@ fn startup_failure_error(startup_error: Report, cleanup_result: Result<()>) -> R
     match cleanup_result {
         Ok(()) => startup_error,
         Err(cleanup_error) => {
-            // Keep the original report in the chain so an unconfirmed process
-            // exit remains downcastable and callers cannot release its lease.
+            // keep the original report in the chain so an unconfirmed process exit
+            // stays downcastable and callers can't release its lease
             if cleanup_error
                 .downcast_ref::<UnconfirmedProcessExit>()
                 .is_some()
@@ -696,8 +697,8 @@ fn startup_failure_error(startup_error: Report, cleanup_result: Result<()>) -> R
 }
 
 fn remove_runtime_directory(runtime_dir: &Path, vmid: &str) -> Result<()> {
-    // Avoid exists(): metadata access errors must not turn failed credential
-    // cleanup into success. Only an already-absent directory is harmless.
+    // don't use exists(), a metadata error there would turn failed credential
+    // cleanup into success. Only an already-missing directory is fine
     match fs::remove_dir_all(runtime_dir) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -764,8 +765,8 @@ mod tests {
     fn startup_and_runtime_cleanup_failure_preserves_error_marker_and_config() {
         let runtime_path =
             std::env::temp_dir().join(format!("odorobo-cleanup-failure-{}", Ulid::generate()));
-        // A file in place of the runtime directory reliably makes remove_dir_all
-        // fail without relying on permissions (tests may run as root).
+        // a file where the runtime directory should be makes remove_dir_all fail
+        // reliably without relying on permissions (tests might run as root)
         std::fs::write(&runtime_path, "cloud-init credentials").unwrap();
         let mut instance = VMInstance::new(
             &Ulid::generate().to_string(),

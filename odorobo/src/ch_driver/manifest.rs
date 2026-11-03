@@ -50,8 +50,8 @@ pub fn to_vm_config(manifest: &VmManifest, runtime_dir: &Path) -> Result<VmConfi
         .collect::<Vec<_>>();
 
     // Unlike cloud-init, vsock has a direct Cloud Hypervisor representation, so
-    // the declarative manifest fields can be passed through after the node-local
-    // allocator resolves an optional guest CID.
+    // the declarative manifest fields can be passed through once the node-local
+    // allocator has filled in the (optional) guest CID
     let vsock = desired
         .vsock
         .as_ref()
@@ -75,8 +75,8 @@ pub fn to_vm_config(manifest: &VmManifest, runtime_dir: &Path) -> Result<VmConfi
     let memory_size = i64::try_from(desired.compute.memory_bytes)
         .map_err(|_| eyre!("memory size exceeds Cloud Hypervisor limits"))?;
 
-    // Create the artifact only after all other fallible manifest conversions
-    // have succeeded, so rejected configs do not leave runtime files behind.
+    // only create the seed image once every other fallible conversion has
+    // succeeded, so rejected configs don't leave runtime files behind
     let cloud_init_disk = desired
         .cloud_init
         .as_ref()
@@ -132,9 +132,9 @@ pub fn to_vm_config(manifest: &VmManifest, runtime_dir: &Path) -> Result<VmConfi
     })
 }
 
-/// Reject storage IDs that conflict with devices generated from enabled
-/// manifest features. Cloud Hypervisor requires device IDs to be unique across
-/// disks and vsock devices.
+/// reject storage IDs that clash with devices we generate from enabled manifest
+/// features. Cloud Hypervisor needs device IDs to be unique across disks and
+/// vsock devices
 fn validate_generated_device_ids(manifest: &VmManifest) -> Result<()> {
     let desired = &manifest.desired;
     for (feature_enabled, generated_id, feature_name) in [

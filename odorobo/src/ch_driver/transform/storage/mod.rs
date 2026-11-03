@@ -21,7 +21,7 @@ mod rbd;
 enum StorageOwnership {
     Owned,
     Borrowed,
-    // Appearance after a failed command does not prove who created the resource.
+    // showing up after a failed command doesn't tell us who actually created it
     Uncertain(String),
 }
 
@@ -39,9 +39,9 @@ impl StorageOwnership {
     }
 }
 
-/// Tracks proven ownership separately from uncertain command outcomes. Only
-/// proven owned resources may be automatically released; uncertainty quarantines
-/// the resource and its VM lease until manual reconciliation.
+/// keeps "we know we own this" separate from "the command did something weird".
+/// We only auto-release stuff we know we own. Anything uncertain gets quarantined
+/// along with its VM lease until someone fixes it up by hand
 pub struct StorageAcquisition {
     ownership: StorageOwnership,
     error: Option<Report>,
@@ -62,8 +62,8 @@ impl StorageAcquisition {
         }
     }
 
-    /// Setup failed after ownership was positively established (not just because
-    /// a resource appeared after a failed map/login command).
+    /// setup failed after we already knew we owned the resource (not just because
+    /// something showed up after a failed map/login command)
     pub const fn partial(error: Report) -> Self {
         Self {
             ownership: StorageOwnership::Owned,
@@ -78,8 +78,9 @@ impl StorageAcquisition {
         }
     }
 
-    /// A failed/wait-failed command may have created a resource, or raced an
-    /// external creator. Only confirmed absence permits discarding the lease.
+    /// a command that failed (or that we couldn't wait on) might've still created the
+    /// resource, or raced someone else creating it. We only drop the lease if we know
+    /// for sure it's not there
     fn after_failed_command(error: Report, exists: Result<bool>) -> Result<Self> {
         match exists {
             Ok(false) => Err(error),
@@ -91,12 +92,12 @@ impl StorageAcquisition {
     }
 }
 
-/// A release command that was spawned but whose completion is not known. Its
-/// daemon/kernel side effect might finish after apparent absence on a retry.
-/// This is deliberately distinct from a completed nonzero exit (retryable).
+/// a release command we spawned but don't know if it finished. The daemon/kernel
+/// side of it could still land after a retry thinks the resource is gone. This is
+/// on purpose separate from a command that exited nonzero (that one's retryable)
 #[derive(Debug, thiserror::Error)]
 #[error("Storage release outcome is uncertain: {0:#}")]
-#[allow(clippy::redundant_pub_crate)] // Shared explicitly with sibling backends.
+#[allow(clippy::redundant_pub_crate)] // shared with the sibling backends on purpose
 pub(crate) struct StorageReleaseUncertain(Report);
 
 #[allow(clippy::redundant_pub_crate)]
@@ -104,18 +105,18 @@ pub(crate) fn uncertain_release(error: Report) -> Report {
     StorageReleaseUncertain(error).into()
 }
 
-/// A storage backend. Acquisition is separate from path resolution so resources
-/// remain owned even if later device discovery fails. Returning an acquisition
-/// error means no resource needs tracking. Report proven partial ownership with
-/// `StorageAcquisition::partial`, or an ambiguous outcome with `uncertain`.
+/// a storage backend. Acquiring is separate from resolving the path so we still
+/// own the resource even if finding the device fails later. If acquire returns an
+/// error, there's nothing to track. Use `StorageAcquisition::partial` when we know
+/// we own something but setup failed, or `uncertain` when we can't tell
 #[async_trait]
 pub trait StorageDriver: Send + Sync {
     fn scheme(&self) -> &'static str;
 
-    /// Canonicalize connection identity before acquisition and retain it for
-    /// release. All accepted aliases must use the same key, including the key
-    /// reserved before acquisition. If the discovered identity differs, reject
-    /// borrowing before side effects or return uncertain after acquisition.
+    /// normalize the connection identity before acquiring and keep it around for
+    /// release. Every alias we accept has to map to the same key, including the
+    /// key we reserved before acquiring. If the identity we discover is different,
+    /// refuse to borrow before doing anything, or return uncertain if we already did
     async fn canonical_uri(&self, uri: &Url) -> Result<Url> {
         let mut uri = uri.clone();
         uri.set_query(None);
@@ -123,26 +124,26 @@ pub trait StorageDriver: Send + Sync {
         Ok(uri)
     }
 
-    /// Identity of the resource released by this backend (not necessarily a disk:
-    /// iSCSI logout releases an entire session, including all its LUNs).
+    /// identity of the thing this backend releases. Not always a single disk, like
+    /// iSCSI logout drops the whole session along with all its LUNs
     fn resource_key(&self, uri: &Url) -> Result<String> {
         Ok(uri.to_string())
     }
 
     async fn acquire(&self, uri: &Url) -> Result<StorageAcquisition>;
 
-    /// Finds a local path without acquiring any additional resources.
+    /// finds a local path without acquiring anything else
     async fn resolve(&self, uri: &Url) -> Result<PathBuf>;
 
-    /// A completed failure may be retried. A spawned command with unknown
-    /// completion must return `uncertain_release(error)` so even apparent
-    /// absence on a later retry cannot permit reuse before a late detach.
+    /// a failure that actually finished can be retried. If we spawned a command
+    /// and don't know if it finished, return `uncertain_release(error)` so a later
+    /// retry that sees nothing there can't hand it out again before a late detach
     async fn release(&self, uri: &Url) -> Result<()>;
 }
 
-// Wait deadlines bound the caller, not the backend future. In particular,
-// block_in_place/Handle::block_on callers regain control without cancelling a
-// map/logout command whose subprocess or daemon may still have side effects.
+// wait deadlines only limit how long the caller waits, not the backend future.
+// So block_in_place/Handle::block_on callers get control back without cancelling
+// a map/logout command whose subprocess or daemon might still be doing stuff
 const OPERATION_WAIT: Duration = Duration::from_secs(30);
 
 struct Operation<T: Clone> {
@@ -157,7 +158,7 @@ impl<T: Clone + Send + Sync> Operation<T> {
     }
 
     fn complete(&self, result: Result<T>) {
-        // Retain publication even after the last caller has cancelled its wait.
+        // keep the result around even if every caller already gave up waiting
         self.result
             .send_replace(Some(result.map_err(|error| format!("{error:#}"))));
     }
@@ -194,7 +195,7 @@ enum ResourceState {
     Ready,
     AcquisitionFailed(String),
     Releasing(Arc<Operation<()>>),
-    // A completed failure permits explicit cleanup retry, never a new borrower.
+    // a finished failure can be retried by cleanup, but nobody new gets to borrow it
     ReleaseFailed(String),
 }
 
@@ -210,8 +211,8 @@ struct Resource {
 struct StorageRegistry {
     resources: HashMap<String, Resource>,
     leases: HashMap<String, Vec<String>>,
-    // Reserve VM ownership before even canonical lookup. Cleanup must not report
-    // success while a detached lookup could subsequently acquire a resource.
+    // claim the VM before we even do the canonical lookup. Otherwise cleanup could
+    // say it's done while a detached lookup goes on to acquire something after
     resolving: HashMap<String, Vec<Arc<Operation<PathBuf>>>>,
     cleaning: HashMap<String, Arc<Operation<()>>>,
 }
@@ -229,17 +230,18 @@ impl StorageRegistry {
     }
 }
 
-// VM instances have separate transform chains. Registry guards protect only
-// short bookkeeping changes; per-key operation states serialize external work.
-// Owned tasks survive waiter cancellation and transformer drop. As before, an
-// agent process restart requires external reconciliation of all agent storage.
+// each VM gets its own transform chain. The registry lock is only held for quick
+// bookkeeping. The per-key operation states are what keep external work in order.
+// Spawned tasks keep going even if the waiter gets cancelled or the transformer is
+// dropped. Same as before, if the agent restarts someone has to reconcile all of
+// its storage by hand
 fn shared_registry() -> Arc<Mutex<StorageRegistry>> {
     static REGISTRY: OnceLock<Arc<Mutex<StorageRegistry>>> = OnceLock::new();
     Arc::clone(REGISTRY.get_or_init(Arc::default))
 }
 
-/// Resolves disk URIs and records only resources actually acquired by each VM.
-/// Config URI fields are descriptive metadata, never evidence of ownership.
+/// resolves disk URIs and only tracks resources each VM actually acquired. The URIs
+/// in the config just describe the disk, they don't mean we own anything
 pub struct StorageDriverTransformer {
     backends: Vec<Arc<dyn StorageDriver>>,
     registry: Arc<Mutex<StorageRegistry>>,
@@ -287,8 +289,8 @@ impl StorageDriverTransformer {
         let uri = uri.clone();
         let backend = Arc::clone(backend);
         let owned_operation = Arc::clone(&operation);
-        // Reserve and spawn without an intervening await: cancellation can never
-        // leave a VM reservation with no worker to finish it.
+        // reserve and spawn with no await in between, so cancelling can't leave a
+        // VM reservation behind with no worker to finish it
         tokio::spawn(async move {
             let result = AssertUnwindSafe(Self::resolve_owned(
                 Arc::clone(&registry_owner),
@@ -370,13 +372,13 @@ impl StorageDriverTransformer {
                     state: ResourceState::Acquiring(Arc::clone(&operation)),
                 },
             );
-            // Reserve the actual resource lease before invoking risky acquire.
+            // take the resource lease before we call acquire, since that can go wrong
             ledger
                 .leases
                 .entry(vmid.to_owned())
                 .or_default()
                 .push(key.clone());
-            // This helper only spawns; no await before the worker owns the lease.
+            // this only spawns, there's no await before the worker owns the lease
             Self::spawn_acquisition(
                 Arc::clone(&registry),
                 vmid.to_owned(),
@@ -387,7 +389,7 @@ impl StorageDriverTransformer {
             );
             drop(ledger);
             operation.wait().await?;
-            // The first reference was reserved before acquire, not added again.
+            // we already took the first reference before acquire, don't add it again
             break;
         }
         backend.resolve(&uri).await
@@ -422,8 +424,8 @@ impl StorageDriverTransformer {
                         .get_mut(&key)
                         .expect("in-flight acquisition retains its resource");
                     resource.ownership = acquisition.ownership;
-                    // Uncertain ownership keeps its specific manual-recovery
-                    // error. Proven partial ownership can be cleaned, not shared.
+                    // uncertain ownership keeps its own manual recovery error.
+                    // Partial ownership we know about can be cleaned up, not shared
                     resource.state = if matches!(resource.ownership, StorageOwnership::Uncertain(_))
                     {
                         ResourceState::Ready
@@ -435,8 +437,8 @@ impl StorageDriverTransformer {
                     error.map_or(Ok(()), Err)
                 }
                 Err(error) => {
-                    // The backend contract guarantees confirmed absence on
-                    // Err; ambiguity must be returned as uncertain instead.
+                    // backends only return Err when the resource definitely
+                    // isn't there. If they can't tell, they return uncertain
                     ledger.resources.remove(&key);
                     ledger.remove_lease(&vmid, &key);
                     Err(error)
@@ -447,10 +449,10 @@ impl StorageDriverTransformer {
         });
     }
 
-    /// Release only this VM's leases after confirmed process exit. A cancelled or
-    /// timed-out caller leaves the owned cleanup running and blocks VM reuse.
-    /// Pre-existing/uncertain mappings are never released; failures retain leases
-    /// for explicit retry, including by a reconstructed default transformer.
+    /// releases only this VM's leases, once we know the process exited. If the
+    /// caller is cancelled or times out, cleanup keeps running and the VM can't be
+    /// reused yet. We never release pre-existing or uncertain mappings. Failures keep
+    /// their leases so they can be retried, even from a fresh default transformer
     pub async fn release_vm(&self, vmid: &str) -> Result<()> {
         let mut registry = self.registry.lock().await;
         let operation = if let Some(operation) = registry.cleaning.get(vmid) {
@@ -469,8 +471,8 @@ impl StorageDriverTransformer {
             let owned_operation = Arc::clone(&operation);
             tokio::spawn(async move {
                 let result = AssertUnwindSafe(async {
-                    // A lookup/acquire/resolve that outlived transform must finish
-                    // before cleanup can clear the VM's quarantine/ownership.
+                    // any lookup/acquire/resolve that outlived transform has to finish
+                    // before cleanup can clear the VM's quarantine/ownership
                     for operation in pending {
                         drop(operation.wait().await);
                     }
@@ -526,8 +528,8 @@ impl StorageDriverTransformer {
         {
             let operation = Arc::clone(operation);
             drop(ledger);
-            // The owning task publishes all lease/refcount changes atomically.
-            // VM cleanup serialization normally makes this only a release join.
+            // the task that owns this updates the lease and refcount all at once.
+            // Since VM cleanup is serialized, this is usually just waiting on a release
             return operation.wait().await;
         }
         if let Some(error) = resource.ownership.uncertainty_error(key) {
@@ -657,8 +659,8 @@ mod tests {
             match uri.path() {
                 "/fail-acquire" => Err(eyre!("acquisition failed without resources")),
                 "/partial" => Ok(StorageAcquisition::partial(eyre!("partial acquisition"))),
-                // Deterministic failed-command races: absence was checked before
-                // launching, but a resource appeared or discovery failed after.
+                // fake failed-command races: it wasn't there before we ran the
+                // command, but then it showed up or the follow-up check failed
                 "/uncertain" => StorageAcquisition::after_failed_command(
                     eyre!("map/login failed while an external resource appeared"),
                     Ok(true),
@@ -774,7 +776,7 @@ mod tests {
             {
                 gate.block().await;
             }
-            // Record the actual side effect AFTER the caller may have cancelled.
+            // record the side effect after the caller might've already cancelled
             self.0.acquisitions.lock().unwrap().push(uri.to_string());
             if self.0.uncertain_acquire {
                 Ok(StorageAcquisition::uncertain(eyre!(
@@ -973,7 +975,7 @@ mod tests {
             ["controlled://storage/b", "controlled://storage/a"]
         );
         controlled_resolve(&transform, "new-vm", "a").await.unwrap();
-        assert_eq!(state.acquisitions.lock().unwrap().len(), 3); // fresh acquisition, AFTER release
+        assert_eq!(state.acquisitions.lock().unwrap().len(), 3); // fresh acquisition, after release
         gate.finish();
         transform.release_vm("new-vm").await.unwrap();
     }
@@ -1289,7 +1291,7 @@ mod tests {
                 error.to_string().contains("partial acquisition")
                     || error.to_string().contains("device discovery failed")
             );
-            // Teardown is independent of the partially transformed config.
+            // teardown doesn't care about the half-transformed config
             transform
                 .teardown("failed", &mut VmConfig::default())
                 .unwrap();
@@ -1338,7 +1340,7 @@ mod tests {
             assert!(error.to_string().contains("Manual recovery required"));
             let error = owner.teardown("failed", &mut owner_config).unwrap_err();
             assert!(error.to_string().contains(reason));
-            // Proven acquisitions still clean up; uncertain ones never detach.
+            // stuff we know we own still gets cleaned up, uncertain stuff never detaches
             assert_eq!(state.lock().unwrap().releases, ["mock://quarantine/owned"]);
             drop(owner);
 
@@ -1353,7 +1355,7 @@ mod tests {
                         .contains("automatic detach and reuse are blocked")
                 );
             }
-            // A rejected VM has no lease to release and cannot clear quarantine.
+            // a rejected VM has no lease to release and can't clear the quarantine
             next.teardown("another-vm", &mut VmConfig::default())
                 .unwrap();
             let error = next
@@ -1419,7 +1421,7 @@ mod tests {
             registry.leases[&vmid].as_slice(),
             std::slice::from_ref(&uri)
         );
-        // Test-only reset of this unique key; production never clears uncertainty.
+        // only the test resets this key. Production never clears uncertainty
         registry.resources.remove(&uri);
         registry.leases.remove(&vmid);
     }
@@ -1464,8 +1466,8 @@ mod tests {
             registry: Arc::clone(&state.lock().unwrap().registry),
             ..StorageDriverTransformer::default()
         };
-        // Even the default transformer, with no mock backend registered, can
-        // release the retained backend after the original transform is dropped.
+        // even the default transformer, with no mock backend registered, can
+        // release using the stored backend after the original one is dropped
         retry.teardown("vm", &mut VmConfig::default()).unwrap();
         assert_eq!(
             state.lock().unwrap().releases,

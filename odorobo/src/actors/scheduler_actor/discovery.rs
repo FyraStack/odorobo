@@ -261,8 +261,8 @@ impl Message<VmUpdated> for SchedulerActor {
 
     async fn handle(&mut self, msg: VmUpdated, _ctx: &mut Context<Self, Self::Reply>) {
         let vmid = msg.data.vmid;
-        // Late discovery must still expose a previously unknown cleanup owner
-        // while deletion is pending, but must not recreate placement intent.
+        // if a delete is still pending, late discovery should still tell us about a
+        // cleanup owner we didn't know about, but shouldn't bring back placement intent
         if self.vm_tombstones.get(&vmid) != Some(&false)
             || self.vm_delete_targets.contains_key(&vmid)
         {
@@ -275,10 +275,10 @@ impl Message<VmUpdated> for SchedulerActor {
         self.vm_actorid_ulid_map.insert(actor_id, vmid);
         if let Some(manifest) = msg.data.config {
             self.vm_effective_manifests.insert(vmid, manifest.clone());
-            // A manifest discovered after scheduler startup is the only intent
-            // available. Otherwise preserve the original request: effective
-            // values such as an agent-assigned vsock CID are node-local and
-            // must not become hard requirements during failover.
+            // if we only found this manifest after the scheduler started, it's the
+            // only intent we've got. Otherwise keep the original request. Effective
+            // values like an agent-assigned vsock CID are node-local and shouldn't
+            // turn into hard requirements during failover
             self.vm_manifests.entry(vmid).or_insert(manifest);
             Self::reconcile_discovered_vm(
                 vmid,
@@ -311,8 +311,8 @@ impl Message<AgentUpdated> for SchedulerActor {
     type Reply = ();
 
     async fn handle(&mut self, msg: AgentUpdated, _ctx: &mut Context<Self, Self::Reply>) {
-        // Only accepted snapshots/additions establish ownership. A removal
-        // says nothing about a stopped node-local CID lease.
+        // only accepted snapshots/additions count as owning the VM. A removal
+        // doesn't tell us anything about a stopped node-local CID lease
         let observed = match &msg.update {
             AgentStatusUpdate::Full { revision, status }
                 if self

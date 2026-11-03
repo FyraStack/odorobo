@@ -154,8 +154,9 @@ impl SchedulerActor {
         data_cache.remove(&vmid);
     }
 
-    /// Remembers a node that may retain a VM process or stopped CID lease.
-    /// Status removals and placement expiry are not proof of CID release.
+    /// remembers a node that might still have a VM process or stopped CID lease.
+    /// A VM dropping out of status or a placement expiring doesn't mean the CID
+    /// was released
     pub(super) fn remember_vm_delete_owner(&mut self, vmid: Ulid, owner: VmDeleteOwner) {
         let agent = self.known_agent_refs.get(&owner).cloned();
         let target = self
@@ -172,7 +173,7 @@ impl SchedulerActor {
         }
     }
 
-    /// Refreshes routing without replacing the stable node-local cleanup identity.
+    /// updates the agent ref we route to without changing which node owns cleanup
     pub(super) fn remember_agent_ref(&mut self, agent: &RemoteActorRef<AgentActor>) {
         let owner = VmDeleteOwner::agent(agent.id());
         if self
@@ -190,12 +191,12 @@ impl SchedulerActor {
         }
     }
 
-    /// Captures all ownership evidence before stop/delete or eviction destroys it.
-    /// Historical per-VM owners remain even after status no longer reports the VM.
+    /// grabs every possible owner before stop/delete or eviction wipes that info.
+    /// Old per-VM owners stick around even once status stops reporting the VM
     pub(super) fn capture_vm_delete_owners(&mut self, vmid: Ulid) {
         if self.vm_tombstones.contains_key(&vmid) {
-            // Intent and its evidence were already captured. Only explicit
-            // late discovery may add owners now, not stale cache/index data.
+            // we already captured everything. Only explicit late discovery can
+            // add owners now, not stale cache/index data
             return;
         }
         let mut owners = AHashSet::new();
@@ -230,7 +231,8 @@ impl SchedulerActor {
             if agent.data.vms.contains(&vmid) {
                 owners.insert(VmDeleteOwner::agent(agent.actor_ref.id()));
             }
-            // Resolve placements even when a full status has not reported the VM.
+            // remember every agent's ref so we can resolve placements even if no
+            // full status has reported the VM yet
             self.known_agent_refs
                 .entry(VmDeleteOwner::agent(agent.actor_ref.id()))
                 .or_insert_with(|| agent.actor_ref.clone());
@@ -240,9 +242,9 @@ impl SchedulerActor {
         }
     }
 
-    /// Confirms a create retry only when acceptance or actor discovery has been
-    /// recorded. A pending placeholder alone can represent a request whose
-    /// transport outcome is unknown.
+    /// only counts a create retry as confirmed if we recorded the agent accepting
+    /// it or discovered the actor. A pending placeholder on its own could be a
+    /// request where we don't know if it ever made it
     pub(super) fn create_is_confirmed(&self, vmid: Ulid) -> bool {
         self.vm_effective_manifests.contains_key(&vmid)
             || self
@@ -260,9 +262,9 @@ impl SchedulerActor {
             })
     }
 
-    /// Settles cleanup ownership after an explicit create rejection and a
-    /// successful lookup found no VM actor. Unacknowledged cleanup remains a
-    /// deletion target and blocks recreation until a later delete retry.
+    /// sorts out cleanup owners after the agent explicitly rejected a create and
+    /// a lookup found no VM actor. If cleanup wasn't acked, it stays a delete
+    /// target and blocks recreating the VM until a later delete retry works
     pub(super) fn settle_failed_create_cleanup(
         &mut self,
         vmid: Ulid,
@@ -291,8 +293,8 @@ impl SchedulerActor {
         }
     }
 
-    /// Marks only a positively acknowledged owner; failures and missing routes
-    /// stay pending across retries, regardless of unrelated agents' replies.
+    /// only marks an owner that actually acked. Failures and missing routes stay
+    /// pending across retries, no matter what other agents reply
     pub(super) fn acknowledge_vm_delete_owner(&mut self, vmid: Ulid, owner: VmDeleteOwner) {
         if let Some(target) = self
             .vm_delete_targets
@@ -303,7 +305,7 @@ impl SchedulerActor {
         }
     }
 
-    /// Only positive agent replies for every known owner can finish deletion.
+    /// deletion only finishes once every known owner has replied with a success
     pub(super) fn finish_vm_delete(&mut self, vmid: Ulid) -> bool {
         if self.vm_delete_targets.get(&vmid).is_some_and(|targets| {
             !targets.is_empty() && targets.values().all(|target| target.confirmed)
@@ -317,8 +319,8 @@ impl SchedulerActor {
     }
 
     /// Removes VM intent and every actor-ID association so reconciliation cannot
-    /// recreate a VM after an explicit stop or delete request. Cleanup ownership
-    /// is deliberately retained, including for shutdown's stopped CID leases.
+    /// recreate a VM after an explicit stop or delete request. We still keep
+    /// the cleanup owners around on purpose, including for shutdown's stopped CID leases
     pub(super) fn remove_vm_intent(&mut self, vmid: Ulid) {
         self.capture_vm_delete_owners(vmid);
         self.vm_tombstones.entry(vmid).or_insert(false);

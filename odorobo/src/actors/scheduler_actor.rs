@@ -129,9 +129,10 @@ pub struct CachedVMActor {
     pub actor_ref: Option<RemoteActorRef<VMActor>>,
 }
 
-/// Node-local cleanup ownership survives actor replacement and cache eviction.
-/// A peer identifies the agent responsible for both VM teardown and CID leases.
-/// Without a peer, retain the exact identity rather than guessing another owner.
+/// who's on the hook for cleaning up a VM on a node. This sticks around through
+/// actor replacement and cache eviction. A peer tells us which agent handles both
+/// VM teardown and CID leases. Without a peer we keep the exact ID instead of
+/// guessing some other owner
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum VmDeleteOwner {
     Peer(libp2p::PeerId),
@@ -180,18 +181,18 @@ pub struct SchedulerActor {
     pub vm_actorid_ulid_map: AHashMap<ActorId, Ulid>,
     /// Canonical VM intent retained while a VM is reconciled or migrated.
     pub vm_manifests: AHashMap<Ulid, VmManifest>,
-    /// Last effective manifest reported by a VM actor, including node-local values.
+    /// last effective manifest a VM actor reported, including node-local values
     pub vm_effective_manifests: AHashMap<Ulid, VmManifest>,
-    /// Suppresses late discovery after explicit stop/delete. True means delete
-    /// cleanup is still pending, so recreation must wait for a successful retry.
+    /// ignores late discovery after an explicit stop/delete. `true` means delete
+    /// cleanup is still pending, so recreating has to wait for a retry to succeed
     vm_tombstones: AHashMap<Ulid, bool>,
-    /// Last discovered agent per owner, retained across reachability-cache eviction.
-    /// These references resolve known VM owners; they are never a broadcast list.
+    /// last discovered agent per owner, kept even after reachability-cache eviction.
+    /// These are just for finding known VM owners, not a list to broadcast to
     known_agent_refs: AHashMap<VmDeleteOwner, RemoteActorRef<AgentActor>>,
-    /// Potential cleanup owners recorded at create/discovery time and retained
-    /// through shutdown, migration, and eviction. Confirmed entries remain until
-    /// all owners acknowledge deletion so stale discovery cannot re-add them.
-    /// A missing reference keeps an undiscovered owner pending instead of losing it.
+    /// nodes that might need to clean up a VM, recorded at create/discovery time
+    /// and kept through shutdown, migration, and eviction. Confirmed entries stay
+    /// until every owner acks the delete, so stale discovery can't re-add them.
+    /// If we don't have a ref yet, the owner stays pending instead of getting lost
     vm_delete_targets: AHashMap<Ulid, AHashMap<VmDeleteOwner, VmDeleteTarget>>,
     /// Desired and observed VM placements; multiple entries allow migration.
     pub vm_placements: AHashMap<Ulid, Vec<VmPlacement>>,

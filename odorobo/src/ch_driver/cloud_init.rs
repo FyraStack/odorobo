@@ -1,4 +1,4 @@
-//! `NoCloud` seed-image generation for Cloud Hypervisor guests.
+//! `NoCloud` seed image generation for Cloud Hypervisor guests
 
 use std::{
     fs::{self, OpenOptions},
@@ -22,11 +22,10 @@ const MAX_IMAGE_SIZE: u64 = 64 * 1024 * 1024;
 const SECTOR_SIZE: u64 = 512;
 static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
 
-/// Create a read-only-attachable FAT seed disk recognized by `NoCloud` as CIDATA.
+/// create a FAT seed disk (attachable read-only) that `NoCloud` picks up as CIDATA
 ///
-/// The image is stored inside the VM runtime directory, which is removed by the
-/// VM teardown path. Its host-side mode is private because user/vendor-data may
-/// contain credentials.
+/// the image lives in the VM runtime directory, which gets removed on VM teardown.
+/// The file is private on the host since user/vendor-data might have credentials
 pub fn create_seed_image(runtime_dir: &Path, cloud_init: &CloudInit) -> Result<PathBuf> {
     create_seed_image_with_io(runtime_dir, cloud_init, std::convert::identity)
 }
@@ -153,7 +152,7 @@ fn write_seed_file<T: fatfs::ReadWriteSeek>(
         .wrap_err_with(|| format!("failed to create NoCloud {name}"))?;
     file.write_all(contents.as_bytes())
         .wrap_err_with(|| format!("failed to write NoCloud {name}"))?;
-    // Drop only logs errors when fatfs writes the file's size/cluster directory entry.
+    // flush ourselves, fatfs's Drop only logs errors writing the size/cluster dir entry
     file.flush()
         .wrap_err_with(|| format!("failed to flush NoCloud {name}"))?;
     Ok(())
@@ -201,8 +200,8 @@ mod tests {
 
     impl Write for FailDirEntryWrite {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            // The small user-data payload fits in one cluster. The next write is
-            // the short-name field at the start of its final directory entry.
+            // the small user-data payload fits in one cluster, so the next write is
+            // the short-name field at the start of its final directory entry
             if self.state.contents_written.get() && self.state.failed_write_len.get().is_none() {
                 self.state.failed_write_len.set(Some(buf.len()));
                 return Err(io::Error::from_raw_os_error(libc::EIO));

@@ -192,9 +192,9 @@ impl Message<CreateVM> for SchedulerActor {
             self.vm_actorid_ulid_map.insert(actor_id, msg.vmid);
         }
 
-        // A transport or discovery failure is not proof that startup failed.
-        // Roll back only after an explicit agent rejection and a successful
-        // lookup confirming no VM actor is present.
+        // a transport or discovery failure doesn't mean startup actually failed.
+        // Only roll back if the agent explicitly rejected it and a lookup worked
+        // and found no VM actor
         if reply.is_err()
             && !startup_outcome_unknown
             && matches!(
@@ -282,8 +282,8 @@ impl Message<SendConsoleInput> for SchedulerActor {
     }
 }
 
-/// Suppresses recreation immediately but retains cleanup ownership until agents
-/// confirm process exit and node-local CID release, including evicted owners.
+/// stops recreation right away, but keeps track of cleanup owners (evicted ones
+/// too) until the agents confirm the process exited and the node-local CID was released
 impl Message<DeleteVM> for SchedulerActor {
     type Reply = Result<DeleteVMReply, Report>;
 
@@ -296,9 +296,9 @@ impl Message<DeleteVM> for SchedulerActor {
             && !self.vm_delete_targets.contains_key(&msg.vmid);
         self.remove_vm_intent(msg.vmid);
         self.vm_tombstones.insert(msg.vmid, true);
-        // The unique VM name may expose a migration owner before its agent
-        // status arrives. Do not ask VM actors directly: that cannot acknowledge
-        // the agent's stopped lease cleanup.
+        // the unique VM name can show us a migration owner before its agent status
+        // shows up. Don't ask the VM actors directly though, since they can't ack
+        // the agent's stopped lease cleanup
         let mut vms = RemoteActorRef::<VMActor>::lookup_all(vm_actor_id(msg.vmid));
         while let Some(vm) = vms.try_next().await? {
             self.remember_vm_delete_owner(msg.vmid, VmDeleteOwner::vm(vm.id()));
@@ -307,8 +307,8 @@ impl Message<DeleteVM> for SchedulerActor {
             self.vm_tombstones.insert(msg.vmid, false);
             return Ok(DeleteVMReply { error: None });
         }
-        // Discovery is required even with cached targets: an agent restarted on
-        // the same peer has a new actor ID and must replace the obsolete route.
+        // we still need discovery even with cached targets. An agent that restarted
+        // on the same peer has a new actor ID, and that has to replace the old route
         let mut discovered = RemoteActorRef::<AgentActor>::lookup_all(AGENT);
         let mut available = AHashMap::new();
         while let Some(agent) = discovered.try_next().await? {
@@ -320,8 +320,8 @@ impl Message<DeleteVM> for SchedulerActor {
             .get(&msg.vmid)
             .is_none_or(|targets| targets.is_empty())
         {
-            // No ownership history (e.g. a stopped VM after scheduler restart):
-            // search currently known agents, never all historical dead agents.
+            // no owner history (like a stopped VM after a scheduler restart), so
+            // just ask the agents we know about now, not every dead agent ever
             available.extend(
                 self.agent_data_cache
                     .values()
@@ -349,8 +349,8 @@ impl Message<DeleteVM> for SchedulerActor {
 
         let mut failures = Vec::new();
         for (owner, retained) in targets {
-            // Registry results can contain both old and replacement actors on
-            // one peer. A stale route must not permanently mask a working one.
+            // the registry can return both the old and the replacement actor on
+            // one peer. Don't let a stale route hide a working one forever
             let mut candidates: AHashMap<_, _> = available
                 .iter()
                 .filter(|(id, _)| owner.matches_agent(**id))

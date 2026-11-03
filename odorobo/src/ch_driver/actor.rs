@@ -33,13 +33,13 @@ pub struct MigrationState {
     pub listening_address: String,
     /// The task handle for the migration process.
     pub migration_task: Option<JoinHandle<Result<()>>>,
-    /// Set by the receive operation itself, before its completion notification.
-    /// Teardown must commit a successful receive even if its mailbox is closed.
+    /// set by the receive operation itself, before it sends the completion notice.
+    /// Teardown has to commit a successful receive even if the mailbox is closed
     receive_succeeded: Arc<AtomicBool>,
     completion_task: Option<JoinHandle<()>>,
     receive_abort: Option<tokio::task::AbortHandle>,
     console_attach_task: Option<JoinHandle<()>>,
-    /// Reservation is committed only after the incoming migration completes.
+    /// only committed once the incoming migration finishes
     cid_reservation: Option<VsockCidReservation>,
     previous_manifest: Option<VmManifest>,
 }
@@ -59,8 +59,8 @@ impl MigrationState {
 #[error("VM startup cleanup failed: {0}")]
 pub struct FailedStartupCleanup(pub String);
 
-/// Shared with the agent even when startup/teardown fails and no actor remains.
-/// Process exit alone grants no authority over a lease acquired by another VMM.
+/// shared with the agent, even if startup/teardown fails and there's no actor left.
+/// A process exiting doesn't let us touch a lease some other VMM grabbed
 #[derive(Debug)]
 pub struct VMCleanupProof {
     process_exit_confirmed: AtomicBool,
@@ -265,11 +265,11 @@ pub struct VMActor {
     /// Desired provider-neutral intent retained for VM info and migration.
     /// The translated Cloud Hypervisor config lives only in `VMInstance`.
     pub manifest: Option<VmManifest>,
-    /// Explicit VM deletion releases any persistent vsock CID; shutdown keeps it.
+    /// explicit VM deletion releases any persistent vsock CID, shutdown keeps it
     release_vsock_cid: bool,
-    /// Exit and exact lease identity survive actor teardown for agent retries.
+    /// confirmed exit and the exact lease token outlive the actor so the agent can retry
     cleanup_proof: Arc<VMCleanupProof>,
-    /// Owns and supervises the child after it is transferred out of `VMInstance`.
+    /// owns and watches the child once it's moved out of `VMInstance`
     process_watcher: Option<(
         tokio::sync::oneshot::Sender<()>,
         JoinHandle<std::io::Result<ExitStatus>>,
@@ -304,8 +304,8 @@ fn allocate_vsock_cid(
             .vsock_guest_cid = Some(reservation.cid);
         return Ok(Some(reservation));
     }
-    // Disabling vsock cannot evade an older incarnation's active lease after
-    // an agent restart. Stopping this new VMM would not prove the old one exited.
+    // turning off vsock doesn't let us skip an older run's active lease after an
+    // agent restart. Stopping this new VMM wouldn't tell us the old one exited
     VsockCidAllocator::from_environment().ensure_no_active_lease(vmid)?;
     Ok(None)
 }
@@ -320,8 +320,8 @@ fn classify_cid_reservation_error(error: Report, cleanup_proof: &VMCleanupProof)
             "vsock CID reservation was published but not durably synced".to_owned(),
         ))
     } else {
-        // Validation/pre-publication failures may refer to another live
-        // incarnation's lease. Never give the agent proof to release that one.
+        // validation or pre-publish failures might be about another running
+        // instance's lease. Don't give the agent anything that'd let it release it
         error
     }
 }
@@ -355,8 +355,8 @@ fn migration_vsock_cid(
     })
 }
 
-/// Produce a temporary manifest for the provider converter without turning an
-/// automatically allocated CID into desired intent stored by the scheduler.
+/// make a throwaway manifest for the provider converter, without turning an
+/// auto-allocated CID into desired state that the scheduler would store
 fn manifest_with_resolved_vsock_cid(manifest: &VmManifest) -> VmManifest {
     let mut resolved = manifest.clone();
     if let Some(vsock) = resolved.desired.vsock.as_mut()
@@ -398,8 +398,8 @@ fn finish_vsock_lease(
             allocator.mark_process_exited_owned(vmid, token)?;
         }
     } else if delete {
-        // Deletion of a no-vsock incarnation may release a retained *stopped*
-        // assignment, but never an older active lease whose exit we can't prove.
+        // deleting a VM without vsock can release a leftover *stopped* assignment,
+        // but never an older active lease when we can't tell it exited
         allocator.release_stopped(vmid)?;
     }
     Ok(())
@@ -536,8 +536,8 @@ impl Actor for VMActor {
                 let (result, teardown_requested) = tokio::select! {
                     result = child_process.wait() => (result, false),
                     _ = kill_receiver => {
-                        // The process may already have exited. wait() reaps it
-                        // either way; its result is the proof needed to release CID.
+                        // the process might've already exited. wait() reaps it
+                        // either way, and its result is what lets us release the CID
                         drop(child_process.start_kill());
                         (child_process.wait().await, true)
                     }
@@ -619,13 +619,13 @@ impl Actor for VMActor {
                 })?;
             true
         } else {
-            // Without a watcher there is no proof that the VMM process exited;
-            // retain reservations rather than risk reassigning a live guest CID.
+            // without a watcher we can't tell if the VMM process exited, so keep
+            // the reservations instead of risking giving a live guest's CID away
             false
         };
 
-        // Reaping closes the receive connection. Let its task observe the
-        // final response before deciding whether to roll back the reservation.
+        // reaping closes the receive connection. Let its task see the final
+        // response before we decide whether to roll back the reservation
         if let Some(state) = self.migration_state.as_mut()
             && let Some(mut task) = state.completion_task.take()
             && tokio::time::timeout(std::time::Duration::from_secs(5), &mut task)
@@ -778,8 +778,9 @@ impl Message<MigrateVMReceive> for VMActor {
             match allocate_vsock_cid(self.vmid, &mut prep_manifest, true, &self.cleanup_proof) {
                 Ok(reservation) => reservation,
                 Err(error) => {
-                    // allocate_vsock_cid retains only the exact published token.
-                    // Rejection of another incarnation never grants ownership.
+                    // allocate_vsock_cid only keeps the token if it actually got
+                    // published. Getting rejected over another instance's lease
+                    // never makes it ours
                     return MigrateVMReceiveReply {
                         listening_address: String::new(),
                         error: Some(error.to_string()),
@@ -787,9 +788,9 @@ impl Message<MigrateVMReceive> for VMActor {
                 }
             };
 
-        // Keep ownership of this reservation in the actor until the process
-        // exits. Any failure below tears down the receiver and rolls back from
-        // on_stop, after the process watcher confirms exit.
+        // the actor holds onto this reservation until the process exits. If
+        // anything below fails, we tear down the receiver and on_stop rolls it
+        // back once the process watcher confirms exit
         let receive_succeeded = Arc::new(AtomicBool::new(false));
         self.migration_state = Some(MigrationState {
             migration_task: None,
@@ -817,8 +818,8 @@ impl Message<MigrateVMReceive> for VMActor {
             }
         };
 
-        // Perform every fallible preparation step before opening the receiver.
-        // On failure, stop the actor so on_stop rolls back after process exit.
+        // do everything that can fail before opening the receiver. If something
+        // fails, stop the actor so on_stop rolls back after the process exits
         if let Err(error) = self.vm_instance.prep_config(config.clone()).await {
             ctx.stop();
             return MigrateVMReceiveReply {
@@ -864,8 +865,8 @@ impl Message<MigrateVMReceive> for VMActor {
             state.console_attach_task = Some(console_attach_task);
         }
 
-        // Notify the VM actor after receive finishes so it can commit the CID
-        // reservation or stop and roll it back after process exit.
+        // tell the VM actor once receive finishes so it can commit the CID
+        // reservation, or stop and roll it back after the process exits
         if let Some(migration_state) = self.migration_state.as_mut()
             && let Some(migration_task) = migration_state.migration_task.take()
         {
@@ -953,14 +954,14 @@ mod vsock_manifest_tests {
         let vmid = ulid::Ulid::generate();
         let reservation = allocator.reserve_with_previous(vmid, Some(42)).unwrap();
         let registry = std::fs::read(&registry_path).unwrap();
-        // An unreadable registry prevents completing rollback, independently
-        // of whether the tests run as root or as an unprivileged user.
+        // write garbage to the registry so rollback fails. Unlike permissions,
+        // this works the same whether tests run as root or not
         std::fs::write(&registry_path, b"invalid registry").unwrap();
         let error = rollback_vsock_cid(&allocator, vmid, Some(reservation)).unwrap_err();
         assert!(error.downcast_ref::<FailedStartupCleanup>().is_some());
         std::fs::write(&registry_path, registry).unwrap();
-        // The agent's quarantine retains the confirmed-exit proof, allowing
-        // explicit deletion to repair the persisted lease after storage recovers.
+        // the agent's quarantine keeps the confirmed exit, so an explicit delete
+        // can fix up the lease on disk once storage is back
         allocator
             .mark_process_exited_owned(vmid, reservation.token)
             .unwrap();
@@ -1060,7 +1061,7 @@ mod vsock_manifest_tests {
             ) {
                 msg.entered.notify_one();
                 msg.proceed.notified().await;
-                // The same non-enqueueing stop used by VM migration failures.
+                // same non-enqueueing stop that VM migration failures use
                 ctx.stop();
             }
         }
@@ -1113,7 +1114,7 @@ mod vsock_manifest_tests {
             cid_reservation: Some(reservation),
             previous_manifest: None,
         };
-        // The receive worker has finished but its notification is gated/closed.
+        // the receive worker finished, but its notification is held up or closed
         receive_succeeded.store(true, Ordering::SeqCst);
         rollback_vsock_cid(&allocator, vmid, state.uncommitted_reservation()).unwrap();
         finish_vsock_lease(&allocator, vmid, Some(reservation.token), false).unwrap();
@@ -1179,8 +1180,8 @@ impl Message<DeleteVM> for VMActor {
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         trace!(vmid = %self.vmid, "Shutting down VM actor");
-        // Explicit deletion also releases a lease retained by an earlier
-        // incarnation, even if this incarnation no longer has a vsock device.
+        // explicit deletion also releases a lease left over from an earlier run,
+        // even if this run doesn't have a vsock device anymore
         self.release_vsock_cid = true;
         ctx.stop();
     }

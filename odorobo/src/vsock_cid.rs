@@ -1,4 +1,4 @@
-//! Persistent, node-local virtio-vsock guest CID allocation.
+//! persistent, node-local virtio-vsock guest CID allocation
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
@@ -31,20 +31,20 @@ pub struct VsockCidAllocator {
     sync_fault: Option<RegistrySyncFault>,
 }
 
-/// A registry update was published, but its crash durability is unconfirmed.
+/// a registry update went through, but we couldn't confirm it'll survive a crash
 ///
-/// The atomic rename succeeded, but syncing its directory failed. Callers must
-/// not treat this as an unchanged registry. For a failed reservation made
-/// before spawning a VMM, the caller can safely retain confirmed-exit cleanup
-/// state; ordinary validation or pre-publication errors do not provide that
-/// guarantee for an existing lease.
+/// the rename worked but syncing the directory failed, so callers can't treat
+/// the registry as unchanged. For a failed reservation made before we spawn a
+/// VMM, the caller can safely hang on to its confirmed-exit cleanup state.
+/// Normal validation or pre-publish errors don't give that guarantee, since
+/// they might be about someone else's existing lease
 #[derive(Debug, thiserror::Error)]
 #[error("failed to sync vsock CID registry directory after publishing update: {source}")]
 pub struct PublishedRegistryUpdate {
     #[source]
     pub source: std::io::Error,
-    /// Present for a reservation even when the directory sync failed after
-    /// publication. Only this token may prove that reservation's process exited.
+    /// set for a reservation even if the directory sync failed after the rename.
+    /// Only this token can show that reservation's process exited
     pub reservation_token: Option<VsockLeaseToken>,
 }
 
@@ -59,7 +59,7 @@ enum RegistrySyncFault {
     Directory,
 }
 
-/// Opaque identity of one reservation, independent of VM ID and CID reuse.
+/// opaque ID for a single reservation, separate from the VM ID and CID reuse
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct VsockLeaseToken(Ulid);
 
@@ -78,8 +78,8 @@ struct Registry {
     assignments: BTreeMap<String, u32>,
     #[serde(default)]
     process_exited: BTreeSet<String>,
-    /// Old registries have no tokens. They can only be released with persisted
-    /// exit proof; every new reservation acquires a fresh guarded identity.
+    /// old registries don't have tokens, so those leases only get released once
+    /// there's a stopped record on disk. Every new reservation gets a fresh token
     #[serde(default)]
     lease_tokens: BTreeMap<String, VsockLeaseToken>,
 }
@@ -117,10 +117,10 @@ impl VsockCidAllocator {
         Self::new(path)
     }
 
-    /// Reserve a CID and retain enough information to undo the change if VM
-    /// startup fails. CID 0-2 and `u32::MAX` are reserved by the transport.
-    /// An error containing [`PublishedRegistryUpdate`] means this attempt's
-    /// active reservation was published; its owned token is included in the error.
+    /// reserve a CID and keep enough info to undo it if VM startup fails. CIDs
+    /// 0-2 and `u32::MAX` are reserved by the transport. If the error has a
+    /// [`PublishedRegistryUpdate`] in it, this reservation did get written, and
+    /// the error carries its token
     pub fn reserve_with_previous(
         &self,
         vmid: Ulid,
@@ -176,8 +176,8 @@ impl VsockCidAllocator {
         })
     }
 
-    /// Restore the prior assignment after a failed startup, but only if the
-    /// registry still contains the reservation made by this attempt.
+    /// put the old assignment back after a failed startup, but only if the
+    /// registry still has the reservation we made
     pub fn rollback(&self, vmid: Ulid, reservation: VsockCidReservation) -> Result<()> {
         self.with_registry(|registry| {
             let vmid = vmid.to_string();
@@ -195,8 +195,8 @@ impl VsockCidAllocator {
                     ));
                 }
                 registry.assignments.insert(vmid.clone(), previous_cid);
-                // Keep this reservation's token: restoring the stopped CID
-                // must not revive the authority of any earlier incarnation.
+                // keep this reservation's token. Restoring the stopped CID
+                // shouldn't let an older token act on the lease again
                 if reservation.previous_process_exited {
                     registry.process_exited.insert(vmid);
                 } else {
@@ -209,8 +209,8 @@ impl VsockCidAllocator {
         })
     }
 
-    /// A new no-vsock incarnation still must not bypass an older active lease.
-    /// This read-only check never establishes ownership or exit proof.
+    /// a new VM without vsock still can't skip past an older active lease. This
+    /// only reads the registry, it never takes ownership or marks anything exited
     pub fn ensure_no_active_lease(&self, vmid: Ulid) -> Result<()> {
         let registry = self.read_registry()?;
         let key = vmid.to_string();
@@ -220,8 +220,8 @@ impl VsockCidAllocator {
         Ok(())
     }
 
-    /// Record exit only for the exact reservation owned by this VMM. A stale
-    /// token cannot establish exit proof for a newer incarnation of the same VM.
+    /// mark exit only for the exact reservation this VMM owns. A stale token
+    /// can't mark a newer run of the same VM as exited
     pub fn mark_process_exited_owned(&self, vmid: Ulid, token: VsockLeaseToken) -> Result<()> {
         if !self.registry_path.try_exists()? {
             return Ok(());
@@ -235,8 +235,8 @@ impl VsockCidAllocator {
         })
     }
 
-    /// Release after confirmed exit, guarded under the same registry lock as
-    /// removal. Never fall back to stopped release after an ownership mismatch.
+    /// release after a confirmed exit, under the same registry lock as removal.
+    /// Don't fall back to `release_stopped` if the token doesn't match
     pub fn release_owned(&self, vmid: Ulid, token: VsockLeaseToken) -> Result<()> {
         if !self.registry_path.try_exists()? {
             return Ok(());
@@ -250,8 +250,8 @@ impl VsockCidAllocator {
         })
     }
 
-    /// Unguarded helpers exist only for legacy allocator tests. Production
-    /// callers must carry a token or use persisted stopped proof.
+    /// unguarded helpers, only for the old allocator tests. Real callers need a
+    /// token or a stopped record on disk
     #[cfg(test)]
     pub fn mark_process_exited(&self, vmid: Ulid) -> Result<()> {
         if !self.registry_path.try_exists()? {
@@ -278,9 +278,9 @@ impl VsockCidAllocator {
         })
     }
 
-    /// Release a persisted lease only when the VM actor previously recorded a
-    /// confirmed process exit. Returns whether a lease was present; callers use
-    /// `false` to distinguish an untracked VM from a safely released lease.
+    /// release a lease on disk, but only if the VM actor already recorded a
+    /// confirmed process exit. Returns whether there was a lease, so callers can
+    /// use `false` to tell an untracked VM apart from one we actually released
     pub fn release_stopped(&self, vmid: Ulid) -> Result<bool> {
         if !self.registry_path.try_exists()? {
             return Ok(false);
@@ -328,8 +328,8 @@ impl VsockCidAllocator {
         let mut registry = self.read_registry()?;
         let result = update(&mut registry)?;
         self.write_registry(&registry, reservation_token)?;
-        // Closing the file releases the lock without a fallible explicit unlock
-        // turning a successfully published update into an unclassified error.
+        // just drop the file to unlock. An explicit unlock can fail, and then an
+        // update that already went through would come back as an error
         drop(lock);
         Ok(result)
     }
@@ -407,7 +407,7 @@ impl VsockCidAllocator {
         result
     }
 
-    // The allocator carries per-instance fault injection only in test builds.
+    // the allocator only carries per-instance fault injection in test builds
     #[cfg_attr(not(test), allow(clippy::unused_self))]
     fn sync_temporary_registry(&self, file: &File) -> std::io::Result<()> {
         #[cfg(test)]
@@ -525,7 +525,7 @@ mod tests {
         let restored = allocator.reserve_with_previous(vmid, None).unwrap();
         assert_eq!(restored.cid, 42);
         allocator.rollback(vmid, restored).unwrap();
-        // Restoring an earlier CID never revives that earlier token's authority.
+        // restoring an earlier CID doesn't make the earlier token valid again
         drop(allocator.rollback(vmid, previous).unwrap_err());
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -556,8 +556,8 @@ mod tests {
             .expect("published reservation carries ownership");
         assert_eq!(registry.lease_tokens.get(&vmid.to_string()), Some(&token));
 
-        // The failed write released its lock. A fresh allocator observes an
-        // active lease and can clean it up only with confirmed no-spawn exit.
+        // the failed write let go of its lock. A fresh allocator sees an active
+        // lease and can only clean it up once exit is confirmed (nothing spawned)
         let reopened = VsockCidAllocator::new(allocator.registry_path);
         let error = reopened.release_stopped(vmid).unwrap_err();
         assert!(error.downcast_ref::<PublishedRegistryUpdate>().is_none());
@@ -675,8 +675,8 @@ mod tests {
         assert_eq!(fs::read(&allocator.registry_path).unwrap(), before);
         drop(allocator.release_stopped(vmid).unwrap_err());
 
-        // A new persisted exit does not transfer delete authority to an older
-        // token, even if a retry previously managed to mark its own exit.
+        // marking a new exit doesn't let an older token delete the lease, even if
+        // a retry already managed to mark its own exit
         allocator
             .mark_process_exited_owned(vmid, second.token)
             .unwrap();
@@ -746,7 +746,7 @@ mod tests {
         drop(allocator.release_stopped(vmid).unwrap_err());
         allocator.rollback(vmid, reservation).unwrap();
         assert!(allocator.release_stopped(vmid).unwrap());
-        // The legacy stopped record can also be deleted without reservation.
+        // the legacy stopped record can also be deleted without a reservation
         fs::write(
             &allocator.registry_path,
             serde_json::to_vec(&stopped).unwrap(),

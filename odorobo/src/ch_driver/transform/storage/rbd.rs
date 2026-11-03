@@ -113,7 +113,7 @@ impl RbdImage {
         PathBuf::from(format!("/dev/rbd/{}/{}", self.pool, self.image))
     }
 
-    /// Maps the RBD image, borrowing existing mappings rather than owning them.
+    /// maps the RBD image. If it's already mapped we borrow it instead of owning it
     #[tracing::instrument(skip(self))]
     pub async fn map(&self) -> Result<StorageAcquisition> {
         let rbd_path = self.rbd_path();
@@ -147,8 +147,8 @@ impl RbdImage {
             "rbd map failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        // Absence before the command does not attribute a later mapping to us:
-        // another process may have mapped it while our command failed.
+        // it not being there before we ran the command doesn't mean a mapping now
+        // is ours. Something else could've mapped it while our command failed
         let exists = rbd_map_list()
             .await
             .map(|mappings| mappings.iter().any(|(path, _)| path == &rbd_path));

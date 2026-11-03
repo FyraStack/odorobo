@@ -1,5 +1,5 @@
-//! Bounded CLI execution for storage backends. A killed CLI may already have
-//! submitted work to a daemon/kernel, so errors after spawn are always uncertain.
+//! runs storage CLIs with a time limit. A CLI we killed might've already handed
+//! work off to a daemon/kernel, so any error after spawn is always uncertain
 use super::super::StorageAcquisition;
 use stable_eyre::{Report, Result, eyre::eyre};
 use std::{process::Output, process::Stdio, time::Duration};
@@ -36,8 +36,8 @@ impl CommandFailure {
     ) -> Result<StorageAcquisition> {
         match self {
             Self::BeforeSpawn(error) => Err(error),
-            // An immediate absence check is not enough: an in-flight daemon or
-            // kernel request can finish after the CLI has been killed/reaped.
+            // checking that it's not there right away isn't enough. A daemon or
+            // kernel request could still finish after we killed/reaped the CLI
             Self::Uncertain(error) => Ok(StorageAcquisition::uncertain(error)),
         }
     }
@@ -50,10 +50,10 @@ struct RunningCommand {
 
 impl RunningCommand {
     fn terminate(&mut self) {
-        // The CLI's helpers may inherit its output pipes. Kill the isolated
-        // process group, not just the leader, before attempting a bounded reap.
-        // SAFETY: spawn configured a new group whose id is this child's PID;
-        // the strictly positive id can never address our own process group.
+        // the CLI's helpers might inherit its output pipes, so kill the whole
+        // process group, not just the leader, before we try to reap it.
+        // SAFETY: spawn put the child in a new group whose id is its PID.
+        // That id is always positive, so this can't hit our own process group
         unsafe {
             libc::kill(
                 self.group.checked_neg().expect("positive child PID"),
@@ -71,9 +71,9 @@ impl RunningCommand {
         if let Ok(Ok(_)) = tokio::time::timeout(REAP_TIMEOUT, child.wait()).await {
             self.child.take();
         } else {
-            // A process stuck in an uninterruptible kernel operation may not
-            // reap promptly. Keep a background waiter rather than block storage
-            // forever. kill_on_drop also covers runtime shutdown/cancellation.
+            // a process stuck in an uninterruptible kernel call might not get
+            // reaped quickly. Leave a waiter in the background instead of blocking
+            // storage forever. kill_on_drop also handles runtime shutdown/cancellation
             let mut child = self.child.take().expect("running child");
             tokio::spawn(async move {
                 _ = child.wait().await;
@@ -86,8 +86,8 @@ impl Drop for RunningCommand {
     fn drop(&mut self) {
         if self.child.is_some() {
             self.terminate();
-            // Tokio's kill_on_drop and orphan reaper cover cancellation while
-            // either execution or bounded cleanup is awaiting.
+            // Tokio's kill_on_drop and orphan reaper handle us getting cancelled
+            // while waiting on either the command or the cleanup
         }
     }
 }
@@ -100,15 +100,15 @@ async fn capture(mut reader: impl AsyncRead + Unpin) -> std::io::Result<Vec<u8>>
         let count = reader.read(&mut buffer).await?;
         if count == 0 {
             return if truncated {
-                // In particular, a truncated `rbd device list` must not silently
-                // hide an existing mapping and lead to a false ownership claim.
+                // like, a truncated `rbd device list` could hide an existing mapping
+                // and make us think we own it when we don't
                 Err(std::io::Error::other("storage CLI output exceeded limit"))
             } else {
                 Ok(output)
             };
         }
-        // Continue draining after the cap so a verbose CLI cannot deadlock on
-        // its pipes, without allowing unbounded memory use.
+        // keep draining after we hit the cap so a chatty CLI can't deadlock on
+        // its pipes, but don't keep the extra output around in memory
         let keep = count.min(OUTPUT_LIMIT.saturating_sub(output.len()));
         truncated |= keep != count;
         output.extend_from_slice(&buffer[..keep]);
@@ -147,8 +147,8 @@ async fn run_with_timeout(
     let stderr = child.stderr.take().expect("piped stderr");
     let output = tokio::time::timeout(timeout, async {
         let (stdout, stderr) = tokio::try_join!(capture(stdout), capture(stderr))?;
-        // Reap after draining pipes. If a helper inherits them, retain the
-        // leader's PID until group termination, preventing PID/group-id reuse.
+        // reap after draining the pipes. If a helper inherited them, we hold on to
+        // the leader's PID until the group is killed so the PID/group id can't get reused
         let status = child.wait().await?;
         Ok::<_, std::io::Error>(Output {
             status,
@@ -159,7 +159,7 @@ async fn run_with_timeout(
     .await;
     let error = match output {
         Ok(Ok(output)) => {
-            // Successfully reaped; disarm the cancellation guard.
+            // reaped it, so disarm the cancellation guard
             running.child.take();
             return Ok(output);
         }
@@ -257,8 +257,8 @@ mod tests {
             .trim()
             .parse()
             .unwrap();
-        // SIGKILL is not sufficient on its own: the leader must also be reaped.
-        // SAFETY: signal zero only queries existence of the test child PID.
+        // SIGKILL alone isn't enough, the leader has to get reaped too.
+        // SAFETY: signal zero just checks if the test child PID exists
         assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
         assert_eq!(
             std::io::Error::last_os_error().raw_os_error(),

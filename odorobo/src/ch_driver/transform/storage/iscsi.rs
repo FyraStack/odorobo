@@ -12,7 +12,7 @@ use std::{
 };
 use tokio::process::Command;
 
-// Shared privately with RBD without changing storage/mod.rs.
+// shared privately with RBD so we don't have to touch storage/mod.rs
 #[path = "command.rs"]
 pub(super) mod command;
 use tracing::info;
@@ -36,8 +36,8 @@ impl ISCSITarget {
         ))
     }
 
-    /// Sessions are shared across LUNs. Inspect sysfs, not just this LUN's
-    /// by-path symlink, which may not exist yet for an already logged-in target.
+    /// sessions are shared across LUNs, so check sysfs instead of just this LUN's
+    /// by-path symlink, which might not exist yet if the target's already logged in
     async fn session_exists(&self) -> Result<bool> {
         self.session_exists_at(Path::new("/sys/class")).await
     }
@@ -50,9 +50,9 @@ impl ISCSITarget {
         self.session_target_at(Path::new("/sys/class")).await
     }
 
-    /// open-iscsi retains the node record's hostname in `persistent_address`
-    /// even when login used an IP. This persistent portal is both the resource
-    /// identity and the actual locator for udev by-path lookup and node logout.
+    /// open-iscsi keeps the node record's hostname in `persistent_address` even
+    /// when login used an IP. We use that persistent portal as the resource key,
+    /// and it's also what udev by-path lookup and node logout actually go by
     async fn session_target_at(&self, root: &Path) -> Result<Option<Self>> {
         let mut sessions = match tokio::fs::read_dir(root.join("iscsi_session")).await {
             Ok(sessions) => sessions,
@@ -123,8 +123,8 @@ impl ISCSITarget {
                     }
                 }
             }
-            // Logout is session-wide. Do not accept two connection portals as
-            // independently keyed resources of the same multi-connection session.
+            // logout is session-wide, so don't treat two connection portals in the
+            // same multi-connection session as separately keyed resources
             if inconsistent_portals
                 && matched
                     .as_ref()
@@ -162,10 +162,10 @@ impl ISCSITarget {
             Err(error) => return error.into_acquisition(),
         };
         if output.status.success() {
-            // iscsiadm can exit zero without logging in (e.g. the requested
-            // session count was already present after our absence check). Only
-            // an explicit successful login plus one matching session proves an
-            // acquisition; presence alone is vulnerable to an external race.
+            // iscsiadm can exit zero without actually logging in (like if the
+            // session showed up after our absence check). We only count it as
+            // ours if it says the login worked and there's exactly one matching
+            // session. Just seeing a session could be someone else racing us
             if !confirms_login(&output.stdout, &self.iqn) {
                 return Ok(StorageAcquisition::uncertain(eyre!(
                     "iscsiadm exited successfully without confirming a new login"
@@ -178,8 +178,8 @@ impl ISCSITarget {
             output.status.code(),
             String::from_utf8_lossy(&output.stderr)
         );
-        // Even exit 15 (session exists) cannot establish who created a session
-        // after our absence check. Do not borrow or detach an ambiguous session.
+        // even exit 15 (session exists) doesn't tell us who made the session after
+        // our absence check, so don't borrow or detach a session we're unsure about
         StorageAcquisition::after_failed_command(error, self.session_exists().await)
     }
 
@@ -187,9 +187,9 @@ impl ISCSITarget {
         let Some(session) = self.session_target_at(root).await? else {
             return Ok(None);
         };
-        // Canonicalization happens before the registry reserves its key.
-        // A session appearing in that gap must not be borrowed under a
-        // different key; retrying resolution will find its persistent key.
+        // canonicalization happens before the registry reserves its key. If a
+        // session shows up in that gap, don't borrow it under a different key.
+        // Retrying resolution will find its persistent key
         self.ensure_session_identity(&session)?;
         Ok(Some(StorageAcquisition::borrowed()))
     }
@@ -198,9 +198,9 @@ impl ISCSITarget {
         match self.session_target_at(root).await {
             Ok(Some(session)) => match self.ensure_session_identity(&session) {
                 Ok(()) => StorageAcquisition::owned(),
-                // Login may have used an existing hostname node record or
-                // raced an alias acquisition. Never release a session under
-                // a key different from the one reserved before login.
+                // login might've used an existing hostname node record or
+                // raced an alias acquisition. Never release a session under a
+                // different key than the one we reserved before login
                 Err(error) => StorageAcquisition::uncertain(error),
             },
             Ok(None) => StorageAcquisition::uncertain(eyre!(
@@ -226,7 +226,7 @@ impl ISCSITarget {
 
     #[tracing::instrument(skip(self))]
     pub async fn detach(&self) -> Result<()> {
-        // Allow retained cleanup to be retried after a session disappeared.
+        // if the session's already gone that's fine, so retained cleanup can be retried
         let Some(session) = self.session_target().await? else {
             return Ok(());
         };
@@ -325,13 +325,13 @@ async fn portal_matches(
     }
     let addresses = portal_addresses(host, port).await?;
     let persistent_ip = persistent.parse::<IpAddr>().ok();
-    // A numeric persistent portal and its redirected connected portal are
-    // aliases of the same node. Both must canonicalize to the persistent key.
+    // a numeric persistent portal and the portal it got redirected to are
+    // aliases of the same node, so both should map to the persistent key
     if persistent_ip.is_some_and(|address| addresses.contains(&address)) {
         return Ok(true);
     }
-    // A hostname node's current DNS is not evidence of its connected peer.
-    // Its exact name remains usable even after DNS churn or lookup failure.
+    // a hostname node's current DNS doesn't tell us which peer it's actually
+    // connected to. Its exact name still works even if DNS changes or lookup fails
     if let Some(runtime) =
         runtime.and_then(|value| value.trim().trim_matches(['[', ']']).parse::<IpAddr>().ok())
     {
@@ -430,10 +430,10 @@ impl ISCSIStorage {
         if uri.host_str().is_none() {
             return Err(eyre!("iSCSI URI must have a portal host"));
         }
-        // The persistent portal is stable across redirects/reconnects, unlike
-        // runtime addresses or a hostname's current DNS. Before login retain
-        // the requested portal: acquisition must confirm that this exact key
-        // is still the session identity before it can report owned/borrowed.
+        // the persistent portal stays the same across redirects and reconnects,
+        // unlike runtime addresses or a hostname's current DNS. Before login we
+        // keep the requested portal, and acquisition has to check that this exact
+        // key is still the session's identity before reporting owned/borrowed
         let session = target.session_target_at(root).await?;
         let portal = normalized_portal(&session.as_ref().unwrap_or(&target).host)?;
         let (host, port) = split_portal(&portal)?;
@@ -687,7 +687,7 @@ mod tests {
         };
         transform.release_vm("owner").await.unwrap();
         assert_eq!(state.logouts.load(Ordering::SeqCst), 0);
-        // Dropping the owner's reference must not unmap the alias borrower's LUN.
+        // dropping the owner's reference shouldn't unmap the alias borrower's LUN
         assert_eq!(
             resolve_synthetic(&transform, "third", alias).await.unwrap(),
             path
@@ -725,8 +725,8 @@ mod tests {
             )
             .await
         });
-        // The alias must wait for ownership publication, not create a borrowed
-        // resource while the owner's login task is still acquiring.
+        // the alias has to wait for the owner to publish, not make a borrowed
+        // resource while the owner's login task is still acquiring
         let _elapsed = tokio::time::timeout(Duration::from_millis(25), &mut borrower)
             .await
             .unwrap_err();
@@ -787,8 +787,8 @@ mod tests {
 
     #[tokio::test]
     async fn hostname_owner_and_connected_alias_keep_the_prelogin_hostname_key() {
-        // This name intentionally has no DNS record. The actual sysfs node
-        // identity, not fresh DNS, must drive alias lookup and final cleanup.
+        // this name has no DNS record on purpose. Alias lookup and final cleanup
+        // should go by the node identity in sysfs, not a fresh DNS lookup
         let state = SyntheticStorage::new("missing-odorobo-node.invalid", "192.0.2.18", false);
         let transform = synthetic_transformer(&state);
         let owner = "iscsi://missing-odorobo-node.invalid/iqn.test/0";
@@ -837,8 +837,8 @@ mod tests {
         let before = ISCSIStorage::canonical_uri_at(&requested, &root)
             .await
             .unwrap();
-        // An existing node may retain a hostname although login was requested
-        // numerically. Without an alias ledger this is not the reserved key.
+        // an existing node can keep a hostname even though we asked to log in by
+        // IP. We don't track aliases, so this isn't the key we reserved
         synthetic_session(
             &root,
             17,
@@ -875,7 +875,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(matches!(borrowed.ownership, StorageOwnership::Borrowed));
-        // Retrying or teardown with the stale key must not detach this session.
+        // retrying or tearing down with the stale key shouldn't detach this session
         assert!(target.ensure_session_identity(&canonical_target).is_err());
         tokio::fs::remove_dir_all(root).await.unwrap();
     }
@@ -907,8 +907,8 @@ mod tests {
     async fn runtime_address_survives_dns_churn_and_lookup_failure() {
         let root =
             std::env::temp_dir().join(format!("odorobo-iscsi-runtime-{}", ulid::Ulid::generate()));
-        // localhost resolves to loopback, not the runtime address. It must not
-        // cause the old session to be misattributed to a new canonical IP.
+        // localhost resolves to loopback, not the runtime address, so it shouldn't
+        // make us think the old session belongs to a new canonical IP
         synthetic_session(&root, 17, "localhost\n", Some("192.0.2.17\n")).await;
         let old = ISCSITarget::from(&Url::parse("iscsi://192.0.2.17/iqn.test/0").unwrap());
         assert_eq!(
@@ -917,8 +917,8 @@ mod tests {
         );
         let new = ISCSITarget::from(&Url::parse("iscsi://127.0.0.1/iqn.test/0").unwrap());
         assert!(!new.session_exists_at(&root).await.unwrap());
-        // A vanished DNS record must still resolve and logout via the exact
-        // node portal. No lookup of this .invalid hostname is needed.
+        // even with the DNS record gone, we should still resolve and log out via
+        // the exact node portal. We don't need to look up this .invalid hostname
         tokio::fs::write(
             root.join("iscsi_connection/connection17:0/persistent_address"),
             "missing-odorobo-node.invalid\n",
