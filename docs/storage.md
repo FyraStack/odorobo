@@ -7,7 +7,12 @@ an RBD image onto each compute node.
 
 The initial storage contract supports local files and kernel-mapped Ceph RBD
 images. iSCSI remains available through the existing transform, but is outside
-the Ceph lifecycle contract described here. This defines behavior for new
+the Ceph lifecycle contract described here. iSCSI URIs must be exactly
+`iscsi://<portal>[:<port>]/<iqn>/<lun>` (port defaults to 3260), where `<lun>`
+is plain decimal digits that fit in 32 bits, optionally written `lun<n>`. The
+LUN is required. URIs with a malformed or out-of-range LUN, extra path segments,
+a query or fragment, or a percent-encoded portal or IQN are rejected before any
+login rather than falling back to LUN 0. This defines behavior for new
 manifest attachments; it does not migrate existing Odorobo deployments or
 rewrite existing local images. A manifest attachment has a stable
 attachment ID, one source (`uri` or `volume_id`), and an optional `read_only`

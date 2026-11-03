@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use stable_eyre::{
     Result,
-    eyre::{WrapErr, eyre},
+    eyre::{WrapErr, ensure, eyre},
 };
 use std::{
     net::IpAddr,
@@ -374,21 +374,84 @@ impl From<ISCSITarget> for PathBuf {
     }
 }
 
-impl From<&Url> for ISCSITarget {
-    fn from(uri: &Url) -> Self {
-        let host_ip = uri.host_str().unwrap_or_default().to_owned();
-        let port = uri.port().unwrap_or(3260);
-        let host = format_portal(&host_ip, port);
-        let mut path_segments = uri.path_segments().into_iter().flatten();
-        let iqn = path_segments.next().unwrap_or_default().to_owned();
-        let lun_str = path_segments.next().unwrap_or_default();
-        let lun = lun_str
-            .strip_prefix("lun")
-            .unwrap_or(lun_str)
-            .parse::<u32>()
-            .unwrap_or(0);
-        Self { host, iqn, lun }
+impl ISCSITarget {
+    /// validate the original URI before URL parsing can normalize dot segments or
+    /// strip URL whitespace/control characters, same idea as the RBD raw check
+    pub(super) fn parse_uri(value: &str) -> Result<Self> {
+        let resource = value
+            .strip_prefix("iscsi://")
+            .ok_or_else(|| eyre!("iSCSI storage URI must use the iscsi:// scheme"))?;
+        let parsed =
+            Url::parse(value).map_err(|error| eyre!("Invalid iSCSI storage URI: {error}"))?;
+        let target = Self::try_from(&parsed)?;
+        // the raw path has to be exactly what the parser kept. otherwise something
+        // like `/iqn/../other/0` would quietly log into a different target
+        let raw_path = resource.find('/').map_or("", |start| &resource[start..]);
+        ensure!(
+            raw_path == parsed.path(),
+            "iSCSI URI path must not change during URL normalization"
+        );
+        Ok(target)
     }
+}
+
+impl TryFrom<&Url> for ISCSITarget {
+    type Error = stable_eyre::Report;
+
+    /// accepts exactly `iscsi://<portal>[:<port>]/<iqn>/<lun>`. a bad LUN is an
+    /// error, never LUN 0, since guessing boots the VM off the wrong disk
+    fn try_from(uri: &Url) -> Result<Self, Self::Error> {
+        ensure!(
+            uri.scheme() == "iscsi",
+            "iSCSI storage URI must use the iscsi:// scheme"
+        );
+        ensure!(
+            uri.query().is_none() && uri.fragment().is_none(),
+            "iSCSI storage URI must not include a query or fragment"
+        );
+        let host_ip = uri
+            .host_str()
+            .filter(|host| !host.is_empty())
+            .ok_or_else(|| eyre!("iSCSI URI must have a portal host"))?;
+        // non-special URL hosts stay percent-encoded, and iscsiadm would get
+        // the encoded name as-is
+        ensure!(
+            !host_ip.contains('%'),
+            "iSCSI portal host must not be percent-encoded"
+        );
+        let host = format_portal(host_ip, uri.port().unwrap_or(3260));
+        let segments: Vec<_> = uri.path_segments().into_iter().flatten().collect();
+        let [iqn, lun] = segments.as_slice() else {
+            return Err(eyre!(
+                "iSCSI URI must be iscsi://<portal>/<iqn>/<lun>, got {} path segment(s)",
+                segments.len()
+            ));
+        };
+        ensure!(!iqn.is_empty(), "iSCSI URI must have a target IQN");
+        // path segments aren't decoded, so an encoded IQN would log into the
+        // wrong target name
+        ensure!(
+            !iqn.contains('%'),
+            "iSCSI target IQN must not be percent-encoded"
+        );
+        Ok(Self {
+            host,
+            iqn: (*iqn).to_owned(),
+            lun: parse_lun(lun)?,
+        })
+    }
+}
+
+/// plain decimal digits that fit in a u32. the old `lun<n>` form still works
+fn parse_lun(segment: &str) -> Result<u32> {
+    let digits = segment.strip_prefix("lun").unwrap_or(segment);
+    ensure!(
+        !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()),
+        "iSCSI LUN must be plain decimal digits, got {segment:?}"
+    );
+    digits
+        .parse()
+        .map_err(|error| eyre!("iSCSI LUN {segment:?} is out of range: {error}"))
 }
 
 // fn list_iscsi_devices() -> Result<Vec<PathBuf>> {
@@ -445,13 +508,8 @@ pub struct ISCSIStorage;
 
 impl ISCSIStorage {
     async fn canonical_uri_at(uri: &Url, root: &Path) -> Result<Url> {
-        let target = ISCSITarget::from(uri);
-        if target.iqn.is_empty() {
-            return Err(eyre!("iSCSI URI must have a target IQN"));
-        }
-        if uri.host_str().is_none() {
-            return Err(eyre!("iSCSI URI must have a portal host"));
-        }
+        // fails here, before any login, if the URI is malformed
+        let target = ISCSITarget::try_from(uri)?;
         // the persistent portal stays the same across redirects and reconnects,
         // unlike runtime addresses or a hostname's current DNS. before login we
         // keep the requested portal, and acquisition has to check that this exact
@@ -470,8 +528,6 @@ impl ISCSIStorage {
         canonical
             .set_port(Some(port))
             .map_err(|()| eyre!("Invalid iSCSI port"))?;
-        canonical.set_query(None);
-        canonical.set_fragment(None);
         Ok(canonical)
     }
 }
@@ -486,16 +542,16 @@ impl StorageDriver for ISCSIStorage {
     }
 
     fn resource_key(&self, uri: &Url) -> Result<String> {
-        let target = ISCSITarget::from(uri);
+        let target = ISCSITarget::try_from(uri)?;
         Ok(format!("iscsi://{}/{}", target.host, target.iqn))
     }
 
     async fn acquire(&self, uri: &Url) -> Result<StorageAcquisition> {
-        ISCSITarget::from(uri).attach().await
+        ISCSITarget::try_from(uri)?.attach().await
     }
 
     async fn resolve(&self, uri: &Url) -> Result<PathBuf> {
-        let target = ISCSITarget::from(uri);
+        let target = ISCSITarget::try_from(uri)?;
         let session = target.session_target().await?.ok_or_else(|| {
             eyre!(
                 "No iSCSI session found for portal {} and IQN {}",
@@ -508,7 +564,7 @@ impl StorageDriver for ISCSIStorage {
     }
 
     async fn release(&self, uri: &Url) -> Result<()> {
-        let target = ISCSITarget::from(uri);
+        let target = ISCSITarget::try_from(uri)?;
         target.detach().await
     }
 }
@@ -524,10 +580,10 @@ mod tests {
     use tokio::sync::Semaphore;
 
     #[test]
-    fn resource_identity_is_session_not_lun_or_disk_id() {
+    fn resource_identity_is_session_not_lun() {
         let backend = ISCSIStorage;
-        let first = Url::parse("iscsi://127.0.0.1/iqn.test/0?id=first").unwrap();
-        let second = Url::parse("iscsi://127.0.0.1:3260/iqn.test/lun1?id=second").unwrap();
+        let first = Url::parse("iscsi://127.0.0.1/iqn.test/0").unwrap();
+        let second = Url::parse("iscsi://127.0.0.1:3260/iqn.test/lun1").unwrap();
         assert_eq!(
             backend.resource_key(&first).unwrap(),
             backend.resource_key(&second).unwrap()
@@ -556,7 +612,8 @@ mod tests {
         tokio::fs::write(connection.join("persistent_port"), "3260\n")
             .await
             .unwrap();
-        let mut target = ISCSITarget::from(&Url::parse("iscsi://127.0.0.1/iqn.test/99").unwrap());
+        let mut target =
+            ISCSITarget::try_from(&Url::parse("iscsi://127.0.0.1/iqn.test/99").unwrap()).unwrap();
         assert!(target.session_exists_at(&root).await.unwrap());
         target.host = "127.0.0.2:3260".to_owned();
         assert!(!target.session_exists_at(&root).await.unwrap());
@@ -629,7 +686,7 @@ mod tests {
         }
 
         async fn acquire(&self, uri: &Url) -> Result<StorageAcquisition> {
-            let target = ISCSITarget::from(uri);
+            let target = ISCSITarget::try_from(uri)?;
             if let Some(acquisition) = target.existing_acquisition_at(&self.root).await? {
                 return Ok(acquisition);
             }
@@ -641,14 +698,14 @@ mod tests {
         }
 
         async fn resolve(&self, uri: &Url) -> Result<PathBuf> {
-            let target = ISCSITarget::from(uri);
+            let target = ISCSITarget::try_from(uri)?;
             let session = target.session_target_at(&self.root).await?.unwrap();
             target.ensure_session_identity(&session)?;
             Ok(session.to_device_path())
         }
 
         async fn release(&self, uri: &Url) -> Result<()> {
-            let target = ISCSITarget::from(uri);
+            let target = ISCSITarget::try_from(uri)?;
             let session = target.session_target_at(&self.root).await?.unwrap();
             target.ensure_session_identity(&session)?;
             self.logouts.fetch_add(1, Ordering::SeqCst);
@@ -680,7 +737,7 @@ mod tests {
     async fn redirected_owner_and_alias_share_the_key_reserved_before_login() {
         let state = SyntheticStorage::new("192.0.2.17", "192.0.2.18", false);
         let transform = synthetic_transformer(&state);
-        let owner_uri = Url::parse("iscsi://192.0.2.17/iqn.test/0?id=owner").unwrap();
+        let owner_uri = Url::parse("iscsi://192.0.2.17/iqn.test/0").unwrap();
         let before_login = ISCSIStorage::canonical_uri_at(&owner_uri, &state.root)
             .await
             .unwrap();
@@ -688,7 +745,7 @@ mod tests {
         resolve_synthetic(&transform, "owner", owner_uri.as_str())
             .await
             .unwrap();
-        let alias = "iscsi://192.0.2.18:3260/iqn.test/lun1?id=borrower";
+        let alias = "iscsi://192.0.2.18:3260/iqn.test/lun1";
         let path = resolve_synthetic(&transform, "borrower", alias)
             .await
             .unwrap();
@@ -799,7 +856,8 @@ mod tests {
         assert_eq!(state.logins.load(Ordering::SeqCst), 0);
         assert_eq!(state.logouts.load(Ordering::SeqCst), 0);
         assert!(
-            ISCSITarget::from(&Url::parse("iscsi://192.0.2.17/iqn.test/0").unwrap())
+            ISCSITarget::try_from(&Url::parse("iscsi://192.0.2.17/iqn.test/0").unwrap())
+                .unwrap()
                 .session_exists_at(&state.root)
                 .await
                 .unwrap()
@@ -841,7 +899,8 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("odorobo-iscsi-dns-{}", ulid::Ulid::generate()));
         synthetic_session(&root, 17, "localhost\n", Some("127.0.0.1\n")).await;
-        let target = ISCSITarget::from(&Url::parse("iscsi://127.0.0.1/iqn.test/99").unwrap());
+        let target =
+            ISCSITarget::try_from(&Url::parse("iscsi://127.0.0.1/iqn.test/99").unwrap()).unwrap();
         let session = target.session_target_at(&root).await.unwrap().unwrap();
         assert_eq!(session.host, "localhost:3260");
         assert_eq!(
@@ -868,7 +927,7 @@ mod tests {
             Some("192.0.2.17"),
         )
         .await;
-        let target = ISCSITarget::from(&before);
+        let target = ISCSITarget::try_from(&before).unwrap();
         assert!(
             target
                 .existing_acquisition_at(&root)
@@ -890,7 +949,7 @@ mod tests {
             ISCSIStorage.resource_key(&before).unwrap(),
             ISCSIStorage.resource_key(&after).unwrap()
         );
-        let canonical_target = ISCSITarget::from(&after);
+        let canonical_target = ISCSITarget::try_from(&after).unwrap();
         let borrowed = canonical_target
             .existing_acquisition_at(&root)
             .await
@@ -932,12 +991,14 @@ mod tests {
         // localhost resolves to loopback, not the runtime address, so it shouldn't
         // make us think the old session belongs to a new canonical IP
         synthetic_session(&root, 17, "localhost\n", Some("192.0.2.17\n")).await;
-        let old = ISCSITarget::from(&Url::parse("iscsi://192.0.2.17/iqn.test/0").unwrap());
+        let old =
+            ISCSITarget::try_from(&Url::parse("iscsi://192.0.2.17/iqn.test/0").unwrap()).unwrap();
         assert_eq!(
             old.session_target_at(&root).await.unwrap().unwrap().host,
             "localhost:3260"
         );
-        let new = ISCSITarget::from(&Url::parse("iscsi://127.0.0.1/iqn.test/0").unwrap());
+        let new =
+            ISCSITarget::try_from(&Url::parse("iscsi://127.0.0.1/iqn.test/0").unwrap()).unwrap();
         assert!(!new.session_exists_at(&root).await.unwrap());
         // even with the DNS record gone, we should still resolve and log out via
         // the exact node portal. we don't need to look up this .invalid hostname
@@ -964,7 +1025,8 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("odorobo-iscsi-unknown-{}", ulid::Ulid::generate()));
         synthetic_session(&root, 17, "missing-odorobo-node.invalid\n", None).await;
-        let target = ISCSITarget::from(&Url::parse("iscsi://127.0.0.1/iqn.test/0").unwrap());
+        let target =
+            ISCSITarget::try_from(&Url::parse("iscsi://127.0.0.1/iqn.test/0").unwrap()).unwrap();
         drop(target.session_exists_at(&root).await.unwrap_err());
         tokio::fs::remove_dir_all(root).await.unwrap();
     }
@@ -1006,7 +1068,8 @@ mod tests {
             std::env::temp_dir().join(format!("odorobo-iscsi-multiple-{}", ulid::Ulid::generate()));
         synthetic_session(&root, 17, "127.0.0.1\n", Some("127.0.0.1\n")).await;
         synthetic_session(&root, 18, "localhost\n", Some("127.0.0.1\n")).await;
-        let target = ISCSITarget::from(&Url::parse("iscsi://127.0.0.1/iqn.test/0").unwrap());
+        let target =
+            ISCSITarget::try_from(&Url::parse("iscsi://127.0.0.1/iqn.test/0").unwrap()).unwrap();
         assert!(
             target
                 .session_target_at(&root)
@@ -1034,7 +1097,8 @@ mod tests {
 
     #[test]
     fn ipv6_portals_preserve_brackets_for_device_and_cli() {
-        let target = ISCSITarget::from(&Url::parse("iscsi://[::1]/iqn.test/0").unwrap());
+        let target =
+            ISCSITarget::try_from(&Url::parse("iscsi://[::1]/iqn.test/0").unwrap()).unwrap();
         assert_eq!(target.host, "[::1]:3260");
         assert_eq!(split_portal(&target.host).unwrap(), ("::1", 3260));
         assert_eq!(format_portal("::1", 3260), "[::1]:3260");
@@ -1058,14 +1122,14 @@ mod tests {
         let uri =
             Url::parse("iscsi://target.example.com:3260/iqn.2024-01.com.example:target1/lun0")
                 .unwrap();
-        let target = ISCSITarget::from(&uri);
+        let target = ISCSITarget::try_from(&uri).unwrap();
         println!("{target:?}");
         assert_eq!(target.host, "target.example.com:3260");
         assert_eq!(target.iqn, "iqn.2024-01.com.example:target1");
         assert_eq!(target.lun, 0);
         let uri2 =
             Url::parse("iscsi://target.example.com/iqn.2024-01.com.example:target1/0").unwrap();
-        let target2 = ISCSITarget::from(&uri2);
+        let target2 = ISCSITarget::try_from(&uri2).unwrap();
         println!("{target2:?}");
         assert_eq!(target2.host, "target.example.com:3260");
         assert_eq!(target2.iqn, "iqn.2024-01.com.example:target1");
@@ -1076,7 +1140,7 @@ mod tests {
     fn test_iscsi_lossless_conversion() {
         let uri = Url::parse("iscsi://target.example.com:3260/iqn.2024-01.com.example:target1/0")
             .unwrap();
-        let target = ISCSITarget::from(&uri);
+        let target = ISCSITarget::try_from(&uri).unwrap();
         let reconstructed_uri = format!("iscsi://{}/{}/{}", target.host, target.iqn, target.lun);
         assert_eq!(uri.as_str(), reconstructed_uri);
     }
@@ -1086,7 +1150,7 @@ mod tests {
         let uri =
             Url::parse("iscsi://target.example.com:3260/iqn.2026-03.com.fyrastack:test/0").unwrap();
         let actual_device_path = "/dev/disk/by-path/ip-target.example.com:3260-iscsi-iqn.2026-03.com.fyrastack:test-lun-0";
-        let target = ISCSITarget::from(&uri);
+        let target = ISCSITarget::try_from(&uri).unwrap();
         let device_path = target.to_device_path().display().to_string();
         println!("Device path: {device_path}");
         assert_eq!(device_path, actual_device_path);
@@ -1121,14 +1185,110 @@ mod tests {
         // both numeric (/1) and prefixed (/lun1) URI forms for LUN > 0
         let uri_numeric =
             Url::parse("iscsi://target.example.com:3260/iqn.2026-03.com.fyrastack:boot/1").unwrap();
-        let t1 = ISCSITarget::from(&uri_numeric);
+        let t1 = ISCSITarget::try_from(&uri_numeric).unwrap();
         assert_eq!(t1.lun, 1);
 
         let uri_prefixed =
             Url::parse("iscsi://target.example.com:3260/iqn.2026-03.com.fyrastack:boot/lun1")
                 .unwrap();
-        let t2 = ISCSITarget::from(&uri_prefixed);
+        let t2 = ISCSITarget::try_from(&uri_prefixed).unwrap();
         assert_eq!(t2.lun, 1);
+    }
+
+    #[test]
+    fn accepts_well_formed_iscsi_uris() {
+        for (input, host, lun) in [
+            (
+                "iscsi://san/iqn.2026-03.com.fyrastack:boot/0",
+                "san:3260",
+                0,
+            ),
+            (
+                "iscsi://san:3261/iqn.2026-03.com.fyrastack:boot/7",
+                "san:3261",
+                7,
+            ),
+            (
+                "iscsi://[::1]/iqn.2026-03.com.fyrastack:boot/lun2",
+                "[::1]:3260",
+                2,
+            ),
+            (
+                "iscsi://san/iqn.2026-03.com.fyrastack:boot/4294967295",
+                "san:3260",
+                u32::MAX,
+            ),
+        ] {
+            let target = ISCSITarget::parse_uri(input).unwrap_or_else(|error| {
+                panic!("rejected {input}: {error:#}");
+            });
+            assert_eq!(target.host, host, "{input}");
+            assert_eq!(target.iqn, "iqn.2026-03.com.fyrastack:boot", "{input}");
+            assert_eq!(target.lun, lun, "{input}");
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_iscsi_uris_instead_of_guessing_lun_0() {
+        for input in [
+            // LUNs that used to quietly become LUN 0
+            "iscsi://san/iqn.x:tgt/lun-1",
+            "iscsi://san/iqn.x:tgt/-1",
+            "iscsi://san/iqn.x:tgt/+1",
+            "iscsi://san/iqn.x:tgt/1a",
+            "iscsi://san/iqn.x:tgt/0x1",
+            "iscsi://san/iqn.x:tgt/4294967296",
+            "iscsi://san/iqn.x:tgt/lun",
+            "iscsi://san/iqn.x:tgt/",
+            "iscsi://san/iqn.x:tgt",
+            "iscsi://san/",
+            "iscsi://san",
+            // extra segments used to get ignored
+            "iscsi://san/iqn.x:tgt/1/garbage",
+            "iscsi://san/iqn.x:tgt/1/",
+            "iscsi://san//1",
+            "iscsi:///iqn.x:tgt/1",
+            "iscsi://san/iqn.x:tgt/1?id=disk",
+            "iscsi://san/iqn.x:tgt/1#frag",
+            // encoded names aren't decoded, so they'd log into the wrong target
+            "iscsi://san/iqn.x%3Atgt/1",
+            "iscsi://san/iqn.x:has space/1",
+            "iscsi://s%61n/iqn.x:tgt/1",
+        ] {
+            let error = ISCSITarget::parse_uri(input);
+            assert!(error.is_err(), "accepted {input}");
+            if let Ok(uri) = Url::parse(input) {
+                assert!(ISCSITarget::try_from(&uri).is_err(), "accepted {input}");
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_iscsi_uris_the_url_parser_would_rewrite() {
+        for input in [
+            "iscsi://san/iqn.x:other/../iqn.x:tgt/1",
+            "iscsi://san/./iqn.x:tgt/1",
+            "iscsi://san/iqn.x:tgt/\t1",
+            " iscsi://san/iqn.x:tgt/1",
+            "ISCSI://san/iqn.x:tgt/1",
+        ] {
+            assert!(ISCSITarget::parse_uri(input).is_err(), "accepted {input:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_lun_fails_before_any_login() {
+        let uri = Url::parse("iscsi://192.0.2.17/iqn.test/1a").unwrap();
+        let error = ISCSIStorage.canonical_uri(&uri).await.unwrap_err();
+        assert!(error.to_string().contains("LUN"), "{error:#}");
+        drop(
+            ISCSIStorage
+                .acquire(&uri)
+                .await
+                .err()
+                .expect("acquire must fail"),
+        );
+        drop(ISCSIStorage.resource_key(&uri).unwrap_err());
     }
 
     #[test]

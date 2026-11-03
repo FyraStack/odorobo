@@ -613,11 +613,17 @@ fn raw_uri_scheme(path: &str) -> Option<String> {
 fn parse_storage_uri(path: &str) -> Result<Option<Url>> {
     match Url::parse(path) {
         Ok(uri) => {
-            // check every URL the parser thinks is RBD against the original
-            // input. this rejects casing and parser cleanup/normalization instead of
-            // quietly mapping a fixed-up URI
-            if uri.scheme() == "rbd" {
-                rbd::RbdImage::parse_uri(path)?;
+            // check every URL the parser thinks is RBD or iSCSI against the
+            // original input. this rejects casing and parser cleanup/normalization
+            // instead of quietly mapping a fixed-up URI
+            match uri.scheme() {
+                "rbd" => {
+                    rbd::RbdImage::parse_uri(path)?;
+                }
+                "iscsi" => {
+                    iscsi::ISCSITarget::parse_uri(path)?;
+                }
+                _ => {}
             }
             Ok(Some(uri))
         }
@@ -906,6 +912,10 @@ mod tests {
             "\trbd://pool/image",
             "rbd://pool/\nimage",
             "\u{1}rbd://pool/image",
+            "ISCSI://san/iqn.test/0",
+            "iscsi://san/iqn.other/../iqn.test/0",
+            "iscsi://san/iqn.test/1a",
+            "iscsi://san/iqn.test/0/extra",
         ] {
             assert!(parse_storage_uri(path).is_err(), "accepted {path:?}");
         }
@@ -920,6 +930,11 @@ mod tests {
                 .is_some()
         );
         assert!(parse_storage_uri("rbd://pool/image").unwrap().is_some());
+        assert!(
+            parse_storage_uri("iscsi://san/iqn.test/lun1")
+                .unwrap()
+                .is_some()
+        );
         assert!(
             parse_storage_uri("rbd://rbd-pool_1.ssd/image")
                 .unwrap()
