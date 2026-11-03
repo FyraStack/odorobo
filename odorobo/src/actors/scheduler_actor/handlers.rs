@@ -195,35 +195,36 @@ impl Message<CreateVM> for SchedulerActor {
         // A transport or discovery failure is not proof that startup failed.
         // Roll back only after an explicit agent rejection and a successful
         // lookup confirming no VM actor is present.
-        if reply.is_err() && !startup_outcome_unknown {
-            if let Ok(None) = RemoteActorRef::<VMActor>::lookup(vm_actor_id(msg.vmid)).await {
-                Self::rollback_failed_create(
-                    msg.vmid,
-                    false,
-                    reply.as_ref().ok().and_then(|reply| {
-                        reply
-                            .actor_id
-                            .as_deref()
-                            .and_then(|bytes| ActorId::from_bytes(bytes).ok())
-                    }),
-                    &mut self.vm_actorid_ulid_map,
-                    &mut self.vm_manifests,
-                    &mut self.vm_effective_manifests,
-                    &mut self.vm_placements,
-                    &mut self.vm_data_cache,
-                );
+        if reply.is_err()
+            && !startup_outcome_unknown
+            && matches!(RemoteActorRef::<VMActor>::lookup(vm_actor_id(msg.vmid)).await, Ok(None))
+        {
+            Self::rollback_failed_create(
+                msg.vmid,
+                false,
+                reply.as_ref().ok().and_then(|reply| {
+                    reply
+                        .actor_id
+                        .as_deref()
+                        .and_then(|bytes| ActorId::from_bytes(bytes).ok())
+                }),
+                &mut self.vm_actorid_ulid_map,
+                &mut self.vm_manifests,
+                &mut self.vm_effective_manifests,
+                &mut self.vm_placements,
+                &mut self.vm_data_cache,
+            );
 
-                let cleanup_confirmed = matches!(
-                    target_agent.ask(&DeleteVM { vmid: msg.vmid }).await,
-                    Ok(DeleteVMReply { error: None })
-                );
-                self.settle_failed_create_cleanup(
-                    msg.vmid,
-                    delete_owner,
-                    delete_owner_was_new,
-                    cleanup_confirmed,
-                );
-            }
+            let cleanup_confirmed = matches!(
+                target_agent.ask(&DeleteVM { vmid: msg.vmid }).await,
+                Ok(DeleteVMReply { error: None })
+            );
+            self.settle_failed_create_cleanup(
+                msg.vmid,
+                delete_owner,
+                delete_owner_was_new,
+                cleanup_confirmed,
+            );
         }
 
         if let Ok(reply) = &reply
