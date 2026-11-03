@@ -168,6 +168,11 @@ pub struct ProductionBehaviour {
 fn load_or_create_identity(path: &Path) -> Result<Keypair> {
     match fs::read(path) {
         Ok(bytes) => {
+            if let Ok(metadata) = fs::metadata(path)
+                && std::os::unix::fs::PermissionsExt::mode(&metadata.permissions()) & 0o077 != 0
+            {
+                warn!(path = %path.display(), "libp2p key is readable by other users, it should be 0600");
+            }
             return Keypair::from_protobuf_encoding(&bytes)
                 .wrap_err_with(|| format!("invalid libp2p key at {}", path.display()));
         }
@@ -184,20 +189,27 @@ fn load_or_create_identity(path: &Path) -> Result<Keypair> {
         .parent()
         .ok_or_else(|| eyre!("libp2p key path {} has no parent", path.display()))?;
     fs::create_dir_all(parent).wrap_err("failed to create libp2p key directory")?;
-    // write to a temp file and rename it in, so a crash can't leave a half-written key
-    let temp_path = path.with_extension(format!("tmp-{}", std::process::id()));
+    // write to a temp file and rename it in, so a crash can't leave a half-written key.
+    // create_new won't follow a planted symlink or reuse a leftover file's permissions
+    let temp_path = path.with_extension(format!("tmp-{}", ulid::Ulid::generate()));
     let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .write(true)
         .mode(0o600)
         .open(&temp_path)
         .wrap_err("failed to create libp2p key")?;
-    file.write_all(&encoded)
+    let written = file
+        .write_all(&encoded)
         .and_then(|()| file.sync_all())
-        .and_then(|()| fs::rename(&temp_path, path))
-        .and_then(|()| File::open(parent)?.sync_all())
-        .wrap_err_with(|| format!("failed to save libp2p key to {}", path.display()))?;
+        .and_then(|()| fs::rename(&temp_path, path));
+    if let Err(error) = written {
+        drop(fs::remove_file(&temp_path));
+        return Err(error)
+            .wrap_err_with(|| format!("failed to save libp2p key to {}", path.display()));
+    }
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .wrap_err_with(|| format!("failed to sync libp2p key directory {}", parent.display()))?;
     info!(path = %path.display(), "generated new libp2p identity");
     Ok(keypair)
 }
