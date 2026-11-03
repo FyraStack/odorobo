@@ -83,7 +83,7 @@ impl VMCleanupProof {
         self.process_exit_confirmed.load(Ordering::SeqCst)
     }
 
-    fn set_process_exit_confirmed(&self, confirmed: bool) {
+    pub(crate) fn set_process_exit_confirmed(&self, confirmed: bool) {
         self.process_exit_confirmed
             .store(confirmed, Ordering::SeqCst);
     }
@@ -642,9 +642,8 @@ impl Actor for VMActor {
         }
         // collect every failure instead of bailing early, so one error doesn't hide another
         let mut errors = Vec::new();
-        if let Err(error) = self.vm_instance.stop().await {
-            errors.push(error);
-        }
+        // a failed graceful shutdown only matters if we can't confirm the kill below
+        let stop_error = self.vm_instance.stop().await.err();
         let process_exited = if let Some((kill_sender, watcher)) = self.process_watcher.take() {
             let _send_result: std::result::Result<(), ()> = kill_sender.send(());
             match watcher.await {
@@ -664,8 +663,18 @@ impl Actor for VMActor {
         } else {
             // without a watcher we can't tell if the VMM process exited, so keep
             // the reservations instead of risking giving a live guest's CID away
+            errors.push(Report::msg(
+                "VM has no process watcher, so its exit can't be confirmed",
+            ));
             false
         };
+        if let Some(error) = stop_error {
+            if process_exited {
+                warn!(vmid = %self.vmid, ?error, "graceful VM shutdown failed, but the VMM was killed and reaped");
+            } else {
+                errors.push(error);
+            }
+        }
 
         // reaping closes the receive connection. let its task see the final
         // response before we decide whether to roll back the reservation

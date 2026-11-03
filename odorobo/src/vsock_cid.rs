@@ -258,6 +258,16 @@ impl VsockCidAllocator {
         })
     }
 
+    /// the VMM recorded for an active lease, if we know it
+    pub fn recorded_process(&self, vmid: Ulid) -> Result<Option<ProcessIdentity>> {
+        let registry = self.read_registry()?;
+        let key = vmid.to_string();
+        if registry.process_exited.contains(&key) {
+            return Ok(None);
+        }
+        Ok(registry.processes.get(&key).copied())
+    }
+
     /// mark an active lease stopped if its recorded VMM is gone. this is how a
     /// restarted agent gets past leases it lost track of. returns whether the
     /// lease is now stopped (or there wasn't an active one)
@@ -839,12 +849,14 @@ mod tests {
 
         // a fresh allocator has no token, like an agent after a restart
         let restarted = VsockCidAllocator::new(allocator.registry_path.clone());
+        assert_eq!(restarted.recorded_process(vmid).unwrap(), Some(process));
         assert!(!restarted.reconcile_exited(vmid).unwrap());
         assert!(restarted.ensure_no_active_lease(vmid).is_err());
 
         vmm.kill().await.unwrap();
         assert!(restarted.reconcile_exited(vmid).unwrap());
         restarted.ensure_no_active_lease(vmid).unwrap();
+        assert_eq!(restarted.recorded_process(vmid).unwrap(), None);
         assert!(restarted.release_stopped(vmid).unwrap());
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -879,6 +891,7 @@ mod tests {
 
         let new = allocator.reserve_with_previous(vmid, None).unwrap();
         assert_eq!(new.cid, 42);
+        assert_eq!(allocator.recorded_process(vmid).unwrap(), None);
         assert!(
             allocator
                 .record_process_owned(vmid, old.token, process)
