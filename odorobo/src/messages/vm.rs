@@ -1,10 +1,22 @@
 //! VM-related messages
 
+use std::time::Duration;
+
 use kameo::prelude::*;
 
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
+/// How long the scheduler waits for an agent to start a VM. Must exceed the
+/// Cloud Hypervisor socket wait (~31s) plus VM create/boot.
+pub const VM_CREATE_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// Agent-side bound on one VM teardown (graceful shutdown, VMM exit, cleanup).
+pub const VM_STOP_TIMEOUT: Duration = Duration::from_secs(45);
+/// How long the scheduler waits for an agent's stop reply. Exceeds
+/// [`VM_STOP_TIMEOUT`] so the agent's own timeout error reaches the scheduler.
+pub const VM_STOP_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
+use crate::cluster_state::PlacementRecord;
 use crate::manifest::VmManifest;
 
 /// Message to create a new VM
@@ -18,6 +30,9 @@ pub struct CreateVM {
     /// Provider-neutral VM intent. Cloud Hypervisor conversion happens in the
     /// Cloud Hypervisor driver on the destination agent.
     pub config: VmManifest,
+    /// Exact durable intent authorizing the agent-side create.
+    #[serde(default)]
+    pub placement: Option<PlacementRecord>,
 }
 
 #[derive(Serialize, Deserialize, Reply, Debug)]
@@ -25,6 +40,7 @@ pub struct CreateVMReply {
     pub config: Option<VmManifest>,
     /// Serialized ID of the VM actor created by the agent.
     pub actor_id: Option<Vec<u8>>,
+    pub error: Option<String>,
 }
 
 /// Message to delete a VM's config from the agent, shutting it down
@@ -66,19 +82,33 @@ pub struct MigrateVMReceiveReply {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DeleteVM {
     pub vmid: Ulid,
+    /// Stop fence supplied only by the scheduler after it persists the marker.
+    #[serde(default)]
+    pub placement: Option<PlacementRecord>,
 }
 
 #[derive(Serialize, Deserialize, Reply, Debug, Clone)]
-pub struct DeleteVMReply;
+pub struct DeleteVMReply {
+    pub error: Option<String>,
+}
 
-/// Shuts down a VM temporarily
+/// Shuts down a VM and tears down its runtime.
+///
+/// Durable state is finalized exactly as for [`DeleteVM`]: once teardown is
+/// confirmed, the manifest and placement are removed. There is no stopped-VM
+/// record yet, so a shut-down VM is recreated with a new create request.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ShutdownVM {
     pub vmid: Ulid,
+    /// Stop fence supplied only by the scheduler after it persists the marker.
+    #[serde(default)]
+    pub placement: Option<PlacementRecord>,
 }
 
-#[derive(Serialize, Deserialize, Reply, Debug)]
-pub struct ShutdownVMReply;
+#[derive(Serialize, Deserialize, Reply, Debug, Clone)]
+pub struct ShutdownVMReply {
+    pub error: Option<String>,
+}
 
 /// List VMs on an agent
 #[derive(Serialize, Deserialize, Debug)]
@@ -106,9 +136,10 @@ pub struct GetVMInfoReply {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct GetVMHeartbeat;
 
-#[derive(Serialize, Deserialize, Reply, Debug, Clone, Copy)]
+#[derive(Serialize, Deserialize, Reply, Debug, Clone)]
 pub struct GetVMHeartbeatReply {
     pub vmid: Ulid,
+    pub error: Option<String>,
 }
 
 /// Retrieve the retained serial-console output for a VM.

@@ -1,5 +1,6 @@
+use crate::cluster_state::{PlacementLifecycle, PlacementRecord, StateStore};
 use crate::{
-    ch_driver::actor::VMActor,
+    ch_driver::{VMInstance, actor::VMActor},
     config::Config,
     manifest::VmManifest,
     messages::{
@@ -12,7 +13,7 @@ use crate::{
         vm::{
             AgentListVMs, AgentListVMsReply, CreateVM, CreateVMReply, DeleteVM, DeleteVMReply,
             GetVMInfo, GetVMInfoReply, MigrateVMReceive, MigrateVMReceiveReply, ShutdownVM,
-            ShutdownVMReply,
+            ShutdownVMReply, VM_STOP_TIMEOUT,
         },
     },
     networking::actor::NetworkAgentActor,
@@ -23,12 +24,14 @@ use ahash::AHashMap;
 use bytesize::ByteSize;
 use kameo::prelude::*;
 use stable_eyre::{Report, Result};
-use std::ops::ControlFlow;
+use std::{ops::ControlFlow, sync::Arc, time::Duration};
 use sysinfo::System;
 use tracing::{error, info, trace, warn};
 use ulid::Ulid;
 
 use kameo::error::PanicError;
+
+const VM_ACTOR_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct VMCacheData {
     actor_ref: ActorRef<VMActor>,
@@ -49,6 +52,7 @@ pub struct AgentActor {
     pub vms: AHashMap<Ulid, VMCacheData>,
     // pub network_actor: ActorRef<NetworkAgentActor>,
     pub metadata: ObjectMetadata,
+    pub state_store: Arc<StateStore>,
 }
 
 impl AgentActor {
@@ -62,6 +66,30 @@ impl AgentActor {
         while self.status_history.len() > STATUS_CHANGE_HISTORY_LIMIT {
             self.status_history.pop_front();
         }
+    }
+
+    async fn validate_vm_state(
+        &self,
+        vmid: Ulid,
+        expected: &PlacementRecord,
+        lifecycle: PlacementLifecycle,
+        manifest: Option<&VmManifest>,
+    ) -> std::result::Result<(), String> {
+        let state = self
+            .state_store
+            .get_vm_state::<VmManifest>(vmid)
+            .await
+            .map_err(|error| format!("unable to read durable VM state: {error}"))?
+            .ok_or_else(|| "durable VM state is missing".to_owned())?;
+        if state.manifest.id != vmid
+            || &state.placement != expected
+            || state.placement.node != self.config.get_hostname()
+            || state.placement.lifecycle != lifecycle
+            || manifest.is_some_and(|manifest| manifest != &state.manifest)
+        {
+            return Err("durable VM owner or lifecycle does not authorize this request".to_owned());
+        }
+        Ok(())
     }
 
     fn insert_vm(&mut self, vmid: Ulid, cache: VMCacheData) {
@@ -85,41 +113,107 @@ impl AgentActor {
         Some(removed)
     }
 
-    async fn lookup_vm_actor(vmid: Ulid) -> Option<ActorRef<VMActor>> {
-        ActorRef::<VMActor>::lookup(format!("vm:{vmid}"))
-            .await
-            .ok()
-            .flatten()
+    /// Tears down a VM whose durable stop marker matches `placement`.
+    ///
+    /// A cached VM actor is asked to tear down via `ask`, which returns the
+    /// actor's reported error. Without a live cached actor, any runtime left on
+    /// disk (by a previous agent process, a failed start, or a timed-out
+    /// teardown) is cleaned up; an absent runtime directory confirms teardown.
+    async fn teardown_vm<F, Fut>(
+        &mut self,
+        placement: &PlacementRecord,
+        lifecycle: PlacementLifecycle,
+        ask: F,
+    ) -> std::result::Result<(), String>
+    where
+        F: FnOnce(ActorRef<VMActor>) -> Fut,
+        Fut: Future<Output = std::result::Result<Option<String>, String>>,
+    {
+        let vmid = placement.vmid;
+        self.validate_vm_state(vmid, placement, lifecycle, None)
+            .await?;
+        let cached = self.vms.get(&vmid).map(|vm| vm.actor_ref.clone());
+        if let Some(actor_ref) = cached.filter(ActorRef::is_alive) {
+            let result = tokio::time::timeout(VM_STOP_TIMEOUT, ask(actor_ref))
+                .await
+                .map_err(|_| "timed out waiting for VM actor teardown".to_owned())
+                .and_then(|reply| reply.and_then(|error| error.map_or(Ok(()), Err)));
+            if result.is_ok() {
+                self.remove_vm(vmid);
+            }
+            return result;
+        }
+
+        // A dead cached actor is removed by on_link_died; do it eagerly here.
+        self.remove_vm(vmid);
+        tokio::time::timeout(
+            VM_STOP_TIMEOUT,
+            VMInstance::teardown_orphan(&vmid.to_string()),
+        )
+        .await
+        .map_err(|_| "timed out tearing down uncached VM runtime".to_owned())?
+        .map_err(|error| format!("uncached VM runtime teardown is unconfirmed: {error:#}"))
+    }
+
+    /// Registering with Kademlia can wait indefinitely when no peers are
+    /// available. Keep it outside the agent's serial message handler so local
+    /// VM creation and status polling continue in single-node deployments.
+    fn register_vm_actor(actor_ref: ActorRef<VMActor>, vmid: Ulid) {
+        tokio::spawn(async move {
+            for name in [vm_actor_id(vmid), VM.to_owned()] {
+                // A VM deleted before registration ran must not be advertised.
+                if !actor_ref.is_alive() {
+                    return;
+                }
+                match tokio::time::timeout(
+                    VM_ACTOR_REGISTRATION_TIMEOUT,
+                    actor_ref.register(name.clone()),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => warn!(?error, %vmid, %name, "Unable to register VM actor"),
+                    Err(_) => warn!(%vmid, %name, "Timed out registering VM actor"),
+                }
+            }
+        });
     }
 }
 
 #[allow(clippy::unused_async_trait_impl)]
 impl Actor for AgentActor {
-    type Args = Config;
+    type Args = (Config, Arc<StateStore>);
     type Error = Report;
 
-    async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self> {
+    async fn on_start(
+        (config, state_store): Self::Args,
+        actor_ref: ActorRef<Self>,
+    ) -> Result<Self> {
         let peer_id = *actor_ref.id().peer_id().unwrap();
 
         info!(?peer_id, "Agent Actor started!");
 
         // spawn networking actor
         let network_actor: ActorRef<NetworkAgentActor> =
-            NetworkAgentActor::spawn_link(&actor_ref, args.network.clone()).await;
+            NetworkAgentActor::spawn_link(&actor_ref, config.network.clone()).await;
         network_actor.register(NETWORK).await?;
 
         let sys = System::new_all();
-
+        // Durable intent is not evidence that this process owns a live runtime.
+        // Explicit creates attach actors after validating the exact active pair.
+        let vms = AHashMap::new();
+        let (used_vcpus, used_memory_bytes) = (0, 0);
         Ok(Self {
             vcpus: u32::try_from(sys.cpus().len()).unwrap_or(u32::MAX),
             memory: ByteSize::b(sys.total_memory()),
-            config: args,
-            vms: AHashMap::new(),
-            used_vcpus: 0,
-            used_memory_bytes: 0,
+            config,
+            vms,
+            used_vcpus,
+            used_memory_bytes,
             membership_revision: 0,
             status_history: StatusChangeHistory::new(),
             metadata: ObjectMetadata::default(),
+            state_store,
         })
     }
 
@@ -163,24 +257,58 @@ impl Message<CreateVM> for AgentActor {
 
     async fn handle(&mut self, msg: CreateVM, ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
         let vmid = msg.vmid;
+        let Some(placement) = msg.placement.as_ref() else {
+            return CreateVMReply {
+                config: None,
+                actor_id: None,
+                error: Some("create is missing its durable placement".to_owned()),
+            };
+        };
+        if let Err(error) = self
+            .validate_vm_state(
+                vmid,
+                placement,
+                PlacementLifecycle::Active,
+                Some(&msg.config),
+            )
+            .await
+        {
+            return CreateVMReply {
+                config: None,
+                actor_id: None,
+                error: Some(error),
+            };
+        }
         if let Some(existing) = self.vms.get(&vmid) {
-            if existing.config == msg.config {
-                info!(?vmid, actor_id = ?existing.actor_ref.id(), "VM already exists; treating create as idempotent");
-            } else {
-                warn!(?vmid, actor_id = ?existing.actor_ref.id(), "Ignoring conflicting create for existing VM");
+            if existing.config != msg.config {
+                return CreateVMReply {
+                    config: None,
+                    actor_id: None,
+                    error: Some("conflicting create for cached VM".to_owned()),
+                };
             }
             return CreateVMReply {
                 config: Some(existing.config.clone()),
                 actor_id: Some(existing.actor_ref.id().to_bytes()),
+                error: None,
             };
         }
 
-        // Spawn and link at the same time.
         let actor_ref =
             VMActor::spawn_link(ctx.actor_ref(), (vmid, Some(msg.config.clone()))).await;
+        if let Err(error) = actor_ref
+            .wait_for_startup_with_result(|result| result.map_err(|error| error.to_string()))
+            .await
+        {
+            warn!(%error, %vmid, "Unable to start VM actor");
+            return CreateVMReply {
+                config: None,
+                actor_id: None,
+                error: Some(error),
+            };
+        }
 
-        _ = actor_ref.register(vm_actor_id(vmid)).await;
-        _ = actor_ref.register(VM).await;
+        Self::register_vm_actor(actor_ref.clone(), vmid);
         self.insert_vm(
             vmid,
             VMCacheData {
@@ -190,11 +318,11 @@ impl Message<CreateVM> for AgentActor {
                 memory_bytes: msg.config.desired.compute.memory_bytes,
             },
         );
-
         info!(?vmid, "VM Spawned successfully");
         CreateVMReply {
             config: Some(msg.config),
             actor_id: Some(actor_ref.id().to_bytes()),
+            error: None,
         }
     }
 }
@@ -211,8 +339,7 @@ impl Message<MigrateVMReceive> for AgentActor {
         let vmid = msg.vmid;
         let actor_ref = VMActor::spawn_link(ctx.actor_ref(), (vmid, None)).await;
 
-        _ = actor_ref.register(vm_actor_id(vmid)).await;
-        _ = actor_ref.register(VM).await;
+        Self::register_vm_actor(actor_ref.clone(), vmid);
         self.insert_vm(
             vmid,
             VMCacheData {
@@ -255,45 +382,63 @@ impl Message<DeleteVM> for AgentActor {
         msg: DeleteVM,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        match self.remove_vm(msg.vmid) {
-            Some(cache_data) => {
-                let res = cache_data.actor_ref.tell(msg.clone()).await;
-                if let Err(err) = res {
-                    // probably a bad way to do this
-                    warn!(vm_id = %msg.vmid, ?err, "failed to stop VM actor gracefully, killing");
-                    cache_data.actor_ref.kill();
-                }
-            }
-            None => {
-                warn!(vm_id = %msg.vmid, "VM actor not found for delete");
-            }
+        let Some(placement) = msg.placement.clone() else {
+            return DeleteVMReply {
+                error: Some("delete is missing its durable stop fence".to_owned()),
+            };
+        };
+        let request = msg.clone();
+        let result = self
+            .teardown_vm(
+                &placement,
+                PlacementLifecycle::Deleting,
+                |actor_ref| async move {
+                    actor_ref
+                        .ask(request)
+                        .await
+                        .map(|reply| reply.error)
+                        .map_err(|error| error.to_string())
+                },
+            )
+            .await;
+        DeleteVMReply {
+            error: result.err(),
         }
-
-        DeleteVMReply
     }
 }
 
 #[remote_message]
 impl Message<ShutdownVM> for AgentActor {
-    type Reply = Result<ShutdownVMReply, String>;
+    type Reply = ShutdownVMReply;
 
     async fn handle(
         &mut self,
         msg: ShutdownVM,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        if let Some(actor_ref) = Self::lookup_vm_actor(msg.vmid).await {
-            trace!(?msg, "Telling VM to shut down");
-            let res = actor_ref.tell(msg.clone()).await;
-            if let Err(err) = res {
-                warn!(vm_id = %msg.vmid, ?err, "failed to shutdown VM actor");
-            }
-        } else {
-            warn!(vm_id = %msg.vmid, "VM actor not found for shutdown");
-            return Err("VM actor not found for shutdown".to_owned());
+        let Some(placement) = msg.placement.clone() else {
+            return ShutdownVMReply {
+                error: Some("shutdown is missing its durable stop fence".to_owned()),
+            };
+        };
+        trace!(?msg, "Requesting VM shutdown");
+        let request = msg.clone();
+        let result = self
+            .teardown_vm(
+                &placement,
+                PlacementLifecycle::Stopping,
+                |actor_ref| async move {
+                    actor_ref
+                        .ask(request)
+                        .await
+                        .map(|reply| reply.error)
+                        .map_err(|error| error.to_string())
+                },
+            )
+            .await;
+        ShutdownVMReply {
+            error: result.err(),
         }
-
-        Ok(ShutdownVMReply)
     }
 }
 // forward GetVMInfo to VM actor
@@ -314,8 +459,8 @@ impl Message<GetVMInfo> for AgentActor {
             });
         };
 
-        let Some(actor_ref) = Self::lookup_vm_actor(vmid).await else {
-            warn!(vm_id = %vmid, "VM actor not found for info lookup");
+        let Some(actor_ref) = self.vms.get(&vmid).map(|vm| vm.actor_ref.clone()) else {
+            warn!(vm_id = %vmid, "VM actor not cached for info lookup");
             return ForwardedReply::from_ok(GetVMInfoReply { vmid, config: None });
         };
 
