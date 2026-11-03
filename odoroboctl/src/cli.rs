@@ -187,12 +187,11 @@ pub async fn run_command(cli: Cli) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{Cli, Command, run_command};
-    use stable_eyre::{Result, eyre::eyre};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use bytesize::ByteSize;
     use clap::Parser;
+    use stable_eyre::{Result, eyre::eyre};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-      
     #[tokio::test]
     async fn delete_returns_error_when_api_responds_with_failure() -> Result<()> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -215,7 +214,7 @@ mod tests {
                 vmid: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
             },
         })
-            .await;
+        .await;
 
         server.await??;
         let error = result
