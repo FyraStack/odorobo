@@ -55,6 +55,12 @@ Install the CLI helper
 cargo install --path odoroboctl
 ```
 
+You can then use `odoroboctl` to directly interact with the Manager, for example to spawn a VM instance from a disk image:
+
+```bash
+odoroboctl create --image file:///path/to/disk.img
+```
+
 You can then use `odoroboctl` to directly interact with the Manager. Create a VM by providing a disk image with `--image`:
 
 ```bash
