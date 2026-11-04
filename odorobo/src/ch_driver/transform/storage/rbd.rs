@@ -1,7 +1,10 @@
 use super::{StorageAcquisition, StorageDriver, iscsi::command};
 use async_trait::async_trait;
-use stable_eyre::{Result, eyre::eyre};
-use std::path::PathBuf;
+use stable_eyre::{
+    Result,
+    eyre::{ensure, eyre},
+};
+use std::{path::PathBuf, time::Duration};
 use tokio::process::Command;
 use tracing::{info, trace};
 use url::Url;
@@ -10,6 +13,10 @@ const CEPH_ID_ENV: &str = "CEPH_ID";
 const CEPH_KEYFILE_ENV: &str = "CEPH_KEYFILE";
 const CEPH_CLUSTER_ENV: &str = "CEPH_CLUSTER";
 const CEPH_CONFIG_ENV: &str = "CEPH_CONFIG";
+
+const UDEV_POLL: Duration = Duration::from_millis(100);
+/// how long resolve waits for the udev stable path before falling back
+pub(super) const UDEV_WAIT: Duration = Duration::from_secs(10);
 
 fn rbd_extra_args() -> Vec<String> {
     let mut args = Vec::new();
@@ -113,7 +120,7 @@ impl RbdImage {
         PathBuf::from(format!("/dev/rbd/{}/{}", self.pool, self.image))
     }
 
-    /// maps the RBD image. If it's already mapped we borrow it instead of owning it
+    /// maps the RBD image. if it's already mapped we borrow it instead of owning it
     #[tracing::instrument(skip(self))]
     pub async fn map(&self) -> Result<StorageAcquisition> {
         let rbd_path = self.rbd_path();
@@ -148,7 +155,7 @@ impl RbdImage {
             String::from_utf8_lossy(&output.stderr)
         );
         // it not being there before we ran the command doesn't mean a mapping now
-        // is ours. Something else could've mapped it while our command failed
+        // is ours. something else could've mapped it while our command failed
         let exists = rbd_map_list()
             .await
             .map(|mappings| mappings.iter().any(|(path, _)| path == &rbd_path));
@@ -193,21 +200,96 @@ impl RbdImage {
     }
 }
 
+impl RbdImage {
+    /// validate the original URI before URL parsing can normalize dot segments or
+    /// strip URL whitespace/control characters. the raw lowercase rule gets
+    /// enforced here, since the `rbd` URL parser doesn't normalize pool-name casing
+    pub(super) fn parse_uri(value: &str) -> Result<Self> {
+        let resource = value
+            .strip_prefix("rbd://")
+            .ok_or_else(|| eyre!("RBD storage URI must use the rbd:// scheme"))?;
+        let (pool, image) = resource
+            .split_once('/')
+            .ok_or_else(|| eyre!("RBD URI must have a pool and one image path segment"))?;
+        ensure!(
+            !pool.chars().any(|character| character.is_ascii_uppercase()),
+            "RBD pool names in the URI must be lowercase"
+        );
+        validate_rbd_component(pool, "pool")?;
+        ensure!(
+            !image.contains('/'),
+            "RBD URI supports only rbd://<pool>/<image>; namespaces and nested image paths are not supported"
+        );
+        validate_rbd_component(image, "image")?;
+
+        let parsed =
+            Url::parse(value).map_err(|error| eyre!("Invalid RBD storage URI: {error}"))?;
+        let parsed_image = Self::try_from(&parsed)?;
+        // refusing any parser rewrite means we can't quietly pick a different
+        // pool or image than the one the original URI named
+        ensure!(
+            parsed_image.pool == pool && parsed_image.image == image,
+            "RBD URI components must not change during URL normalization"
+        );
+        Ok(parsed_image)
+    }
+}
+
 impl TryFrom<&Url> for RbdImage {
     type Error = stable_eyre::Report;
 
     fn try_from(uri: &Url) -> Result<Self, Self::Error> {
+        ensure!(
+            uri.scheme() == "rbd",
+            "RBD storage URI must use the rbd:// scheme"
+        );
+        ensure!(
+            uri.username().is_empty()
+                && uri.password().is_none()
+                && uri.port().is_none()
+                && uri.query().is_none()
+                && uri.fragment().is_none(),
+            "RBD storage URI must not include credentials, a port, query, or fragment"
+        );
+
         let pool = uri
             .host_str()
             .ok_or_else(|| eyre!("RBD URI must have a host (pool name)"))?
             .to_owned();
-        let path = uri.path();
-        if path.is_empty() || path == "/" {
-            return Err(eyre!("RBD URI must have a path (image name)"));
-        }
-        let image = path.trim_start_matches('/').to_owned();
-        Ok(Self { pool, image })
+        validate_rbd_component(&pool, "pool")?;
+
+        let image = uri
+            .path()
+            .strip_prefix('/')
+            .ok_or_else(|| eyre!("RBD URI must have exactly one image path segment"))?;
+        ensure!(
+            !image.contains('/'),
+            "RBD URI supports only rbd://<pool>/<image>; namespaces and nested image paths are not supported"
+        );
+        validate_rbd_component(image, "image")?;
+
+        Ok(Self {
+            pool,
+            image: image.to_owned(),
+        })
     }
+}
+
+fn validate_rbd_component(value: &str, name: &str) -> Result<()> {
+    if value.is_empty()
+        || value == "."
+        || value == ".."
+        || value.starts_with('-')
+        || value.contains('%')
+        || value.chars().any(|character| {
+            !(character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.'))
+        })
+    {
+        return Err(eyre!(
+            "RBD {name} must be a non-empty name using only ASCII letters, digits, '.', '_' or '-'"
+        ));
+    }
+    Ok(())
 }
 
 pub struct RbdStorage;
@@ -216,6 +298,14 @@ pub struct RbdStorage;
 impl StorageDriver for RbdStorage {
     fn scheme(&self) -> &'static str {
         "rbd"
+    }
+
+    async fn canonical_uri(&self, uri: &Url) -> Result<Url> {
+        // unlike generic URI options, RBD query/fragment data doesn't mean anything
+        // to the backend. reject it instead of quietly dropping it and mapping
+        // a different image than the manifest asked for
+        RbdImage::try_from(uri)?;
+        Ok(uri.clone())
     }
 
     fn resource_key(&self, uri: &Url) -> Result<String> {
@@ -228,19 +318,20 @@ impl StorageDriver for RbdStorage {
 
     async fn resolve(&self, uri: &Url) -> Result<PathBuf> {
         let image = RbdImage::try_from(uri)?;
-        // map() uses `--options noudev`: with udev enabled, the rbd CLI waits
+        // map() uses `--options noudev`. with udev enabled, the rbd CLI waits
         // for a udev event in its own network namespace, but rbd devices are
         // created in the host's namespace, so that wait never completes in a
-        // container. The kernel uevent still reaches the host's udevd, so the
-        // stable path appears shortly after the map. Wait up to 10s (100 x
-        // 100ms steps) for it, and fall back to the kernel device name (e.g.
-        // /dev/rbd0) when the host has no ceph udev rule.
+        // container. the kernel uevent still reaches the host's udevd, so the
+        // stable path appears shortly after the map. wait up to UDEV_WAIT for
+        // it, and fall back to the kernel device name (e.g. /dev/rbd0) when the
+        // host has no ceph udev rule
         let udev_path = image.device_path();
-        for _ in 0..100 {
+        let started = tokio::time::Instant::now();
+        while started.elapsed() < UDEV_WAIT {
             if udev_path.exists() {
                 return Ok(udev_path);
             }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            tokio::time::sleep(UDEV_POLL).await;
         }
         let device = rbd_map_list()
             .await?
@@ -278,6 +369,27 @@ mod tests {
             image.device_path(),
             std::path::PathBuf::from("/dev/rbd/my-pool/my-image")
         );
+    }
+
+    #[test]
+    fn rejects_unsupported_rbd_uri_components() {
+        for input in [
+            "file:///pool/image",
+            "rbd:///image",
+            "rbd://pool/",
+            "rbd://pool/image/",
+            "rbd://pool/ns/image",
+            "rbd://pool/image@snapshot",
+            "rbd://pool/image?read_only=true",
+            "rbd://pool/image#snapshot",
+            "rbd://user@pool/image",
+            "rbd://pool:6789/image",
+            "rbd://pool/has%20space",
+            "rbd://pool/-option",
+        ] {
+            let uri = Url::parse(input).expect("test URI parses");
+            assert!(RbdImage::try_from(&uri).is_err(), "accepted {input}");
+        }
     }
 
     #[test]

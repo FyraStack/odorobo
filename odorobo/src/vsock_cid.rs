@@ -17,9 +17,16 @@ use stable_eyre::{
 };
 use ulid::Ulid;
 
+use crate::vmm_process::{BootId, ProcessIdentity};
+
 const FIRST_GUEST_CID: u32 = 3;
 const MAX_GUEST_CID: u32 = u32::MAX - 1;
-const REGISTRY_VERSION: u32 = 1;
+/// bump this for any change an older agent can't read. older agents refuse a
+/// newer version instead of rewriting the file without the fields they don't
+/// know. 2 added the boot ID to recorded processes
+const REGISTRY_VERSION: u32 = 2;
+/// oldest version we can still read and upgrade in place
+const OLDEST_REGISTRY_VERSION: u32 = 1;
 const REGISTRY_ENV: &str = "ODOROBO_VSOCK_CID_REGISTRY";
 const DEFAULT_REGISTRY: &str = "/var/lib/odorobo/vsock-cids.json";
 static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
@@ -34,9 +41,9 @@ pub struct VsockCidAllocator {
 /// a registry update went through, but we couldn't confirm it'll survive a crash
 ///
 /// the rename worked but syncing the directory failed, so callers can't treat
-/// the registry as unchanged. For a failed reservation made before we spawn a
+/// the registry as unchanged. for a failed reservation made before we spawn a
 /// VMM, the caller can safely hang on to its confirmed-exit cleanup state.
-/// Normal validation or pre-publish errors don't give that guarantee, since
+/// normal validation or pre-publish errors don't give that guarantee, since
 /// they might be about someone else's existing lease
 #[derive(Debug, thiserror::Error)]
 #[error("failed to sync vsock CID registry directory after publishing update: {source}")]
@@ -44,8 +51,9 @@ pub struct PublishedRegistryUpdate {
     #[source]
     pub source: std::io::Error,
     /// set for a reservation even if the directory sync failed after the rename.
-    /// Only this token can show that reservation's process exited
-    pub reservation_token: Option<VsockLeaseToken>,
+    /// only its token can show that reservation's process exited, and its
+    /// previous CID is what a rollback has to restore
+    pub reservation: Option<VsockCidReservation>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -79,9 +87,56 @@ struct Registry {
     #[serde(default)]
     process_exited: BTreeSet<String>,
     /// old registries don't have tokens, so those leases only get released once
-    /// there's a stopped record on disk. Every new reservation gets a fresh token
+    /// there's a stopped record on disk. every new reservation gets a fresh token
     #[serde(default)]
     lease_tokens: BTreeMap<String, VsockLeaseToken>,
+    /// the VMM holding each active lease, so a restarted agent can tell whether
+    /// it's still running instead of blocking the ID forever
+    #[serde(default, deserialize_with = "deserialize_processes")]
+    processes: BTreeMap<String, ProcessIdentity>,
+}
+
+/// just enough to check the version before the strict parse, so a newer file
+/// gets a clear error instead of a complaint about fields we don't know
+#[derive(Deserialize)]
+struct RegistryVersion {
+    version: u32,
+}
+
+/// a recorded process as any version wrote it. version 1 had no boot ID
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredProcess {
+    pid: u32,
+    start_time: u64,
+    #[serde(default)]
+    boot_id: Option<BootId>,
+}
+
+/// drops processes recorded without a boot ID. we can't tell which boot they
+/// came from, so they can't safely be checked or killed. their leases go back
+/// to needing a manual cleanup, like before processes were recorded at all
+fn deserialize_processes<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<String, ProcessIdentity>, D::Error> {
+    let stored = BTreeMap::<String, StoredProcess>::deserialize(deserializer)?;
+    Ok(stored
+        .into_iter()
+        .filter_map(|(vmid, process)| {
+            let Some(boot_id) = process.boot_id else {
+                tracing::warn!(%vmid, pid = process.pid, "forgetting a VMM recorded without a boot ID");
+                return None;
+            };
+            Some((
+                vmid,
+                ProcessIdentity {
+                    pid: process.pid,
+                    start_time: process.start_time,
+                    boot_id,
+                },
+            ))
+        })
+        .collect())
 }
 
 impl Registry {
@@ -99,6 +154,7 @@ impl Registry {
         self.assignments.remove(vmid);
         self.process_exited.remove(vmid);
         self.lease_tokens.remove(vmid);
+        self.processes.remove(vmid);
     }
 }
 
@@ -118,16 +174,17 @@ impl VsockCidAllocator {
     }
 
     /// reserve a CID and keep enough info to undo it if VM startup fails. CIDs
-    /// 0-2 and `u32::MAX` are reserved by the transport. If the error has a
+    /// 0-2 and `u32::MAX` are reserved by the transport. if the error has a
     /// [`PublishedRegistryUpdate`] in it, this reservation did get written, and
-    /// the error carries its token
+    /// the error carries it
     pub fn reserve_with_previous(
         &self,
         vmid: Ulid,
         requested: Option<u32>,
     ) -> Result<VsockCidReservation> {
         let token = VsockLeaseToken(Ulid::generate());
-        self.with_registry_token(Some(token), |registry| {
+        let mut made = None;
+        let result = self.with_registry(|registry| {
             let lease_owner = vmid;
             let vmid = vmid.to_string();
             let existing = registry.assignments.get(&vmid).copied();
@@ -166,13 +223,23 @@ impl VsockCidAllocator {
                 registry.assignments.insert(vmid.clone(), cid);
             }
             registry.process_exited.remove(&vmid);
+            registry.processes.remove(&vmid);
             registry.lease_tokens.insert(vmid, token);
-            Ok(VsockCidReservation {
+            let reservation = VsockCidReservation {
                 cid,
                 token,
                 previous_cid: existing,
                 previous_process_exited,
-            })
+            };
+            made = Some(reservation);
+            Ok(reservation)
+        });
+        result.map_err(|error| match error.downcast::<PublishedRegistryUpdate>() {
+            Ok(mut published) => {
+                published.reservation = made;
+                stable_eyre::Report::new(published)
+            }
+            Err(error) => error,
         })
     }
 
@@ -195,7 +262,9 @@ impl VsockCidAllocator {
                     ));
                 }
                 registry.assignments.insert(vmid.clone(), previous_cid);
-                // keep this reservation's token. Restoring the stopped CID
+                // rollback only happens after our VMM exited, so its PID is stale
+                registry.processes.remove(&vmid);
+                // keep this reservation's token. restoring the stopped CID
                 // shouldn't let an older token act on the lease again
                 if reservation.previous_process_exited {
                     registry.process_exited.insert(vmid);
@@ -209,7 +278,7 @@ impl VsockCidAllocator {
         })
     }
 
-    /// a new VM without vsock still can't skip past an older active lease. This
+    /// a new VM without vsock still can't skip past an older active lease. this
     /// only reads the registry, it never takes ownership or marks anything exited
     pub fn ensure_no_active_lease(&self, vmid: Ulid) -> Result<()> {
         let registry = self.read_registry()?;
@@ -220,7 +289,70 @@ impl VsockCidAllocator {
         Ok(())
     }
 
-    /// mark exit only for the exact reservation this VMM owns. A stale token
+    /// remember which VMM holds this reservation. a stale token can't attach a
+    /// process to a newer run of the same VM
+    pub fn record_process_owned(
+        &self,
+        vmid: Ulid,
+        token: VsockLeaseToken,
+        process: ProcessIdentity,
+    ) -> Result<()> {
+        self.with_registry(|registry| {
+            let vmid = vmid.to_string();
+            if registry.owns_lease(&vmid, token)? {
+                registry.processes.insert(vmid, process);
+            }
+            Ok(())
+        })
+    }
+
+    /// the VMM recorded for an active lease, if we know it
+    pub fn recorded_process(&self, vmid: Ulid) -> Result<Option<ProcessIdentity>> {
+        let registry = self.read_registry()?;
+        let key = vmid.to_string();
+        if registry.process_exited.contains(&key) {
+            return Ok(None);
+        }
+        Ok(registry.processes.get(&key).copied())
+    }
+
+    /// mark an active lease stopped if its recorded VMM is gone. this is how a
+    /// restarted agent gets past leases it lost track of. returns whether the
+    /// lease is now stopped (or there wasn't an active one)
+    pub fn reconcile_exited(&self, vmid: Ulid) -> Result<bool> {
+        let key = vmid.to_string();
+        let registry = self.read_registry()?;
+        if !registry.assignments.contains_key(&key) || registry.process_exited.contains(&key) {
+            return Ok(true);
+        }
+        let Some(process) = registry.processes.get(&key).copied() else {
+            return Ok(false);
+        };
+        if process.is_running()? {
+            return Ok(false);
+        }
+        self.with_registry(|registry| {
+            // only trust the check if nobody swapped the lease while we weren't holding the lock
+            if registry.assignments.contains_key(&key)
+                && registry.processes.get(&key) == Some(&process)
+            {
+                registry.process_exited.insert(key.clone());
+            }
+            Ok(!registry.assignments.contains_key(&key) || registry.process_exited.contains(&key))
+        })
+    }
+
+    /// every VM with a lease on this node, running or not
+    pub fn leased_vms(&self) -> Result<Vec<Ulid>> {
+        Ok(self
+            .read_registry()?
+            .assignments
+            .keys()
+            .filter_map(|vmid| vmid.parse().ok())
+            .collect())
+    }
+
+    /// mark exit only for the exact reservation this VMM owns. a stale token
     /// can't mark a newer run of the same VM as exited
     pub fn mark_process_exited_owned(&self, vmid: Ulid, token: VsockLeaseToken) -> Result<()> {
         if !self.registry_path.try_exists()? {
@@ -236,7 +368,7 @@ impl VsockCidAllocator {
     }
 
     /// release after a confirmed exit, under the same registry lock as removal.
-    /// Don't fall back to `release_stopped` if the token doesn't match
+    /// don't fall back to `release_stopped` if the token doesn't match
     pub fn release_owned(&self, vmid: Ulid, token: VsockLeaseToken) -> Result<()> {
         if !self.registry_path.try_exists()? {
             return Ok(());
@@ -250,7 +382,7 @@ impl VsockCidAllocator {
         })
     }
 
-    /// unguarded helpers, only for the old allocator tests. Real callers need a
+    /// unguarded helpers, only for the old allocator tests. real callers need a
     /// token or a stopped record on disk
     #[cfg(test)]
     pub fn mark_process_exited(&self, vmid: Ulid) -> Result<()> {
@@ -279,7 +411,7 @@ impl VsockCidAllocator {
     }
 
     /// release a lease on disk, but only if the VM actor already recorded a
-    /// confirmed process exit. Returns whether there was a lease, so callers can
+    /// confirmed process exit. returns whether there was a lease, so callers can
     /// use `false` to tell an untracked VM apart from one we actually released
     pub fn release_stopped(&self, vmid: Ulid) -> Result<bool> {
         if !self.registry_path.try_exists()? {
@@ -299,14 +431,6 @@ impl VsockCidAllocator {
     }
 
     fn with_registry<T>(&self, update: impl FnOnce(&mut Registry) -> Result<T>) -> Result<T> {
-        self.with_registry_token(None, update)
-    }
-
-    fn with_registry_token<T>(
-        &self,
-        reservation_token: Option<VsockLeaseToken>,
-        update: impl FnOnce(&mut Registry) -> Result<T>,
-    ) -> Result<T> {
         let parent = self
             .registry_path
             .parent()
@@ -327,31 +451,42 @@ impl VsockCidAllocator {
 
         let mut registry = self.read_registry()?;
         let result = update(&mut registry)?;
-        self.write_registry(&registry, reservation_token)?;
-        // just drop the file to unlock. An explicit unlock can fail, and then an
+        self.write_registry(&registry)?;
+        // just drop the file to unlock. an explicit unlock can fail, and then an
         // update that already went through would come back as an error
         drop(lock);
         Ok(result)
     }
 
     fn read_registry(&self) -> Result<Registry> {
-        let registry = match fs::read(&self.registry_path) {
-            Ok(contents) => serde_json::from_slice::<Registry>(&contents)
-                .wrap_err("vsock CID registry is invalid JSON")?,
+        let mut registry = match fs::read(&self.registry_path) {
+            Ok(contents) => {
+                let version = serde_json::from_slice::<RegistryVersion>(&contents)
+                    .wrap_err("vsock CID registry is invalid JSON")?
+                    .version;
+                if version > REGISTRY_VERSION {
+                    return Err(eyre!(
+                        "vsock CID registry is version {version}, written by a newer odorobo. \
+                         this one only supports up to version {REGISTRY_VERSION}"
+                    ));
+                }
+                if version < OLDEST_REGISTRY_VERSION {
+                    return Err(eyre!("unsupported vsock CID registry version {version}"));
+                }
+                serde_json::from_slice::<Registry>(&contents)
+                    .wrap_err("vsock CID registry is invalid JSON")?
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Registry {
                 version: REGISTRY_VERSION,
                 assignments: BTreeMap::new(),
                 process_exited: BTreeSet::new(),
                 lease_tokens: BTreeMap::new(),
+                processes: BTreeMap::new(),
             },
             Err(error) => return Err(error).wrap_err("failed to read vsock CID registry"),
         };
-        if registry.version != REGISTRY_VERSION {
-            return Err(eyre!(
-                "unsupported vsock CID registry version {}",
-                registry.version
-            ));
-        }
+        // older versions upgrade in place. the next write saves the new version
+        registry.version = REGISTRY_VERSION;
         let mut seen = HashSet::new();
         for (vmid, cid) in &registry.assignments {
             if !(FIRST_GUEST_CID..=MAX_GUEST_CID).contains(cid) {
@@ -366,11 +501,7 @@ impl VsockCidAllocator {
         Ok(registry)
     }
 
-    fn write_registry(
-        &self,
-        registry: &Registry,
-        reservation_token: Option<VsockLeaseToken>,
-    ) -> Result<()> {
+    fn write_registry(&self, registry: &Registry) -> Result<()> {
         let parent = self
             .registry_path
             .parent()
@@ -397,7 +528,7 @@ impl VsockCidAllocator {
             self.sync_registry_directory(parent)
                 .map_err(|source| PublishedRegistryUpdate {
                     source,
-                    reservation_token,
+                    reservation: None,
                 })?;
             Ok(())
         })();
@@ -552,11 +683,12 @@ mod tests {
         assert_eq!(registry.assignments.get(&vmid.to_string()), Some(&42));
         assert!(!registry.process_exited.contains(&vmid.to_string()));
         let token = published
-            .reservation_token
+            .reservation
+            .map(|reservation| reservation.token)
             .expect("published reservation carries ownership");
         assert_eq!(registry.lease_tokens.get(&vmid.to_string()), Some(&token));
 
-        // the failed write let go of its lock. A fresh allocator sees an active
+        // the failed write let go of its lock. a fresh allocator sees an active
         // lease and can only clean it up once exit is confirmed (nothing spawned)
         let reopened = VsockCidAllocator::new(allocator.registry_path);
         let error = reopened.release_stopped(vmid).unwrap_err();
@@ -579,7 +711,8 @@ mod tests {
         let token = error
             .downcast_ref::<PublishedRegistryUpdate>()
             .unwrap()
-            .reservation_token
+            .reservation
+            .map(|reservation| reservation.token)
             .expect("published replacement carries ownership");
         let registry = allocator.read_registry().unwrap();
         assert_eq!(registry.assignments.get(&vmid.to_string()), Some(&43));
@@ -757,6 +890,72 @@ mod tests {
     }
 
     #[test]
+    fn version_1_registries_upgrade_and_drop_processes_without_a_boot_id() {
+        let (allocator, directory) = allocator();
+        fs::create_dir_all(&directory).unwrap();
+        let vmid = Ulid::generate();
+        let token = VsockLeaseToken(Ulid::generate());
+        let legacy = serde_json::json!({
+            "version": 1,
+            "assignments": { vmid.to_string(): 42 },
+            "lease_tokens": { vmid.to_string(): token },
+            "processes": { vmid.to_string(): { "pid": 1, "start_time": 1 } },
+        });
+        fs::write(
+            &allocator.registry_path,
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+
+        // we can't tell which boot that process came from, so it's not used
+        assert_eq!(allocator.recorded_process(vmid).unwrap(), None);
+        assert!(!allocator.reconcile_exited(vmid).unwrap());
+
+        // the next write saves it as the current version with a boot ID
+        let process = ProcessIdentity::of(std::process::id()).unwrap();
+        allocator
+            .record_process_owned(vmid, token, process)
+            .unwrap();
+        let written: serde_json::Value =
+            serde_json::from_slice(&fs::read(&allocator.registry_path).unwrap()).unwrap();
+        assert_eq!(written["version"], REGISTRY_VERSION);
+        assert_eq!(
+            written["processes"][vmid.to_string()]["boot_id"],
+            BootId::current().unwrap().to_string()
+        );
+        assert_eq!(allocator.recorded_process(vmid).unwrap(), Some(process));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn newer_registry_versions_are_refused_with_a_clear_error() {
+        let (allocator, directory) = allocator();
+        fs::create_dir_all(&directory).unwrap();
+        let newer = serde_json::json!({
+            "version": REGISTRY_VERSION + 1,
+            "assignments": {},
+            "something_new": true,
+        });
+        fs::write(
+            &allocator.registry_path,
+            serde_json::to_vec(&newer).unwrap(),
+        )
+        .unwrap();
+        let error = allocator.leased_vms().unwrap_err().to_string();
+        assert!(error.contains("written by a newer odorobo"), "{error}");
+        // and nothing gets rewritten over it
+        drop(
+            allocator
+                .reserve_with_previous(Ulid::generate(), None)
+                .unwrap_err(),
+        );
+        let on_disk: serde_json::Value =
+            serde_json::from_slice(&fs::read(&allocator.registry_path).unwrap()).unwrap();
+        assert_eq!(on_disk, newer);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn rejects_wildcard_cid() {
         let (allocator, directory) = allocator();
         drop(
@@ -764,6 +963,99 @@ mod tests {
                 .reserve_with_previous(Ulid::generate(), Some(u32::MAX))
                 .unwrap_err(),
         );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn restarted_agent_reconciles_a_lease_only_once_its_vmm_is_gone() {
+        let (allocator, directory) = allocator();
+        let vmid = Ulid::generate();
+        let reservation = allocator.reserve_with_previous(vmid, Some(42)).unwrap();
+        let mut vmm = tokio::process::Command::new("sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let process = ProcessIdentity::of(vmm.id().unwrap()).unwrap();
+        allocator
+            .record_process_owned(vmid, reservation.token, process)
+            .unwrap();
+        assert_eq!(allocator.leased_vms().unwrap(), vec![vmid]);
+
+        // a fresh allocator has no token, like an agent after a restart
+        let restarted = VsockCidAllocator::new(allocator.registry_path.clone());
+        assert_eq!(restarted.recorded_process(vmid).unwrap(), Some(process));
+        assert!(!restarted.reconcile_exited(vmid).unwrap());
+        assert!(restarted.ensure_no_active_lease(vmid).is_err());
+
+        vmm.kill().await.unwrap();
+        assert!(restarted.reconcile_exited(vmid).unwrap());
+        restarted.ensure_no_active_lease(vmid).unwrap();
+        assert_eq!(restarted.recorded_process(vmid).unwrap(), None);
+        assert!(restarted.release_stopped(vmid).unwrap());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn lease_without_a_recorded_vmm_stays_active() {
+        let (allocator, directory) = allocator();
+        let vmid = Ulid::generate();
+        reserve(&allocator, vmid, Some(42)).unwrap();
+        assert!(!allocator.reconcile_exited(vmid).unwrap());
+        assert!(allocator.ensure_no_active_lease(vmid).is_err());
+        // nothing to reconcile when there's no lease at all
+        assert!(allocator.reconcile_exited(Ulid::generate()).unwrap());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn stale_token_cant_attach_a_process_and_new_reservations_forget_the_old_one() {
+        let (allocator, directory) = allocator();
+        let vmid = Ulid::generate();
+        let old = allocator.reserve_with_previous(vmid, Some(42)).unwrap();
+        let process = ProcessIdentity {
+            pid: std::process::id(),
+            start_time: 1,
+            boot_id: BootId::current().unwrap(),
+        };
+        allocator
+            .record_process_owned(vmid, old.token, process)
+            .unwrap();
+        allocator
+            .mark_process_exited_owned(vmid, old.token)
+            .unwrap();
+
+        let new = allocator.reserve_with_previous(vmid, None).unwrap();
+        assert_eq!(new.cid, 42);
+        assert_eq!(allocator.recorded_process(vmid).unwrap(), None);
+        assert!(
+            allocator
+                .record_process_owned(vmid, old.token, process)
+                .is_err()
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn published_reservation_error_carries_rollback_info() {
+        let (mut allocator, directory) = allocator();
+        let vmid = Ulid::generate();
+        reserve(&allocator, vmid, Some(42)).unwrap();
+        allocator.mark_process_exited(vmid).unwrap();
+        allocator.sync_fault = Some(RegistrySyncFault::Directory);
+
+        let error = allocator.reserve_with_previous(vmid, Some(43)).unwrap_err();
+        let reservation = error
+            .downcast_ref::<PublishedRegistryUpdate>()
+            .and_then(|published| published.reservation)
+            .expect("published reservation");
+        assert_eq!(reservation.cid, 43);
+
+        allocator.sync_fault = None;
+        allocator.rollback(vmid, reservation).unwrap();
+        let registry = allocator.read_registry().unwrap();
+        assert_eq!(registry.assignments.get(&vmid.to_string()), Some(&42));
+        assert!(registry.process_exited.contains(&vmid.to_string()));
         std::fs::remove_dir_all(directory).unwrap();
     }
 }

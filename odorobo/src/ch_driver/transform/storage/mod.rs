@@ -40,7 +40,7 @@ impl StorageOwnership {
 }
 
 /// keeps "we know we own this" separate from "the command did something weird".
-/// We only auto-release stuff we know we own. Anything uncertain gets quarantined
+/// we only auto-release stuff we know we own. anything uncertain gets quarantined
 /// along with its VM lease until someone fixes it up by hand
 pub struct StorageAcquisition {
     ownership: StorageOwnership,
@@ -79,7 +79,7 @@ impl StorageAcquisition {
     }
 
     /// a command that failed (or that we couldn't wait on) might've still created the
-    /// resource, or raced someone else creating it. We only drop the lease if we know
+    /// resource, or raced someone else creating it. we only drop the lease if we know
     /// for sure it's not there
     fn after_failed_command(error: Report, exists: Result<bool>) -> Result<Self> {
         match exists {
@@ -92,8 +92,8 @@ impl StorageAcquisition {
     }
 }
 
-/// a release command we spawned but don't know if it finished. The daemon/kernel
-/// side of it could still land after a retry thinks the resource is gone. This is
+/// a release command we spawned but don't know if it finished. the daemon/kernel
+/// side of it could still land after a retry thinks the resource is gone. this is
 /// on purpose separate from a command that exited nonzero (that one's retryable)
 #[derive(Debug, thiserror::Error)]
 #[error("Storage release outcome is uncertain: {0:#}")]
@@ -105,17 +105,17 @@ pub(crate) fn uncertain_release(error: Report) -> Report {
     StorageReleaseUncertain(error).into()
 }
 
-/// a storage backend. Acquiring is separate from resolving the path so we still
-/// own the resource even if finding the device fails later. If acquire returns an
-/// error, there's nothing to track. Use `StorageAcquisition::partial` when we know
+/// a storage backend. acquiring is separate from resolving the path so we still
+/// own the resource even if finding the device fails later. if acquire returns an
+/// error, there's nothing to track. use `StorageAcquisition::partial` when we know
 /// we own something but setup failed, or `uncertain` when we can't tell
 #[async_trait]
 pub trait StorageDriver: Send + Sync {
     fn scheme(&self) -> &'static str;
 
     /// normalize the connection identity before acquiring and keep it around for
-    /// release. Every alias we accept has to map to the same key, including the
-    /// key we reserved before acquiring. If the identity we discover is different,
+    /// release. every alias we accept has to map to the same key, including the
+    /// key we reserved before acquiring. if the identity we discover is different,
     /// refuse to borrow before doing anything, or return uncertain if we already did
     async fn canonical_uri(&self, uri: &Url) -> Result<Url> {
         let mut uri = uri.clone();
@@ -124,7 +124,7 @@ pub trait StorageDriver: Send + Sync {
         Ok(uri)
     }
 
-    /// identity of the thing this backend releases. Not always a single disk, like
+    /// identity of the thing this backend releases. not always a single disk, like
     /// iSCSI logout drops the whole session along with all its LUNs
     fn resource_key(&self, uri: &Url) -> Result<String> {
         Ok(uri.to_string())
@@ -135,16 +135,37 @@ pub trait StorageDriver: Send + Sync {
     /// finds a local path without acquiring anything else
     async fn resolve(&self, uri: &Url) -> Result<PathBuf>;
 
-    /// a failure that actually finished can be retried. If we spawned a command
+    /// a failure that actually finished can be retried. if we spawned a command
     /// and don't know if it finished, return `uncertain_release(error)` so a later
     /// retry that sees nothing there can't hand it out again before a late detach
     async fn release(&self, uri: &Url) -> Result<()>;
 }
 
 // wait deadlines only limit how long the caller waits, not the backend future.
-// So block_in_place/Handle::block_on callers get control back without cancelling
-// a map/logout command whose subprocess or daemon might still be doing stuff
-const OPERATION_WAIT: Duration = Duration::from_secs(30);
+// so block_in_place/Handle::block_on callers get control back without cancelling
+// a map/logout command whose subprocess or daemon might still be doing stuff.
+// it still has to cover the slowest work that can actually succeed, or a slow
+// but fine create gets reported as failed and torn down. worst cases per op:
+// - RBD resolve: `device list` + `device map` + `device list` to acquire, then
+//   the udev wait and one more `device list`. that's the most commands, 4
+// - RBD release: `device list` + `device unmap` + `device list`
+// - iSCSI: one login/logout, but each sysfs scan can do a DNS lookup (canonical
+//   lookup, pre-login check, post-login check, resolve/logout check)
+// a stuck command gets its timeout plus reap grace before we give up on it.
+// adding the RBD and iSCSI extras together over-counts a bit, which is fine
+const MAX_COMMANDS_PER_OPERATION: u32 = 4;
+const MAX_DNS_LOOKUPS_PER_OPERATION: u32 = 4;
+const OPERATION_WAIT: Duration = iscsi::command::COMMAND_TIMEOUT
+    .saturating_add(iscsi::command::REAP_TIMEOUT)
+    .saturating_mul(MAX_COMMANDS_PER_OPERATION)
+    .saturating_add(rbd::UDEV_WAIT)
+    .saturating_add(iscsi::DNS_TIMEOUT.saturating_mul(MAX_DNS_LOOKUPS_PER_OPERATION));
+
+/// the longest VM create can spend on storage while it still succeeds. each
+/// disk gets its own operation budget, one after another
+pub fn create_wait(disks: usize) -> Duration {
+    OPERATION_WAIT.saturating_mul(u32::try_from(disks).unwrap_or(u32::MAX))
+}
 
 struct Operation<T: Clone> {
     result: watch::Sender<Option<std::result::Result<T, String>>>,
@@ -211,7 +232,7 @@ struct Resource {
 struct StorageRegistry {
     resources: HashMap<String, Resource>,
     leases: HashMap<String, Vec<String>>,
-    // claim the VM before we even do the canonical lookup. Otherwise cleanup could
+    // claim the VM before we even do the canonical lookup. otherwise cleanup could
     // say it's done while a detached lookup goes on to acquire something after
     resolving: HashMap<String, Vec<Arc<Operation<PathBuf>>>>,
     cleaning: HashMap<String, Arc<Operation<()>>>,
@@ -230,17 +251,17 @@ impl StorageRegistry {
     }
 }
 
-// each VM gets its own transform chain. The registry lock is only held for quick
-// bookkeeping. The per-key operation states are what keep external work in order.
-// Spawned tasks keep going even if the waiter gets cancelled or the transformer is
-// dropped. Same as before, if the agent restarts someone has to reconcile all of
+// each VM gets its own transform chain. the registry lock is only held for quick
+// bookkeeping. the per-key operation states are what keep external work in order.
+// spawned tasks keep going even if the waiter gets cancelled or the transformer is
+// dropped. same as before, if the agent restarts someone has to reconcile all of
 // its storage by hand
 fn shared_registry() -> Arc<Mutex<StorageRegistry>> {
     static REGISTRY: OnceLock<Arc<Mutex<StorageRegistry>>> = OnceLock::new();
     Arc::clone(REGISTRY.get_or_init(Arc::default))
 }
 
-/// resolves disk URIs and only tracks resources each VM actually acquired. The URIs
+/// resolves disk URIs and only tracks resources each VM actually acquired. the URIs
 /// in the config just describe the disk, they don't mean we own anything
 pub struct StorageDriverTransformer {
     backends: Vec<Arc<dyn StorageDriver>>,
@@ -425,7 +446,7 @@ impl StorageDriverTransformer {
                         .expect("in-flight acquisition retains its resource");
                     resource.ownership = acquisition.ownership;
                     // uncertain ownership keeps its own manual recovery error.
-                    // Partial ownership we know about can be cleaned up, not shared
+                    // partial ownership we know about can be cleaned up, not shared
                     resource.state = if matches!(resource.ownership, StorageOwnership::Uncertain(_))
                     {
                         ResourceState::Ready
@@ -438,7 +459,7 @@ impl StorageDriverTransformer {
                 }
                 Err(error) => {
                     // backends only return Err when the resource definitely
-                    // isn't there. If they can't tell, they return uncertain
+                    // isn't there. if they can't tell, they return uncertain
                     ledger.resources.remove(&key);
                     ledger.remove_lease(&vmid, &key);
                     Err(error)
@@ -449,12 +470,13 @@ impl StorageDriverTransformer {
         });
     }
 
-    /// releases only this VM's leases, once we know the process exited. If the
+    /// releases only this VM's leases, once we know the process exited. if the
     /// caller is cancelled or times out, cleanup keeps running and the VM can't be
-    /// reused yet. We never release pre-existing or uncertain mappings. Failures keep
+    /// reused yet. we never release pre-existing or uncertain mappings. failures keep
     /// their leases so they can be retried, even from a fresh default transformer
     pub async fn release_vm(&self, vmid: &str) -> Result<()> {
         let mut registry = self.registry.lock().await;
+        let deadline = self.cleanup_wait(&registry, vmid);
         let operation = if let Some(operation) = registry.cleaning.get(vmid) {
             Arc::clone(operation)
         } else {
@@ -489,7 +511,19 @@ impl StorageDriverTransformer {
             operation
         };
         drop(registry);
-        operation.wait_bounded(self.operation_wait).await
+        operation.wait_bounded(deadline).await
+    }
+
+    /// cleanup goes through a VM's disks one at a time, so give it one operation
+    /// budget per step instead of squeezing every disk into one. a pending
+    /// resolve has to finish first and can add a lease of its own, so it counts
+    /// twice. joining an in-flight cleanup only has what's left to wait on
+    fn cleanup_wait(&self, registry: &StorageRegistry, vmid: &str) -> Duration {
+        let leases = registry.leases.get(vmid).map_or(0, Vec::len);
+        let pending = registry.resolving.get(vmid).map_or(0, Vec::len);
+        let steps = leases.saturating_add(pending.saturating_mul(2)).max(1);
+        self.operation_wait
+            .saturating_mul(u32::try_from(steps).unwrap_or(u32::MAX))
     }
 
     async fn release_owned(registry: Arc<Mutex<StorageRegistry>>, vmid: &str) -> Result<()> {
@@ -529,7 +563,7 @@ impl StorageDriverTransformer {
             let operation = Arc::clone(operation);
             drop(ledger);
             // the task that owns this updates the lease and refcount all at once.
-            // Since VM cleanup is serialized, this is usually just waiting on a release
+            // since VM cleanup is serialized, this is usually just waiting on a release
             return operation.wait().await;
         }
         if let Some(error) = resource.ownership.uncertainty_error(key) {
@@ -589,6 +623,68 @@ impl Default for StorageDriverTransformer {
     }
 }
 
+fn raw_uri_scheme(path: &str) -> Option<String> {
+    // the URL parser ignores these characters in parts of its input and trims
+    // leading C0 controls and spaces. we only mirror that preprocessing so we can
+    // spot malformed supported URIs. validation still uses `path` as-is.
+    // we skip trailing trimming since it can never change the scheme
+    let normalized: String = path
+        .chars()
+        .filter(|&character| !matches!(character, '\t' | '\n' | '\r'))
+        .skip_while(|&character| character <= '\u{20}')
+        .collect();
+
+    let (scheme, _) = normalized.split_once(':')?;
+    let mut characters = scheme.chars();
+    // the parser lowercases schemes, so match that to catch e.g. `RBD://`
+    (characters.next()?.is_ascii_alphabetic()
+        && characters.all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.')
+        }))
+    .then(|| scheme.to_ascii_lowercase())
+}
+
+fn parse_storage_uri(path: &str) -> Result<Option<Url>> {
+    match Url::parse(path) {
+        Ok(uri) => {
+            // check every URL the parser thinks is RBD or iSCSI against the
+            // original input. this rejects casing and parser cleanup/normalization
+            // instead of quietly mapping a fixed-up URI
+            match uri.scheme() {
+                "rbd" => {
+                    rbd::RbdImage::parse_uri(path)?;
+                }
+                "iscsi" => {
+                    iscsi::ISCSITarget::parse_uri(path)?;
+                }
+                _ => {}
+            }
+            Ok(Some(uri))
+        }
+        Err(error)
+            if raw_uri_scheme(path).as_deref() == Some("rbd")
+                || ["file://", "iscsi://"]
+                    .iter()
+                    .any(|prefix| path.starts_with(prefix)) =>
+        {
+            Err(eyre!("Invalid supported storage URI: {error}"))
+        }
+        // plain local paths like `/var/lib/disk.img` are supposed to land here
+        // and get left alone. only warn when the input looks like a URI
+        Err(error) => {
+            if let Some(scheme) = raw_uri_scheme(path) {
+                warn!(
+                    scheme,
+                    path,
+                    %error,
+                    "Disk path looks like a URI but failed to parse, leaving disk path unchanged"
+                );
+            }
+            Ok(None)
+        }
+    }
+}
+
 impl ConfigTransform for StorageDriverTransformer {
     fn teardown(&self, vmid: &str, _config: &mut VmConfig) -> Result<()> {
         tokio::task::block_in_place(|| {
@@ -605,7 +701,7 @@ impl ConfigTransform for StorageDriverTransformer {
             let Some(path) = disk.path.as_deref() else {
                 continue;
             };
-            let Ok(uri) = Url::parse(path) else {
+            let Some(uri) = parse_storage_uri(path)? else {
                 continue;
             };
             let Some(backend) = self.find_backend(&uri) else {
@@ -833,6 +929,169 @@ mod tests {
         transform
             .resolve_disk(vmid, &uri, transform.find_backend(&uri).unwrap())
             .await
+    }
+
+    #[test]
+    fn default_deadline_covers_worst_case_backend_work() {
+        let command = iscsi::command::COMMAND_TIMEOUT + iscsi::command::REAP_TIMEOUT;
+        // RBD acquire + resolve is the slowest path that can still succeed
+        assert!(OPERATION_WAIT >= command * 4 + rbd::UDEV_WAIT);
+        assert!(OPERATION_WAIT >= command + iscsi::DNS_TIMEOUT * 4);
+    }
+
+    #[test]
+    fn cleanup_deadline_scales_with_serial_steps() {
+        let transform = StorageDriverTransformer {
+            registry: Arc::default(),
+            operation_wait: Duration::from_secs(10),
+            ..StorageDriverTransformer::new()
+        };
+        let mut registry = StorageRegistry::default();
+        assert_eq!(
+            transform.cleanup_wait(&registry, "vm"),
+            Duration::from_secs(10)
+        );
+        registry
+            .leases
+            .insert("vm".to_owned(), vec!["a".to_owned(), "b".to_owned()]);
+        registry
+            .resolving
+            .insert("vm".to_owned(), vec![Operation::new()]);
+        assert_eq!(
+            transform.cleanup_wait(&registry, "vm"),
+            Duration::from_secs(40)
+        );
+        assert_eq!(
+            transform.cleanup_wait(&registry, "other"),
+            Duration::from_secs(10)
+        );
+    }
+
+    #[test]
+    fn malformed_supported_storage_uri_syntax_is_not_passed_through() {
+        for path in [
+            "rbd://[",
+            "RBD://[",
+            "file://[",
+            "rbd://pool/../other-image",
+            "rbd://pool/a/../image",
+            "rbd://pool/a/%2e%2e/image",
+            "RBD://pool/image",
+            "rBd://pool/image",
+            " rbd://pool/image",
+            "\trbd://pool/image",
+            "rbd://pool/\nimage",
+            "\u{1}rbd://pool/image",
+            "ISCSI://san/iqn.test/0",
+            "iscsi://san/iqn.other/../iqn.test/0",
+            "iscsi://san/iqn.test/1a",
+            "iscsi://san/iqn.test/0/extra",
+        ] {
+            assert!(parse_storage_uri(path).is_err(), "accepted {path:?}");
+        }
+        assert!(
+            parse_storage_uri("/var/lib/odorobo/disk.raw")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            parse_storage_uri("custom://storage/disk")
+                .unwrap()
+                .is_some()
+        );
+        assert!(parse_storage_uri("rbd://pool/image").unwrap().is_some());
+        assert!(
+            parse_storage_uri("iscsi://san/iqn.test/lun1")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            parse_storage_uri("rbd://rbd-pool_1.ssd/image")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            parse_storage_uri("rbd://UPPER/image")
+                .unwrap_err()
+                .to_string()
+                .contains("must be lowercase")
+        );
+    }
+
+    struct RbdMockStorage(Arc<StdMutex<MockState>>);
+
+    #[async_trait]
+    impl StorageDriver for RbdMockStorage {
+        fn scheme(&self) -> &'static str {
+            "rbd"
+        }
+
+        async fn acquire(&self, uri: &Url) -> Result<StorageAcquisition> {
+            self.0.lock().unwrap().acquisitions.push(uri.to_string());
+            Ok(StorageAcquisition::owned())
+        }
+
+        async fn resolve(&self, _uri: &Url) -> Result<PathBuf> {
+            Ok(PathBuf::from("/dev/fake-rbd"))
+        }
+
+        async fn release(&self, uri: &Url) -> Result<()> {
+            self.0.lock().unwrap().releases.push(uri.to_string());
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn malformed_rbd_uris_are_rejected_before_backend_or_lease_changes() {
+        let state = Arc::new(StdMutex::new(MockState::default()));
+        let mut transformer =
+            StorageDriverTransformer::new().with_backend(RbdMockStorage(Arc::clone(&state)));
+        transformer.registry = Arc::clone(&state.lock().unwrap().registry);
+
+        for (index, path) in [
+            "RBD://pool/image",
+            "rBd://pool/image",
+            " rbd://pool/image",
+            "\trbd://pool/image",
+            "rbd://pool/\nimage",
+            "\u{1}rbd://pool/image",
+            "rbd://pool/a/../image",
+            "rbd://pool/a/%2e%2e/image",
+            "RBD://[",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let vmid = format!("malformed-rbd-{index}");
+            let mut vm_config = config(&[path]);
+            let error = transformer
+                .transform(&vmid, &mut vm_config)
+                .expect_err("an invalid RBD source must fail closed");
+            assert!(error.to_string().contains("RBD") || error.to_string().contains("URI"));
+            assert_eq!(
+                vm_config.disks.as_ref().unwrap()[0].path.as_deref(),
+                Some(path)
+            );
+            assert_eq!(
+                vm_config.disks.as_ref().unwrap()[0].id.as_deref(),
+                Some("disk")
+            );
+
+            let registry = {
+                let backend_state = state.lock().unwrap();
+                assert!(
+                    backend_state.acquisitions.is_empty(),
+                    "backend acquired for {path:?}"
+                );
+                assert!(backend_state.releases.is_empty());
+                Arc::clone(&backend_state.registry)
+            };
+            let registry = registry.lock().await;
+            assert!(registry.resources.is_empty());
+            assert!(registry.leases.is_empty());
+            assert!(registry.resolving.is_empty());
+            drop(registry);
+        }
     }
 
     fn config(paths: &[&str]) -> VmConfig {
@@ -1421,7 +1680,7 @@ mod tests {
             registry.leases[&vmid].as_slice(),
             std::slice::from_ref(&uri)
         );
-        // only the test resets this key. Production never clears uncertainty
+        // only the test resets this key. production never clears uncertainty
         registry.resources.remove(&uri);
         registry.leases.remove(&vmid);
     }

@@ -13,10 +13,25 @@ use crate::manifest::VmManifest;
 
 use super::{
     CachedVMActor, SchedulerActor, VmDeleteOwner, VmDeleteTarget, VmLifecycle, VmPlacement,
+    VmTombstone, VmTombstoneState,
 };
 
-// Pending creates are given time to appear in an agent status update.
+// Pending creates are given time to appear in an agent status update once
+// the agent is done starting them. see `pending_placement_timeout`
 const UNRESOLVED_VM_CACHE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// how long a pending placement waits to show up before it's given up on and
+/// the VM gets rescheduled. a create whose reply got lost (the libp2p request
+/// times out well before a slow create finishes) is still starting on that
+/// agent, so this has to cover its whole startup or the VM ends up running twice
+pub(super) fn pending_placement_timeout(manifest: Option<&VmManifest>) -> Duration {
+    // +1 for the cloud-init seed disk, which the manifest doesn't list
+    let disks = manifest.map_or(0, |manifest| {
+        manifest.desired.storage.len().saturating_add(1)
+    });
+    crate::ch_driver::instance::startup_timeout(disks).saturating_add(UNRESOLVED_VM_CACHE_TIMEOUT)
+}
+
 // Previously observed VMs are expired promptly when repeated status updates omit them.
 const UNCONFIRMED_RUNNING_PLACEMENT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -60,6 +75,7 @@ impl SchedulerActor {
     /// the manifest remains scheduler intent, allowing periodic reconciliation to
     /// dispatch a replacement create request.
     pub(super) fn cleanup_unresolved_vm_cache(
+        manifests: &AHashMap<Ulid, VmManifest>,
         placements: &mut AHashMap<Ulid, Vec<VmPlacement>>,
         data_cache: &mut AHashMap<Ulid, Vec<CachedVMActor>>,
     ) {
@@ -76,10 +92,11 @@ impl SchedulerActor {
         let empty_vmids: Vec<_> = placements
             .iter_mut()
             .filter_map(|(vmid, entries)| {
+                let timeout = pending_placement_timeout(manifests.get(vmid));
                 entries.retain(|entry| {
                     entry.lifecycle != VmLifecycle::Pending
                         || discovered_vmids.contains(vmid)
-                        || now.duration_since(entry.created_at) < UNRESOLVED_VM_CACHE_TIMEOUT
+                        || now.duration_since(entry.created_at) < timeout
                 });
                 Self::shrink_non_migrating_entries(entries);
                 entries.is_empty().then_some(*vmid)
@@ -155,7 +172,7 @@ impl SchedulerActor {
     }
 
     /// remembers a node that might still have a VM process or stopped CID lease.
-    /// A VM dropping out of status or a placement expiring doesn't mean the CID
+    /// a VM dropping out of status or a placement expiring doesn't mean the CID
     /// was released
     pub(super) fn remember_vm_delete_owner(&mut self, vmid: Ulid, owner: VmDeleteOwner) {
         let agent = self.known_agent_refs.get(&owner).cloned();
@@ -192,10 +209,10 @@ impl SchedulerActor {
     }
 
     /// grabs every possible owner before stop/delete or eviction wipes that info.
-    /// Old per-VM owners stick around even once status stops reporting the VM
+    /// old per-VM owners stick around even once status stops reporting the VM
     pub(super) fn capture_vm_delete_owners(&mut self, vmid: Ulid) {
         if self.vm_tombstones.contains_key(&vmid) {
-            // we already captured everything. Only explicit late discovery can
+            // we already captured everything. only explicit late discovery can
             // add owners now, not stale cache/index data
             return;
         }
@@ -243,7 +260,7 @@ impl SchedulerActor {
     }
 
     /// only counts a create retry as confirmed if we recorded the agent accepting
-    /// it or discovered the actor. A pending placeholder on its own could be a
+    /// it or discovered the actor. a pending placeholder on its own could be a
     /// request where we don't know if it ever made it
     pub(super) fn create_is_confirmed(&self, vmid: Ulid) -> bool {
         self.vm_effective_manifests.contains_key(&vmid)
@@ -263,7 +280,7 @@ impl SchedulerActor {
     }
 
     /// sorts out cleanup owners after the agent explicitly rejected a create and
-    /// a lookup found no VM actor. If cleanup wasn't acked, it stays a delete
+    /// a lookup found no VM actor. if cleanup wasn't acked, it stays a delete
     /// target and blocks recreating the VM until a later delete retry works
     pub(super) fn settle_failed_create_cleanup(
         &mut self,
@@ -273,7 +290,7 @@ impl SchedulerActor {
         cleanup_confirmed: bool,
     ) {
         if !cleanup_confirmed {
-            self.vm_tombstones.insert(vmid, true);
+            self.set_vm_tombstone(vmid, VmTombstoneState::DeletePending);
             return;
         }
 
@@ -289,11 +306,11 @@ impl SchedulerActor {
         }
 
         if !self.finish_vm_delete(vmid) && self.vm_delete_targets.contains_key(&vmid) {
-            self.vm_tombstones.insert(vmid, true);
+            self.set_vm_tombstone(vmid, VmTombstoneState::DeletePending);
         }
     }
 
-    /// only marks an owner that actually acked. Failures and missing routes stay
+    /// only marks an owner that actually acked. failures and missing routes stay
     /// pending across retries, no matter what other agents reply
     pub(super) fn acknowledge_vm_delete_owner(&mut self, vmid: Ulid, owner: VmDeleteOwner) {
         if let Some(target) = self
@@ -311,7 +328,7 @@ impl SchedulerActor {
             !targets.is_empty() && targets.values().all(|target| target.confirmed)
         }) {
             self.vm_delete_targets.remove(&vmid);
-            self.vm_tombstones.insert(vmid, false);
+            self.set_vm_tombstone(vmid, VmTombstoneState::Deleted);
             true
         } else {
             false
@@ -319,11 +336,15 @@ impl SchedulerActor {
     }
 
     /// Removes VM intent and every actor-ID association so reconciliation cannot
-    /// recreate a VM after an explicit stop or delete request. We still keep
-    /// the cleanup owners around on purpose, including for shutdown's stopped CID leases
+    /// recreate a VM after an explicit stop or delete request. we still keep
+    /// the cleanup owners around on purpose, including for shutdown's stopped CID leases.
+    /// a fresh tombstone is `Stopped`, never `Deleted`, so a stopped VM's lease
+    /// is never deleted in the background. delete upgrades it afterwards
     pub(super) fn remove_vm_intent(&mut self, vmid: Ulid) {
         self.capture_vm_delete_owners(vmid);
-        self.vm_tombstones.entry(vmid).or_insert(false);
+        self.vm_tombstones
+            .entry(vmid)
+            .or_insert_with(|| VmTombstone::new(VmTombstoneState::Stopped));
         Self::remove_vm_state(
             vmid,
             &mut self.vm_manifests,
@@ -575,6 +596,7 @@ impl SchedulerActor {
         let empty_vmids: Vec<_> = placements
             .iter_mut()
             .filter_map(|(vmid, entries)| {
+                let pending_timeout = pending_placement_timeout(manifests.get(vmid));
                 entries.retain_mut(|entry| {
                     if entry.agent_id != agent_id {
                         return true;
@@ -588,7 +610,7 @@ impl SchedulerActor {
 
                     match entry.lifecycle {
                         VmLifecycle::Pending => {
-                            now.duration_since(entry.created_at) < UNRESOLVED_VM_CACHE_TIMEOUT
+                            now.duration_since(entry.created_at) < pending_timeout
                         }
                         VmLifecycle::Running => {
                             entry.last_confirmed_at.is_some_and(|last_confirmed_at| {

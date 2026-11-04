@@ -1,22 +1,23 @@
 //! Remote actor discovery, polling tasks, and their internal messages.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use kameo::prelude::*;
 use libp2p::futures::TryStreamExt;
 use stable_eyre::{Report, eyre::eyre};
-use tracing::{trace, warn};
+use tracing::{info, trace, warn};
 
 use crate::actors::agent_actor::AgentActor;
 use crate::ch_driver::actor::VMActor;
 use crate::messages::agent::{AgentStatusUpdate, GetAgentStatus, apply_status_update};
-use crate::messages::vm::{GetVMHeartbeat, GetVMInfo};
+use crate::messages::vm::{DeleteVM, DeleteVMReply, GetVMHeartbeat, GetVMInfo};
 use crate::utils::actor_names::{AGENT, VM};
 
+use super::deletion::{AUTO_DELETE_TIMEOUT, status_update_held_vmids};
 use super::{
-    AgentActorDiscovered, AgentUpdated, AgentUpdaterStopped, CachedActorKind, CachedAgentActor,
-    CachedVMActor, ReconcileVmPlacements, SchedulerActor, VmActorDiscovered, VmDeleteOwner,
-    VmUpdated, VmUpdaterStopped,
+    AgentActorDiscovered, AgentUpdated, AgentUpdaterStopped, AutoDeleteFinished, CachedActorKind,
+    CachedAgentActor, CachedVMActor, ReconcileVmPlacements, SchedulerActor, VmActorDiscovered,
+    VmDeleteOwner, VmUpdated, VmUpdaterStopped,
 };
 
 impl SchedulerActor {
@@ -263,9 +264,7 @@ impl Message<VmUpdated> for SchedulerActor {
         let vmid = msg.data.vmid;
         // if a delete is still pending, late discovery should still tell us about a
         // cleanup owner we didn't know about, but shouldn't bring back placement intent
-        if self.vm_tombstones.get(&vmid) != Some(&false)
-            || self.vm_delete_targets.contains_key(&vmid)
-        {
+        if self.should_record_delete_owner(vmid) {
             self.remember_vm_delete_owner(vmid, VmDeleteOwner::vm(msg.actor_ref.id()));
         }
         if self.vm_tombstones.contains_key(&vmid) {
@@ -276,7 +275,7 @@ impl Message<VmUpdated> for SchedulerActor {
         if let Some(manifest) = msg.data.config {
             self.vm_effective_manifests.insert(vmid, manifest.clone());
             // if we only found this manifest after the scheduler started, it's the
-            // only intent we've got. Otherwise keep the original request. Effective
+            // only intent we've got. otherwise keep the original request. effective
             // values like an agent-assigned vsock CID are node-local and shouldn't
             // turn into hard requirements during failover
             self.vm_manifests.entry(vmid).or_insert(manifest);
@@ -306,43 +305,21 @@ impl Message<VmUpdaterStopped> for SchedulerActor {
     }
 }
 
-/// Applies a newer agent update, requiring a full snapshot before accepting deltas.
-impl Message<AgentUpdated> for SchedulerActor {
-    type Reply = ();
-
-    async fn handle(&mut self, msg: AgentUpdated, _ctx: &mut Context<Self, Self::Reply>) {
-        // only accepted snapshots/additions count as owning the VM. A removal
-        // doesn't tell us anything about a stopped node-local CID lease
-        let observed = match &msg.update {
-            AgentStatusUpdate::Full { revision, status }
-                if self
-                    .agent_data_cache
-                    .get(&msg.actor_id)
-                    .is_none_or(|cached| *revision > cached.status_revision) =>
-            {
-                Some(status.vms.as_slice())
-            }
-            AgentStatusUpdate::Delta {
-                revision, added, ..
-            } if self
-                .agent_data_cache
-                .get(&msg.actor_id)
-                .is_some_and(|cached| *revision > cached.status_revision) =>
-            {
-                Some(added.as_slice())
-            }
-            AgentStatusUpdate::Full { .. } | AgentStatusUpdate::Delta { .. } => None,
+impl SchedulerActor {
+    /// applies an agent status update to the caches. returns whether it was
+    /// accepted, so callers know the cached snapshot is fresh. a same-revision
+    /// delta with no membership changes is accepted too, since it carries the
+    /// latest usage and `retained_vms` and background deletes need those to retry
+    fn apply_agent_update(&mut self, msg: AgentUpdated) -> bool {
+        let cached_revision = self
+            .agent_data_cache
+            .get(&msg.actor_id)
+            .map(|cached| cached.status_revision);
+        let Some(held) = status_update_held_vmids(&msg.update, cached_revision) else {
+            return false;
         };
-        if let Some(observed) = observed {
-            self.remember_agent_ref(&msg.actor_ref);
-            for vmid in observed {
-                if self.vm_tombstones.get(vmid) != Some(&false)
-                    || self.vm_delete_targets.contains_key(vmid)
-                {
-                    self.remember_vm_delete_owner(*vmid, VmDeleteOwner::agent(msg.actor_id));
-                }
-            }
-        }
+        self.remember_agent_ref(&msg.actor_ref);
+        self.record_status_delete_owners(msg.actor_id, held);
         let Some(cached) = self.agent_data_cache.get_mut(&msg.actor_id) else {
             if let AgentStatusUpdate::Full { revision, status } = msg.update {
                 self.agent_vm_index
@@ -363,17 +340,11 @@ impl Message<AgentUpdated> for SchedulerActor {
                         status_revision: revision,
                     },
                 );
+                return true;
             }
-            return;
+            return false;
         };
 
-        let revision = match &msg.update {
-            AgentStatusUpdate::Full { revision, .. }
-            | AgentStatusUpdate::Delta { revision, .. } => *revision,
-        };
-        if revision <= cached.status_revision {
-            return;
-        }
         if let AgentStatusUpdate::Delta { added, removed, .. } = &msg.update {
             let added = added.clone();
             let removed = removed.clone();
@@ -409,6 +380,78 @@ impl Message<AgentUpdated> for SchedulerActor {
             );
             self.invalidate_pending_resources();
         }
+        true
+    }
+
+    /// sends a background delete for every VM this agent still reports (running
+    /// or retained) that we already finished deleting, like after a force delete
+    /// skipped a node that later came back. stopped VMs are never touched. the
+    /// status handler doesn't wait on these, results come back as `AutoDeleteFinished`
+    fn spawn_auto_deletes(&mut self, scheduler: &ActorRef<Self>, agent_id: ActorId) {
+        let Some(cached) = self.agent_data_cache.get(&agent_id) else {
+            return;
+        };
+        let agent = cached.actor_ref.clone();
+        let reported: Vec<_> = cached
+            .data
+            .vms
+            .iter()
+            .chain(&cached.data.retained_vms)
+            .copied()
+            .collect();
+        // the cached snapshot is complete even after a delta, so anything it
+        // doesn't list isn't on this node anymore
+        self.forget_unreported_leftovers(agent_id, &reported.iter().copied().collect());
+        for vmid in self.take_auto_delete_vmids(agent_id, reported, Instant::now()) {
+            info!(%vmid, ?agent_id, "agent still holds a deleted VM, deleting it in the background");
+            let scheduler = scheduler.clone();
+            let agent = agent.clone();
+            let request = DeleteVM {
+                vmid,
+                force: false,
+                issued_at: Some(self.next_stamp()),
+            };
+            tokio::spawn(async move {
+                let error =
+                    match tokio::time::timeout(AUTO_DELETE_TIMEOUT, agent.ask(&request)).await {
+                        Ok(Ok(DeleteVMReply { error })) => error,
+                        Ok(Err(error)) => Some(error.to_string()),
+                        Err(_) => Some("timed out waiting for the agent".to_owned()),
+                    };
+                let send_result = scheduler
+                    .tell(AutoDeleteFinished {
+                        vmid,
+                        agent_id,
+                        error,
+                    })
+                    .send()
+                    .await;
+                if let Err(error) = send_result {
+                    warn!(?error, %vmid, "background delete could not notify scheduler");
+                }
+            });
+        }
+    }
+}
+
+/// Applies a newer agent update, requiring a full snapshot before accepting deltas.
+impl Message<AgentUpdated> for SchedulerActor {
+    type Reply = ();
+
+    async fn handle(&mut self, msg: AgentUpdated, ctx: &mut Context<Self, Self::Reply>) {
+        let agent_id = msg.actor_id;
+        if self.apply_agent_update(msg) {
+            self.spawn_auto_deletes(ctx.actor_ref(), agent_id);
+        }
+    }
+}
+
+/// clears the in-flight marker for a background delete
+impl Message<AutoDeleteFinished> for SchedulerActor {
+    type Reply = ();
+
+    async fn handle(&mut self, msg: AutoDeleteFinished, _ctx: &mut Context<Self, Self::Reply>) {
+        self.settle_auto_delete(msg.vmid, msg.agent_id, msg.error, Instant::now());
     }
 }
 
@@ -422,12 +465,18 @@ impl Message<AgentUpdaterStopped> for SchedulerActor {
     }
 }
 
-/// Performs periodic pending-placement expiry and refreshes resource accounting.
+/// Performs periodic pending-placement expiry, prunes old tombstones, and
+/// refreshes resource accounting.
 impl Message<ReconcileVmPlacements> for SchedulerActor {
     type Reply = ();
 
     async fn handle(&mut self, _msg: ReconcileVmPlacements, _ctx: &mut Context<Self, Self::Reply>) {
-        Self::cleanup_unresolved_vm_cache(&mut self.vm_placements, &mut self.vm_data_cache);
+        Self::cleanup_unresolved_vm_cache(
+            &self.vm_manifests,
+            &mut self.vm_placements,
+            &mut self.vm_data_cache,
+        );
+        self.prune_vm_tombstones(Instant::now());
         self.invalidate_pending_resources();
 
         let unplaced_vms: Vec<_> = self
@@ -442,7 +491,11 @@ impl Message<ReconcileVmPlacements> for SchedulerActor {
             .collect();
 
         for (vmid, config) in unplaced_vms {
-            let request = crate::messages::vm::CreateVM { vmid, config };
+            let request = crate::messages::vm::CreateVM {
+                vmid,
+                config,
+                generation: Some(self.next_stamp()),
+            };
             match self.schedule_agent(&request) {
                 Ok(agent) => {
                     self.remember_agent_ref(&agent);

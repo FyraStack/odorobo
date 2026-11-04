@@ -38,6 +38,27 @@ pub type ConsoleStream = std::fs::File;
 const DEFAULT_RUNTIME_ROOT_DIR: &str = "/run/odorobo";
 const RUNTIME_ROOT_ENV_VAR: &str = "ODOROBO_RUNTIME_DIR";
 
+/// how many times we ping a fresh VMM's API socket before giving up on it
+const SOCKET_ATTEMPTS: u32 = 31;
+const SOCKET_PING_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+const SOCKET_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+/// how long CH gets to create and boot a VM, on top of resolving its disks
+const CH_CREATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// how long creating a VM with this many disks can take once the VMM is up
+pub fn create_timeout(disks: usize) -> std::time::Duration {
+    CH_CREATE_TIMEOUT.saturating_add(super::transform::storage::create_wait(disks))
+}
+
+/// the longest [`VMInstance::spawn`] can take for a VM with this many disks,
+/// from spawning the VMM to a booted VM
+pub fn startup_timeout(disks: usize) -> std::time::Duration {
+    SOCKET_PING_TIMEOUT
+        .saturating_add(SOCKET_RETRY_DELAY)
+        .saturating_mul(SOCKET_ATTEMPTS)
+        .saturating_add(create_timeout(disks))
+}
+
 pub struct VMInstance {
     pub id: String,
     pub ch_socket_path: PathBuf,
@@ -387,16 +408,21 @@ impl VMInstance {
 
     /// Spawn a Cloud Hypervisor process and optionally create/boot its VM.
     ///
+    /// see [`startup_timeout`] for how long this can take at most
+    ///
     /// `vm_config` is already translated by the CH manifest boundary. The
     /// separate `boot` flag preserves the manifest's desired start behavior;
     /// callers can create a stopped VM without changing its provider config.
     /// The socket is polled for up to roughly 30 seconds before failing.
+    /// `on_spawned` gets the VMM's PID as soon as the process exists, before
+    /// any of that waiting, so callers can record it in case we die mid-startup
     #[tracing::instrument(skip_all)]
-    pub async fn spawn(
+    pub async fn spawn<F: FnOnce(Option<u32>)>(
         id: &str,
         vm_config: Option<VmConfig>,
         boot: bool,
         transformer: Option<TransformChain>,
+        on_spawned: F,
     ) -> Result<Self> {
         let ch_socket_path = Self::runtime_dir_for(id).join(SOCKET_FILE_NAME);
         info!(?ch_socket_path, "Spawning VM");
@@ -409,24 +435,24 @@ impl VMInstance {
             .arg(&ch_socket_path)
             .kill_on_drop(true)
             .spawn()?;
+        on_spawned(ch_process.id());
         let mut instance = Self::new(id, ch_socket_path, transformer, Some(ch_process));
 
-        const MAX_ATTEMPTS: u32 = 31;
-        for attempt in 0..MAX_ATTEMPTS {
+        for attempt in 0..SOCKET_ATTEMPTS {
             info!(vm_id = id, attempt, "Checking if CH socket is available");
             if matches!(
-                tokio::time::timeout(
-                    std::time::Duration::from_millis(500),
-                    instance.conn().vmm_ping_get()
-                )
-                .await,
+                tokio::time::timeout(SOCKET_PING_TIMEOUT, instance.conn().vmm_ping_get()).await,
                 Ok(Ok(_))
             ) {
                 info!(vm_id = id, "CH socket available");
                 if let Some(vm_config) = vm_config {
                     info!(boot, ?vm_config, "Creating VM config");
+                    // storage resolves inside create_config, so the timeout has
+                    // to cover every disk's budget, or a slow but working map
+                    // gets torn down as a failed create
+                    let disks = vm_config.disks.as_ref().map_or(0, Vec::len);
                     let create_result = tokio::time::timeout(
-                        std::time::Duration::from_secs(60),
+                        create_timeout(disks),
                         instance.create_config(vm_config, boot),
                     )
                     .await
@@ -441,15 +467,15 @@ impl VMInstance {
                 return Ok(instance);
             }
 
-            if attempt < MAX_ATTEMPTS - 1 {
-                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            if attempt < SOCKET_ATTEMPTS - 1 {
+                tokio::time::sleep(SOCKET_RETRY_DELAY).await;
             }
         }
 
         Err(startup_failure_error(
             eyre!(
                 "CH socket not available after {} attempts for VM {}",
-                MAX_ATTEMPTS,
+                SOCKET_ATTEMPTS,
                 id
             ),
             instance.cleanup_failed_start().await,
@@ -555,7 +581,7 @@ impl VMInstance {
 
     fn purge_instance_data_at(&mut self, runtime_dir: &Path) -> Result<()> {
         // keep the original config and runtime files until all cleanup succeeds.
-        // A failed teardown might still need its disk IDs/paths on a later retry
+        // a failed teardown might still need its disk IDs/paths on a later retry
         let mut vm_config = self.vm_config.clone().unwrap_or_default();
         self.transformer.teardown(self.vm_id(), &mut vm_config)?;
         remove_runtime_directory(runtime_dir, self.vm_id())?;
@@ -704,7 +730,7 @@ fn startup_failure_error(startup_error: Report, cleanup_result: Result<()>) -> R
 
 fn remove_runtime_directory(runtime_dir: &Path, vmid: &str) -> Result<()> {
     // don't use exists(), a metadata error there would turn failed credential
-    // cleanup into success. Only an already-missing directory is fine
+    // cleanup into success. only an already-missing directory is fine
     match fs::remove_dir_all(runtime_dir) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),

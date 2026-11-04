@@ -112,7 +112,7 @@ impl VmManifest {
     }
 }
 
-/// compares create intent while ignoring node-local observed values. Leaving out
+/// compares create intent while ignoring node-local observed values. leaving out
 /// the desired CID means "allocate one for me", which isn't the same as an explicit CID
 #[must_use]
 pub fn same_create_intent(existing: &VmManifest, requested: &VmManifest) -> bool {
@@ -380,7 +380,7 @@ pub struct CloudInit {
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Vsock {
-    /// optional guest CID. If it's left out, the agent picks one and saves it
+    /// optional guest CID. if it's left out, the agent picks one and saves it
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guest_cid: Option<u32>,
     pub socket: String,
@@ -402,7 +402,7 @@ pub struct ObservedState {
     /// Actionable failure detail when the observed status is `error`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// the node-local guest CID vsock is actually using. It's reported for runtime
+    /// the node-local guest CID vsock is actually using. it's reported for runtime
     /// inspection and migration, but it isn't a hard placement requirement
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vsock_guest_cid: Option<u32>,

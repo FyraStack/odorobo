@@ -52,8 +52,25 @@ reservations from failed startup attempts are rolled back only after confirmed
 process exit. An active lease cannot be reused—even for the same VM ID—until
 exit is confirmed. Every reservation has a distinct persisted lease token;
 startup rollback, exit recording, and deletion retries use that token so one
-incarnation cannot release a newer incarnation's lease. After an unclean agent/host failure, stale active leases may
-need manual recovery rather than assuming the old VMM is gone. A requested CID is
+incarnation cannot release a newer incarnation's lease.
+
+On SIGTERM/SIGINT the agent stops its VMs before exiting (waiting up to 60
+seconds), so each VMM is reaped and its lease is marked stopped. A second
+signal exits immediately. The shipped systemd unit uses `KillMode=mixed` so
+only the agent gets the SIGTERM (the VMMs run in its cgroup), and a 90 second
+`TimeoutStopSec` so systemd doesn't SIGKILL it mid-shutdown. If you write your
+own unit, keep both. The single-instance lockfile (`/var/lock/odorobo.lock`) is
+an flock, so an agent that was killed outright doesn't block the next start.
+
+The registry also records each lease's VMM process by PID, kernel start time,
+and boot ID, so a process from before a reboot is never mistaken for a new one.
+After an unclean agent exit, a restarted agent treats a lease as stopped once
+that exact process is gone, meaning every one of its threads has exited. An explicit delete
+of a VM whose VMM is still running with no actor left (for example after the
+agent was killed) SIGKILLs that exact process before releasing its lease and
+runtime files. A lease that never had its process recorded (the agent died
+between reserving the CID and spawning the VMM, or recording failed) still
+needs manual recovery. A requested CID is
 reserved if free; a conflict fails VM creation rather than silently assigning
 a different CID. `GetVMInfo` returns the effective VM manifest, including the
 allocated CID in `observed.vsock_guest_cid` and the desired socket path;
@@ -69,9 +86,27 @@ a host need distinct key paths.
 
 Deletion is acknowledged only after the known VM-owning agents confirm process
 exit and node-local cleanup. Missing owners keep deletion pending; retry after
-those agents become reachable. Cleanup ownership survives discovery-cache
-eviction in scheduler memory, but is not a durable cluster inventory across
-scheduler restarts. Keep node identities stable when recovering failed agents.
+those agents become reachable, or delete with `?force=true` to drop owners whose
+agent can't be reached at all (an agent that answers with an error, or that
+might have gotten the request but timed out, still fails the delete). Every
+create and delete the scheduler sends carries a time-ordered stamp, so a delete
+that arrives after its VM ID was recreated is acked without touching the new
+VM. Cleanup ownership survives discovery-cache eviction in scheduler
+memory, and after a scheduler restart it is rebuilt from agent status: each
+agent reports running VMs and `retained_vms` (IDs that still hold node-local
+state, like a stopped CID lease). An agent that was unreachable since the
+restart can't be known as an owner, so keep node identities stable when
+recovering failed agents.
+
+If an agent reports a VM the scheduler already finished deleting (like a node
+skipped by a forced delete coming back), the scheduler deletes it there in the
+background. Stopped VMs are never cleaned up this way. Until that node acks a
+delete or reports a full status without the VM, the ID can't be recreated, since
+the old copy could still be running on the same storage. Use a new VM ID if the
+node isn't coming back. Stop/delete tombstones are kept in scheduler memory
+only: stopped ones for an hour, deleted ones for a day (longer while a node
+might still hold the VM), and pending deletes until they finish. A scheduler
+restart forgets all of this.
 
 Storage teardown releases only resources acquired by Odorobo. Shared mappings
 are reference-counted within the agent process; pre-existing external mappings

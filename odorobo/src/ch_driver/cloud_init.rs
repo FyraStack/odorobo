@@ -25,7 +25,7 @@ static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
 /// create a FAT seed disk (attachable read-only) that `NoCloud` picks up as CIDATA
 ///
 /// the image lives in the VM runtime directory, which gets removed on VM teardown.
-/// The file is private on the host since user/vendor-data might have credentials
+/// the file is private on the host since user/vendor-data might have credentials
 pub fn create_seed_image(runtime_dir: &Path, cloud_init: &CloudInit) -> Result<PathBuf> {
     create_seed_image_with_io(runtime_dir, cloud_init, std::convert::identity)
 }
