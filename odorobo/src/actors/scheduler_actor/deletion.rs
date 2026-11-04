@@ -10,7 +10,7 @@ use kameo::prelude::*;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::messages::agent::AgentStatusUpdate;
+use crate::messages::agent::{AgentStatus, AgentStatusUpdate};
 
 use super::{AutoDeleteState, SchedulerActor, VmDeleteOwner, VmTombstone, VmTombstoneState};
 
@@ -197,6 +197,29 @@ pub(super) fn status_update_held_vmids(
         }
         AgentStatusUpdate::Full { .. } | AgentStatusUpdate::Delta { .. } => None,
     }
+}
+
+/// refuses a create for a VM ID some agent says it's running. that's a VM we
+/// haven't discovered yet (right after a scheduler restart) or one whose exit
+/// couldn't be confirmed. scheduling it somewhere else would run two copies on
+/// the same storage. a retained stopped lease is fine, that's how a stopped VM
+/// gets started again
+pub(super) fn check_not_running_elsewhere<'a, I>(vmid: Ulid, agents: I) -> Result<(), String>
+where
+    I: IntoIterator<Item = (ActorId, &'a AgentStatus)>,
+{
+    let reporting: Vec<_> = agents
+        .into_iter()
+        .filter(|(_, status)| status.vms.contains(&vmid))
+        .map(|(agent_id, _)| agent_id)
+        .collect();
+    if reporting.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "agent(s) {reporting:?} still report a running VM with this ID that the scheduler \
+         hasn't discovered; retry shortly, or delete it before recreating"
+    ))
 }
 
 impl SchedulerActor {
@@ -401,6 +424,17 @@ impl SchedulerActor {
             }
             !owners.is_empty()
         });
+    }
+
+    /// refuses a create for a VM ID some agent says it's running when we have
+    /// no intent for it. see [`check_not_running_elsewhere`]
+    pub(super) fn check_not_running_elsewhere(&self, vmid: Ulid) -> Result<(), String> {
+        check_not_running_elsewhere(
+            vmid,
+            self.agent_data_cache
+                .iter()
+                .map(|(agent_id, agent)| (*agent_id, &agent.data)),
+        )
     }
 
     /// refuses to recreate a VM ID while something from its last life could

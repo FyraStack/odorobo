@@ -471,7 +471,11 @@ impl Message<ReconcileVmPlacements> for SchedulerActor {
     type Reply = ();
 
     async fn handle(&mut self, _msg: ReconcileVmPlacements, _ctx: &mut Context<Self, Self::Reply>) {
-        Self::cleanup_unresolved_vm_cache(&mut self.vm_placements, &mut self.vm_data_cache);
+        Self::cleanup_unresolved_vm_cache(
+            &self.vm_manifests,
+            &mut self.vm_placements,
+            &mut self.vm_data_cache,
+        );
         self.prune_vm_tombstones(Instant::now());
         self.invalidate_pending_resources();
 

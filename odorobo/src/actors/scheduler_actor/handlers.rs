@@ -142,6 +142,10 @@ impl Message<CreateVM> for SchedulerActor {
             });
         }
 
+        // only for IDs we have no intent for. a known VM showing up in agent
+        // status is just that VM, and the retry handling above covers it
+        self.check_not_running_elsewhere(msg.vmid)
+            .map_err(|error| eyre!(error))?;
         let target_agent = self.schedule_agent(&msg)?;
 
         self.remember_agent_ref(&target_agent);

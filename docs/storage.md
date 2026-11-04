@@ -143,7 +143,12 @@ seconds plus a 2-second reap grace, and one disk resolution can run up to four
 of them (RBD `device list`, `device map`, `device list`, then another
 `device list` after up to 10 seconds of waiting for the udev path), plus up to
 four 5-second iSCSI DNS lookups. That gives a per-operation budget of about
-158 seconds. VM create applies it to each disk separately. VM delete releases
+158 seconds. VM create applies it to each disk separately, and Cloud
+Hypervisor's create timeout is 60 seconds on top of every disk's budget, so a
+slow but working map isn't torn down as a failed create. The scheduler keeps a
+pending placement for the VM's whole worst-case startup plus two minutes
+before rescheduling it, since the create request itself times out after 120
+seconds while the agent is still starting the VM. VM delete releases
 disks one after another, so its deadline is one budget per lease (and two per
 still-pending resolution, which must finish and may add a lease).
 

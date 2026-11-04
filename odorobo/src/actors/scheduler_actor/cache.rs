@@ -16,8 +16,22 @@ use super::{
     VmTombstone, VmTombstoneState,
 };
 
-// Pending creates are given time to appear in an agent status update.
+// Pending creates are given time to appear in an agent status update once
+// the agent is done starting them. see `pending_placement_timeout`
 const UNRESOLVED_VM_CACHE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// how long a pending placement waits to show up before it's given up on and
+/// the VM gets rescheduled. a create whose reply got lost (the libp2p request
+/// times out well before a slow create finishes) is still starting on that
+/// agent, so this has to cover its whole startup or the VM ends up running twice
+pub(super) fn pending_placement_timeout(manifest: Option<&VmManifest>) -> Duration {
+    // +1 for the cloud-init seed disk, which the manifest doesn't list
+    let disks = manifest.map_or(0, |manifest| {
+        manifest.desired.storage.len().saturating_add(1)
+    });
+    crate::ch_driver::instance::startup_timeout(disks).saturating_add(UNRESOLVED_VM_CACHE_TIMEOUT)
+}
+
 // Previously observed VMs are expired promptly when repeated status updates omit them.
 const UNCONFIRMED_RUNNING_PLACEMENT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -61,6 +75,7 @@ impl SchedulerActor {
     /// the manifest remains scheduler intent, allowing periodic reconciliation to
     /// dispatch a replacement create request.
     pub(super) fn cleanup_unresolved_vm_cache(
+        manifests: &AHashMap<Ulid, VmManifest>,
         placements: &mut AHashMap<Ulid, Vec<VmPlacement>>,
         data_cache: &mut AHashMap<Ulid, Vec<CachedVMActor>>,
     ) {
@@ -77,10 +92,11 @@ impl SchedulerActor {
         let empty_vmids: Vec<_> = placements
             .iter_mut()
             .filter_map(|(vmid, entries)| {
+                let timeout = pending_placement_timeout(manifests.get(vmid));
                 entries.retain(|entry| {
                     entry.lifecycle != VmLifecycle::Pending
                         || discovered_vmids.contains(vmid)
-                        || now.duration_since(entry.created_at) < UNRESOLVED_VM_CACHE_TIMEOUT
+                        || now.duration_since(entry.created_at) < timeout
                 });
                 Self::shrink_non_migrating_entries(entries);
                 entries.is_empty().then_some(*vmid)
@@ -580,6 +596,7 @@ impl SchedulerActor {
         let empty_vmids: Vec<_> = placements
             .iter_mut()
             .filter_map(|(vmid, entries)| {
+                let pending_timeout = pending_placement_timeout(manifests.get(vmid));
                 entries.retain_mut(|entry| {
                     if entry.agent_id != agent_id {
                         return true;
@@ -593,7 +610,7 @@ impl SchedulerActor {
 
                     match entry.lifecycle {
                         VmLifecycle::Pending => {
-                            now.duration_since(entry.created_at) < UNRESOLVED_VM_CACHE_TIMEOUT
+                            now.duration_since(entry.created_at) < pending_timeout
                         }
                         VmLifecycle::Running => {
                             entry.last_confirmed_at.is_some_and(|last_confirmed_at| {

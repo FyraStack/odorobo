@@ -161,6 +161,12 @@ const OPERATION_WAIT: Duration = iscsi::command::COMMAND_TIMEOUT
     .saturating_add(rbd::UDEV_WAIT)
     .saturating_add(iscsi::DNS_TIMEOUT.saturating_mul(MAX_DNS_LOOKUPS_PER_OPERATION));
 
+/// the longest VM create can spend on storage while it still succeeds. each
+/// disk gets its own operation budget, one after another
+pub fn create_wait(disks: usize) -> Duration {
+    OPERATION_WAIT.saturating_mul(u32::try_from(disks).unwrap_or(u32::MAX))
+}
+
 struct Operation<T: Clone> {
     result: watch::Sender<Option<std::result::Result<T, String>>>,
 }

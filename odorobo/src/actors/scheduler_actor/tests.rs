@@ -58,16 +58,17 @@ fn expires_unresolved_vm_placeholder_but_retains_vm_intent() {
         vec![VmPlacement {
             agent_id,
             lifecycle: VmLifecycle::Pending,
-            created_at: Instant::now()
-                .checked_sub(Duration::from_secs(121))
-                .expect("test timestamp should be representable"),
+            created_at: ago(
+                super::cache::pending_placement_timeout(Some(&test_manifest(1, 1)))
+                    .saturating_add(Duration::from_secs(1)),
+            ),
             last_confirmed_at: None,
         }],
     );
     let manifests = AHashMap::from([(vmid, test_manifest(1, 1))]);
     let mut data_cache: AHashMap<Ulid, Vec<CachedVMActor>> = AHashMap::new();
 
-    SchedulerActor::cleanup_unresolved_vm_cache(&mut placements, &mut data_cache);
+    SchedulerActor::cleanup_unresolved_vm_cache(&manifests, &mut placements, &mut data_cache);
 
     assert!(manifests.contains_key(&vmid));
     assert!(placements[&vmid].is_empty());
@@ -1611,4 +1612,64 @@ fn stamps_always_move_forward() {
     scheduler.last_stamp = Ulid::from_parts(u64::MAX >> 16, 0);
     let after_clock_skew = scheduler.next_stamp();
     assert!(after_clock_skew > Ulid::from_parts(u64::MAX >> 16, 0));
+}
+
+#[test]
+fn create_is_refused_while_an_agent_runs_an_undiscovered_copy() {
+    use super::deletion::check_not_running_elsewhere;
+
+    let vmid = Ulid::generate();
+    let running_here = status_with(vec![vmid], Vec::new());
+    let stopped_here = status_with(Vec::new(), vec![vmid]);
+    let unrelated = status_with(vec![Ulid::generate()], Vec::new());
+
+    // say right after a scheduler restart, before VM discovery found it
+    let error = check_not_running_elsewhere(
+        vmid,
+        [
+            (super::ActorId::new(1), &unrelated),
+            (super::ActorId::new(2), &running_here),
+        ],
+    )
+    .unwrap_err();
+    assert!(error.contains("still report a running VM"), "{error}");
+
+    // a stopped VM's retained lease doesn't block starting it again
+    assert_eq!(
+        check_not_running_elsewhere(
+            vmid,
+            [
+                (super::ActorId::new(1), &unrelated),
+                (super::ActorId::new(2), &stopped_here),
+            ],
+        ),
+        Ok(())
+    );
+}
+
+#[test]
+fn pending_placement_outlives_a_slow_but_successful_startup() {
+    use super::cache::pending_placement_timeout;
+    use crate::ch_driver::instance::startup_timeout;
+
+    let with_disks = |count: usize| {
+        let mut manifest = test_manifest(1, 1);
+        manifest.desired.storage = (0..count)
+            .map(|index| crate::manifest::Storage {
+                id: format!("disk{index}"),
+                uri: Some(format!("rbd://pool/image{index}")),
+                volume_id: None,
+                read_only: false,
+            })
+            .collect();
+        manifest
+    };
+    let one_disk = with_disks(1);
+    let three_disks = with_disks(3);
+    let disks = |manifest: &crate::manifest::VmManifest| manifest.desired.storage.len() + 1;
+
+    assert!(pending_placement_timeout(Some(&one_disk)) > startup_timeout(disks(&one_disk)));
+    assert!(pending_placement_timeout(Some(&three_disks)) > startup_timeout(disks(&three_disks)));
+    // the scheduler's request timeout can't be what decides this
+    assert!(pending_placement_timeout(Some(&one_disk)) > Duration::from_secs(120));
 }
