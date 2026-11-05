@@ -211,9 +211,7 @@ impl VMInstance {
 
         let receiver_uri = format!("tcp:0.0.0.0:{rand_port}");
 
-        let receive_migration_data = models::ReceiveMigrationData {
-            receiver_url: receiver_uri.clone(),
-        };
+        let receive_migration_data = models::ReceiveMigrationData::new(receiver_uri.clone());
 
         let vm_id = self.vm_id().to_owned();
         info!(

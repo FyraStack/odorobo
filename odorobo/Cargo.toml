@@ -62,7 +62,7 @@ aide = { version = "0.16.0-alpha.4", features = [
 schemars = "1.2"
 
 
-cloud-hypervisor-client = { git = "https://github.com/FyraStack/cloud-hypervisor-client.git" }
+cloud-hypervisor-client = { git = "https://github.com/FyraStack/cloud-hypervisor-client.git", rev = "7d6e0c90c3c7fa401afded127c6fad163be6884c" }
 signal-hook = "0.4.4"
 
 [target.'cfg(target_os = "linux")'.dependencies]

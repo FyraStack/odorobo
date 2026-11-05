@@ -1,4 +1,4 @@
-use cloud_hypervisor_client::models::{ConsoleConfig, VmConfig};
+use cloud_hypervisor_client::models::{ConsoleConfig, SerialConfig, VmConfig};
 use stable_eyre::Result;
 use tracing::trace;
 
@@ -18,7 +18,7 @@ impl ConfigTransform for ConsoleTransform {
             mode: cloud_hypervisor_client::models::ConsoleMode::Off,
             ..Default::default()
         });
-        config.serial = Some(ConsoleConfig {
+        config.serial = Some(SerialConfig {
             mode: cloud_hypervisor_client::models::ConsoleMode::Socket,
             // file: Some(format!("{}/serial", runtime_path.display())),
             socket: Some(format!("{}/console.sock", runtime_path.display())),
