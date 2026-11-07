@@ -6,11 +6,18 @@ RUN dnf do -y --action=install \
     clang-devel \
     cloud-hypervisor-nightly \
     cmake \
+    composefs \
+    e2fsprogs \
+    fsverity-utils \
     git \
     libvirt-devel \
     ninja \
+    openssl-devel \
     rust \
     rustup \
+    skopeo \
+    util-linux \
+    virtiofsd \
     zig
 
 WORKDIR /workspace

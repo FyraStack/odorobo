@@ -5,6 +5,7 @@
 
 pub mod actor;
 pub mod api;
+pub mod containers;
 pub mod devices;
 pub mod instance;
 pub mod manifest;

@@ -5,11 +5,12 @@
 //! from manifest intent.
 
 use cloud_hypervisor_client::models::{
-    CpusConfig, DiskConfig, ImageType, MemoryConfig, NetConfig, PayloadConfig, PlatformConfig,
-    VmConfig, VsockConfig,
+    CpusConfig, DiskConfig, FsConfig, ImageType, MemoryConfig, NetConfig, PayloadConfig,
+    PlatformConfig, VmConfig, VsockConfig,
 };
 use stable_eyre::{Result, eyre::eyre};
 
+use crate::ch_driver::containers;
 use crate::manifest::{Storage, VmManifest};
 
 /// Convert a validated Odorobo manifest to a Cloud Hypervisor configuration.
@@ -58,6 +59,50 @@ pub fn to_vm_config(manifest: &VmManifest) -> Result<VmConfig> {
         ..Default::default()
     });
 
+    // Container rootfs: the agent serves a digest-pinned composefs layer
+    // stack of the OCI image over virtiofs (see containers.rs). The fs device's
+    // socket lives in the VM runtime dir, where containers::mount_rootfs and the
+    // actor's virtiofsd supervisor put it. A second share carries the image's
+    // OCI config document for the guest init. vhost-user requires shared guest
+    // memory, so rootfs VMs always boot with memory shared=on. Boot defaults
+    // to the tiny microvm kernel + initramfs unless the manifest overrides
+    // them; the init mounts the virtiofs root itself.
+    let has_rootfs = desired.rootfs.is_some();
+    let fs = has_rootfs.then(|| {
+        let socket = containers::socket_path_for(&manifest.id.to_string());
+        let mut rootfs = FsConfig::new(
+            containers::ROOTFS_TAG.to_owned(),
+            socket.display().to_string(),
+            1,
+            1024,
+        );
+        rootfs.id = Some("odorobo-rootfs".to_owned());
+        let config_socket = containers::config_socket_path_for(&manifest.id.to_string());
+        let mut config = FsConfig::new(
+            containers::CONFIG_TAG.to_owned(),
+            config_socket.display().to_string(),
+            1,
+            1024,
+        );
+        config.id = Some("odorobo-config".to_owned());
+        vec![rootfs, config]
+    });
+    let kernel = desired
+        .boot
+        .kernel
+        .clone()
+        .or_else(|| has_rootfs.then(|| containers::MICROVM_KERNEL_PATH.to_owned()));
+    let initramfs = desired
+        .boot
+        .initramfs
+        .clone()
+        .or_else(|| has_rootfs.then(|| containers::MICROVM_INITRAMFS_PATH.to_owned()));
+    let cmdline = desired
+        .boot
+        .cmdline
+        .clone()
+        .or_else(|| has_rootfs.then(|| containers::DEFAULT_ROOTFS_CMDLINE.to_owned()));
+
     Ok(VmConfig {
         cpus: Some(CpusConfig {
             boot_vcpus: i32::try_from(desired.compute.vcpus)
@@ -69,6 +114,7 @@ pub fn to_vm_config(manifest: &VmManifest) -> Result<VmConfig> {
         memory: Some(MemoryConfig {
             size: i64::try_from(desired.compute.memory_bytes)
                 .map_err(|_| eyre!("memory size exceeds Cloud Hypervisor limits"))?,
+            shared: has_rootfs.then_some(true),
             ..Default::default()
         }),
         payload: PayloadConfig {
@@ -78,19 +124,21 @@ pub fn to_vm_config(manifest: &VmManifest) -> Result<VmConfig> {
                 // firmware, or Cloud Hypervisor rejects the config with
                 // "Specifying a kernel is not supported when a firmware is
                 // provided".
-                if desired.boot.kernel.is_some() {
+                if kernel.is_some() {
                     None
                 } else {
                     Some("/var/lib/odorobo/CLOUDHV.fd".to_owned())
                 }
             }),
-            kernel: desired.boot.kernel.clone(),
-            cmdline: desired.boot.cmdline.clone(),
+            kernel,
+            initramfs,
+            cmdline,
             ..Default::default()
         },
         disks: (!disks.is_empty()).then_some(disks),
         net: (!networks.is_empty()).then_some(networks),
         vsock,
+        fs,
         platform: Some(PlatformConfig {
             serial_number: Some("ds=nocloud".to_owned()),
             ..Default::default()
@@ -198,11 +246,88 @@ mod tests {
     }
 
     #[test]
+    fn converts_rootfs_to_fs_shared_memory_and_direct_kernel_boot() {
+        let mut manifest = minimal();
+        manifest.desired.rootfs = Some(crate::manifest::Rootfs {
+            oci: "docker://busybox:latest".to_owned(),
+            mode: crate::manifest::RootfsMode::ReadOnly,
+        });
+        let config = to_vm_config(&manifest).expect("rootfs manifest converts");
+
+        // fs devices: rootfs + config, both sockets in the runtime dir
+        let fs = config.fs.as_ref().expect("fs device for rootfs");
+        assert_eq!(fs.len(), 2);
+        assert_eq!(fs[0].tag, "rootfs");
+        assert_eq!(
+            fs[0].socket,
+            format!("/run/odorobo/vms/{}/rootfs.sock", manifest.id)
+        );
+        assert_eq!(fs[0].num_queues, 1);
+        assert_eq!(fs[1].tag, "odorobo-config");
+        assert_eq!(
+            fs[1].socket,
+            format!("/run/odorobo/vms/{}/odorobo-config.sock", manifest.id)
+        );
+
+        // vhost-user requires shared guest memory
+        assert_eq!(config.memory.expect("memory").shared, Some(true));
+
+        // direct kernel boot defaults (tiny microvm kernel + PID 1 initramfs)
+        assert_eq!(
+            config.payload.kernel.as_deref(),
+            Some(super::containers::MICROVM_KERNEL_PATH)
+        );
+        assert_eq!(
+            config.payload.initramfs.as_deref(),
+            Some(super::containers::MICROVM_INITRAMFS_PATH)
+        );
+        assert_eq!(
+            config.payload.cmdline.as_deref(),
+            Some(super::containers::DEFAULT_ROOTFS_CMDLINE)
+        );
+        assert_eq!(config.payload.firmware, None);
+    }
+
+    #[test]
+    fn rootfs_boot_overrides_win() {
+        let mut manifest = minimal();
+        manifest.desired.rootfs = Some(crate::manifest::Rootfs {
+            oci: "docker://busybox:latest".to_owned(),
+            mode: crate::manifest::RootfsMode::Ephemeral,
+        });
+        manifest.desired.boot.kernel = Some("/custom/vmlinux".to_owned());
+        manifest.desired.boot.initramfs = Some("/custom/initramfs.img".to_owned());
+        manifest.desired.boot.cmdline = Some("console=hvc0 quiet".to_owned());
+        let config = to_vm_config(&manifest).expect("rootfs manifest converts");
+        assert_eq!(config.payload.kernel.as_deref(), Some("/custom/vmlinux"));
+        assert_eq!(
+            config.payload.initramfs.as_deref(),
+            Some("/custom/initramfs.img")
+        );
+        assert_eq!(
+            config.payload.cmdline.as_deref(),
+            Some("console=hvc0 quiet")
+        );
+    }
+
+    #[test]
+    fn non_rootfs_vms_have_no_fs_device_and_keep_firmware_default() {
+        let config = to_vm_config(&minimal()).expect("minimal converts");
+        assert!(config.fs.is_none());
+        assert_eq!(config.memory.expect("memory").shared, None);
+        assert_eq!(
+            config.payload.firmware.as_deref(),
+            Some("/var/lib/odorobo/CLOUDHV.fd")
+        );
+    }
+
+    #[test]
     fn converts_networks_for_the_transform_pipeline() {
         let mut manifest = minimal();
         manifest.desired.networks.push(crate::manifest::Network {
             id: "private".to_owned(),
             mac_address: Some("02:00:00:00:00:01".to_owned()),
+            ports: Vec::new(),
         });
         let config = to_vm_config(&manifest).expect("network manifest converts");
         let network = &config.net.expect("network config")[0];
