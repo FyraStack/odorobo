@@ -11,7 +11,10 @@ The guest sees an ordinary virtiofs root and does not need composefs support.
 - **Immutable base:** cache OCI layers locally by digest, compose each unique layer as a read-only, fs-verity-protected composefs image, and stack the layers with OverlayFS. Do not retain a separate flattened rootfs per image.
 - **Write modes:** `read_only` allows only bounded VM-private scratch; `ephemeral` is a fully writable per-VM overlay removed at stop and is the default; `persistent` retains a per-VM writable upper across stop/restart.
 - **Storage:** OCI/layer caches stay node-local. Persistent state supports a local backend for development and testing, and an RBD backend for cross-node cold restart. Live migration remains unsupported.
-- **Reference aliases:** each normalized OCI source string gets a cached layout alias. Mutable tags are not refreshed automatically; persistent state separately pins the selected manifest digest.
+- **Reference aliases:** each OCI source string, exactly as written in the manifest, gets a cached layout alias. `fedora:latest` and `docker://registry.fedoraproject.org/fedora:latest` are separate aliases that share layer caches. Mutable tags are not refreshed automatically; persistent state separately pins the selected manifest digest.
+- **No cleanup:** nothing evicts cached blobs or layers. Disk use only grows until an operator removes content that no mounted or persistent VM needs.
+- **Init:** the guest runs the image's own init (or `init=` from `boot.cmdline`). The image's `ENTRYPOINT`/`CMD` are not used. See [Guest boot and init](#guest-boot-and-init).
+- **Prerequisites:** the node needs the microVM kernel built by `scripts/build-microvm-kernel.sh`, plus `skopeo`, `composefs`, `fsverity-utils` and `virtiofsd`. `/var/lib/odorobo` must be on an fs-verity filesystem such as ext4 or btrfs.
 
 ## Goals and scope
 
@@ -83,6 +86,16 @@ Before starting a persistent VM, write/validate state metadata including the sta
 5. On explicit DeleteVM, first complete unmount/unmap cleanup, then delete the RBD image. Ordinary stop must retain it. The request waits for guest quiescence and rootfs cleanup; shutdown, unmount, or volume-deletion failures are returned to the caller and leave the actor/state reachable for retry.
 
 Live migration remains rejected for all OCI-rootfs VMs. The RBD path provides persistence across a cold stop/detach/reattach/restart, not device-state migration.
+
+## Guest boot and init
+
+Cloud Hypervisor direct-boots the node's microVM kernel (`/var/lib/odorobo/microvm/vmlinux`, built by `scripts/build-microvm-kernel.sh`) with no firmware or initramfs. The default command line is `console=ttyS0 root=rootfs rootfstype=virtiofs rw`. The kernel mounts the virtiofs share tagged `rootfs` as `/`, then runs the first program it finds among the `init=` parameter, `/sbin/init`, `/etc/init`, `/bin/init` and `/bin/sh`.
+
+- **Odorobo ships no guest init or agent.** The image must provide its own init. A systemd image runs systemd as PID 1; a minimal image can set `init=` through `desired.boot.cmdline`. Systemd images are untested.
+- **The OCI config's `ENTRYPOINT`, `CMD`, `Env`, `WorkingDir` and `User` are ignored.** Only the layer list and DiffIDs are read from the config. To run a specific program, set `init=/path` in `boot.cmdline`, or ship an init that starts it.
+- **The console is the 16550 serial port (`ttyS0`).** The agent exposes it as a socket and keeps a history, read through `GET /vms/{vmid}/console/history`. The virtio console (`hvc0`) is off.
+- **Overrides:** `boot.kernel` replaces the kernel and `boot.cmdline` replaces the whole default command line. Include `root=rootfs rootfstype=virtiofs` again when overriding, or the VM cannot find its root.
+- **The ignored KVM test** (`faas_vm_boots_oci_rootfs_through_the_actor`) compiles a static C program with Zig, installs it as `/bin/sh` in a fixture image and boots with `init=/bin/sh`. The test passes when the console shows the program's message.
 
 ## Integrity, isolation, and process model
 
