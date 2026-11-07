@@ -400,29 +400,26 @@ mod tests {
         let persistent = PathBuf::from("/var/lib/odorobo/persistent-rootfs").join(vmid.to_string());
         std::fs::write(persistent.join("rootfs.upper/marker"), b"retained").unwrap();
         // Force a post-VMM-stop cleanup failure. A restart must not succeed
-        // through a stale 'started' flag while the old layer is still busy.
-        let layer_root = VMInstance::runtime_dir_for(&vmid.to_string()).join("rootfs-layers");
-        let layer = std::fs::read_dir(&layer_root)
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .path();
+        // through a stale 'started' flag while the old root is still busy.
+        let busy_mount =
+            VMInstance::runtime_dir_for(&vmid.to_string()).join(containers::ROOTFS_TAG);
         let mut busy = tokio::process::Command::new("sleep")
             .arg("100")
-            .current_dir(&layer)
+            .current_dir(&busy_mount)
             .kill_on_drop(true)
             .spawn()
             .unwrap();
+        let shutdown = actor_ref
+            .ask(crate::messages::vm::ShutdownVM { vmid })
+            .await;
         assert!(
-            actor_ref
-                .ask(crate::messages::vm::ShutdownVM { vmid })
-                .await
-                .is_err()
+            shutdown.is_err(),
+            "shutdown must retain the busy root: {shutdown:?}"
         );
+        let start = actor_ref.ask(super::StartVM).await;
         assert!(
-            actor_ref.ask(super::StartVM).await.is_err(),
-            "restart must retry retained teardown"
+            start.is_err(),
+            "restart must retry retained teardown: {start:?}"
         );
         busy.kill().await.unwrap();
         actor_ref
@@ -444,15 +441,11 @@ mod tests {
             .await
             .unwrap();
         actor_ref.ask(super::CheckRunning).await.unwrap();
-        let layer = std::fs::read_dir(&layer_root)
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .path();
+        let busy_mount =
+            VMInstance::runtime_dir_for(&vmid.to_string()).join(containers::ROOTFS_TAG);
         let mut busy = tokio::process::Command::new("sleep")
             .arg("100")
-            .current_dir(layer)
+            .current_dir(&busy_mount)
             .kill_on_drop(true)
             .spawn()
             .unwrap();
@@ -473,7 +466,7 @@ mod tests {
                 .unwrap()
                 .error
                 .is_some(),
-            "crash must retain busy-layer cleanup owner"
+            "crash must retain busy-root cleanup owner"
         );
         busy.kill().await.unwrap();
         actor_ref
@@ -736,7 +729,7 @@ async fn teardown_rootfs(
     Ok(())
 }
 
-/// Asks the network actor to publish this VM's FaaS ports.
+/// Asks the network actor to publish this VM's ports.
 ///
 /// The actor resolves the guest address from the DHCP lease, so this only
 /// queues the mapping; the rule appears once the guest has a lease.
@@ -800,6 +793,71 @@ impl VMActor {
         message
     }
 
+    /// Prepare the rootfs mount and start the supervised virtiofsd children
+    /// before Cloud Hypervisor creates the VM; a failure rolls back all of it.
+    async fn start_rootfs(
+        &mut self,
+        vmid: ulid::Ulid,
+        rootfs: &crate::manifest::Rootfs,
+        image: Option<crate::ch_driver::containers::PreparedImage>,
+    ) -> Result<()> {
+        let virtiofs = &mut self.virtiofs;
+        let config_virtiofs = &mut self.config_virtiofs;
+        let rootfs_mount = &mut self.rootfs_mount;
+        let runtime_dir = VMInstance::runtime_dir_for(&vmid.to_string());
+        // Resolve everything that can fail cheaply BEFORE mounting, so
+        // early errors cannot leak a mounted rootfs.
+        let program = crate::ch_driver::containers::virtiofsd_path().ok_or_else(|| {
+            eyre!("virtiofsd not found (looked in PATH and /usr/libexec) — `dnf install virtiofsd`")
+        })?;
+        let image = image.ok_or_else(|| eyre!("OCI image was not prepared before start"))?;
+        // The init reads this before it execs the workload. The runtime
+        // dir is root-only, and the guest mounts the share read-only.
+        let config_dir = runtime_dir.join("config");
+        tokio::fs::create_dir_all(&config_dir).await?;
+        tokio::fs::write(config_dir.join("config.json"), image.config()).await?;
+        crate::ch_driver::containers::mount_rootfs_owned(
+            &vmid.to_string(),
+            rootfs,
+            &image,
+            rootfs_mount,
+        )
+        .await?;
+        let rootfs_spec = VirtiofsdSpec {
+            program: program.clone(),
+            socket: crate::ch_driver::containers::socket_path_for(&vmid.to_string()),
+            shared_dir: rootfs_mount.as_ref().unwrap().mount.clone(),
+            log: runtime_dir.join("virtiofsd.log"),
+        };
+        let config_spec = VirtiofsdSpec {
+            program,
+            socket: crate::ch_driver::containers::config_socket_path_for(&vmid.to_string()),
+            shared_dir: config_dir,
+            log: runtime_dir.join("virtiofsd-config.log"),
+        };
+        let start = async {
+            *virtiofs = Some(VirtioFsSupervisor::start(rootfs_spec));
+            virtiofs
+                .as_ref()
+                .unwrap()
+                .wait_socket_ready(std::time::Duration::from_secs(15))
+                .await?;
+            *config_virtiofs = Some(VirtioFsSupervisor::start(config_spec));
+            config_virtiofs
+                .as_ref()
+                .unwrap()
+                .wait_socket_ready(std::time::Duration::from_secs(15))
+                .await
+        }
+        .await;
+        if let Err(err) = start {
+            let cleanup = teardown_rootfs(virtiofs, config_virtiofs, rootfs_mount).await;
+            return Err(err.wrap_err(format!("virtiofs startup rollback: {cleanup:?}")));
+        }
+        info!(%vmid, "virtiofsd supervised children started and sockets ready");
+        Ok(())
+    }
+
     /// `image` must be set for rootfs VMs; `prepare_image` builds it off the mailbox.
     async fn start(
         &mut self,
@@ -825,70 +883,18 @@ impl VMActor {
             .is_some_and(|manifest| manifest.desired.boot.start);
         let vm_config_for_ch = vm_config.as_ref().map(to_vm_config).transpose()?;
 
-        // FaaS rootfs (issue #112): prepare the composefs mount and start the
-        // supervised virtiofsd processes BEFORE spawning CH — the fs devices
-        // connect to their vhost-user sockets at VM create time. Everything
-        // started here is cleaned up on any later failure.
-        let virtiofs = &mut self.virtiofs;
-        let config_virtiofs = &mut self.config_virtiofs;
-        let rootfs_mount = &mut self.rootfs_mount;
+        // FaaS rootfs (issue #112): the composefs mount and the supervised
+        // virtiofsd processes must exist BEFORE Cloud Hypervisor creates the
+        // VM; the fs devices connect at create time.
         if let Some(manifest) = &vm_config
             && let Some(rootfs) = &manifest.desired.rootfs
         {
-            let runtime_dir = VMInstance::runtime_dir_for(&vmid.to_string());
-            // Resolve everything that can fail cheaply BEFORE mounting, so
-            // early errors cannot leak a mounted rootfs.
-            let program = crate::ch_driver::containers::virtiofsd_path().ok_or_else(|| {
-                eyre!(
-                    "virtiofsd not found (looked in PATH and /usr/libexec) — `dnf install virtiofsd`"
-                )
-            })?;
-            let image = image.ok_or_else(|| eyre!("OCI image was not prepared before start"))?;
-            // The init reads this before it execs the workload. The runtime
-            // dir is root-only, and the guest mounts the share read-only.
-            let config_dir = runtime_dir.join("config");
-            tokio::fs::create_dir_all(&config_dir).await?;
-            tokio::fs::write(config_dir.join("config.json"), image.config()).await?;
-            crate::ch_driver::containers::mount_rootfs_owned(
-                &vmid.to_string(),
-                rootfs,
-                &image,
-                rootfs_mount,
-            )
-            .await?;
-            let rootfs_spec = VirtiofsdSpec {
-                program: program.clone(),
-                socket: crate::ch_driver::containers::socket_path_for(&vmid.to_string()),
-                shared_dir: rootfs_mount.as_ref().unwrap().mount.clone(),
-                log: runtime_dir.join("virtiofsd.log"),
-            };
-            let config_spec = VirtiofsdSpec {
-                program,
-                socket: crate::ch_driver::containers::config_socket_path_for(&vmid.to_string()),
-                shared_dir: config_dir,
-                log: runtime_dir.join("virtiofsd-config.log"),
-            };
-            let start = async {
-                *virtiofs = Some(VirtioFsSupervisor::start(rootfs_spec));
-                virtiofs
-                    .as_ref()
-                    .unwrap()
-                    .wait_socket_ready(std::time::Duration::from_secs(15))
-                    .await?;
-                *config_virtiofs = Some(VirtioFsSupervisor::start(config_spec));
-                config_virtiofs
-                    .as_ref()
-                    .unwrap()
-                    .wait_socket_ready(std::time::Duration::from_secs(15))
-                    .await
-            }
-            .await;
-            if let Err(err) = start {
-                let cleanup = teardown_rootfs(virtiofs, config_virtiofs, rootfs_mount).await;
-                return Err(err.wrap_err(format!("virtiofs startup rollback: {cleanup:?}")));
-            }
-            info!(%vmid, "virtiofsd supervised children started and sockets ready");
+            self.start_rootfs(vmid, rootfs, image).await?;
         }
+
+        let virtiofs = &mut self.virtiofs;
+        let config_virtiofs = &mut self.config_virtiofs;
+        let rootfs_mount = &mut self.rootfs_mount;
 
         self.generation = self
             .generation

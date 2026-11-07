@@ -70,17 +70,6 @@ impl Limit {
 
 pub(super) const MAX_COMPRESSED_BYTES: Limit =
     Limit::size("ODOROBO_ROOTFS_MAX_COMPRESSED_BYTES", "16G", MIB, TIB);
-pub(super) const MAX_LAYER_BYTES: Limit =
-    Limit::size("ODOROBO_ROOTFS_MAX_LAYER_BYTES", "8G", MIB, TIB);
-pub(super) const MAX_IMAGE_BYTES: Limit =
-    Limit::size("ODOROBO_ROOTFS_MAX_IMAGE_BYTES", "32G", MIB, TIB);
-pub(super) const MAX_IMAGE_ENTRIES: Limit = Limit {
-    env: "ODOROBO_ROOTFS_MAX_ENTRIES",
-    default: "1000000",
-    min: 1,
-    max: 10_000_000,
-    sized: false,
-};
 pub(super) const RBD_SIZE: Limit = Limit::size("ODOROBO_ROOTFS_RBD_SIZE", "1G", 64 * MIB, 64 * GIB);
 pub(super) const TMP_SCRATCH: Limit = Limit::size("ODOROBO_ROOTFS_TMP_SIZE", "64M", MIB, 2 * GIB);
 pub(super) const RUN_SCRATCH: Limit = Limit::size("ODOROBO_ROOTFS_RUN_SIZE", "32M", MIB, 2 * GIB);
@@ -129,14 +118,6 @@ mod tests {
         assert_eq!(RBD_SIZE.parse("64G").unwrap(), 64 * 1024 * MIB);
         for invalid in ["63M", "65G", "1Gjunk", "-1G", "99999999999999999T"] {
             let _err = RBD_SIZE.parse(invalid).unwrap_err();
-        }
-    }
-
-    #[test]
-    fn oci_entry_limit_is_a_bounded_plain_count() {
-        assert_eq!(MAX_IMAGE_ENTRIES.parse("1000000").unwrap(), 1_000_000);
-        for invalid in ["0", "10000001", "1M"] {
-            let _err = MAX_IMAGE_ENTRIES.parse(invalid).unwrap_err();
         }
     }
 }

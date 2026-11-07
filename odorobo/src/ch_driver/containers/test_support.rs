@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use serde_json::json;
 use sha2::Digest;
 
-use super::oci::{OciLayerDescriptor, digest_blob_path, normalized_arch};
+use super::oci::normalized_arch;
 use super::process::Tool;
 use super::to_hex;
 
@@ -42,16 +42,6 @@ impl Drop for TempDir {
     fn drop(&mut self) {
         _ = std::fs::remove_dir_all(&self.0);
     }
-}
-
-/// Whether every external tool can be spawned; tests skip otherwise.
-pub fn require_tools(tools: &[&str]) -> bool {
-    tools.iter().all(|tool| {
-        std::process::Command::new(tool)
-            .arg("--help")
-            .output()
-            .is_ok()
-    })
 }
 
 /// Build an in-memory tar archive.
@@ -98,11 +88,11 @@ pub fn append_entry<W: Write>(
 }
 
 fn put_blob(layout: &Path, bytes: &[u8]) -> String {
-    let digest = format!("sha256:{}", to_hex(&sha2::Sha256::digest(bytes)));
-    let path = digest_blob_path(layout, &digest).unwrap();
+    let hex = to_hex(&sha2::Sha256::digest(bytes));
+    let path = layout.join("blobs/sha256").join(&hex);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, bytes).unwrap();
-    digest
+    format!("sha256:{hex}")
 }
 
 /// Single-layer OCI layout with a multi-platform index, under `base/layout`.
@@ -128,10 +118,10 @@ impl Default for OciFixture<'_> {
 
 impl OciFixture<'_> {
     pub fn layout(self, base: &Path) -> PathBuf {
-        self.build(base).0
+        self.build(base)
     }
 
-    pub(super) fn build(self, base: &Path) -> (PathBuf, OciLayerDescriptor) {
+    pub(super) fn build(self, base: &Path) -> PathBuf {
         use tar::EntryType::{Directory, Regular};
         let layout = base.join("layout");
         std::fs::create_dir_all(&layout).unwrap();
@@ -139,6 +129,7 @@ impl OciFixture<'_> {
             for (path, mode) in [
                 ("etc/", 0o755),
                 ("bin/", 0o755),
+                ("usr/", 0o755),
                 ("dev/", 0o755),
                 ("proc/", 0o555),
                 ("sys/", 0o555),
@@ -182,21 +173,8 @@ impl OciFixture<'_> {
             br#"{"imageLayoutVersion":"1.0.0"}"#,
         )
         .unwrap();
-        (
-            layout,
-            OciLayerDescriptor {
-                digest: layer_digest,
-                diff_id,
-                media_type: "application/vnd.oci.image.layer.v1.tar".into(),
-                size: Some(tar_bytes.len() as u64),
-            },
-        )
+        layout
     }
-}
-
-/// Default fixture layout and its single layer descriptor.
-pub(super) fn fixture_oci_layout(base: &Path) -> (PathBuf, OciLayerDescriptor) {
-    OciFixture::default().build(base)
 }
 
 /// `oci:` image reference for a fixture layout's `latest` tag.
@@ -213,11 +191,6 @@ pub(super) async fn mount(fstype: &str, options: Option<String>, target: &Path) 
             .flat_map(|options| ["-o".to_owned(), options]),
     );
     Tool::ORDERED.run("mount", args, &[target]).await.unwrap();
-}
-
-/// Detach `target`, failing if it is not mounted.
-pub(super) async fn umount(target: &Path) {
-    Tool::ORDERED.run("umount", [], &[target]).await.unwrap();
 }
 
 /// `sh -c script sh dir`, so the script addresses the test dir as `$1`.

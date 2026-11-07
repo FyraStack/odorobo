@@ -2,24 +2,24 @@
 
 Odorobo runs OCI container workloads inside hardware-isolated microVMs: the image supplies the guest's root filesystem, while the host prepares and serves it over virtiofs. This document describes the container execution model and its storage behavior; it is not a general-purpose Docker-compatible runtime specification.
 
-**Status:** Implemented for issues #112 and #113 on `caleb/containers`. Unit and privileged single-node integration tests cover layer materialization/composition, write modes, and the disposable RBD lifecycle. Cross-node fencing/drain still requires a multi-host test. This is the single source of truth for container support, image/layer caching, write modes, and persistent state. Future distributed-storage exploration is separate in [future-distributed-storage-design.md](future-distributed-storage-design.md).
+**Status:** Implemented for issues #112 and #113 on `caleb/containers`. Unit and privileged single-node integration tests cover image import and composition, write modes, and the disposable RBD lifecycle. Cross-node fencing/drain still requires a multi-host test. This is the single source of truth for container support, the composefs repository, write modes, and persistent state. Future distributed-storage exploration is separate in [future-distributed-storage-design.md](future-distributed-storage-design.md).
 
 ## At a glance
 
 The guest sees an ordinary virtiofs root and does not need composefs support.
 
-- **Immutable base:** cache OCI layers locally by digest, compose each unique layer as a read-only, fs-verity-protected composefs image, and stack the layers with OverlayFS. Do not retain a separate flattened rootfs per image.
+- **Immutable base:** import the image into one node-local composefs repository, which stores file payloads once per digest and gives each image a single fs-verity-protected EROFS metadata object. Mount that object with OverlayFS; do not retain a separate flattened rootfs per image.
 - **Write modes:** `read_only` allows only bounded VM-private scratch; `ephemeral` is a fully writable per-VM overlay removed at stop and is the default; `persistent` retains a per-VM writable upper across stop/restart.
-- **Storage:** OCI/layer caches stay node-local. Persistent state supports a local backend for development and testing, and an RBD backend for cross-node cold restart. Live migration remains unsupported.
-- **Reference aliases:** each OCI source string, exactly as written in the manifest, gets a cached layout alias. `fedora:latest` and `docker://registry.fedoraproject.org/fedora:latest` are separate aliases that share layer caches. Mutable tags are not refreshed automatically; persistent state separately pins the selected manifest digest.
-- **No cleanup:** nothing evicts cached blobs or layers. Disk use only grows until an operator removes content that no mounted or persistent VM needs.
+- **Storage:** the composefs repository stays node-local. Persistent state supports a local backend for development and testing, and an RBD backend for cross-node cold restart. Live migration remains unsupported.
+- **Digest pinning:** an import resolves the source reference to a manifest digest first and pulls that digest, so a mutable tag changes content only on a later import. Persistent state separately pins the selected manifest digest.
+- **No cleanup:** nothing evicts repository objects. Disk use only grows until an operator removes content that no mounted or persistent VM needs; there is no reference-aware garbage collector yet.
 - **Init:** the guest boots a small initramfs whose PID 1 mounts the image's virtiofs root and runs the image's `ENTRYPOINT`/`CMD` with its `Env`, `WorkingDir` and `User`. `boot.cmdline` can still set `init=`. See [Guest boot and init](#guest-boot-and-init).
-- **Prerequisites:** the node needs the microVM kernel and initramfs built by `scripts/build-microvm-kernel.sh` and `just -f odorobo-init/justfile initramfs`, plus `skopeo`, `composefs`, `fsverity-utils` and `virtiofsd`. `/var/lib/odorobo` must be on an fs-verity filesystem such as ext4 or btrfs.
+- **Prerequisites:** the node needs the microVM kernel and initramfs built by `scripts/build-microvm-kernel.sh` and `just -f odorobo-init/justfile initramfs`, plus `skopeo` and `virtiofsd`. `/var/lib/odorobo` should be on an fs-verity filesystem such as ext4 or btrfs so mounts verify content; otherwise imports mount unverified.
 
 ## Goals and scope
 
 - Boot an OCI image as a microVM root over virtiofs.
-- Avoid storing a separate flattened rootfs for every image/VM; reuse identical OCI layers and cache immutable content on each node.
+- Avoid storing a separate flattened rootfs for every image/VM; deduplicate identical image content in one repository per node.
 - Keep immutable root content read-only, digest-pinned, and shared; keep every VM's writes private.
 - Provide read-only-with-scratch, writable ephemeral, and writable persistent modes.
 - Support cross-node **cold restart** for persistent mode using Ceph RBD. Live migration remains unsupported.
@@ -28,29 +28,27 @@ The guest sees an ordinary virtiofs root and does not need composefs support.
 
 ## Architecture decision
 
-Use **node-local OCI layer and composefs caches** plus **one of two per-VM persistence backends**:
+Use a **node-local composefs repository** plus **one of two per-VM persistence backends**:
 
 1. `local`: node-local directories, suitable for all local tests and same-node restarts.
 2. `rbd`: one RBD-backed filesystem per persistent VM, mounted by the host and used for that VM's writable upper. This is the backend for cross-node cold restart and maintenance drain.
 
-The immutable base is not stored on Ceph for this implementation. Each node can warm/populate its local cache independently. Ceph RBD is used only for persistent mutable VM state. This avoids requiring CephFS fs-verity support or putting immutable image reads on a network filesystem.
+The immutable base is not stored on Ceph for this implementation. Each node imports its own repository independently. Ceph RBD is used only for persistent mutable VM state. This avoids requiring CephFS fs-verity support or putting immutable image reads on a network filesystem.
 
-## OCI pull, cache, and layer composition
+## OCI import and the composefs repository
 
-**Supported-image boundary:** hard links must target an already extracted file in the same layer. Cross-layer and forward hard-link targets are rejected explicitly. Resolving them requires image-context materialization rather than the current digest-only reusable layer cache; general OCI changeset compatibility is not claimed for those images.
+Every image is imported into one node-local composefs repository at `/var/lib/odorobo/composefs`. The importer unpacks layer content into content-addressed, fs-verity-protected objects and gives each image a single small EROFS metadata object linked to its OCI config. This is the only immutable root store: there is no per-image flattened rootfs, no per-layer composefs cache, and no per-reference OCI layout.
 
-1. Resolve the requested OCI reference to a concrete OCI manifest digest and the platform selected for the guest kernel. A mutable tag is an input alias, not the immutable cache identity. Persistent VM state records the resolved base digest.
-2. Verify descriptor digests for the index/manifest/config and every layer blob. Cache compressed OCI blobs by SHA-256 digest in the **node-local** image cache. Refs that use the same layer blob should reuse it.
-3. For each unique layer digest, securely unpack the layer into a temporary layer tree. Preserve OCI layer semantics: translate `.wh.<name>` to OverlayFS xattr whiteouts and `.wh..wh..opq` to opaque-directory metadata; apply whiteouts after extracting the same layer so same-layer files take precedence. Reject path traversal and symlink-based escapes. Enforce the compressed blob cap while skopeo writes its temporary OCI layout, plus per-layer/aggregate uncompressed-byte and tar-entry limits before publishing layer content.
-4. Build a read-only composefs image for that layer, with a layer-specific content store, then delete the temporary unpacked tree. Cache the result by OCI layer digest. Enable and verify fs-verity for the composefs metadata image and required backing objects; fail closed if the configured cache filesystem cannot provide the required integrity guarantees.
-5. Mount cached composefs layers read-only and stack them in OCI order (top layer first in the lowerdir list). Writable modes use OverlayFS with a per-VM upper/work. Read-only mode uses a lower-only OverlayFS for multiple layers; when there is exactly one layer, it appends a controlled empty lowest-priority lower directory because Linux rejects a one-lower, lower-only OverlayFS mount. All exported roots pass through OverlayFS so whiteout markers never appear as ordinary guest files. The resulting immutable base is exported over virtiofs.
-6. Each node has a local fs-verity-capable cache filesystem (ext4 or btrfs by default). Cache and layer mounts are shared by VMs on that node. The implementation hard-links each verified compressed blob into `/var/lib/odorobo/oci-blobs/sha256` from the per-reference OCI layout, so identical descriptors share an inode. Each alias is kept under a sanitized, hashed ref key; tags are not refreshed automatically. Clear the per-ref alias to pull a mutable tag again. Persistent VMs reject a different selected manifest digest.
+1. **Preflight:** resolve the reference with `skopeo inspect --raw` to a concrete manifest digest and the platform selected for the guest kernel, and check its compressed size against the cap. A mutable tag is an input alias, not an identity: the import pulls the exact digest that was just inspected and verified.
+2. **Import:** pull that digest into the repository through `containers-image-proxy`. The importer applies OCI changeset semantics itself and merges the image's layers in order into one EROFS metadata object; file payloads become repository objects, so identical content anywhere in the repository is stored once. Re-importing an image whose objects are already present adds nothing. The importer copies the root directory metadata from `/usr` for deterministic digests, so an image without a `/usr` directory is rejected.
+3. **Mount:** the mount target is that EROFS metadata object. `read_only` mounts the composefs filesystem directly; `ephemeral` and `persistent` mount it as an OverlayFS lower with a per-VM upper/work. Whiteouts and opaque directories are resolved inside the imported image, so nothing layer-shaped reaches the guest and no `lowerdir` list, empty-lower workaround, or layer-count cap is involved.
+4. **Config:** the image's OCI config document is read back from the repository as a content stream and written to the VM's config share for the guest init.
+
+`ODOROBO_ROOTFS_ALLOW_LOCAL_TRANSPORTS=1` additionally allows local transports such as `oci:` and `docker-archive:` for development.
 
 ### Deduplication boundary
 
-The first implementation guarantees whole-layer reuse: identical OCI layer digests share a cached composefs layer and its object store. It does **not** add a global composefs object store shared across different layer digests. That would deduplicate identical file payloads found in non-identical layers, but adds shared-object publication and reference-aware garbage collection. Defer it until measurements with representative images show enough extra savings to justify that complexity.
-
-The temporary extraction tree is deleted after each layer is built and is not retained as a flattened image copy. The raw compressed-blob CAS and per-layer composefs cache are separate representations. Docker tags are inspected first and the copy is pinned to the selected manifest digest; the descriptor sizes are checked before the blob copy. Skopeo copies layers serially under a per-file limit while a live aggregate-byte monitor enforces the image cap. Rootfs startup logs the referenced unique compressed layer bytes, composefs metadata-image bytes, and composefs object-store payload bytes separately; these are per-image figures, not node-wide physical-usage totals. The compressed-byte cap also covers manifest/config blobs in the temporary OCI layout and removes the temporary layout if exceeded. There is currently no automatic cache eviction or garbage collector: this avoids deleting active or persistent-pinned content but means node cache usage grows until an operator performs safe maintenance cleanup. Do not remove mounted layers or content needed by persistent VM base digests.
+Deduplication is repository-wide: two images that share file payloads share those objects even when their layers are not byte-identical, and re-importing an image is idempotent. Each image still has its own EROFS metadata object, so a repository grows with the image count plus the union of distinct file payloads. The import logs the compressed bytes pulled and the objects/bytes actually added, so a warm re-import is visible as zero new objects. There is currently no reference-aware garbage collector: do not remove repository objects while any root is mounted or any persistent upper pins its base digest.
 
 ## Rootfs write modes
 
@@ -58,9 +56,9 @@ The manifest uses `desired.rootfs.mode`; omission defaults to `ephemeral`. For c
 
 | Mode | Base and writes | Lifecycle |
 |---|---|---|
-| `read_only` | Immutable merged OCI lower with no writable root upper. VM-private tmpfs scratch is mounted at `/tmp`, `/run`, and `/var/tmp`; other root writes fail. | Scratch is volatile and disappears at stop. |
-| `ephemeral` | Immutable lower plus a unique per-VM OverlayFS upper/work. This is the default when mode is omitted. | Upper/work are removed at VM teardown. |
-| `persistent` | Immutable lower plus a unique persistent upper/work for this VM. | Upper survives stop/restart and is removed only by explicit VM deletion. |
+| `read_only` | Immutable composefs image with no writable root upper. VM-private tmpfs scratch is mounted at `/tmp`, `/run`, and `/var/tmp`; other root writes fail. | Scratch is volatile and disappears at stop. |
+| `ephemeral` | Immutable image plus a unique per-VM OverlayFS upper/work. This is the default when mode is omitted. | Upper/work are removed at VM teardown. |
+| `persistent` | Immutable image plus a unique persistent upper/work for this VM. | Upper survives stop/restart and is removed only by explicit VM deletion. |
 
 Scratch mounts always use `nosuid,nodev`, and VM runtime trees are host-private (0700). Scratch defaults are bounded (`/tmp` 64 MiB, `/run` 32 MiB, `/var/tmp` 32 MiB), configurable by node policy through `ODOROBO_ROOTFS_TMP_SIZE`, `ODOROBO_ROOTFS_RUN_SIZE`, and `ODOROBO_ROOTFS_VARTMP_SIZE` (`M`/`G` values, 1 MiB–2 GiB each), and volatile. Startup validates all three paths before mounting any tmpfs, and rejects an absent, non-directory, or symlink mount point; this avoids partial mount leaks, mutating the shared image, or traversing an image-controlled path.
 
@@ -80,9 +78,9 @@ Before starting a persistent VM, write/validate state metadata including the sta
 ### RBD cold-restart and drain lifecycle
 
 1. On the source, stop the guest cleanly and quiesce virtiofsd.
-2. Unmount the per-VM merged root and layer mounts; flush/unmount the persistent filesystem; unmap the RBD device.
+2. Unmount the per-VM root; flush/unmount the persistent filesystem; unmap the RBD device.
 3. Confirm the source no longer owns a writable mount before allowing the volume to be attached elsewhere. Never rely on ext4 being safe for concurrent read-write mounts on multiple nodes; use explicit ownership/fencing in addition to Ceph's RBD locking mechanisms.
-4. On the destination, map and mount the same RBD image, validate its state metadata and base OCI digest, rebuild/warm the local immutable layer cache as needed, then start a new VM actor with that upper.
+4. On the destination, map and mount the same RBD image, validate its state metadata and base OCI digest, import the pinned base image into the local repository as needed, then start a new VM actor with that upper.
 5. On explicit DeleteVM, first complete unmount/unmap cleanup, then delete the RBD image. Ordinary stop must retain it. The request waits for guest quiescence and rootfs cleanup; shutdown, unmount, or volume-deletion failures are returned to the caller and leave the actor/state reachable for retry.
 
 Live migration remains rejected for all OCI-rootfs VMs. The RBD path provides persistence across a cold stop/detach/reattach/restart, not device-state migration.
@@ -111,8 +109,8 @@ The ignored KVM test (`faas_vm_boots_oci_rootfs_through_the_actor`) compiles a s
 
 ## Integrity, isolation, and process model
 
-- OCI index/manifest/config/layer descriptor SHA-256 checks and config DiffID checks protect pull/materialization input. Defaults bound downloaded OCI blobs to 16 GiB per image, uncompressed layers to 8 GiB each, aggregate uncompressed image content to 32 GiB, and tar entries to 1,000,000; node policy may tune these using `ODOROBO_ROOTFS_MAX_COMPRESSED_BYTES`, `ODOROBO_ROOTFS_MAX_LAYER_BYTES`, `ODOROBO_ROOTFS_MAX_IMAGE_BYTES` (`M`/`G`/`T`) and `ODOROBO_ROOTFS_MAX_ENTRIES` (1–10,000,000). `mkcomposefs` stores filesystem metadata in EROFS and non-empty file payloads in the layer digest store; file metadata/xattrs (including OverlayFS markers) are part of the composefs image. Extraction preserves numeric UID/GID, sticky/setuid/setgid permissions, capabilities, SELinux labels, POSIX ACLs, and ordinary user xattrs; image-supplied OverlayFS control xattrs and other unsupported namespaces are rejected. Attribute writes never follow symlinks. Staging directories are host-private (0700), exported host mounts use nosuid/nodev, and virtiofsd enables xattr/ACL support. Directory metadata (including `.` and default ACLs) is restored after extraction so tar order cannot create inherited ACLs absent from child entries. Layer-cache format v8 records explicit directory changes and distinct deletion/opaque boundaries. Opaque markers reset descendants only, preserving the directory's own inherited attributes unless explicitly changed. Per-VM directory-only composefs metadata corrects synthetic ancestors so later file-only layers do not replace inherited directory ownership, modes or ACLs. Inheritance stops at deleted, opaque, symlink or non-directory ancestor generations; candidates are checked without following symlink ancestors; file payloads remain in shared immutable layer caches. The measured composefs image digest pins metadata. fs-verity on the image and backing objects protects metadata and payload bytes; mounts require both the digest pin and `verity` checks, and fail closed if unsupported. Device nodes/FIFOs under `/dev` are omitted because guest devtmpfs supplies `/dev`; other unsupported tar entry types reject the layer rather than silently changing its contents.
-- All immutable layer mounts and merged lower mounts are read-only. A VM can only write to its own upper or explicitly allowed scratch tmpfs paths.
+- Imports are digest-pinned: `skopeo inspect --raw` resolves the platform manifest first and the pull copies exactly that digest, so a tag that moves mid-import cannot substitute content. Defaults bound downloaded compressed data to 16 GiB per image (`ODOROBO_ROOTFS_MAX_COMPRESSED_BYTES`, `M`/`G`/`T`). The older per-layer, aggregate-uncompressed and tar-entry limits were removed together with the host-side unpacking path, since nothing is unpacked into a host-visible tree anymore. `composefs-oci` materializes the merged image: file metadata, xattrs and directory structure live in the EROFS metadata object, and file payloads become repository objects. fs-verity covers metadata and payloads when the repository filesystem supports it, and mounts verify the image object digest; a repository on a filesystem without fs-verity mounts unverified.
+- The composefs image mount and every exported root are read-only. A VM can only write to its own upper or explicitly allowed scratch tmpfs paths.
 - Each VM's writable upper/work is distinct, including VMs with the same OCI manifest digest.
 - The VM actor supervises two virtiofsd processes with `--sandbox=chroot` (the rootfs store and the read-only config directory), starts them before Cloud Hypervisor connects, stops the config share first, then the root share before unmount, and cleans up partial startup failures.
 - Rootfs VMs require shared guest memory for the vhost-user virtiofs device. The direct-boot kernel/cmdline and `ttyS0` UART console remain as documented for issue #112. The guest does not need composefs support.
@@ -121,22 +119,19 @@ The ignored KVM test (`faas_vm_boots_oci_rootfs_through_the_actor`) compiles a s
 ## Storage choices for this implementation
 
 - Persistent rootfs state supports both `local` and `rbd` backends. Use `local` for development and tests; use RBD when the persistent upper must follow a VM across nodes.
-- OCI blobs, per-layer composefs images, and their content stores remain node-local for both backends.
+- The composefs repository remains node-local for both backends.
 - CephFS, Ceph Object Gateway, Podman, and a custom distributed storage system are not dependencies of this work. Consider them only through the separate [future storage design](future-distributed-storage-design.md).
-- A global composefs CAS shared across non-identical layer digests is deferred; add only if measurements justify its garbage-collection and concurrency complexity.
+- Reference-aware garbage collection for the repository is deferred; add only if measurements justify its complexity. Whole-image imports are already idempotent and payloads are shared across images.
 
 ## Verification results
 
-Follow-up lifecycle review: workspace tests and privileged OCI write-mode, composefs, OverlayFS, busy-layer retry/purge-protection, and KVM userspace-boot tests pass. The busy-layer regression proves that a successful root unmount followed by a failed layer unmount retains data, refuses recursive runtime purging, and completes on retry. Supervisor tests use a real long-lived fixture process and check stop/drop by PID, plus a forced timeout regression. Exclusive RBD mapping and cross-node fencing still need a live multi-host Ceph run; no Ceph service is active in this review VM.
+Recorded on the development host with a rootful debug agent, plus the ignored privileged tests run directly as root.
 
-Previously validated on the single-node privileged `.local/dev` Ceph environment (RBD image size set to a disposable `128M`):
+- `cargo test -p odorobo`: 95 passed, 5 ignored (privileged/KVM/RBD). `cargo clippy -p odorobo -p odorobo-init --all-targets` and `cargo fmt --all --check` are clean apart from the pre-existing macro-semicolon warnings.
+- Boot, stop and delete end to end: an ephemeral `docker://traefik/whoami:latest` VM imported 347 objects / 12,890,895 bytes from 5,139,859 compressed bytes across 3 layers, created one EROFS image object, mounted it, and answered `whoami` over the guest network. Deleting both test VMs left no runtime directories, mounts, published-port rules or `virtiofsd` processes.
+- Deduplication boundary: re-importing the same image logged `new_objects: 0, new_bytes: 0` while the repository stayed at 14 MB / 358 objects.
+- The ignored KVM actor test (`faas_vm_boots_oci_rootfs_through_the_actor`) passes: the guest runs `/init` from the initramfs, mounts the composefs image over virtiofs, reads the OCI config share, executes the fixture entrypoint, then exercises busy-root teardown retention across `ShutdownVM`, restart, a hypervisor crash and `DeleteVM`.
+- Privileged mount tests pass: write-mode isolation and removal for `read_only`, `ephemeral` and `persistent`, failed-start inventory retention, and purge protection while the root mount is busy.
+- The disposable per-VM RBD helper test (earlier run on the same host) passed formatting, filesystem check, exclusive-lock feature verification, unmount/unmap/remap, persisted-upper reattach, and explicit volume deletion.
 
-- `cargo test --workspace`: passed; five privileged/KVM tests are ignored by default.
-- `cargo clippy --workspace --all-targets --all-features`: passes with the workspace's current pedantic warnings.
-- The ignored actor KVM test boots the guest initramfs, mounts the virtiofs root, reads the OCI config share, executes the fixture entrypoint, and checks that `DeleteVM` cleans both shares. The test uses a static fixture binary built with Zig and needs nested KVM plus the host tools.
-- Privileged OCI end-to-end test passed all three modes: per-VM bounded scratch and read-only write rejection; ephemeral isolation/removal; local persistent stop/restart, base-digest mismatch rejection, and explicit deletion.
-- Privileged layer mount and OverlayFS integration tests passed: composefs/fs-verity image and payload verification, top-layer order, replacement, whiteout, and opaque-directory behavior.
-- Disposable per-VM RBD helper test passed formatting, filesystem check, exclusive-lock feature verification, unmount/unmap/remap, persisted-upper reattach, and explicit volume deletion. A separate manual disposable RBD OverlayFS test also passed.
-- Identical blob layouts share a hardlink inode in the raw OCI CAS; repeated identical layer digests resolve to the same composefs cache path. Per-image referenced compressed blob, composefs metadata, and object-store byte counts are logged.
-
-The Ceph environment has one node only: this verifies cold detach/reattach on one host but does not prove cross-node lock fencing or failover. The node-local backend remains node-affine. There is no automatic node-cache eviction/GC; do not remove content used by active mounts or persistent bases. The microVM kernel script resolves the latest kernel.org longterm release dynamically; the dev host already had the resulting `vmlinux` built. A global composefs object store across distinct OCI layer digests remains deferred.
+The Ceph environment has one node only: this verifies cold detach/reattach on one host but does not prove cross-node lock fencing or failover. The node-local backend remains node-affine. There is no automatic repository garbage collection; do not remove objects used by active mounts or persistent bases. The microVM kernel script resolves the latest kernel.org longterm release dynamically; the dev host already had the resulting `vmlinux` built.

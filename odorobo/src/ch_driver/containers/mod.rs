@@ -2,28 +2,24 @@
 //! `OverlayFS`, fs-verity, and persistence preparation happens on the host; the
 //! guest sees an ordinary virtiofs root and does not need composefs support.
 //!
-//! Skopeo layouts keep per-reference metadata while verified compressed blobs
-//! are hard-linked into a node-local digest CAS. Each unique OCI layer is
-//! extracted temporarily, translated to `OverlayFS` whiteout semantics, and
-//! built as an immutable fs-verity composefs image with a per-layer object
-//! store. Temporary extraction is deleted. Per-VM composefs mounts are stacked
-//! in OCI order with `OverlayFS` before actor-supervised virtiofsd exports them.
-//! Security notes: layers are unpacked by this process as root; tar paths
-//! are validated (`..` rejected) and every unpack/whiteout operation refuses
-//! to traverse symlinks planted by earlier layers, so a hostile image cannot
-//! write through or remove host paths. The store must live on an
-//! fs-verity-capable filesystem (ext4, btrfs) for digest-pinned mounts.
+//! Images are imported into a node-local composefs repository (see [`repo`]),
+//! which unpacks every layer into content-addressed fs-verity objects and links
+//! the image config to one EROFS metadata object. Each VM mounts that object
+//! through the kernel overlay with its own upper directory, and
+//! actor-supervised virtiofsd exports the result. Imports are digest-pinned:
+//! the mount verifies the image object against the fs-verity id recorded at
+//! import time, and the first pull of a tag is what a later tag repull compares
+//! against. The repository must live on an fs-verity-capable filesystem (ext4,
+//! btrfs, erofs) for verified mounts; otherwise imports mount unverified.
 
-mod dirmeta;
-mod layer_store;
 mod limits;
 mod mount;
 mod oci;
 mod persistent;
 mod process;
+mod repo;
 #[cfg(test)]
 pub mod test_support;
-mod unpack;
 mod virtiofs;
 
 pub use mount::{PreparedImage, mount_rootfs_owned, prepare_image, unmount_rootfs};
@@ -32,7 +28,7 @@ pub use virtiofs::{
     VirtioFsSupervisor, VirtiofsdSpec, config_socket_path_for, socket_path_for, virtiofsd_path,
 };
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use stable_eyre::{Result, eyre::bail};
@@ -60,10 +56,6 @@ pub const MICROVM_INITRAMFS_PATH: &str = "/var/lib/odorobo/microvm/initramfs.cpi
 /// sockets the UART; the virtio-console (hvc0) is off.
 pub const DEFAULT_ROOTFS_CMDLINE: &str = "console=ttyS0";
 
-const OCI_CACHE_ROOT: &str = "/var/lib/odorobo/oci-cache";
-
-const OCI_BLOBS_ROOT: &str = "/var/lib/odorobo/oci-blobs/sha256";
-
 const PERSISTENT_ROOTFS_ROOT: &str = "/var/lib/odorobo/persistent-rootfs";
 
 /// Remove temporary external-tool artifacts even if their async operation is
@@ -73,9 +65,6 @@ struct RemovePathOnDrop(Option<PathBuf>);
 impl RemovePathOnDrop {
     const fn new(path: PathBuf) -> Self {
         Self(Some(path))
-    }
-    fn disarm(&mut self) {
-        self.0 = None;
     }
 }
 
@@ -109,8 +98,6 @@ pub struct PreparedRootfs {
     pub upper: Option<PathBuf>,
     /// Per-VM overlayfs work directory when the root is writable.
     pub work: Option<PathBuf>,
-    /// Per-layer composefs mounts backing the merged `OverlayFS` lower.
-    layer_mounts: Vec<PathBuf>,
     /// Persistent backend mount directory; populated only for RBD state.
     persistent_state_mount: Option<PathBuf>,
     /// RBD image identity for explicit deletion.
@@ -131,38 +118,6 @@ fn to_hex(bytes: &[u8]) -> String {
         write!(out, "{byte:02x}").expect("writing to a String cannot fail");
         out
     })
-}
-
-fn remove_path(path: &Path) {
-    match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.is_dir() => {
-            _ = std::fs::remove_dir_all(path);
-        }
-        Ok(_) => {
-            _ = std::fs::remove_file(path);
-        }
-        Err(_) => {}
-    }
-}
-
-/// Serializes work on one cache path so concurrent callers reuse the first result.
-async fn keyed_lock(key: PathBuf) -> tokio::sync::OwnedMutexGuard<()> {
-    use std::collections::HashMap;
-    use std::sync::{LazyLock, Mutex, Weak};
-    static LOCKS: LazyLock<Mutex<HashMap<PathBuf, Weak<tokio::sync::Mutex<()>>>>> =
-        LazyLock::new(Mutex::default);
-    let lock = {
-        let mut locks = LOCKS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        locks.retain(|_, weak| weak.strong_count() > 0);
-        locks.get(&key).and_then(Weak::upgrade).unwrap_or_else(|| {
-            let lock = Arc::new(tokio::sync::Mutex::new(()));
-            locks.insert(key, Arc::downgrade(&lock));
-            lock
-        })
-    };
-    lock.lock_owned().await
 }
 
 fn validate_vmid(vmid: &str) -> Result<()> {

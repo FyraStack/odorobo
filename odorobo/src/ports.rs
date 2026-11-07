@@ -1,4 +1,4 @@
-//! Published `FaaS` ports.
+//! Published ports.
 //!
 //! Manifests express a published port as `<host>:<guest>` with an optional
 //! `/tcp` or `/udp` suffix, matching the container runtimes' shorthand.

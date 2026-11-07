@@ -2,7 +2,7 @@
 
 **Status:** Planning note only. This document records options and questions for a future issue; it does not change the current container-rootfs implementation spec and does not commit Odorobo to a bespoke distributed storage system.
 
-The current design keeps OCI blobs and per-layer composefs caches node-local. Persistent writable rootfs state can use either node-local storage (development/testing) or a per-VM Ceph RBD volume (cross-node cold restart). This investigation is about whether, and how, the data plane should evolve if Ceph performance remains inadequate.
+The current design keeps imported OCI images node-local as one composefs repository: content-addressed payload objects plus one EROFS metadata object per image, all derived from the OCI layers and config. Persistent writable rootfs state can use either node-local storage (development/testing) or a per-VM Ceph RBD volume (cross-node cold restart). This investigation is about whether, and how, the data plane should evolve if Ceph performance remains inadequate.
 
 ## Problem to solve
 

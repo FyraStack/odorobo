@@ -90,9 +90,16 @@ impl ProvisioningHook for NetworkProvisioningHook {
             tap_count = taps.len(),
             "networking before_stop hook invoked for Odorobo-managed net:// TAP devices"
         );
-        let network_actor = network_agent()
-            .await
-            .wrap_err("failed to look up network actor")?;
+        let network_actor = match network_agent().await {
+            Ok(actor) => actor,
+            Err(err) if taps.is_empty() => {
+                // A stop must not hang on a network actor that is not there;
+                // there is nothing to detach and no ports left to unpublish.
+                warn!(%vmid, ?err, "no network actor during stop; skipping port unpublish");
+                return Ok(());
+            }
+            Err(err) => return Err(err.wrap_err("failed to look up network actor")),
+        };
 
         // Remove published ports even if the TAP has already disappeared.
         if let Err(err) = network_actor.ask(UnpublishPorts { vmid }).await {

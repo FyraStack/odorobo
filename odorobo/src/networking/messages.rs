@@ -34,7 +34,7 @@ pub struct DetachTap {
     pub tap_name: String,
 }
 
-/// Publishes host ports to a booted FaaS guest.
+/// Publishes host ports to a booted guest.
 ///
 /// The guest address is resolved from the dnsmasq lease for `mac_address`,
 /// so publishing completes once the guest has obtained its DHCP lease.

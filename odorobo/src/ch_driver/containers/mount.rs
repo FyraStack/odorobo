@@ -1,29 +1,26 @@
-//! Per-VM rootfs assembly: composefs layer mounts, `OverlayFS` stacking,
-//! scratch tmpfs mounts, and teardown.
+//! Per-VM rootfs assembly: mounting the imported composefs image with a
+//! per-VM overlay upper, scratch tmpfs mounts, and teardown.
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use composefs::fsverity::{FsVerityHashValue, Sha256HashValue};
 use stable_eyre::{
     Result,
-    eyre::{Context, bail, eyre},
+    eyre::{Context, bail},
 };
 use tokio::process::Command;
 use tracing::info;
 
-use futures_util::{StreamExt, TryStreamExt};
-
-use super::dirmeta::{DIRECTORY_OPERATIONS, compose_directory_metadata};
-use super::layer_store::materialize_layer;
 use super::limits::{EPHEMERAL_STATE, MIB, RUN_SCRATCH, TMP_SCRATCH, VARTMP_SCRATCH};
-use super::oci::{OciManifest, OciUnpackLimits, pull_oci, read_oci_manifest};
+use super::oci::OciUnpackLimits;
 use super::persistent::{
     EPHEMERAL_STATE_DIR, PersistentBackend, acquire_rootfs_lock, persistent_backend, prepare_upper,
     rbd_identity, rbd_lookup_device, release_persistent_backend,
 };
 use super::process::{TOOL_OPERATIONS, Tool};
-use super::unpack::{DirectoryReset, LayerStats};
+use super::repo;
 use super::{PERSISTENT_ROOTFS_ROOT, PreparedRootfs, ROOTFS_TAG, validate_vmid};
 use crate::manifest::{Rootfs, RootfsMode};
 
@@ -89,18 +86,13 @@ pub(super) async fn mount_rootfs(vmid: &str, rootfs: &Rootfs) -> Result<Prepared
     }
 }
 
-/// Concurrent layer builds per image; each runs `tar` extraction and `mkcomposefs`.
-const MAX_PARALLEL_LAYER_BUILDS: usize = 4;
-
-/// An OCI image pulled and built into cached composefs layers, ready to mount for any VM.
+/// An OCI image imported into the node-local composefs repository, ready to
+/// mount for any VM.
 #[derive(Debug)]
 pub struct PreparedImage {
     digest: String,
+    image: Sha256HashValue,
     config: Vec<u8>,
-    layers: Vec<PreparedLayer>,
-    compressed_bytes: u64,
-    composefs_image_bytes: u64,
-    composefs_object_bytes: u64,
 }
 
 impl PreparedImage {
@@ -110,118 +102,21 @@ impl PreparedImage {
     }
 }
 
-#[derive(Debug)]
-struct PreparedLayer {
-    digest: String,
-    cache: PathBuf,
-    verity_digest: String,
-    explicit_directories: Vec<PathBuf>,
-    directory_resets: Vec<DirectoryReset>,
-}
-
-/// Pull an image and build its layers. Holds no per-VM state, so it can run off the VM actor.
+/// Import the image into the shared composefs repository. Holds no per-VM
+/// state, so it can run off the VM actor.
 pub async fn prepare_image(rootfs: &Rootfs) -> Result<PreparedImage> {
     let limits = OciUnpackLimits::from_env()?;
-    let layout = pull_oci(&rootfs.oci, limits.max_compressed_bytes).await?;
-    let layout_for_parse = layout.clone();
-    let OciManifest {
-        digest,
-        config: config_bytes,
-        layers: descriptors,
-    } = tokio::task::spawn_blocking(move || read_oci_manifest(&layout_for_parse))
-        .await
-        .map_err(|e| eyre!("OCI manifest validation task failed: {e}"))??;
-    if descriptors.is_empty() {
-        bail!("OCI image has no filesystem layers");
-    }
-    if descriptors.len() > 500 {
-        bail!(
-            "OCI image has {} layers; OverlayFS supports at most 500 lower layers",
-            descriptors.len()
-        );
-    }
-    let mut seen_layer_digests = std::collections::HashSet::new();
-    let compressed_bytes = descriptors.iter().try_fold(0_u64, |sum, desc| {
-        if !seen_layer_digests.insert(&desc.digest) {
-            return Ok(sum);
-        }
-        sum.checked_add(desc.size.ok_or_else(|| eyre!("OCI layer has no size"))?)
-            .ok_or_else(|| eyre!("total compressed OCI size overflows"))
-    })?;
-    if compressed_bytes > limits.max_compressed_bytes {
-        bail!(
-            "OCI image compressed layers total {compressed_bytes} bytes, exceeding configured limit {}",
-            limits.max_compressed_bytes
-        );
-    }
-
-    // Aggregate limits are checked after the parallel builds, so each build gets the per-layer cap.
-    let layer_limit = limits.max_layer_bytes.min(limits.max_image_bytes);
-    let parallelism = std::thread::available_parallelism()
-        .map_or(1, std::num::NonZeroUsize::get)
-        .min(MAX_PARALLEL_LAYER_BUILDS);
-    let max_entries = limits.max_image_entries;
-    let builds: Vec<_> = descriptors
-        .iter()
-        .map(|desc| {
-            let (layout, desc) = (layout.clone(), desc.clone());
-            async move { materialize_layer(&layout, &desc, layer_limit, max_entries).await }
-        })
-        .collect();
-    let built: Vec<(PathBuf, LayerStats)> = futures_util::stream::iter(builds)
-        .buffered(parallelism)
-        .try_collect()
-        .await?;
-
-    let mut unpacked_bytes = 0_u64;
-    let mut unpacked_entries = 0_u64;
-    let mut composefs_image_bytes = 0_u64;
-    let mut composefs_object_bytes = 0_u64;
-    let mut accounted_layers = std::collections::HashSet::new();
-    let mut layers = Vec::with_capacity(built.len());
-    for (desc, (cache, stats)) in descriptors.iter().zip(built) {
-        unpacked_bytes = unpacked_bytes
-            .checked_add(stats.uncompressed_bytes)
-            .ok_or_else(|| eyre!("unpacked image size overflows"))?;
-        unpacked_entries = unpacked_entries
-            .checked_add(stats.entry_count)
-            .ok_or_else(|| eyre!("unpacked image entry count overflows"))?;
-        if accounted_layers.insert(&desc.digest) {
-            composefs_image_bytes = composefs_image_bytes
-                .checked_add(stats.composefs_image_bytes)
-                .ok_or_else(|| eyre!("composefs image cache size overflows"))?;
-            composefs_object_bytes = composefs_object_bytes
-                .checked_add(stats.object_store_bytes)
-                .ok_or_else(|| eyre!("composefs object cache size overflows"))?;
-        }
-        let verity_digest = tokio::fs::read_to_string(cache.join("layer-digest")).await?;
-        layers.push(PreparedLayer {
-            digest: desc.digest.clone(),
-            cache,
-            verity_digest: verity_digest.trim().to_owned(),
-            explicit_directories: stats.explicit_directories,
-            directory_resets: stats.directory_resets,
-        });
-    }
-    if unpacked_bytes > limits.max_image_bytes || unpacked_entries > limits.max_image_entries {
-        bail!("OCI image exceeds configured aggregate extraction limits");
-    }
+    let imported = repo::import_image(&rootfs.oci, limits.max_compressed_bytes).await?;
+    let (digest, image, config) = imported.into_parts();
     Ok(PreparedImage {
         digest,
-        config: config_bytes,
-        layers,
-        compressed_bytes,
-        composefs_image_bytes,
-        composefs_object_bytes,
+        image,
+        config,
     })
 }
 
 /// Publish acquired resources to a lifecycle owner before the first mount.
 /// A failed startup retains this inventory for an explicit teardown retry.
-#[expect(
-    clippy::too_many_lines,
-    reason = "sequential setup with interleaved cleanup; splitting would obscure ownership"
-)]
 pub async fn mount_rootfs_owned(
     vmid: &str,
     rootfs: &Rootfs,
@@ -254,48 +149,11 @@ pub async fn mount_rootfs_owned(
             state.display()
         );
     }
-    let directory_changes: Vec<Vec<PathBuf>> = image
-        .layers
-        .iter()
-        .map(|layer| layer.explicit_directories.clone())
-        .collect();
-    let directory_resets: Vec<Vec<DirectoryReset>> = image
-        .layers
-        .iter()
-        .map(|layer| layer.directory_resets.clone())
-        .collect();
-    let layer_root = runtime_dir.join("rootfs-layers");
-    tokio::fs::create_dir_all(&layer_root).await?;
-    let mut mount_specs = Vec::with_capacity(image.layers.len());
-    for (index, layer) in image.layers.iter().enumerate() {
-        let (_, hex) = layer
-            .digest
-            .split_once(':')
-            .expect("validated layer digest");
-        let layer_mount = layer_root.join(format!("{index}-{hex}"));
-        tokio::fs::create_dir_all(&layer_mount).await?;
-        if is_mountpoint(&layer_mount).await? {
-            bail!(
-                "OCI layer mountpoint {} is already mounted",
-                layer_mount.display()
-            );
-        }
-        mount_specs.push((
-            layer.digest.clone(),
-            layer.cache.clone(),
-            layer.verity_digest.clone(),
-            layer_mount,
-        ));
-    }
     *owner = Some(PreparedRootfs {
         digest: manifest_digest.clone(),
         mount: root_mount.clone(),
         upper: None,
         work: None,
-        layer_mounts: mount_specs
-            .iter()
-            .map(|(_, _, _, path)| path.clone())
-            .collect(),
         persistent_state_mount: None,
         rbd_image: None,
         _state_lock: state_lock,
@@ -305,59 +163,6 @@ pub async fn mount_rootfs_owned(
         // start can still be torn down through the owner.
         ephemeral_state_mount: ephemeral_state,
     });
-    let mut lowerdirs = Vec::with_capacity(mount_specs.len());
-    for (_layer_digest, cache, verity_digest, layer_mount) in &mount_specs {
-        let opts = format!(
-            "basedir={},digest={},verity,ro",
-            cache.join("store").display(),
-            verity_digest
-        );
-        Tool::ORDERED
-            .run(
-                "mount.composefs",
-                ["-o".to_owned(), opts],
-                &[cache.join("layer.cfs").as_path(), layer_mount.as_path()],
-            )
-            .await?;
-        Tool::ORDERED
-            .run(
-                "mount",
-                ["--make-rprivate".to_owned()],
-                &[layer_mount.as_path()],
-            )
-            .await?;
-        // mount.composefs does not accept standard nosuid/nodev options;
-        // apply these host-side restrictions to the resulting mount instead.
-        Tool::ORDERED
-            .run(
-                "mount",
-                ["-o".into(), "remount,bind,ro,nosuid,nodev".into()],
-                &[layer_mount],
-            )
-            .await?;
-        lowerdirs.push(layer_mount.clone());
-    }
-    // Correct directory-only metadata in a VM-private composefs layer. OCI
-    // omitted ancestors inherit prior metadata, unlike OverlayFS's highest
-    // directory rule. Payload caches remain immutable and fully reusable.
-    let correction = runtime_dir.join("rootfs-directory-metadata");
-    owner
-        .as_mut()
-        .unwrap()
-        .layer_mounts
-        .push(correction.clone());
-    let corrected = compose_directory_metadata(
-        &runtime_dir,
-        &root_mount,
-        &lowerdirs,
-        &directory_changes,
-        &directory_resets,
-    )
-    .await?;
-    // OCI order is base to top; OverlayFS expects its highest-priority lower first.
-    lowerdirs.reverse();
-    lowerdirs.insert(0, corrected);
-
     // Include persistence in inventory before attaching; failed formatting,
     // metadata validation or unmapping must remain reachable for cleanup.
     if rootfs.mode == RootfsMode::Persistent && persistent_backend()? == PersistentBackend::Rbd {
@@ -376,52 +181,24 @@ pub async fn mount_rootfs_owned(
         prepared.upper.clone_from(&upper_state.upper);
         prepared.work.clone_from(&upper_state.work);
     };
-    if rootfs.mode == RootfsMode::ReadOnly && lowerdirs.len() == 1 {
-        // A second, controlled empty lower preserves OverlayFS interpretation
-        // of OCI whiteouts. A direct bind export would expose marker files.
-        let empty = runtime_dir.join("rootfs-empty-lower");
-        tokio::fs::create_dir_all(&empty).await?;
-        lowerdirs.push(empty);
-    }
-    let mut options = format!(
-        "nosuid,nodev,lowerdir={}",
-        lowerdirs
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-            .join(":")
-    );
-    if let (Some(upper), Some(work)) = (&upper_state.upper, &upper_state.work) {
-        use std::fmt::Write as _;
-        write!(
-            options,
-            ",upperdir={},workdir={}",
-            upper.display(),
-            work.display()
-        )?;
-    } else {
-        options.push_str(",ro");
-    }
-    if options.len() >= 4096 {
-        bail!("OCI OverlayFS mount options exceed the kernel page-size limit");
-    }
-    Tool::ORDERED
-        .run(
-            "mount",
-            [
-                "-t".into(),
-                "overlay".into(),
-                "overlay".into(),
-                "-o".into(),
-                options,
-            ],
-            &[root_mount.as_path()],
-        )
-        .await?;
+    let overlay = match (&upper_state.upper, &upper_state.work) {
+        (Some(upper), Some(work)) => Some((upper.as_path(), work.as_path())),
+        _ => None,
+    };
+    repo::mount_image(&image.image, &root_mount, overlay)?;
     Tool::ORDERED
         .run(
             "mount",
             ["--make-rprivate".to_owned()],
+            &[root_mount.as_path()],
+        )
+        .await?;
+    // composefs mounts carry only the read-only attribute; keep the root as
+    // restricted as the overlay options it replaces.
+    Tool::ORDERED
+        .run(
+            "mount",
+            ["-o".into(), "remount,bind,nosuid,nodev".into()],
             &[root_mount.as_path()],
         )
         .await?;
@@ -438,34 +215,21 @@ pub async fn mount_rootfs_owned(
     } else {
         Vec::new()
     };
-    info!(vmid, %manifest_digest, layers=image.layers.len(), unique_layer_blob_bytes=image.compressed_bytes, composefs_image_bytes=image.composefs_image_bytes, composefs_object_bytes=image.composefs_object_bytes, mount=%root_mount.display(), "OCI rootfs mounted; referenced cache usage (compressed blobs / composefs metadata / composefs objects)");
+    info!(vmid, %manifest_digest, image_object = %image.image.to_hex(), mount=%root_mount.display(), "OCI rootfs mounted from the composefs repository");
     owner.as_mut().unwrap().scratch_mounts = scratch_mounts;
     Ok(())
 }
 
-/// Tear down mounts in dependency order. Persistent upper data is never removed
-/// here; RBD is unmounted and unmapped only after the overlay and layers stop.
+/// Tear down mounts in dependency order. Persistent upper data is never
+/// removed here; RBD is unmounted and unmapped only after the overlay stops.
 pub async fn unmount_rootfs(prepared: &PreparedRootfs) -> Result<()> {
-    let directory_barrier = DIRECTORY_OPERATIONS.lock().await;
     unmount_scratch_mounts(&prepared.scratch_mounts).await?;
     unmount_path(&prepared.mount).await?;
-    unmount_layer_mounts(&prepared.layer_mounts).await?;
     if let Some(state) = &prepared.ephemeral_state_mount {
         unmount_path(state)
             .await
             .wrap_err("ephemeral rootfs state unmount failed")?;
     }
-    if let Some(runtime) = prepared.mount.parent().and_then(Path::file_name) {
-        let directory = Path::new("/var/lib/odorobo/directory-metadata").join(runtime);
-        match tokio::fs::remove_dir_all(directory).await {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err.into()),
-        }
-    }
-    // The backend lock can be held for a long persistent attach elsewhere;
-    // don't block other VMs' directory-metadata composition meanwhile.
-    drop(directory_barrier);
     release_persistent_backend(
         prepared.persistent_state_mount.as_deref(),
         prepared.rbd_image.as_deref(),
@@ -697,29 +461,26 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "requires privileged tmpfs mounts; tests busy-layer rollback and purge protection"]
+    #[ignore = "requires privileged tmpfs mounts; tests busy-root rollback and purge protection"]
     async fn partial_teardown_retries_without_purging_live_mounts() {
         let vmid = ulid::Ulid::generate().to_string();
         let mut instance = VMInstance::new(&vmid, PathBuf::from("/unused"), None, None);
         let runtime = instance.runtime_dir();
         let root = runtime.join("rootfs");
-        let layer = runtime.join("rootfs-layers/0");
         let state = runtime.join(EPHEMERAL_STATE_DIR);
         let upper = state.join("rootfs.upper");
-        for path in [&root, &layer, &state] {
+        for path in [&root, &state] {
             std::fs::create_dir_all(path).unwrap();
             mount("tmpfs", None, path).await;
         }
-        std::fs::write(layer.join("keep"), b"never purge through a mount").unwrap();
         std::fs::create_dir_all(&upper).unwrap();
         std::fs::write(upper.join("keep"), b"persistent until detached").unwrap();
-        let mut busy = hold_busy(&layer);
+        let mut busy = hold_busy(&root);
         let prepared = PreparedRootfs {
             digest: "fixture".into(),
             mount: root.clone(),
             upper: Some(upper.clone()),
             work: None,
-            layer_mounts: vec![layer.clone()],
             persistent_state_mount: None,
             rbd_image: None,
             _state_lock: acquire_rootfs_lock(&vmid).await.unwrap(),
@@ -729,14 +490,12 @@ mod tests {
         };
         async {
             assert!(unmount_rootfs(&prepared).await.is_err());
-            assert!(!is_mountpoint(&root).await.unwrap());
-            assert!(is_mountpoint(&layer).await.unwrap());
+            assert!(is_mountpoint(&root).await.unwrap());
             assert!(
                 is_mountpoint(&state).await.unwrap(),
-                "ephemeral state must outlive a failed lower teardown"
+                "ephemeral state must outlive a failed root teardown"
             );
             assert!(instance.purge_instance_data().is_err());
-            assert!(layer.join("keep").exists());
             assert!(upper.join("keep").exists());
             busy.kill().await.unwrap();
             unmount_rootfs(&prepared).await.unwrap();
@@ -757,7 +516,7 @@ mod tests {
         clippy::too_many_lines,
         reason = "end-to-end test exercises one long scenario"
     )]
-    async fn oci_rootfs_modes_share_verified_layers_and_keep_writes_isolated() {
+    async fn oci_rootfs_modes_keep_base_and_writes_isolated() {
         let base = TempDir::under(Path::new("/var/lib/odorobo/oci-rootfs-tests"), "modes");
         let image = oci_ref(&OciFixture::default().layout(&base.join("base")));
         let changed_image = oci_ref(
@@ -835,7 +594,7 @@ mod tests {
         }
         assert!(
             !ro_a.mount.join("etc/deleted").exists(),
-            "single-layer read-only root must interpret whiteouts"
+            "whiteouts must be applied when the image is imported"
         );
         unmount_rootfs(&ro_a).await.unwrap();
         unmount_rootfs(&ro_b).await.unwrap();
@@ -843,7 +602,7 @@ mod tests {
         drop(ro_b);
 
         // A late missing scratch path must fail without leaving a /tmp
-        // tmpfs, the root bind, or its composefs layer mounted.
+        // tmpfs or the root mount behind.
         let incomplete = OciFixture {
             fill: b'z',
             include_run: false,
@@ -859,9 +618,6 @@ mod tests {
                 .await
                 .unwrap()
         );
-        for entry in std::fs::read_dir(failed_runtime.join("rootfs-layers")).unwrap() {
-            assert!(!is_mountpoint(&entry.unwrap().path()).await.unwrap());
-        }
 
         let p = mount_image(&persistent, &image, RootfsMode::Persistent)
             .await
@@ -923,7 +679,7 @@ mod tests {
             .expect("failed acquisition must retain ownership");
         assert!(is_mountpoint(&prepared.mount).await.unwrap());
         let _err = acquire_rootfs_lock(&vmid).await.unwrap_err();
-        let mut busy = hold_busy(&prepared.layer_mounts[0]);
+        let mut busy = hold_busy(&prepared.mount);
         assert!(unmount_rootfs(prepared).await.is_err());
         let _err = acquire_rootfs_lock(&vmid).await.unwrap_err();
         busy.kill().await.unwrap();
