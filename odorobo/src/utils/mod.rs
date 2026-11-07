@@ -167,10 +167,18 @@ pub fn connect_to_swarm() -> Result<PeerId> {
 
     info!("Local peer id: {:?}", local_peer_id);
 
+    // kameo 0.22 Behaviour::poll drops its command-channel waker after Unregister; the tick re-polls.
+    let mut wake = tokio::time::interval(std::time::Duration::from_millis(50));
+    wake.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     // Spawn the swarm task
     tokio::spawn(async move {
         loop {
-            match swarm.select_next_some().await {
+            let event = tokio::select! {
+                event = swarm.select_next_some() => event,
+                _ = wake.tick() => continue,
+            };
+            match event {
                 // Handle mDNS discovery
                 SwarmEvent::Behaviour(ProductionBehaviourEvent::Mdns(mdns::Event::Discovered(
                     list,
