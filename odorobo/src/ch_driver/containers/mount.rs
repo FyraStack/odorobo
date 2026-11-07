@@ -17,7 +17,7 @@ use futures_util::{StreamExt, TryStreamExt};
 use super::dirmeta::{DIRECTORY_OPERATIONS, compose_directory_metadata};
 use super::layer_store::materialize_layer;
 use super::limits::{EPHEMERAL_STATE, MIB, RUN_SCRATCH, TMP_SCRATCH, VARTMP_SCRATCH};
-use super::oci::{OciUnpackLimits, pull_oci, read_oci_manifest};
+use super::oci::{OciManifest, OciUnpackLimits, pull_oci, read_oci_manifest};
 use super::persistent::{
     EPHEMERAL_STATE_DIR, PersistentBackend, acquire_rootfs_lock, persistent_backend, prepare_upper,
     rbd_identity, rbd_lookup_device, release_persistent_backend,
@@ -96,10 +96,18 @@ const MAX_PARALLEL_LAYER_BUILDS: usize = 4;
 #[derive(Debug)]
 pub struct PreparedImage {
     digest: String,
+    config: Vec<u8>,
     layers: Vec<PreparedLayer>,
     compressed_bytes: u64,
     composefs_image_bytes: u64,
     composefs_object_bytes: u64,
+}
+
+impl PreparedImage {
+    /// Raw OCI image config document, delivered to the guest init.
+    pub fn config(&self) -> &[u8] {
+        &self.config
+    }
 }
 
 #[derive(Debug)]
@@ -116,10 +124,13 @@ pub async fn prepare_image(rootfs: &Rootfs) -> Result<PreparedImage> {
     let limits = OciUnpackLimits::from_env()?;
     let layout = pull_oci(&rootfs.oci, limits.max_compressed_bytes).await?;
     let layout_for_parse = layout.clone();
-    let (digest, descriptors) =
-        tokio::task::spawn_blocking(move || read_oci_manifest(&layout_for_parse))
-            .await
-            .map_err(|e| eyre!("OCI manifest validation task failed: {e}"))??;
+    let OciManifest {
+        digest,
+        config: config_bytes,
+        layers: descriptors,
+    } = tokio::task::spawn_blocking(move || read_oci_manifest(&layout_for_parse))
+        .await
+        .map_err(|e| eyre!("OCI manifest validation task failed: {e}"))??;
     if descriptors.is_empty() {
         bail!("OCI image has no filesystem layers");
     }
@@ -197,6 +208,7 @@ pub async fn prepare_image(rootfs: &Rootfs) -> Result<PreparedImage> {
     }
     Ok(PreparedImage {
         digest,
+        config: config_bytes,
         layers,
         compressed_bytes,
         composefs_image_bytes,

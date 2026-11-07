@@ -125,10 +125,10 @@ Omit `mac_address` unless you need a fixed address. Two VMs on the same bridge w
 
 ### Guest configuration
 
-The agent configures only the host side. Something inside the guest must bring `eth0` up and run a DHCP client. A shell as PID 1 does neither, and the Fedora container image ships no `ip` or DHCP client. For a quick test, let the kernel do it by adding `ip=dhcp` to `boot.cmdline`, which makes the guest configure `eth0` before init runs:
+The agent configures only the host side. Something inside the guest must bring `eth0` up and run a DHCP client, which most images do through their OCI `ENTRYPOINT`/`CMD`. A bare shell as PID 1 does neither, and the Fedora container image ships no `ip` or DHCP client. For a quick test, let the kernel do it by adding `ip=dhcp` to `boot.cmdline`, which makes the guest configure `eth0` before init runs:
 
 ```json
-"boot": { "start": true, "cmdline": "console=ttyS0 root=rootfs rootfstype=virtiofs rw init=/bin/sh ip=dhcp" }
+"boot": { "start": true, "cmdline": "console=ttyS0 ip=dhcp" }
 ```
 
 The console then shows `IP-Config: Got DHCP answer from 10.10.100.1`, with the gateway and nameserver set to the bridge address. Images with their own network management do not need `ip=dhcp`.

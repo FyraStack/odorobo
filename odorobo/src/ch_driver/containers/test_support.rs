@@ -168,7 +168,7 @@ impl OciFixture<'_> {
         } else {
             "amd64"
         };
-        let config = serde_json::to_vec(&json!({"architecture": platform_arch, "os":"linux", "rootfs":{"type":"layers","diff_ids":[diff_id]}})).unwrap();
+        let config = serde_json::to_vec(&json!({"architecture": platform_arch, "os":"linux", "config":{"Entrypoint":["/bin/sh"]}, "rootfs":{"type":"layers","diff_ids":[diff_id]}})).unwrap();
         let config_digest = put_blob(&layout, &config);
         let manifest = serde_json::to_vec(&json!({"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":config_digest,"size":config.len()},"layers":[{"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":layer_digest,"size":tar_bytes.len()}]})).unwrap();
         let manifest_digest = put_blob(&layout, &manifest);

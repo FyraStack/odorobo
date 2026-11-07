@@ -1,0 +1,29 @@
+# Build the PID 1 binary and pack the microVM initramfs.
+#
+# The archive holds only /init: the guest creates /dev/console itself, so
+# packing needs no root and no device nodes. The output is deterministic
+# (mtimes and ownership normalised, gzip without name or timestamp), and it
+# is installed once as a stable file the driver boots, never rebuilt per VM.
+manifest := justfile_directory() / "Cargo.toml"
+target := "x86_64-unknown-linux-musl"
+output := "/var/lib/odorobo/microvm/initramfs.cpio.gz"
+
+default: initramfs
+
+build:
+    cargo build --release -p odorobo-init --target {{ target }} --manifest-path {{ manifest }}
+
+initramfs: build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    stage="$(mktemp -d)"
+    trap 'rm -rf "$stage"' EXIT
+    target_dir="$(cargo metadata --no-deps --format-version 1 --manifest-path "{{ manifest }}" |
+        python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
+    install -Dm755 "$target_dir/{{ target }}/release/odorobo-init" "$stage/init"
+    (cd "$stage" &&
+        printf 'init\n' |
+            cpio -o -H newc --reproducible --owner=0:0 --quiet |
+            gzip -9n) > "$stage/initramfs.cpio.gz"
+    sudo install -Dm644 "$stage/initramfs.cpio.gz" "{{ output }}"
+    echo "wrote {{ output }}"

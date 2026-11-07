@@ -122,7 +122,7 @@ pub struct DesiredState {
     pub storage: Vec<Storage>,
     /// Container root filesystem: an OCI image materialized on the node and
     /// served to the guest over virtiofs. The agent supervises virtiofsd and
-    /// boots the microVM kernel directly with `root=rootfs rootfstype=virtiofs`
+    /// boots the microVM kernel with an initramfs whose PID 1 mounts the share
     /// (issues #112/#113). Storage-backed VMs leave this unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rootfs: Option<Rootfs>,

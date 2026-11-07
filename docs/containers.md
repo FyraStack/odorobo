@@ -13,8 +13,8 @@ The guest sees an ordinary virtiofs root and does not need composefs support.
 - **Storage:** OCI/layer caches stay node-local. Persistent state supports a local backend for development and testing, and an RBD backend for cross-node cold restart. Live migration remains unsupported.
 - **Reference aliases:** each OCI source string, exactly as written in the manifest, gets a cached layout alias. `fedora:latest` and `docker://registry.fedoraproject.org/fedora:latest` are separate aliases that share layer caches. Mutable tags are not refreshed automatically; persistent state separately pins the selected manifest digest.
 - **No cleanup:** nothing evicts cached blobs or layers. Disk use only grows until an operator removes content that no mounted or persistent VM needs.
-- **Init:** the guest runs the image's own init (or `init=` from `boot.cmdline`). The image's `ENTRYPOINT`/`CMD` are not used. See [Guest boot and init](#guest-boot-and-init).
-- **Prerequisites:** the node needs the microVM kernel built by `scripts/build-microvm-kernel.sh`, plus `skopeo`, `composefs`, `fsverity-utils` and `virtiofsd`. `/var/lib/odorobo` must be on an fs-verity filesystem such as ext4 or btrfs.
+- **Init:** the guest boots a small initramfs whose PID 1 mounts the image's virtiofs root and runs the image's `ENTRYPOINT`/`CMD` with its `Env`, `WorkingDir` and `User`. `boot.cmdline` can still set `init=`. See [Guest boot and init](#guest-boot-and-init).
+- **Prerequisites:** the node needs the microVM kernel and initramfs built by `scripts/build-microvm-kernel.sh` and `just -f odorobo-init/justfile initramfs`, plus `skopeo`, `composefs`, `fsverity-utils` and `virtiofsd`. `/var/lib/odorobo` must be on an fs-verity filesystem such as ext4 or btrfs.
 
 ## Goals and scope
 
@@ -89,20 +89,30 @@ Live migration remains rejected for all OCI-rootfs VMs. The RBD path provides pe
 
 ## Guest boot and init
 
-Cloud Hypervisor direct-boots the node's microVM kernel (`/var/lib/odorobo/microvm/vmlinux`, built by `scripts/build-microvm-kernel.sh`) with no firmware or initramfs. The default command line is `console=ttyS0 root=rootfs rootfstype=virtiofs rw`. The kernel mounts the virtiofs share tagged `rootfs` as `/`, then runs the first program it finds among the `init=` parameter, `/sbin/init`, `/etc/init`, `/bin/init` and `/bin/sh`.
+Cloud Hypervisor direct-boots the node's microVM kernel (`/var/lib/odorobo/microvm/vmlinux`, built by `scripts/build-microvm-kernel.sh`) with a small gzipped initramfs (`/var/lib/odorobo/microvm/initramfs.cpio.gz`, built by `odorobo-init/justfile`) and no firmware. The default command line is `console=ttyS0`.
 
-- **Odorobo ships no guest init or agent.** The image must provide its own init. A systemd image runs systemd as PID 1; a minimal image can set `init=` through `desired.boot.cmdline`. Systemd images are untested.
-- **The OCI config's `ENTRYPOINT`, `CMD`, `Env`, `WorkingDir` and `User` are ignored.** Only the layer list and DiffIDs are read from the config. To run a specific program, set `init=/path` in `boot.cmdline`, or ship an init that starts it.
-- **The console is the 16550 serial port (`ttyS0`).** The agent exposes it as a socket and keeps a history, read through `GET /vms/{vmid}/console/history`. The virtio console (`hvc0`) is off.
-- **Overrides:** `boot.kernel` replaces the kernel and `boot.cmdline` replaces the whole default command line. Include `root=rootfs rootfstype=virtiofs` again when overriding, or the VM cannot find its root.
-- **The ignored KVM test** (`faas_vm_boots_oci_rootfs_through_the_actor`) compiles a static C program with Zig, installs it as `/bin/sh` in a fixture image and boots with `init=/bin/sh`. The test passes when the console shows the program's message.
+The initramfs contains a single static `odorobo-init` binary as `/init`. As PID 1 it:
+
+1. mounts `devtmpfs`, `proc` and `sysfs`;
+2. mounts the read-only virtiofs share tagged `odorobo-config` at `/run/.odorobo` and reads the image's OCI config document from `/run/.odorobo/config.json`;
+3. mounts the virtiofs share tagged `rootfs` at `/newroot`, moves the pseudo-filesystems in, and `chroot`s into it;
+4. resolves the config's `User` against the image's `/etc/passwd` and `/etc/group`, applies `setgroups`/`setgid`/`setuid`, builds `Env` plus the entrypoint and command, and `execve`s it in the config's `WorkingDir`;
+5. reaps zombies, forwards `SIGTERM`/`SIGINT`/`SIGQUIT`/`SIGHUP` to the workload's process group, and powers the VM off when the workload exits.
+
+If the image has neither an entrypoint nor a command, the init falls back to `/sbin/init`, `/etc/init`, `/bin/init` and then `/bin/sh`. Unknown or missing config fields are ignored; an unreadable config is fatal. The agent writes `config.json` into the VM runtime directory before start, so the guest never sees the network or the host filesystem.
+
+The console is the 16550 serial port (`ttyS0`). The agent exposes it as a socket and keeps a history, read through `GET /vms/{vmid}/console/history`. The virtio console (`hvc0`) is off.
+
+**Overrides:** `boot.kernel` and `boot.initramfs` replace the defaults, and `boot.cmdline` replaces the whole command line. Overriding the initramfs means supplying another image that mounts the virtiofs root itself; overriding the kernel must keep built-in `virtiofs`, `overlayfs` and `devtmpfs`.
+
+The ignored KVM test (`faas_vm_boots_oci_rootfs_through_the_actor`) compiles a static C program with Zig, installs it as `/bin/sh` in a fixture image whose OCI config sets `Entrypoint: ["/bin/sh"]`, and boots it through the actor. The test passes when the console shows the program's message, which proves the config share, the initramfs and the virtiofs root all work together.
 
 ## Integrity, isolation, and process model
 
 - OCI index/manifest/config/layer descriptor SHA-256 checks and config DiffID checks protect pull/materialization input. Defaults bound downloaded OCI blobs to 16 GiB per image, uncompressed layers to 8 GiB each, aggregate uncompressed image content to 32 GiB, and tar entries to 1,000,000; node policy may tune these using `ODOROBO_ROOTFS_MAX_COMPRESSED_BYTES`, `ODOROBO_ROOTFS_MAX_LAYER_BYTES`, `ODOROBO_ROOTFS_MAX_IMAGE_BYTES` (`M`/`G`/`T`) and `ODOROBO_ROOTFS_MAX_ENTRIES` (1–10,000,000). `mkcomposefs` stores filesystem metadata in EROFS and non-empty file payloads in the layer digest store; file metadata/xattrs (including OverlayFS markers) are part of the composefs image. Extraction preserves numeric UID/GID, sticky/setuid/setgid permissions, capabilities, SELinux labels, POSIX ACLs, and ordinary user xattrs; image-supplied OverlayFS control xattrs and other unsupported namespaces are rejected. Attribute writes never follow symlinks. Staging directories are host-private (0700), exported host mounts use nosuid/nodev, and virtiofsd enables xattr/ACL support. Directory metadata (including `.` and default ACLs) is restored after extraction so tar order cannot create inherited ACLs absent from child entries. Layer-cache format v8 records explicit directory changes and distinct deletion/opaque boundaries. Opaque markers reset descendants only, preserving the directory's own inherited attributes unless explicitly changed. Per-VM directory-only composefs metadata corrects synthetic ancestors so later file-only layers do not replace inherited directory ownership, modes or ACLs. Inheritance stops at deleted, opaque, symlink or non-directory ancestor generations; candidates are checked without following symlink ancestors; file payloads remain in shared immutable layer caches. The measured composefs image digest pins metadata. fs-verity on the image and backing objects protects metadata and payload bytes; mounts require both the digest pin and `verity` checks, and fail closed if unsupported. Device nodes/FIFOs under `/dev` are omitted because guest devtmpfs supplies `/dev`; other unsupported tar entry types reject the layer rather than silently changing its contents.
 - All immutable layer mounts and merged lower mounts are read-only. A VM can only write to its own upper or explicitly allowed scratch tmpfs paths.
 - Each VM's writable upper/work is distinct, including VMs with the same OCI manifest digest.
-- The VM actor supervises virtiofsd with `--sandbox=chroot`, starts it before Cloud Hypervisor connects, stops it before unmount, and cleans up partial startup failures.
+- The VM actor supervises two virtiofsd processes with `--sandbox=chroot` (the rootfs store and the read-only config directory), starts them before Cloud Hypervisor connects, stops the config share first, then the root share before unmount, and cleans up partial startup failures.
 - Rootfs VMs require shared guest memory for the vhost-user virtiofs device. The direct-boot kernel/cmdline and `ttyS0` UART console remain as documented for issue #112. The guest does not need composefs support.
 - Rootfs VMs reject live migration. Planned host drain uses clean cold restart with the same persistent upper and pinned OCI base digest.
 
@@ -121,7 +131,7 @@ Previously validated on the single-node privileged `.local/dev` Ceph environment
 
 - `cargo test --workspace`: passed; five privileged/KVM tests are ignored by default.
 - `cargo clippy --workspace --all-targets --all-features`: passes with the workspace's current pedantic warnings.
-- The ignored actor KVM test was run and passed: direct custom-kernel boot reached virtiofs through actor-supervised chroot virtiofsd, and explicit `DeleteVM` cleaned the mount/socket. The test uses a static fixture init binary built with Zig and needs nested KVM plus the host tools.
+- The ignored actor KVM test boots the guest initramfs, mounts the virtiofs root, reads the OCI config share, executes the fixture entrypoint, and checks that `DeleteVM` cleans both shares. The test uses a static fixture binary built with Zig and needs nested KVM plus the host tools.
 - Privileged OCI end-to-end test passed all three modes: per-VM bounded scratch and read-only write rejection; ephemeral isolation/removal; local persistent stop/restart, base-digest mismatch rejection, and explicit deletion.
 - Privileged layer mount and OverlayFS integration tests passed: composefs/fs-verity image and payload verification, top-layer order, replacement, whiteout, and opaque-directory behavior.
 - Disposable per-VM RBD helper test passed formatting, filesystem check, exclusive-lock feature verification, unmount/unmap/remap, persisted-upper reattach, and explicit volume deletion. A separate manual disposable RBD OverlayFS test also passed.

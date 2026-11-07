@@ -268,7 +268,11 @@ pub(super) fn preflight_local_oci_layout(normalized: &str) -> Result<(String, u6
         .rsplit_once(':')
         .ok_or_else(|| eyre!("OCI layout reference has no tag separator"))?;
     let layout = Path::new(layout);
-    let (manifest_digest, layers) = read_oci_manifest(layout)?;
+    let OciManifest {
+        digest: manifest_digest,
+        layers,
+        ..
+    } = read_oci_manifest(layout)?;
     let manifest_path = digest_blob_path(layout, &manifest_digest)?;
     let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
     let config_digest = manifest["config"]["digest"]
@@ -552,7 +556,7 @@ pub(super) async fn pull_oci_inner(image_ref: &str, max_compressed_bytes: u64) -
     let layout_for_check = tmp.clone();
     let expected_manifest = preflight.manifest_digest.clone();
     let selected_manifest = tokio::task::spawn_blocking(move || {
-        read_oci_manifest(&layout_for_check).map(|(digest, _)| digest)
+        read_oci_manifest(&layout_for_check).map(|manifest| manifest.digest)
     })
     .await
     .map_err(|e| eyre!("post-pull OCI validation task panicked: {e}"))?;
@@ -607,6 +611,15 @@ pub(super) struct OciLayerDescriptor {
     pub size: Option<u64>,
 }
 
+/// Platform-selected manifest plus its image config document, which the guest
+/// init applies as the workload's entrypoint, env, workdir, and user.
+#[derive(Debug)]
+pub(super) struct OciManifest {
+    pub digest: String,
+    pub config: Vec<u8>,
+    pub layers: Vec<OciLayerDescriptor>,
+}
+
 pub(super) fn hash_file(path: &Path) -> Result<String> {
     let mut file = std::fs::File::open(path)
         .wrap_err_with(|| format!("open {} for digest verification", path.display()))?;
@@ -628,7 +641,7 @@ pub(super) fn normalized_arch(arch: &str) -> &str {
 /// Select and integrity-check the platform-specific image manifest, config,
 /// and layer descriptors in an OCI layout. This node builds the kernel for its
 /// own architecture, so incompatible manifests are rejected rather than used.
-pub(super) fn read_oci_manifest(layout: &Path) -> Result<(String, Vec<OciLayerDescriptor>)> {
+pub(super) fn read_oci_manifest(layout: &Path) -> Result<OciManifest> {
     let index_bytes = std::fs::read(layout.join("index.json"))?;
     let index: serde_json::Value =
         serde_json::from_slice(&index_bytes).wrap_err("parse OCI index.json")?;
@@ -673,8 +686,9 @@ pub(super) fn read_oci_manifest(layout: &Path) -> Result<(String, Vec<OciLayerDe
     if hash_file(&config_path)? != config_digest {
         bail!("OCI config digest mismatch for {config_digest}");
     }
+    let config_bytes = std::fs::read(&config_path)?;
     let config: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(config_path)?).wrap_err("parse OCI image config")?;
+        serde_json::from_slice(&config_bytes).wrap_err("parse OCI image config")?;
     let config_os = config["os"].as_str().unwrap_or_default();
     let config_arch = config["architecture"].as_str().unwrap_or_default();
     if config_os != "linux" || normalized_arch(config_arch) != host_arch {
@@ -722,7 +736,11 @@ pub(super) fn read_oci_manifest(layout: &Path) -> Result<(String, Vec<OciLayerDe
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    Ok((manifest_digest, layers))
+    Ok(OciManifest {
+        digest: manifest_digest,
+        config: config_bytes,
+        layers,
+    })
 }
 
 #[cfg(test)]
@@ -908,7 +926,7 @@ mod tests {
     async fn verifies_manifest_platform_config_and_layer_descriptors() {
         let base = TempDir::new("oci-index");
         let (layout, layer) = fixture_oci_layout(&base);
-        let (_, descriptors) = read_oci_manifest(&layout).unwrap();
+        let descriptors = read_oci_manifest(&layout).unwrap().layers;
         assert_eq!(descriptors.len(), 1);
         assert_eq!(descriptors[0].digest, layer.digest);
         let mut bad_diff_id = layer.clone();

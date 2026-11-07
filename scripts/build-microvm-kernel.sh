@@ -2,9 +2,10 @@
 # Build a tiny Linux kernel for odorobo FaaS microVMs (issue #112).
 #
 # Boot path: Cloud Hypervisor direct kernel boot (PVH) of the vmlinux ELF,
-# no firmware, no GRUB, no initramfs — the root filesystem is a virtiofs
-# mount provided by virtiofsd (tag "rootfs"), so the virtio/virtiofs and
-# overlayfs drivers MUST be built-in (=y), not modules.
+# no firmware, no GRUB. A tiny gzipped initramfs supplies PID 1, which mounts
+# the root filesystem from a virtiofs share provided by virtiofsd (tag
+# "rootfs"), so the virtio/virtiofs and overlayfs drivers MUST be built-in
+# (=y), not modules.
 #
 # Config is x86_64_defconfig (the issue's buildconfig) plus:
 #   * CONFIG_PVH — paravirt boot entry for CH direct boot
@@ -54,7 +55,10 @@ CFG() { ./scripts/config --file "$SRC_DIR/.build/.config" "$@"; }
 
 # paravirt boot entry for CH direct boot (issue #112)
 CFG --enable PVH
-# virtio (built-in: needed to mount root over virtiofs with no initramfs)
+# gzipped initramfs holding the guest init (odorobo-init/justfile)
+CFG --enable BLK_DEV_INITRD
+CFG --enable RD_GZIP
+# virtio (built-in: needed to mount root over virtiofs from the initramfs)
 CFG --enable VIRTIO
 CFG --enable VIRTIO_PCI
 CFG --enable VIRTIO_NET
@@ -120,4 +124,4 @@ fi
 
 echo "==> done in $((SECONDS - START))s"
 echo "   $(du -h "$OUT_DIR/vmlinux" | cut -f1) -> $OUT_DIR/vmlinux"
-echo "   boot it with: cloud-hypervisor --kernel $OUT_DIR/vmlinux --cmdline \"console=ttyS0 root=rootfs rootfstype=virtiofs rw\" ..."
+echo "   boot it with: cloud-hypervisor --kernel $OUT_DIR/vmlinux --initramfs /var/lib/odorobo/microvm/initramfs.cpio.gz --cmdline \"console=ttyS0\" ..."
