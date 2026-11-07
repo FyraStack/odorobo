@@ -28,7 +28,9 @@ mod virtiofs;
 
 pub use mount::{PreparedImage, mount_rootfs_owned, prepare_image, unmount_rootfs};
 pub use persistent::{PERSISTENT_OPERATIONS, RBD_RESERVATIONS, delete_persistent_rootfs};
-pub use virtiofs::{VirtioFsSupervisor, VirtiofsdSpec, socket_path_for, virtiofsd_path};
+pub use virtiofs::{
+    VirtioFsSupervisor, VirtiofsdSpec, config_socket_path_for, socket_path_for, virtiofsd_path,
+};
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -40,15 +42,23 @@ use crate::manifest::RootfsMode;
 /// virtiofs mount tag the guest root is served under.
 pub const ROOTFS_TAG: &str = "rootfs";
 
+/// virtiofs share carrying the OCI image config document (`config.json`) to
+/// the guest init, which applies its entrypoint, env, workdir and user.
+pub const CONFIG_TAG: &str = "odorobo-config";
+
 /// The tiny custom microvm kernel built by
 /// `scripts/build-microvm-kernel.sh` (issue #112 buildconfig).
 pub const MICROVM_KERNEL_PATH: &str = "/var/lib/odorobo/microvm/vmlinux";
 
+/// PID 1 initramfs packed by `just --justfile odorobo-init/justfile`.
+pub const MICROVM_INITRAMFS_PATH: &str = "/var/lib/odorobo/microvm/initramfs.cpio.gz";
+
 /// Direct-kernel-boot cmdline for a composefs/virtiofs root. The guest init
-/// must live at /sbin/init, /etc/init, /bin/init or /bin/sh (kernel default).
+/// from [`MICROVM_INITRAMFS_PATH`] mounts the virtiofs root itself, so the
+/// kernel gets no `root=`; the init then execs the image's process config.
 /// console=ttyS0 (the 16550 UART) because the driver's `ConsoleTransform`
 /// sockets the UART; the virtio-console (hvc0) is off.
-pub const DEFAULT_ROOTFS_CMDLINE: &str = "console=ttyS0 root=rootfs rootfstype=virtiofs rw";
+pub const DEFAULT_ROOTFS_CMDLINE: &str = "console=ttyS0";
 
 const OCI_CACHE_ROOT: &str = "/var/lib/odorobo/oci-cache";
 

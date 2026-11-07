@@ -77,8 +77,8 @@ non-zero vCPUs and memory, and satisfy these relationships:
   supplied together.
 - A vsock guest CID must be non-zero and its socket must be an absolute path.
 - A `rootfs` must reference a non-empty OCI image reference. The guest boots
-  the agent's microVM kernel with `root=rootfs rootfstype=virtiofs`; supported
-  write modes and the host preparation pipeline are documented in
+  the agent's microVM kernel and initramfs, which mounts the virtiofs root;
+  supported write modes and the host preparation pipeline are documented in
   [`containers.md`](containers.md).
 
 Invalid field combinations are rejected during deserialization, as are unknown

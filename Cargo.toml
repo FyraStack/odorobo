@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["odorobo", "odoroboctl"]
+members = ["odorobo", "odoroboctl", "odorobo-init"]
 
 [workspace.package]
 rust-version = "1.95.0"

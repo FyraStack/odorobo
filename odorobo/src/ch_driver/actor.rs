@@ -337,10 +337,7 @@ mod tests {
                 placement: Placement::default(),
                 boot: Boot {
                     start: true,
-                    // The fixture installs our static init at /bin/sh.
-                    cmdline: Some(
-                        "console=ttyS0 root=rootfs rootfstype=virtiofs rw init=/bin/sh".to_owned(),
-                    ),
+                    // The fixture image's OCI config sets Entrypoint to /bin/sh.
                     ..Default::default()
                 },
                 cloud_init: None,
@@ -364,6 +361,7 @@ mod tests {
             .checked_add(Duration::from_secs(120))
             .expect("deadline in range");
         let mut virtiofs_seen = false;
+        let mut last_history = Vec::new();
         while std::time::Instant::now() < deadline {
             let reply = match actor_ref.ask(GetConsoleHistory { vmid }).await {
                 Ok(reply) => reply,
@@ -377,6 +375,7 @@ mod tests {
                 }
             };
             let text = String::from_utf8_lossy(&reply.history);
+            last_history.clone_from(&reply.history);
             if text.contains("odorobo-test-init") {
                 virtiofs_seen = true;
                 info!(
@@ -391,7 +390,8 @@ mod tests {
         }
         assert!(
             virtiofs_seen,
-            "guest never executed fixture init within 120s"
+            "guest never executed fixture init within 120s; console:\n{}",
+            String::from_utf8_lossy(&last_history)
         );
 
         // Cold stop must detach mounts but keep the lifecycle owner and upper
@@ -537,6 +537,8 @@ pub struct VMActor {
     /// Supervised virtiofsd child (extra process supervised by this actor)
     /// when the VM boots an OCI rootfs over virtiofs (`FaaS`, issue #112).
     pub virtiofs: Option<VirtioFsSupervisor>,
+    /// Second supervisor for the read-only OCI config share.
+    pub config_virtiofs: Option<VirtioFsSupervisor>,
     /// This VM's digest-pinned composefs mount of its OCI rootfs.
     pub rootfs_mount: Option<PreparedRootfs>,
     /// Desired provider-neutral intent retained for VM info and migration.
@@ -608,7 +610,12 @@ impl Message<HypervisorExited> for VMActor {
         {
             let cleanup = async {
                 self.vm_instance.stop().await?;
-                teardown_rootfs(&mut self.virtiofs, &mut self.rootfs_mount).await
+                teardown_rootfs(
+                    &mut self.virtiofs,
+                    &mut self.config_virtiofs,
+                    &mut self.rootfs_mount,
+                )
+                .await
             }
             .await;
             self.startup_error = Some(format!("hypervisor exited; cleanup: {cleanup:?}"));
@@ -644,7 +651,12 @@ impl Message<StartVM> for VMActor {
         // Release any retained mounts now, so a blocked teardown fails this call instead of the boot.
         let teardown = async {
             self.vm_instance.stop().await?;
-            teardown_rootfs(&mut self.virtiofs, &mut self.rootfs_mount).await?;
+            teardown_rootfs(
+                &mut self.virtiofs,
+                &mut self.config_virtiofs,
+                &mut self.rootfs_mount,
+            )
+            .await?;
             self.vm_instance.purge_instance_data()
         }
         .await;
@@ -705,8 +717,13 @@ impl Message<ImageReady> for VMActor {
 /// Keep the prepared state on failure so the same operation can be retried.
 async fn teardown_rootfs(
     virtiofs: &mut Option<VirtioFsSupervisor>,
+    config_virtiofs: &mut Option<VirtioFsSupervisor>,
     rootfs: &mut Option<PreparedRootfs>,
 ) -> Result<()> {
+    if let Some(supervisor) = config_virtiofs.as_ref() {
+        supervisor.stop().await;
+    }
+    *config_virtiofs = None;
     if let Some(supervisor) = virtiofs.as_ref() {
         supervisor.stop().await;
     }
@@ -729,7 +746,12 @@ impl VMActor {
     async fn rollback_start(&mut self, err: &stable_eyre::Report) -> String {
         let cleanup = async {
             self.vm_instance.stop().await?;
-            teardown_rootfs(&mut self.virtiofs, &mut self.rootfs_mount).await?;
+            teardown_rootfs(
+                &mut self.virtiofs,
+                &mut self.config_virtiofs,
+                &mut self.rootfs_mount,
+            )
+            .await?;
             self.vm_instance.purge_instance_data()
         }
         .await;
@@ -747,7 +769,12 @@ impl VMActor {
         // Clean any previous failed acquisition before trying again. Keep its
         // ownership inventory if teardown fails; never overwrite live mounts.
         self.vm_instance.stop().await?;
-        teardown_rootfs(&mut self.virtiofs, &mut self.rootfs_mount).await?;
+        teardown_rootfs(
+            &mut self.virtiofs,
+            &mut self.config_virtiofs,
+            &mut self.rootfs_mount,
+        )
+        .await?;
         self.vm_instance.purge_instance_data()?;
         let vmid = self.vmid;
         let vm_config = self.manifest.clone();
@@ -759,10 +786,11 @@ impl VMActor {
         let vm_config_for_ch = vm_config.as_ref().map(to_vm_config).transpose()?;
 
         // FaaS rootfs (issue #112): prepare the composefs mount and start the
-        // supervised virtiofsd BEFORE spawning CH — the fs device connects to
-        // the vhost-user socket at VM create time. Everything started here is
-        // cleaned up on any later failure.
+        // supervised virtiofsd processes BEFORE spawning CH — the fs devices
+        // connect to their vhost-user sockets at VM create time. Everything
+        // started here is cleaned up on any later failure.
         let virtiofs = &mut self.virtiofs;
+        let config_virtiofs = &mut self.config_virtiofs;
         let rootfs_mount = &mut self.rootfs_mount;
         if let Some(manifest) = &vm_config
             && let Some(rootfs) = &manifest.desired.rootfs
@@ -776,6 +804,11 @@ impl VMActor {
                 )
             })?;
             let image = image.ok_or_else(|| eyre!("OCI image was not prepared before start"))?;
+            // The init reads this before it execs the workload. The runtime
+            // dir is root-only, and the guest mounts the share read-only.
+            let config_dir = runtime_dir.join("config");
+            tokio::fs::create_dir_all(&config_dir).await?;
+            tokio::fs::write(config_dir.join("config.json"), image.config()).await?;
             crate::ch_driver::containers::mount_rootfs_owned(
                 &vmid.to_string(),
                 rootfs,
@@ -783,15 +816,27 @@ impl VMActor {
                 rootfs_mount,
             )
             .await?;
-            let spec = VirtiofsdSpec {
-                program,
+            let rootfs_spec = VirtiofsdSpec {
+                program: program.clone(),
                 socket: crate::ch_driver::containers::socket_path_for(&vmid.to_string()),
                 shared_dir: rootfs_mount.as_ref().unwrap().mount.clone(),
                 log: runtime_dir.join("virtiofsd.log"),
             };
+            let config_spec = VirtiofsdSpec {
+                program,
+                socket: crate::ch_driver::containers::config_socket_path_for(&vmid.to_string()),
+                shared_dir: config_dir,
+                log: runtime_dir.join("virtiofsd-config.log"),
+            };
             let start = async {
-                *virtiofs = Some(VirtioFsSupervisor::start(spec));
+                *virtiofs = Some(VirtioFsSupervisor::start(rootfs_spec));
                 virtiofs
+                    .as_ref()
+                    .unwrap()
+                    .wait_socket_ready(std::time::Duration::from_secs(15))
+                    .await?;
+                *config_virtiofs = Some(VirtioFsSupervisor::start(config_spec));
+                config_virtiofs
                     .as_ref()
                     .unwrap()
                     .wait_socket_ready(std::time::Duration::from_secs(15))
@@ -799,10 +844,10 @@ impl VMActor {
             }
             .await;
             if let Err(err) = start {
-                let cleanup = teardown_rootfs(virtiofs, rootfs_mount).await;
+                let cleanup = teardown_rootfs(virtiofs, config_virtiofs, rootfs_mount).await;
                 return Err(err.wrap_err(format!("virtiofs startup rollback: {cleanup:?}")));
             }
-            info!(%vmid, "virtiofsd supervised child started and socket ready");
+            info!(%vmid, "virtiofsd supervised children started and sockets ready");
         }
 
         self.generation = self
@@ -829,7 +874,7 @@ impl VMActor {
                 // Stop CH before removing a root from a potentially live guest.
                 let cleanup = async {
                     self.vm_instance.stop().await?;
-                    teardown_rootfs(virtiofs, rootfs_mount).await?;
+                    teardown_rootfs(virtiofs, config_virtiofs, rootfs_mount).await?;
                     self.vm_instance.purge_instance_data()
                 }
                 .await;
@@ -873,6 +918,7 @@ impl Actor for VMActor {
             migration_state: None,
             console: Console::default(),
             virtiofs: None,
+            config_virtiofs: None,
             rootfs_mount: None,
             manifest,
             startup_error: None,
@@ -916,7 +962,12 @@ impl Actor for VMActor {
 
         // Never purge the runtime tree until every rootfs mount is detached.
         self.vm_instance.stop().await?;
-        teardown_rootfs(&mut self.virtiofs, &mut self.rootfs_mount).await?;
+        teardown_rootfs(
+            &mut self.virtiofs,
+            &mut self.config_virtiofs,
+            &mut self.rootfs_mount,
+        )
+        .await?;
         self.vm_instance.purge_instance_data()
     }
 }
@@ -1208,9 +1259,13 @@ impl Message<ShutdownVM> for VMActor {
             .await
             .map_err(|err| format!("{err:#}"))?;
         self.started = false;
-        teardown_rootfs(&mut self.virtiofs, &mut self.rootfs_mount)
-            .await
-            .map_err(|err| format!("{err:#}"))?;
+        teardown_rootfs(
+            &mut self.virtiofs,
+            &mut self.config_virtiofs,
+            &mut self.rootfs_mount,
+        )
+        .await
+        .map_err(|err| format!("{err:#}"))?;
         self.vm_instance
             .purge_instance_data()
             .map_err(|err| format!("{err:#}"))?;
@@ -1255,7 +1310,13 @@ impl Message<DeleteVM> for VMActor {
                 .as_ref()
                 .is_some_and(|rootfs| rootfs.mode == crate::manifest::RootfsMode::Persistent)
         });
-        if let Err(err) = teardown_rootfs(&mut self.virtiofs, &mut self.rootfs_mount).await {
+        if let Err(err) = teardown_rootfs(
+            &mut self.virtiofs,
+            &mut self.config_virtiofs,
+            &mut self.rootfs_mount,
+        )
+        .await
+        {
             return DeleteVMReply {
                 error: Some(format!(
                     "rootfs teardown failed; actor retained for retry: {err}"
