@@ -26,7 +26,7 @@ pub mod test_support;
 mod unpack;
 mod virtiofs;
 
-pub use mount::{mount_rootfs_owned, unmount_rootfs};
+pub use mount::{PreparedImage, mount_rootfs_owned, prepare_image, unmount_rootfs};
 pub use persistent::{PERSISTENT_OPERATIONS, RBD_RESERVATIONS, delete_persistent_rootfs};
 pub use virtiofs::{VirtioFsSupervisor, VirtiofsdSpec, socket_path_for, virtiofsd_path};
 
@@ -133,6 +133,26 @@ fn remove_path(path: &Path) {
         }
         Err(_) => {}
     }
+}
+
+/// Serializes work on one cache path so concurrent callers reuse the first result.
+async fn keyed_lock(key: PathBuf) -> tokio::sync::OwnedMutexGuard<()> {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex, Weak};
+    static LOCKS: LazyLock<Mutex<HashMap<PathBuf, Weak<tokio::sync::Mutex<()>>>>> =
+        LazyLock::new(Mutex::default);
+    let lock = {
+        let mut locks = LOCKS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        locks.retain(|_, weak| weak.strong_count() > 0);
+        locks.get(&key).and_then(Weak::upgrade).unwrap_or_else(|| {
+            let lock = Arc::new(tokio::sync::Mutex::new(()));
+            locks.insert(key, Arc::downgrade(&lock));
+            lock
+        })
+    };
+    lock.lock_owned().await
 }
 
 fn validate_vmid(vmid: &str) -> Result<()> {

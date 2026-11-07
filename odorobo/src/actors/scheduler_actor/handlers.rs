@@ -292,7 +292,11 @@ impl Message<GetVMInfo> for SchedulerActor {
         let vm = RemoteActorRef::<VMActor>::lookup(vm_actor_id(vmid)).await?;
 
         let Some(vm) = vm else {
-            return Ok(GetVMInfoReply { vmid, config: None });
+            return Ok(GetVMInfoReply {
+                vmid,
+                config: None,
+                observed: None,
+            });
         };
 
         Ok(vm.ask(&msg).await?)
