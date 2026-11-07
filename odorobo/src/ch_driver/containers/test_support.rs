@@ -139,6 +139,9 @@ impl OciFixture<'_> {
             for (path, mode) in [
                 ("etc/", 0o755),
                 ("bin/", 0o755),
+                ("dev/", 0o755),
+                ("proc/", 0o555),
+                ("sys/", 0o555),
                 ("tmp/", 0o1777),
                 ("run/", 0o755),
                 ("var/", 0o755),
