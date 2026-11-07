@@ -65,6 +65,7 @@ fn mainloop(term: &Arc<AtomicBool>, config: Config) -> Result<()> {
             handle.abort();
             stable_eyre::eyre::bail!("Exit due to termination signal");
         }
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
 
