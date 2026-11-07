@@ -27,6 +27,15 @@ impl TransformChain {
         Self(vec![])
     }
 
+    /// The standard transforms, with the guest console chosen by the caller.
+    pub fn with_console(console: ConsoleTransform) -> Self {
+        Self::new()
+            .add(storage::StorageDriverTransformer::default())
+            .add(console)
+            .add(NetworkTransform)
+            .add(PathVerify)
+    }
+
     pub fn add<T: ConfigTransform + 'static>(mut self, transform: T) -> Self {
         self.0.push(Box::new(transform));
         self
@@ -57,10 +66,6 @@ impl ConfigTransform for TransformChain {
 
 impl Default for TransformChain {
     fn default() -> Self {
-        Self::new()
-            .add(storage::StorageDriverTransformer::default())
-            .add(ConsoleTransform)
-            .add(NetworkTransform)
-            .add(PathVerify)
+        Self::with_console(ConsoleTransform::default())
     }
 }

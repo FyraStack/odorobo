@@ -117,7 +117,7 @@ pub struct GetVMHeartbeatReply {
     pub vmid: Ulid,
 }
 
-/// Retrieve the retained serial-console output for a VM.
+/// Retrieve the retained serial-console output for a VM: kernel and init logs.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct GetConsoleHistory {
     pub vmid: Ulid,
@@ -128,7 +128,19 @@ pub struct GetConsoleHistoryReply {
     pub history: Vec<u8>,
 }
 
-/// Send raw input bytes to a VM's serial console.
+/// Retrieve the retained workload output for a VM: the stdin/stdout/stderr
+/// stream of the OCI workload on the virtio console.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct GetWorkloadLogs {
+    pub vmid: Ulid,
+}
+
+#[derive(Serialize, Deserialize, Reply, Debug, Clone)]
+pub struct GetWorkloadLogsReply {
+    pub logs: Vec<u8>,
+}
+
+/// Send raw input bytes to a VM's console.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SendConsoleInput {
     pub vmid: Ulid,

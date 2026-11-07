@@ -2,14 +2,16 @@ use std::{collections::VecDeque, sync::Arc};
 
 use crate::messages::vm::{
     DeleteVM, DeleteVMReply, GetConsoleHistory, GetConsoleHistoryReply, GetVMHeartbeat,
-    GetVMHeartbeatReply, GetVMInfo, GetVMInfoReply, MigrateVMReceive, MigrateVMReceiveReply,
-    PrepMigration, SendConsoleInput, SendConsoleInputReply, ShutdownVM,
+    GetVMHeartbeatReply, GetVMInfo, GetVMInfoReply, GetWorkloadLogs, GetWorkloadLogsReply,
+    MigrateVMReceive, MigrateVMReceiveReply, PrepMigration, SendConsoleInput,
+    SendConsoleInputReply, ShutdownVM,
 };
 use crate::{
     ch_driver::{
         VMInstance,
         containers::{PreparedRootfs, VirtioFsSupervisor, VirtiofsdSpec},
         manifest::to_vm_config,
+        transform::{ConsoleTransform, TransformChain},
     },
     manifest::VmManifest,
     networking::{actor::NetworkAgentActor, messages::PublishPorts},
@@ -157,7 +159,12 @@ impl Console {
         }
     }
 
-    /// Return the currently retained serial output, oldest bytes first.
+    /// Whether a console spool is attached to a VM socket.
+    pub async fn is_attached(&self) -> bool {
+        self.writer.lock().await.is_some()
+    }
+
+    /// Return the currently retained output, oldest bytes first.
     pub async fn history(&self) -> Vec<u8> {
         let mut history = Vec::new();
         {
@@ -282,7 +289,7 @@ mod tests {
         use crate::manifest::{
             Boot, Compute, DesiredState, MANIFEST_VERSION, Metadata, Placement, Rootfs, VmManifest,
         };
-        use crate::messages::vm::{DeleteVM, GetConsoleHistory};
+        use crate::messages::vm::{DeleteVM, GetConsoleHistory, GetWorkloadLogs};
         use kameo::prelude::*;
         use std::path::PathBuf;
         use std::time::Duration;
@@ -346,6 +353,7 @@ mod tests {
                 rootfs: Some(Rootfs {
                     oci: image_ref,
                     mode: crate::manifest::RootfsMode::Persistent,
+                    stdin: false,
                 }),
             },
             observed: None,
@@ -363,9 +371,10 @@ mod tests {
             .expect("deadline in range");
         let mut virtiofs_seen = false;
         let mut stopped = None;
-        let mut last_history = Vec::new();
+        let mut last_console = Vec::new();
+        let mut last_logs = Vec::new();
         while std::time::Instant::now() < deadline {
-            let reply = match actor_ref.ask(GetConsoleHistory { vmid }).await {
+            let console = match actor_ref.ask(GetConsoleHistory { vmid }).await {
                 Ok(reply) => reply,
                 Err(err) => {
                     let termination = match handle.await {
@@ -376,15 +385,24 @@ mod tests {
                     panic!("console history ask failed: {err}; {termination}");
                 }
             };
-            let text = String::from_utf8_lossy(&reply.history);
-            last_history.clone_from(&reply.history);
-            if text.contains("odorobo-test-init") {
+            last_console.clone_from(&console.history);
+            // The fixture init prints its marker to stdout, which the split
+            // console layout carries on the workload stream, not the serial one.
+            let logs = match actor_ref.ask(GetWorkloadLogs { vmid }).await {
+                Ok(reply) => reply,
+                Err(err) => panic!(
+                    "workload logs ask failed: {err}; console:\n{}",
+                    String::from_utf8_lossy(&console.history)
+                ),
+            };
+            last_logs.clone_from(&logs.logs);
+            if String::from_utf8_lossy(&logs.logs).contains("odorobo-test-init") {
                 virtiofs_seen = true;
                 info!(
                     vmid = %vmid,
-                    tail = %String::from_utf8_lossy(&reply.history
-                        [reply.history.len().saturating_sub(400)..]),
-                    "guest console shows virtiofs"
+                    workload_tail = %String::from_utf8_lossy(&logs.logs
+                        [logs.logs.len().saturating_sub(400)..]),
+                    "guest workload console shows the fixture init"
                 );
                 break;
             }
@@ -401,11 +419,12 @@ mod tests {
         }
         assert!(
             virtiofs_seen,
-            "guest never executed fixture init within 120s{}; console:\n{}\n(check that /var/lib/odorobo/microvm/initramfs.cpio.gz matches the crate: `just initramfs`)",
+            "guest never executed fixture init within 120s{}; console:\n{}\nworkload logs:\n{}\n(check that /var/lib/odorobo/microvm/initramfs.cpio.gz matches the crate: `just initramfs`)",
             stopped
                 .as_ref()
                 .map_or_else(String::new, |err| format!("; VM stopped: {err}")),
-            String::from_utf8_lossy(&last_history)
+            String::from_utf8_lossy(&last_console),
+            String::from_utf8_lossy(&last_logs)
         );
 
         // Cold stop must detach mounts but keep the lifecycle owner and upper
@@ -538,7 +557,10 @@ pub struct VMActor {
     /// path to the Cloud Hypervisor socket, in /run/odorobo/vms/<VMID>/ch.sock
     pub vm_instance: VMInstance,
     pub migration_state: Option<MigrationState>,
+    /// Kernel and init output from the serial console.
     pub console: Console,
+    /// Workload stdin/stdout/stderr from the virtio console.
+    pub workload_console: Console,
     /// Supervised virtiofsd child (extra process supervised by this actor)
     /// when the VM boots an OCI rootfs over virtiofs (issue #112).
     pub virtiofs: Option<VirtioFsSupervisor>,
@@ -882,22 +904,43 @@ impl VMActor {
             .generation
             .checked_add(1)
             .ok_or_else(|| eyre!("hypervisor generation overflow"))?;
+        // An OCI rootfs boots our own kernel and initramfs, so the workload's
+        // stdio can ride the virtio console while kernel and init logs stay on
+        // the serial console; a disk VM boots its own kernel and keeps only the
+        // serial console its cmdline expects.
+        let split_console = vm_config
+            .as_ref()
+            .is_some_and(|manifest| manifest.desired.rootfs.is_some());
+        let transformer = split_console
+            .then(|| TransformChain::with_console(ConsoleTransform::split_workload_console()));
+        // Create without booting: the console spool must be attached before any
+        // guest output, because a virtio console is drained into the socket and
+        // drops whatever the guest writes before a client connects.
         VMInstance::spawn_into(
             &mut self.vm_instance,
             &vmid.to_string(),
             vm_config_for_ch,
-            boot,
-            None,
+            false,
+            transformer,
         )
         .await?;
 
         let console = Console::default();
+        let workload_console = Console::default();
         // A migration receiver has no config yet; its serial socket is created
         // only when the migrated VM is restored.
         if vm_config.is_some() {
-            let attach_result = console
-                .attach_socket(self.vm_instance.console_socket_path())
-                .await;
+            let system_socket = self.vm_instance.console_socket_path();
+            let workload_socket =
+                split_console.then(|| self.vm_instance.workload_console_socket_path());
+            let attach_result = async {
+                console.attach_socket(system_socket).await?;
+                if let Some(socket) = workload_socket {
+                    workload_console.attach_socket(socket).await?;
+                }
+                Ok::<(), Report>(())
+            }
+            .await;
             if let Err(err) = attach_result {
                 // Stop CH before removing a root from a potentially live guest.
                 let cleanup = async {
@@ -911,6 +954,7 @@ impl VMActor {
         }
 
         if boot && let Some(manifest) = &vm_config {
+            self.vm_instance.boot().await?;
             publish_ports(vmid, manifest).await;
         }
 
@@ -927,6 +971,7 @@ impl VMActor {
         });
 
         self.console = console;
+        self.workload_console = workload_console;
         self.started = true;
         self.startup_error = None;
         Ok(())
@@ -949,6 +994,7 @@ impl Actor for VMActor {
             vm_instance: VMInstance::stopped(&vmid.to_string()),
             migration_state: None,
             console: Console::default(),
+            workload_console: Console::default(),
             virtiofs: None,
             rootfs_mount: None,
             manifest,
@@ -1021,6 +1067,21 @@ impl Message<GetConsoleHistory> for VMActor {
 }
 
 #[remote_message]
+impl Message<GetWorkloadLogs> for VMActor {
+    type Reply = GetWorkloadLogsReply;
+
+    async fn handle(
+        &mut self,
+        _msg: GetWorkloadLogs,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        GetWorkloadLogsReply {
+            logs: self.workload_console.history().await,
+        }
+    }
+}
+
+#[remote_message]
 impl Message<SendConsoleInput> for VMActor {
     type Reply = SendConsoleInputReply;
 
@@ -1030,13 +1091,20 @@ impl Message<SendConsoleInput> for VMActor {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         let written = msg.input.len();
-        match self.console.write_input(&msg.input).await {
+        // The workload owns the virtio console's stdin; only fall back to the
+        // serial console when no workload console is attached.
+        let target = if self.workload_console.is_attached().await {
+            &self.workload_console
+        } else {
+            &self.console
+        };
+        match target.write_input(&msg.input).await {
             Ok(()) => SendConsoleInputReply {
                 written,
                 error: None,
             },
             Err(err) => {
-                error!(vmid = %self.vmid, ?err, "failed to write to serial console");
+                error!(vmid = %self.vmid, ?err, "failed to write to console");
                 SendConsoleInputReply {
                     written: 0,
                     error: Some(err.to_string()),

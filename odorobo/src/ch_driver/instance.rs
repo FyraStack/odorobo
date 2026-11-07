@@ -20,6 +20,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::ch_driver::{
+    CONSOLE_SOCKET_FILE_NAME, WORKLOAD_CONSOLE_SOCKET_FILE_NAME,
     provisioning::hooks::HookManager,
     transform::{ConfigTransform, TransformChain},
 };
@@ -414,7 +415,13 @@ impl VMInstance {
 
     /// Returns the configured UNIX socket path for this VM's serial console.
     pub fn console_socket_path(&self) -> PathBuf {
-        self.runtime_dir().join("console.sock")
+        self.runtime_dir().join(CONSOLE_SOCKET_FILE_NAME)
+    }
+
+    /// Returns the UNIX socket path for this VM's workload virtio console,
+    /// which carries the workload's stdin, stdout and stderr.
+    pub fn workload_console_socket_path(&self) -> PathBuf {
+        self.runtime_dir().join(WORKLOAD_CONSOLE_SOCKET_FILE_NAME)
     }
 
     /// Opens the PTY console device for this VM and returns a connected stream.

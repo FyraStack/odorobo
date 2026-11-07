@@ -1,10 +1,10 @@
 //! The OCI image configuration the agent hands to the guest.
 //!
-//! The agent writes the image's config blob verbatim as `config.json`, so
-//! this is the OCI image configuration document, with the process settings
-//! under `config`. Unknown fields are ignored on purpose: labels, history and
-//! diff IDs are not the init's business, and future OCI additions must not
-//! break booting.
+//! The agent writes the image's config blob as `config.json`, adding an
+//! `odorobo` object for the launch options it controls, so this is the OCI
+//! image configuration document with the process settings under `config`.
+//! Unknown fields are ignored on purpose: labels, history and diff IDs are not
+//! the init's business, and future OCI additions must not break booting.
 
 use std::io;
 
@@ -14,6 +14,15 @@ use serde::Deserialize;
 pub struct ImageConfigDocument {
     #[serde(default)]
     pub config: ImageConfig,
+    #[serde(default, rename = "odorobo")]
+    odorobo: OdoroboOptions,
+}
+
+/// Launch options odorobo adds next to the image's own config.
+#[derive(Debug, Default, Deserialize)]
+struct OdoroboOptions {
+    #[serde(default)]
+    stdin: bool,
 }
 
 /// The OCI `config` object, in the casing the image config uses.
@@ -36,6 +45,11 @@ impl ImageConfigDocument {
     pub fn parse(contents: &[u8]) -> io::Result<Self> {
         serde_json::from_slice(contents)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+    }
+
+    /// Whether the workload's stdin is attached to the workload console.
+    pub fn stdin(&self) -> bool {
+        self.odorobo.stdin
     }
 }
 

@@ -1,7 +1,7 @@
 use crate::messages::vm::{
     AgentListVMs, AgentListVMsReply, CreateVM, CreateVMReply, DeleteVM, DeleteVMReply,
-    GetConsoleHistory, GetConsoleHistoryReply, GetVMInfo, GetVMInfoReply, ShutdownVM,
-    ShutdownVMReply,
+    GetConsoleHistory, GetConsoleHistoryReply, GetVMInfo, GetVMInfoReply, GetWorkloadLogs,
+    GetWorkloadLogsReply, ShutdownVM, ShutdownVMReply,
 };
 use kameo::prelude::*;
 use stable_eyre::{
@@ -84,6 +84,22 @@ impl Message<GetConsoleHistory> for HTTPActor {
             .await
             .map_err(|err| eyre!(err.to_string()))
             .wrap_err("failed to retrieve VM console history via scheduler")
+    }
+}
+
+impl Message<GetWorkloadLogs> for HTTPActor {
+    type Reply = Result<GetWorkloadLogsReply, Report>;
+
+    async fn handle(
+        &mut self,
+        msg: GetWorkloadLogs,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.scheduler
+            .ask(msg)
+            .await
+            .map_err(|err| eyre!(err.to_string()))
+            .wrap_err("failed to retrieve VM workload logs via scheduler")
     }
 }
 

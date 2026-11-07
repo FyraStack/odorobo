@@ -309,6 +309,11 @@ pub struct Rootfs {
     /// Write and lifecycle policy for this VM's root filesystem.
     #[serde(default)]
     pub mode: RootfsMode,
+    /// Attach the workload's stdin to the VM's workload console. Off by
+    /// default: a container that probes stdin for interactivity sees it
+    /// closed, which is what non-interactive workloads expect.
+    #[serde(default)]
+    pub stdin: bool,
 }
 
 impl<'de> Deserialize<'de> for Rootfs {
@@ -337,6 +342,8 @@ impl<'de> Deserialize<'de> for Rootfs {
             mode: Option<RootfsMode>,
             #[serde(default, deserialize_with = "deserialize_read_only")]
             read_only: Option<bool>,
+            #[serde(default)]
+            stdin: bool,
         }
 
         let wire = WireRootfs::deserialize(deserializer)?;
@@ -354,6 +361,7 @@ impl<'de> Deserialize<'de> for Rootfs {
         Ok(Self {
             oci: wire.oci,
             mode,
+            stdin: wire.stdin,
         })
     }
 }
@@ -682,12 +690,14 @@ mod tests {
         manifest.desired.rootfs = Some(crate::manifest::Rootfs {
             oci: "docker://registry.fedoraproject.org/fedora:latest".to_owned(),
             mode: RootfsMode::ReadOnly,
+            stdin: false,
         });
         assert_eq!(manifest.validate(), Ok(()));
 
         manifest.desired.rootfs = Some(crate::manifest::Rootfs {
             oci: "   ".to_owned(),
             mode: RootfsMode::Ephemeral,
+            stdin: false,
         });
         assert_eq!(manifest.validate(), Err(ManifestError::EmptyRootfsOci));
 
@@ -778,6 +788,7 @@ mod tests {
         manifest.desired.rootfs = Some(crate::manifest::Rootfs {
             oci: "docker://registry.fedoraproject.org/fedora:latest".to_owned(),
             mode: RootfsMode::ReadOnly,
+            stdin: false,
         });
         assert_eq!(manifest.validate(), Ok(()));
 

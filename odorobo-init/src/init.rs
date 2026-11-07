@@ -93,19 +93,33 @@ fn restore_console() {
 }
 
 fn run_pid1() -> io::Result<i32> {
-    let config = mount_image()?;
+    mount_early_filesystems()?;
+    if kernel_console_is_virtio() {
+        // Nothing else will: the virtio console never saw the records the
+        // kernel printed before it registered.
+        dump_kernel_log();
+    }
+    let workload = mount_image()?;
     let read_fd = signal_pipe()?;
     install_signal_handlers()?;
 
     // SAFETY: the process is single-threaded here, so fork is safe.
     let child = unsafe { libc::fork() };
     match child {
-        0 => child_main(&config),
+        0 => child_main(&workload),
         pid if pid > 0 => {
-            // The child does this too; whichever wins closes the race.
-            // SAFETY: pid is a live child.
-            unsafe { libc::setpgid(pid, pid) };
-            log!("workload started with pid {pid}: {:?}", config.args());
+            // A child that takes the workload console becomes a session leader
+            // for its own controlling terminal and must not be pre-set as a
+            // process group leader; otherwise whichever side wins closes the
+            // race here.
+            if !workload_uses_virtio_console() {
+                // SAFETY: pid is a live child.
+                unsafe { libc::setpgid(pid, pid) };
+            }
+            log!(
+                "workload started with pid {pid}: {:?}",
+                workload.process.args()
+            );
             let info = supervise(pid, read_fd)?;
             log!("workload {} (status {})", info.description, info.code);
             Ok(info.code)
@@ -114,14 +128,149 @@ fn run_pid1() -> io::Result<i32> {
     }
 }
 
-fn child_main(config: &ImageConfig) -> ! {
+/// The kernel command line, empty when it cannot be read.
+fn kernel_cmdline() -> String {
+    fs::read_to_string("/proc/cmdline").unwrap_or_default()
+}
+
+/// Whether the kernel's console is the virtio console (`console=hvc0`).
+fn kernel_console_is_virtio() -> bool {
+    kernel_cmdline()
+        .split_ascii_whitespace()
+        .any(|argument| argument == "console=hvc0")
+}
+
+/// The workload's stdio rides the virtio console whenever the kernel console is
+/// not on it: the split layout keeps kernel and init logs on the serial port.
+fn workload_uses_virtio_console() -> bool {
+    !kernel_console_is_virtio()
+}
+
+/// Give the workload the virtio console as its stdout/stderr and, when asked,
+/// as its stdin, with a controlling terminal so interactive tools and Ctrl-C
+/// work.
+fn attach_workload_console(attach_stdin: bool) {
+    // SAFETY: opening a fixed device path read-write.
+    let fd = unsafe { libc::open(c"/dev/hvc0".as_ptr(), libc::O_RDWR) };
+    if fd < 0 {
+        log!(
+            "cannot open /dev/hvc0: {}; the workload keeps the init console",
+            io::Error::last_os_error()
+        );
+        return;
+    }
+    for target in [libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+        // SAFETY: dup2 duplicates fd onto each standard descriptor.
+        unsafe { libc::dup2(fd, target) };
+    }
+    if attach_stdin {
+        // SAFETY: dup2 duplicates fd onto the standard input descriptor.
+        unsafe { libc::dup2(fd, libc::STDIN_FILENO) };
+    } else {
+        // SAFETY: opening a fixed device path read-only.
+        let null = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
+        if null >= 0 {
+            // SAFETY: dup2 duplicates null onto the standard input descriptor.
+            unsafe { libc::dup2(null, libc::STDIN_FILENO) };
+            if null > libc::STDERR_FILENO {
+                // SAFETY: null is no longer needed after the dup2 call.
+                unsafe { libc::close(null) };
+            }
+        } else {
+            log!(
+                "cannot open /dev/null: {}; closing the workload's stdin",
+                io::Error::last_os_error()
+            );
+            // SAFETY: closing an inherited descriptor.
+            unsafe { libc::close(libc::STDIN_FILENO) };
+        }
+    }
+    // SAFETY: the child has no controlling terminal yet, so this either takes
+    // the fresh terminal or fails because the parent set a process group.
+    if unsafe { libc::setsid() } >= 0 {
+        // SAFETY: fd is an open tty and the process is now a session leader.
+        unsafe { libc::ioctl(fd, libc::TIOCSCTTY, 0) };
+    } else {
+        log!(
+            "workload console cannot become the controlling terminal: {}",
+            io::Error::last_os_error()
+        );
+    }
+    if fd > libc::STDERR_FILENO {
+        // SAFETY: fd is no longer needed after the dup2 calls.
+        unsafe { libc::close(fd) };
+    }
+}
+
+/// The virtio console registers mid-boot and never receives the records the
+/// kernel printed before that, so print the ring buffer here: with `quiet` in
+/// the cmdline the console then carries the whole boot log in order, ahead of
+/// the init's own lines and the workload.
+fn dump_kernel_log() {
+    const SYSLOG_ACTION_READ_ALL: libc::c_int = 3;
+    const SYSLOG_ACTION_SIZE_BUFFER: libc::c_int = 10;
+    const MAX_KERNEL_LOG_BYTES: usize = 1 << 20;
+    // SAFETY: a size query passes no buffer.
+    let size = unsafe { libc::klogctl(SYSLOG_ACTION_SIZE_BUFFER, std::ptr::null_mut(), 0) };
+    let Ok(len) = usize::try_from(size) else {
+        return;
+    };
+    let len = len.min(MAX_KERNEL_LOG_BYTES);
+    if len == 0 {
+        return;
+    }
+    let mut buffer = vec![0_u8; len];
+    // SAFETY: buffer is a writable region of the length given to klogctl.
+    let read = unsafe {
+        libc::klogctl(
+            SYSLOG_ACTION_READ_ALL,
+            buffer.as_mut_ptr().cast::<libc::c_char>(),
+            libc::c_int::try_from(len).unwrap_or(libc::c_int::MAX),
+        )
+    };
+    let Ok(read) = usize::try_from(read) else {
+        return;
+    };
+    // The ring buffer keeps syslog level prefixes; the console does not print
+    // them, so drop them here to match live output.
+    let mut text = Vec::with_capacity(read);
+    for line in buffer[..read].split_inclusive(|byte| *byte == b'\n') {
+        text.extend_from_slice(strip_level_prefix(line));
+    }
+    use std::io::Write as _;
+    #[expect(
+        clippy::let_underscore_must_use,
+        reason = "a missing console must not stop the init"
+    )]
+    let _ = std::io::stdout().write_all(&text);
+}
+
+fn strip_level_prefix(line: &[u8]) -> &[u8] {
+    let Some(rest) = line.strip_prefix(b"<") else {
+        return line;
+    };
+    let Some(end) = rest.iter().position(|byte| *byte == b'>') else {
+        return line;
+    };
+    if end == 0 || end > 3 || !rest[..end].iter().all(u8::is_ascii_digit) {
+        return line;
+    }
+    rest.get(end..)
+        .and_then(|tail| tail.get(1..))
+        .unwrap_or(line)
+}
+
+fn child_main(workload: &Workload) -> ! {
+    if workload_uses_virtio_console() {
+        attach_workload_console(workload.stdin);
+    }
     // SAFETY: pid 0 means the calling process.
     unsafe { libc::setpgid(0, 0) };
     for signal in HANDLED_SIGNALS {
         // SAFETY: restoring the default disposition is always valid.
         unsafe { libc::signal(signal, libc::SIG_DFL) };
     }
-    match exec_workload(config) {
+    match exec_workload(&workload.process) {
         Ok(never) => match never {},
         Err(err) => {
             log!("cannot start workload: {err}");
@@ -131,9 +280,8 @@ fn child_main(config: &ImageConfig) -> ! {
     }
 }
 
-/// Mounts the pseudo filesystems and the image, reads the workload config,
-/// then makes the image root this process's root.
-fn mount_image() -> io::Result<ImageConfig> {
+/// Mounts `/proc`, `/sys` and `/dev` before anything can need them.
+fn mount_early_filesystems() -> io::Result<()> {
     for directory in ["/proc", "/sys", "/dev", ROOT_MOUNT] {
         fs::create_dir_all(directory)
             .map_err(|err| with_context(err, format!("creating {directory}")))?;
@@ -155,13 +303,25 @@ fn mount_image() -> io::Result<ImageConfig> {
         libc::MS_NOSUID | libc::MS_NOEXEC | libc::MS_NODEV,
         None,
     )?;
+    Ok(())
+}
 
+/// Mounts the image, reads the workload config, then makes the image root this
+/// process's root.
+struct Workload {
+    process: ImageConfig,
+    stdin: bool,
+}
+
+fn mount_image() -> io::Result<Workload> {
     mount_fs(Some(ROOTFS_TAG), ROOT_MOUNT, Some(c"virtiofs"), 0, None)
         .map_err(|err| with_context(err, format!("mounting the image at {ROOT_MOUNT}")))?;
     // The config file is part of the image root's writable layer; read it
     // here, while the mount is still reachable from the initramfs root.
-    let config =
+    let document =
         read_config().map_err(|err| with_context(err, format!("reading {CONFIG_FILE}")))?;
+    let stdin = document.stdin();
+    let config = document.config;
 
     for mount in ["/proc", "/sys", "/dev"] {
         let target = format!("{ROOT_MOUNT}{mount}");
@@ -193,10 +353,13 @@ fn mount_image() -> io::Result<ImageConfig> {
         },
         config.env().len()
     );
-    Ok(config)
+    Ok(Workload {
+        process: config,
+        stdin,
+    })
 }
 
-fn read_config() -> io::Result<ImageConfig> {
+fn read_config() -> io::Result<ImageConfigDocument> {
     let mut file = fs::File::open(CONFIG_FILE)?;
     let mut bytes = Vec::new();
     file.by_ref()
@@ -208,7 +371,7 @@ fn read_config() -> io::Result<ImageConfig> {
             format!("{CONFIG_FILE} is larger than {MAX_CONFIG_BYTES} bytes"),
         ));
     }
-    Ok(ImageConfigDocument::parse(&bytes)?.config)
+    ImageConfigDocument::parse(&bytes)
 }
 
 fn mount_fs(

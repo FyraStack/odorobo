@@ -22,7 +22,8 @@ use super::persistent::{
 use super::process::{TOOL_OPERATIONS, Tool};
 use super::repo;
 use super::{
-    CONFIG_FILE_NAME, PERSISTENT_ROOTFS_ROOT, PreparedRootfs, rootfs_mount_path_for, validate_vmid,
+    CONFIG_FILE_NAME, PERSISTENT_ROOTFS_ROOT, PreparedRootfs, guest_config_document,
+    rootfs_mount_path_for, validate_vmid,
 };
 use crate::manifest::{Rootfs, RootfsMode};
 
@@ -197,7 +198,8 @@ pub async fn mount_rootfs_owned(
     // second lower layer; a read-only VM then needs no writable layer at all.
     let config_dir = runtime_dir.join(CONFIG_DIR);
     create_private_dir(&config_dir).await?;
-    tokio::fs::write(config_dir.join(CONFIG_FILE_NAME), image.config()).await?;
+    let document = guest_config_document(image.config(), rootfs.stdin)?;
+    tokio::fs::write(config_dir.join(CONFIG_FILE_NAME), document).await?;
     let overlay = match (&upper_state.upper, &upper_state.work) {
         (Some(upper), Some(work)) => Some((upper.as_path(), work.as_path())),
         _ => None,
@@ -406,6 +408,7 @@ mod tests {
             &Rootfs {
                 oci: oci.to_owned(),
                 mode,
+                stdin: false,
             },
         )
         .await
@@ -680,6 +683,7 @@ mod tests {
         let rootfs = Rootfs {
             oci: oci_ref(&layout),
             mode: RootfsMode::ReadOnly,
+            stdin: false,
         };
         let image = prepare_image(&rootfs).await.unwrap();
         assert!(

@@ -42,7 +42,7 @@ Every image is imported into one node-local composefs repository at `/var/lib/od
 1. **Preflight:** resolve the reference with `skopeo inspect --raw` to a concrete manifest digest and the platform selected for the guest kernel, and check its compressed size against the cap. A mutable tag is an input alias, not an identity: the import pulls the exact digest that was just inspected and verified.
 2. **Import:** pull that digest into the repository through `containers-image-proxy`. The importer applies OCI changeset semantics itself and merges the image's layers in order into one EROFS metadata object; file payloads become repository objects, so identical content anywhere in the repository is stored once. Re-importing an image whose objects are already present adds nothing. The importer copies the root directory metadata from `/usr` for deterministic digests, so an image without a `/usr` directory is rejected.
 3. **Mount:** every VM gets one OverlayFS mount whose lowers are that EROFS metadata object plus a per-VM directory holding the image's OCI config document. `read_only` mounts those two lowers with no writable layer; `ephemeral` and `persistent` add the per-VM upper/work. Whiteouts and opaque directories are resolved inside the imported image, so nothing layer-shaped reaches the guest and no `lowerdir` list, empty-lower workaround, or layer-count cap is involved.
-4. **Config:** the image's OCI config document is read back from the repository as a content stream, written into the per-VM config directory, and shows up in the guest as `/.odorobo-config.json`.
+4. **Config:** the image's OCI config document is read back from the repository as a content stream, written into the per-VM config directory, and shows up in the guest as `/.odorobo-config.json`. When the manifest sets `rootfs.stdin`, an `odorobo` object is added to that document and the init attaches the workload's stdin to the workload console.
 
 `ODOROBO_ROOTFS_ALLOW_LOCAL_TRANSPORTS=1` additionally allows local transports such as `oci:` and `docker-archive:` for development.
 
@@ -87,7 +87,7 @@ Live migration remains rejected for all OCI-rootfs VMs. The RBD path provides pe
 
 ## Guest boot and init
 
-Cloud Hypervisor direct-boots the node's microVM kernel (`/var/lib/odorobo/microvm/vmlinux`, built by `scripts/build-microvm-kernel.sh`) with a small gzipped initramfs (`/var/lib/odorobo/microvm/initramfs.cpio.gz`, built by `odorobo-init/justfile`) and no firmware. The default command line is `console=ttyS0`.
+Cloud Hypervisor direct-boots the node's microVM kernel (`/var/lib/odorobo/microvm/vmlinux`, built by `scripts/build-microvm-kernel.sh`) with a small gzipped initramfs (`/var/lib/odorobo/microvm/initramfs.cpio.gz`, built by `odorobo-init/justfile`) and no firmware. The default command line is `console=ttyS0`: kernel and init logs go to the serial console, which is complete from the first instruction, while the workload's stdout/stderr ride the virtio console (stdin too when `rootfs.stdin` is set).
 
 The initramfs contains a single static `odorobo-init` binary as `/init`. As PID 1 it:
 
@@ -99,7 +99,7 @@ The initramfs contains a single static `odorobo-init` binary as `/init`. As PID 
 
 If the image has neither an entrypoint nor a command, the init falls back to `/sbin/init`, `/etc/init`, `/bin/init` and then `/bin/sh`. Unknown or missing config fields are ignored; an unreadable config is fatal. The agent writes `.odorobo-config.json` into `/run/odorobo/vms/<vmid>/config` and mounts that directory as a lower layer before start, so the guest never sees the network or the host filesystem.
 
-The console is the 16550 serial port (`ttyS0`). The agent exposes it as a socket and keeps a history, read through `GET /vms/{vmid}/console/history`. The virtio console (`hvc0`) is off.
+OCI rootfs VMs get two consoles, chosen per VM by the config transform. Kernel and init output stays on the 16550 serial port (`ttyS0`) at `/run/odorobo/vms/<vmid>/console.sock`; the workload's stdin/stdout/stderr rides the virtio console (`hvc0`) at `/run/odorobo/vms/<vmid>/workload.sock`, which the init opens as the workload's stdout/stderr and, when `rootfs.stdin` is set, its stdin. The agent connects to both before the VM boots and keeps a 1 MiB history of each, read through `GET /vms/{vmid}/console/history` and `GET /vms/{vmid}/logs`. Disk VMs keep only the serial console.
 
 Rootfs VMs can publish guest ports on the host with `ports` on a manifest network. The host resolves the guest address from its DHCP lease and installs DNAT rules; see [networking.md](networking.md#publishing-container-ports).
 
@@ -113,7 +113,7 @@ The ignored KVM test (`oci_rootfs_vm_boots_through_the_actor`) compiles a static
 - The composefs image mount and every exported root are read-only. A VM can only write to its own upper or explicitly allowed scratch tmpfs paths.
 - Each VM's writable upper/work is distinct, including VMs with the same OCI manifest digest.
 - The VM actor supervises one virtiofsd process with `--sandbox=chroot` over the mounted root, starts it before Cloud Hypervisor connects, stops it before unmounting the root and its lowers, and cleans up partial startup failures.
-- Rootfs VMs require shared guest memory for the vhost-user virtiofs device. The direct-boot kernel/cmdline and `ttyS0` UART console remain as documented for issue #112. The guest does not need composefs support.
+- Rootfs VMs require shared guest memory for the vhost-user virtiofs device. The direct-boot kernel/cmdline and its split serial/workload consoles remain as documented for issue #112. The guest does not need composefs support.
 - Rootfs VMs reject live migration. Planned host drain uses clean cold restart with the same persistent upper and pinned OCI base digest.
 
 ## Storage choices for this implementation

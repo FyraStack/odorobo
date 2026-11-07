@@ -243,6 +243,7 @@ mod tests {
         manifest.desired.rootfs = Some(crate::manifest::Rootfs {
             oci: "docker://busybox:latest".to_owned(),
             mode: crate::manifest::RootfsMode::ReadOnly,
+            stdin: false,
         });
         let config = to_vm_config(&manifest).expect("rootfs manifest converts");
 
@@ -281,20 +282,18 @@ mod tests {
         manifest.desired.rootfs = Some(crate::manifest::Rootfs {
             oci: "docker://busybox:latest".to_owned(),
             mode: crate::manifest::RootfsMode::Ephemeral,
+            stdin: false,
         });
         manifest.desired.boot.kernel = Some("/custom/vmlinux".to_owned());
         manifest.desired.boot.initramfs = Some("/custom/initramfs.img".to_owned());
-        manifest.desired.boot.cmdline = Some("console=hvc0 quiet".to_owned());
+        manifest.desired.boot.cmdline = Some("console=hvc0".to_owned());
         let config = to_vm_config(&manifest).expect("rootfs manifest converts");
         assert_eq!(config.payload.kernel.as_deref(), Some("/custom/vmlinux"));
         assert_eq!(
             config.payload.initramfs.as_deref(),
             Some("/custom/initramfs.img")
         );
-        assert_eq!(
-            config.payload.cmdline.as_deref(),
-            Some("console=hvc0 quiet")
-        );
+        assert_eq!(config.payload.cmdline.as_deref(), Some("console=hvc0"));
     }
 
     #[test]

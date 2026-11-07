@@ -76,14 +76,21 @@ No manifest field overrides the image's `Env`, `Cmd`, or `User` yet.
 - **Ignored.** `Labels`, `ExposedPorts`, `Volumes`, `StopSignal`, `Healthcheck`,
   `Shell`, `ArgsEscaped`, and `OnBuild` do nothing. Networking, disk, and layer
   merging happen on the host; there is no container runtime in the guest.
+- **Launch options.** The host adds an `odorobo` object to the document it
+  writes; today it carries `stdin`. Without it the workload's stdin is
+  `/dev/null`, which is what non-interactive containers expect.
 
 ## Boot sequence
 
 1. The kernel runs `/init`; it recreates `/dev/console` and takes over stdio.
+   Kernel and init output stay on that serial console.
 2. It marks its mounts private, then mounts `devtmpfs`, `proc`, and `sysfs`.
 3. It mounts the `rootfs` share at `/newroot` and parses `.odorobo-config.json`.
 4. It moves the pseudo filesystems into `/newroot` and chroots to `/`.
-5. It forks, applies `User`, and execs `Entrypoint` + `Cmd`.
+5. It forks; the child opens `/dev/hvc0` (the virtio console) as its
+   stdout/stderr with a controlling terminal, applies `User`, and execs
+   `Entrypoint` + `Cmd`. Its stdin is `/dev/null` unless the config document
+   asks for `stdin`.
 6. It reaps children, forwards `SIGTERM`, `SIGINT`, `SIGQUIT`, and `SIGHUP` to
    the process group, and powers off when the main child exits. The child's
    status is logged.
@@ -100,7 +107,9 @@ archive holds only `init`. The root `justfile` has the same recipe.
 
 ## Debugging
 
-- Console (`console=ttyS0`): kernel messages, then `odorobo-init:` lines.
+- Console (`console=ttyS0`): kernel messages and `odorobo-init:` lines.
+- Workload logs: `GET /vms/<vmid>/logs`, the virtio console stream the workload
+  writes to.
 - Input: `/run/odorobo/vms/<vmid>/config/.odorobo-config.json`, visible to the
   guest as `/.odorobo-config.json`.
 - Share log: `/run/odorobo/vms/<vmid>/virtiofsd.log`.

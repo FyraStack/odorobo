@@ -29,7 +29,11 @@ pub use virtiofs::{VirtioFsSupervisor, VirtiofsdSpec, socket_path_for, virtiofsd
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use stable_eyre::{Result, eyre::bail};
+use serde_json::json;
+use stable_eyre::{
+    Result,
+    eyre::{WrapErr, bail, eyre},
+};
 
 use crate::manifest::RootfsMode;
 
@@ -56,7 +60,8 @@ pub const MICROVM_INITRAMFS_PATH: &str = "/var/lib/odorobo/microvm/initramfs.cpi
 /// from [`MICROVM_INITRAMFS_PATH`] mounts the virtiofs root itself, so the
 /// kernel gets no `root=`; the init then execs the image's process config.
 /// console=ttyS0 (the 16550 UART) because the driver's `ConsoleTransform`
-/// sockets the UART; the virtio-console (hvc0) is off.
+/// sockets it; the virtio console carries only the workload's stdio, which the
+/// init attaches to `/dev/hvc0`.
 pub const DEFAULT_ROOTFS_CMDLINE: &str = "console=ttyS0";
 
 const PERSISTENT_ROOTFS_ROOT: &str = "/var/lib/odorobo/persistent-rootfs";
@@ -115,6 +120,21 @@ pub struct PreparedRootfs {
     ephemeral_state_mount: Option<PathBuf>,
 }
 
+/// The guest-visible config document: the image's OCI config plus the launch
+/// options odorobo adds. An image without options keeps its bytes verbatim.
+pub(super) fn guest_config_document(config: &[u8], stdin: bool) -> Result<Vec<u8>> {
+    if !stdin {
+        return Ok(config.to_vec());
+    }
+    let mut document: serde_json::Value =
+        serde_json::from_slice(config).wrap_err("parsing the imported OCI config document")?;
+    let object = document
+        .as_object_mut()
+        .ok_or_else(|| eyre!("the imported OCI config document is not a JSON object"))?;
+    object.insert("odorobo".to_owned(), json!({ "stdin": true }));
+    serde_json::to_vec(&document).wrap_err("serializing the guest config document")
+}
+
 fn to_hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     bytes.iter().fold(String::new(), |mut out, byte| {
@@ -134,6 +154,17 @@ fn validate_vmid(vmid: &str) -> Result<()> {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn guest_config_document_adds_options_only_when_asked() {
+        let image = br#"{"config":{"Entrypoint":["/bin/sh"]}}"#;
+        assert_eq!(guest_config_document(image, false).unwrap(), image);
+
+        let document: serde_json::Value =
+            serde_json::from_slice(&guest_config_document(image, true).unwrap()).unwrap();
+        assert_eq!(document["odorobo"]["stdin"], serde_json::Value::Bool(true));
+        assert_eq!(document["config"]["Entrypoint"][0], "/bin/sh");
+    }
 
     #[tokio::test]
     async fn cancelled_builder_does_not_remove_a_live_staging_writer() {
