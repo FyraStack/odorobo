@@ -19,10 +19,6 @@ const UPPER_DIR: &str = "/upper/rootfs.upper";
 const WORK_DIR: &str = "/upper/rootfs.work";
 /// Merged root of an ephemeral VM: the image share plus the tmpfs upper.
 const OVERLAY_MOUNT: &str = "/overlay";
-/// Directory the old (initramfs) root is parked on during the switch; it must
-/// be writable, so a read-only root parks it under its `/tmp` scratch mount.
-const OLD_ROOT: &str = ".odorobo-oldroot";
-const OLD_ROOT_SCRATCH: &str = "tmp/.odorobo-oldroot";
 /// The host writes the image's OCI config into the rootfs's writable layer.
 const CONFIG_FILE: &str = "/newroot/.odorobo-config.json";
 const MAX_CONFIG_BYTES: usize = 1 << 20;
@@ -425,48 +421,41 @@ fn read_config() -> io::Result<ImageConfigDocument> {
     ImageConfigDocument::parse(&bytes)
 }
 
-/// Makes `root` the workload root: `pivot_root(2)` into it, then lazily
-/// unmount the old (initramfs) tree, which also takes the image share and an
-/// ephemeral root's tmpfs upper out of the workload's mount namespace.
+/// Makes `root` the workload root. The initramfs root is `rootfs`, which
+/// `pivot_root(2)` refuses (`!mnt_has_parent(root_mnt)` refuses the absolute
+/// root) and which cannot be unmounted, so this is the documented handoff from
+/// `ramfs-rootfs-initramfs.rst`: overmount rootfs with the new root and chroot
+/// into it. The image share (and an ephemeral root's tmpfs upper) hangs off
+/// rootfs and becomes unreachable at the same time.
 fn switch_root(root: &str) -> io::Result<()> {
-    std::env::set_current_dir(root)
-        .map_err(|err| with_context(err, format!("entering {root}")))?;
-    // pivot_root parks the old tree on a directory inside the new root, so
-    // that directory has to be writable: the /tmp scratch mount of a read-only
-    // root standing in for the image filesystem.
-    let parked = match fs::create_dir_all(OLD_ROOT) {
-        Ok(()) => OLD_ROOT,
-        Err(_) => {
-            fs::create_dir_all(OLD_ROOT_SCRATCH)
-                .map_err(|err| with_context(err, format!("creating {OLD_ROOT_SCRATCH}")))?;
-            OLD_ROOT_SCRATCH
-        }
-    };
-    let new_root = cstring(".", "pivot root")?;
-    let put_old = cstring(parked, "pivot root put_old")?;
-    // SAFETY: both pointers are valid NUL-terminated path strings, and the
-    // kernel only reads them for the duration of the call.
-    if unsafe { libc::syscall(libc::SYS_pivot_root, new_root.as_ptr(), put_old.as_ptr()) } < 0 {
-        let err = io::Error::last_os_error();
-        return Err(with_context(err, "pivoting into the workload root"));
+    std::env::set_current_dir(root).map_err(|err| with_context(err, format!("entering {root}")))?;
+    let source = cstring(".", "switch root")?;
+    let root_slash = cstring("/", "switch root target")?;
+    // SAFETY: every pointer is either null or a valid NUL-terminated string.
+    if unsafe {
+        libc::mount(
+            source.as_ptr(),
+            root_slash.as_ptr(),
+            std::ptr::null(),
+            libc::MS_MOVE,
+            std::ptr::null(),
+        )
+    } < 0
+    {
+        return Err(with_context(
+            io::Error::last_os_error(),
+            "moving the workload root over the initramfs root",
+        ));
     }
-    unmount_lazy(parked)
-        .map_err(|err| with_context(err, format!("unmounting the old root at {parked}")))?;
-    // The old tree is out of the namespace; drop the parking directory.
-    _ = fs::remove_dir(parked);
+    // SAFETY: "." resolves inside the new root, with a NUL terminator added.
+    if unsafe { libc::chroot(c".".as_ptr()) } < 0 {
+        return Err(with_context(
+            io::Error::last_os_error(),
+            "chrooting into the workload root",
+        ));
+    }
     std::env::set_current_dir("/").map_err(|err| with_context(err, "setting / as cwd"))?;
-    log!("pivoted into the workload root; the old root is detached");
-    Ok(())
-}
-
-/// `umount2(2)` with `MNT_DETACH`: the mount leaves the namespace now and is
-/// released once its last user (an overlay lower or upper, say) releases it.
-fn unmount_lazy(path: &str) -> io::Result<()> {
-    let target = cstring(path, "unmount target")?;
-    // SAFETY: the pointer is a valid NUL-terminated path string.
-    if unsafe { libc::umount2(target.as_ptr(), libc::MNT_DETACH) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
+    log!("switched to the workload root; the initramfs mount is hidden underneath");
     Ok(())
 }
 

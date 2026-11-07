@@ -106,8 +106,8 @@ Cloud Hypervisor direct-boots the node's microVM kernel (`/var/lib/odorobo/micro
 The initramfs contains a single static `odorobo-init` binary as `/init`. As PID 1 it:
 
 1. mounts `devtmpfs`, `proc` and `sysfs`;
-2. mounts the virtiofs share tagged `rootfs` at `/newroot` and reads the image's OCI config document from `/.odorobo-config.json` inside it;
-3. creates the scratch mount points, moves the pseudo-filesystems into `/newroot`, and `chroot`s into it;
+2. mounts the virtiofs share tagged `rootfs` at `/newroot` and reads the image's OCI config document from `/.odorobo-config.json` inside it, mounting a size-bounded tmpfs plus overlay first when the document asks for an ephemeral root;
+3. moves the pseudo-filesystems into the new root, overmounts the initramfs root with it (`mount --move` onto `/`) and chroots into it. `pivot_root` cannot be used here: the initramfs root is `rootfs`, which the kernel refuses to pivot away from and cannot be unmounted, so the documented handoff leaves it hidden underneath rather than detached;
 4. resolves the config's `User` against the image's `/etc/passwd` and `/etc/group`, applies `setgroups`/`setgid`/`setuid`, builds `Env` plus the entrypoint and command, and `execve`s it in the config's `WorkingDir`;
 5. reaps zombies, forwards `SIGTERM`/`SIGINT`/`SIGQUIT`/`SIGHUP` to the workload's process group, and powers the VM off when the workload exits.
 

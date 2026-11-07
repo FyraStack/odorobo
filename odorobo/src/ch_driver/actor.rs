@@ -547,45 +547,26 @@ mod tests {
         std::fs::remove_dir_all(fixture_dir).unwrap();
     }
 
-    /// Full ephemeral OCI boot through the actor: the host serves the composefs
-    /// image read-only and the guest init builds the root overlay from its own
-    /// tmpfs, so the fixture init's write to `/` must succeed there.
-    #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "boots a real VM; needs /dev/kvm, cloud-hypervisor, virtiofsd, skopeo, composefs host support, and zig"]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "end-to-end test exercises one long scenario"
-    )]
-    async fn oci_ephemeral_vm_writes_into_its_guest_tmpfs() {
-        use crate::ch_driver::VMInstance;
-        use crate::ch_driver::{actor::VMActor, containers};
+    /// Synopsis of a fixture image whose init probes writes: it prints
+    /// `odorobo-write-probe root=<ok|fail> tmp=<ok|fail>` and then parks, so a
+    /// boot test can tell where writes landed.
+    fn write_probe_fixture(
+        vmid: ulid::Ulid,
+        mode: crate::manifest::RootfsMode,
+    ) -> (std::path::PathBuf, crate::manifest::VmManifest) {
         use crate::manifest::{
-            Boot, Compute, DesiredState, MANIFEST_VERSION, Metadata, Placement, Rootfs, RootfsMode,
-            VmManifest,
+            Boot, Compute, DesiredState, MANIFEST_VERSION, Metadata, Placement, Rootfs, VmManifest,
         };
-        use crate::messages::vm::{DeleteVM, GetConsoleHistory, GetWorkloadLogs};
-        use kameo::prelude::*;
-        use std::path::PathBuf;
-        use std::time::Duration;
-        use tracing::info;
-
-        _ = tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| "odorobo=debug,mk_compressfs=debug".into()),
-            )
-            .with_test_writer()
-            .try_init()
-            .map_err(|err| info!(?err, "tracing subscriber already set"));
-
-        let vmid = ulid::Ulid::generate();
-        let fixture_dir = PathBuf::from("/var/lib/odorobo/vm-boot-fixtures").join(vmid.to_string());
+        let fixture_dir =
+            std::path::PathBuf::from("/var/lib/odorobo/vm-boot-fixtures").join(vmid.to_string());
         std::fs::create_dir_all(&fixture_dir).unwrap();
         let init_source = fixture_dir.join("init.c");
         let init_binary = fixture_dir.join("root-init");
         std::fs::write(
             &init_source,
-            "#include <fcntl.h>\n#include <unistd.h>\nint main(void) { static const char s[] = \"odorobo-ephemeral-init write=\"; write(1, s, sizeof(s)-1); int fd = open(\"/write-proof\", O_CREAT|O_WRONLY|O_TRUNC, 0644); if (fd < 0) { write(1, \"fail\\n\", 5); } else { write(fd, \"x\", 1); close(fd); write(1, \"ok\\n\", 3); } for (;;) pause(); }\n",
+            "#include <fcntl.h>\n#include <unistd.h>\n\
+             static int probe(const char *path) { int fd = open(path, O_CREAT|O_WRONLY|O_TRUNC, 0644); if (fd < 0) return 0; write(fd, \"x\", 1); close(fd); return 1; }\n\
+             int main(void) { static const char s[] = \"odorobo-write-probe root=\"; write(1, s, sizeof(s)-1); write(1, probe(\"/write-proof\") ? \"ok\" : \"fail\", 4); static const char t[] = \" tmp=\"; write(1, t, sizeof(t)-1); write(1, probe(\"/tmp/write-proof\") ? \"ok\" : \"fail\", 4); write(1, \"\\n\", 1); for (;;) pause(); }\n",
         )
         .unwrap();
         let compiled = std::process::Command::new("zig")
@@ -609,7 +590,7 @@ mod tests {
             id: vmid,
             desired: DesiredState {
                 metadata: Metadata {
-                    name: "oci-ephemeral-test".to_owned(),
+                    name: "oci-write-probe".to_owned(),
                     ..Default::default()
                 },
                 compute: Compute {
@@ -628,12 +609,40 @@ mod tests {
                 vsock: None,
                 rootfs: Some(Rootfs {
                     oci: format!("oci:{}:latest", oci_layout.display()),
-                    mode: RootfsMode::Ephemeral,
+                    mode,
                     stdin: false,
                 }),
             },
             observed: None,
         };
+        (fixture_dir, manifest)
+    }
+
+    /// Full ephemeral OCI boot through the actor: the host serves the composefs
+    /// image read-only and the guest init builds the root overlay from its own
+    /// tmpfs, so the fixture init's write to `/` must succeed there.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "boots a real VM; needs /dev/kvm, cloud-hypervisor, virtiofsd, skopeo, composefs host support, and zig"]
+    async fn oci_ephemeral_vm_writes_into_its_guest_tmpfs() {
+        use crate::ch_driver::VMInstance;
+        use crate::ch_driver::{actor::VMActor, containers};
+        use crate::manifest::RootfsMode;
+        use crate::messages::vm::{DeleteVM, GetConsoleHistory, GetWorkloadLogs};
+        use kameo::prelude::*;
+        use std::time::Duration;
+        use tracing::info;
+
+        _ = tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| "odorobo=debug,mk_compressfs=debug".into()),
+            )
+            .with_test_writer()
+            .try_init()
+            .map_err(|err| info!(?err, "tracing subscriber already set"));
+
+        let vmid = ulid::Ulid::generate();
+        let (fixture_dir, manifest) = write_probe_fixture(vmid, RootfsMode::Ephemeral);
 
         let prepared = VMActor::prepare();
         let actor_ref = prepared.actor_ref().clone();
@@ -643,9 +652,9 @@ mod tests {
         let deadline = std::time::Instant::now()
             .checked_add(Duration::from_secs(120))
             .expect("deadline in range");
-        let mut write_proof = false;
         let mut last_console = Vec::new();
         let mut last_logs = Vec::new();
+        let mut probe_seen = false;
         while std::time::Instant::now() < deadline {
             let console = actor_ref
                 .ask(GetConsoleHistory { vmid })
@@ -657,8 +666,8 @@ mod tests {
                 .await
                 .expect("workload logs ask");
             last_logs.clone_from(&logs.logs);
-            if String::from_utf8_lossy(&logs.logs).contains("write=ok") {
-                write_proof = true;
+            if String::from_utf8_lossy(&logs.logs).contains("root=") {
+                probe_seen = true;
                 break;
             }
             // A startup failure means the fixture init will never run.
@@ -672,10 +681,15 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
         assert!(
-            write_proof,
-            "guest init never wrote through its tmpfs overlay within 120s; console:\n{}\nworkload logs:\n{}\n(check that /var/lib/odorobo/microvm/initramfs.cpio.gz matches the crate: `just initramfs`)",
+            probe_seen,
+            "the fixture init never ran within 120s; console:\n{}\nworkload logs:\n{}\n(check that /var/lib/odorobo/microvm/initramfs.cpio.gz matches the crate: `just initramfs`)",
             String::from_utf8_lossy(&last_console),
             String::from_utf8_lossy(&last_logs)
+        );
+        let probe = String::from_utf8_lossy(&last_logs).into_owned();
+        assert!(
+            probe.contains("root=ok") && probe.contains("tmp=ok"),
+            "an ephemeral root must accept writes through its tmpfs overlay: {probe}"
         );
 
         // The host side stays read-only: writes only ever land in the guest.
@@ -695,6 +709,80 @@ mod tests {
             .await
             .expect("DeleteVM reply");
         assert_eq!(deleted.error, None, "ephemeral VM must delete cleanly");
+        handle.await.unwrap().unwrap();
+        std::fs::remove_dir_all(fixture_dir).unwrap();
+    }
+
+    /// Full read-only OCI boot through the actor: the guest switches into the
+    /// served root with `pivot_root`, parking the old tree on its /tmp scratch
+    /// mount, so the root write must fail while the scratch write succeeds.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "boots a real VM; needs /dev/kvm, cloud-hypervisor, virtiofsd, skopeo, composefs host support, and zig"]
+    async fn oci_readonly_vm_keeps_writes_out_of_the_image() {
+        use crate::ch_driver::actor::VMActor;
+        use crate::manifest::RootfsMode;
+        use crate::messages::vm::{DeleteVM, GetConsoleHistory, GetWorkloadLogs};
+        use kameo::prelude::*;
+        use std::time::Duration;
+
+        let vmid = ulid::Ulid::generate();
+        let (fixture_dir, manifest) = write_probe_fixture(vmid, RootfsMode::ReadOnly);
+        let prepared = VMActor::prepare();
+        let actor_ref = prepared.actor_ref().clone();
+        let handle = prepared.spawn((vmid, Some(manifest)));
+        actor_ref.ask(super::StartVM).await.unwrap();
+
+        let deadline = std::time::Instant::now()
+            .checked_add(Duration::from_secs(120))
+            .expect("deadline in range");
+        let mut last_console = Vec::new();
+        let mut last_logs = Vec::new();
+        let mut probe_seen = false;
+        while std::time::Instant::now() < deadline {
+            let console = actor_ref
+                .ask(GetConsoleHistory { vmid })
+                .await
+                .expect("console history ask");
+            last_console.clone_from(&console.history);
+            let logs = actor_ref
+                .ask(GetWorkloadLogs { vmid })
+                .await
+                .expect("workload logs ask");
+            last_logs.clone_from(&logs.logs);
+            if String::from_utf8_lossy(&logs.logs).contains("root=") {
+                probe_seen = true;
+                break;
+            }
+            if let Ok(Some(reason)) = actor_ref.ask(super::StartFailure).await {
+                panic!(
+                    "VM never started: {reason}; console:\n{}\nworkload logs:\n{}",
+                    String::from_utf8_lossy(&last_console),
+                    String::from_utf8_lossy(&last_logs)
+                );
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        assert!(
+            probe_seen,
+            "the fixture init never ran within 120s; console:\n{}\nworkload logs:\n{}\n(check that /var/lib/odorobo/microvm/initramfs.cpio.gz matches the crate: `just initramfs`)",
+            String::from_utf8_lossy(&last_console),
+            String::from_utf8_lossy(&last_logs)
+        );
+        let probe = String::from_utf8_lossy(&last_logs).into_owned();
+        assert!(
+            probe.contains("root=fail"),
+            "a read-only root must reject writes: {probe}"
+        );
+        assert!(
+            probe.contains("tmp=ok"),
+            "the scratch tmpfs must stay writable after the pivot: {probe}"
+        );
+
+        let deleted = actor_ref
+            .ask(DeleteVM { vmid })
+            .await
+            .expect("DeleteVM reply");
+        assert_eq!(deleted.error, None, "read-only VM must delete cleanly");
         handle.await.unwrap().unwrap();
         std::fs::remove_dir_all(fixture_dir).unwrap();
     }

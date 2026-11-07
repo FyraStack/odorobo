@@ -19,12 +19,14 @@ mounts for the VM.
    passes that directory to `repo::mount_image`, which builds one overlayfs
    mount out of the image's EROFS object, this directory, and the repository's
    object store (`odorobo/src/ch_driver/containers/repo.rs`).
-3. A writable mode adds the per-VM upper and work directories; `read_only`
-   mounts only the two lowers.
+3. `ephemeral` roots are served read-only and the guest init layers a tmpfs
+   upper on top; `persistent` adds the per-VM upper and work directories on the
+   host; `read_only` mounts only the two lowers.
 4. One `virtiofsd` serves the mounted root with tag `rootfs` and socket
    `/run/odorobo/vms/<vmid>/rootfs.sock`, so the guest sees a single share.
 5. The init mounts that share at `/newroot`, reads `/.odorobo-config.json`
-   (1 MiB limit) from it, and parses it before chrooting into the same root.
+   (1 MiB limit) from it, and parses it before switching into the workload
+   root.
 
 The bytes are not rewritten. The init uses only the `config` object and ignores
 `architecture`, `os`, `rootfs`, and `history`. A missing share, unreadable file,
@@ -70,15 +72,16 @@ No manifest field overrides the image's `Env`, `Cmd`, or `User` yet.
   environment is passed; the init adds nothing else (no `HOME`, `HOSTNAME`, or
   `TERM`).
 - **User.** A numeric uid without a passwd entry gets gid 0. Supplementary
-  groups are reset to the single resolved gid, and the switch happens after
-  mounts and chroot, before `execve`. Names are looked up inside the image, not
+  groups are reset to the single resolved gid, and the switch happens after the
+  root switch, before `execve`. Names are looked up inside the image, not
   on the host.
 - **Ignored.** `Labels`, `ExposedPorts`, `Volumes`, `StopSignal`, `Healthcheck`,
   `Shell`, `ArgsEscaped`, and `OnBuild` do nothing. Networking, disk, and layer
   merging happen on the host; there is no container runtime in the guest.
 - **Launch options.** The host adds an `odorobo` object to the document it
-  writes; today it carries `stdin`. Without it the workload's stdin is
-  `/dev/null`, which is what non-interactive containers expect.
+  writes; today it carries `stdin` and, for an ephemeral root, the `rootfs`
+  tmpfs-upper contract. Without it the workload's stdin is `/dev/null`, which is
+  what non-interactive containers expect.
 
 ## Boot sequence
 
@@ -86,7 +89,13 @@ No manifest field overrides the image's `Env`, `Cmd`, or `User` yet.
    Kernel and init output stay on that serial console.
 2. It marks its mounts private, then mounts `devtmpfs`, `proc`, and `sysfs`.
 3. It mounts the `rootfs` share at `/newroot` and parses `.odorobo-config.json`.
-4. It moves the pseudo filesystems into `/newroot` and chroots to `/`.
+   When the document asks for an ephemeral root, it mounts a size-bounded tmpfs
+   and an overlay that keeps the share as the read-only lower.
+4. It moves the pseudo filesystems into the new root, overmounts the initramfs
+   root with it (`mount --move` onto `/`) and chroots into it. `pivot_root` is
+   not an option: the initramfs root is `rootfs`, which the kernel refuses to
+   pivot away from and cannot be unmounted, so the old tree stays hidden
+   underneath instead of being detached.
 5. It forks; the child opens `/dev/hvc0` (the virtio console) as its
    stdout/stderr with a controlling terminal, applies `User`, and execs
    `Entrypoint` + `Cmd`. Its stdin is `/dev/null` unless the config document
