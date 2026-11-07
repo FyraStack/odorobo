@@ -12,6 +12,8 @@ use stable_eyre::{
 use tokio::process::Command;
 use tracing::info;
 
+use futures_util::{StreamExt, TryStreamExt};
+
 use super::dirmeta::{DIRECTORY_OPERATIONS, compose_directory_metadata};
 use super::layer_store::materialize_layer;
 use super::limits::{EPHEMERAL_STATE, MIB, RUN_SCRATCH, TMP_SCRATCH, VARTMP_SCRATCH};
@@ -21,6 +23,7 @@ use super::persistent::{
     rbd_identity, rbd_lookup_device, release_persistent_backend,
 };
 use super::process::{TOOL_OPERATIONS, Tool};
+use super::unpack::{DirectoryReset, LayerStats};
 use super::{PERSISTENT_ROOTFS_ROOT, PreparedRootfs, ROOTFS_TAG, validate_vmid};
 use crate::manifest::{Rootfs, RootfsMode};
 
@@ -73,8 +76,9 @@ pub(super) async fn unmount_layer_mounts(mounts: &[PathBuf]) -> Result<()> {
 /// retained; only per-layer stores and per-reference OCI layouts are cached.
 #[cfg(test)]
 pub(super) async fn mount_rootfs(vmid: &str, rootfs: &Rootfs) -> Result<PreparedRootfs> {
+    let image = prepare_image(rootfs).await?;
     let mut owner = None;
-    match mount_rootfs_owned(vmid, rootfs, &mut owner).await {
+    match mount_rootfs_owned(vmid, rootfs, &image, &mut owner).await {
         Ok(()) => Ok(owner.unwrap()),
         Err(err) => {
             if let Some(prepared) = owner.as_ref() {
@@ -85,23 +89,34 @@ pub(super) async fn mount_rootfs(vmid: &str, rootfs: &Rootfs) -> Result<Prepared
     }
 }
 
-/// Publish acquired resources to a lifecycle owner before the first mount.
-/// A failed startup retains this inventory for an explicit teardown retry.
-#[expect(
-    clippy::too_many_lines,
-    reason = "sequential setup with interleaved cleanup; splitting would obscure ownership"
-)]
-pub async fn mount_rootfs_owned(
-    vmid: &str,
-    rootfs: &Rootfs,
-    owner: &mut Option<PreparedRootfs>,
-) -> Result<()> {
-    validate_vmid(vmid)?;
+/// Concurrent layer builds per image; each runs `tar` extraction and `mkcomposefs`.
+const MAX_PARALLEL_LAYER_BUILDS: usize = 4;
+
+/// An OCI image pulled and built into cached composefs layers, ready to mount for any VM.
+#[derive(Debug)]
+pub struct PreparedImage {
+    digest: String,
+    layers: Vec<PreparedLayer>,
+    compressed_bytes: u64,
+    composefs_image_bytes: u64,
+    composefs_object_bytes: u64,
+}
+
+#[derive(Debug)]
+struct PreparedLayer {
+    digest: String,
+    cache: PathBuf,
+    verity_digest: String,
+    explicit_directories: Vec<PathBuf>,
+    directory_resets: Vec<DirectoryReset>,
+}
+
+/// Pull an image and build its layers. Holds no per-VM state, so it can run off the VM actor.
+pub async fn prepare_image(rootfs: &Rootfs) -> Result<PreparedImage> {
     let limits = OciUnpackLimits::from_env()?;
-    let state_lock = acquire_rootfs_lock(vmid).await?;
     let layout = pull_oci(&rootfs.oci, limits.max_compressed_bytes).await?;
     let layout_for_parse = layout.clone();
-    let (manifest_digest, descriptors) =
+    let (digest, descriptors) =
         tokio::task::spawn_blocking(move || read_oci_manifest(&layout_for_parse))
             .await
             .map_err(|e| eyre!("OCI manifest validation task failed: {e}"))??;
@@ -129,6 +144,82 @@ pub async fn mount_rootfs_owned(
         );
     }
 
+    // Aggregate limits are checked after the parallel builds, so each build gets the per-layer cap.
+    let layer_limit = limits.max_layer_bytes.min(limits.max_image_bytes);
+    let parallelism = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .min(MAX_PARALLEL_LAYER_BUILDS);
+    let max_entries = limits.max_image_entries;
+    let builds: Vec<_> = descriptors
+        .iter()
+        .map(|desc| {
+            let (layout, desc) = (layout.clone(), desc.clone());
+            async move { materialize_layer(&layout, &desc, layer_limit, max_entries).await }
+        })
+        .collect();
+    let built: Vec<(PathBuf, LayerStats)> = futures_util::stream::iter(builds)
+        .buffered(parallelism)
+        .try_collect()
+        .await?;
+
+    let mut unpacked_bytes = 0_u64;
+    let mut unpacked_entries = 0_u64;
+    let mut composefs_image_bytes = 0_u64;
+    let mut composefs_object_bytes = 0_u64;
+    let mut accounted_layers = std::collections::HashSet::new();
+    let mut layers = Vec::with_capacity(built.len());
+    for (desc, (cache, stats)) in descriptors.iter().zip(built) {
+        unpacked_bytes = unpacked_bytes
+            .checked_add(stats.uncompressed_bytes)
+            .ok_or_else(|| eyre!("unpacked image size overflows"))?;
+        unpacked_entries = unpacked_entries
+            .checked_add(stats.entry_count)
+            .ok_or_else(|| eyre!("unpacked image entry count overflows"))?;
+        if accounted_layers.insert(&desc.digest) {
+            composefs_image_bytes = composefs_image_bytes
+                .checked_add(stats.composefs_image_bytes)
+                .ok_or_else(|| eyre!("composefs image cache size overflows"))?;
+            composefs_object_bytes = composefs_object_bytes
+                .checked_add(stats.object_store_bytes)
+                .ok_or_else(|| eyre!("composefs object cache size overflows"))?;
+        }
+        let verity_digest = tokio::fs::read_to_string(cache.join("layer-digest")).await?;
+        layers.push(PreparedLayer {
+            digest: desc.digest.clone(),
+            cache,
+            verity_digest: verity_digest.trim().to_owned(),
+            explicit_directories: stats.explicit_directories,
+            directory_resets: stats.directory_resets,
+        });
+    }
+    if unpacked_bytes > limits.max_image_bytes || unpacked_entries > limits.max_image_entries {
+        bail!("OCI image exceeds configured aggregate extraction limits");
+    }
+    Ok(PreparedImage {
+        digest,
+        layers,
+        compressed_bytes,
+        composefs_image_bytes,
+        composefs_object_bytes,
+    })
+}
+
+/// Publish acquired resources to a lifecycle owner before the first mount.
+/// A failed startup retains this inventory for an explicit teardown retry.
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential setup with interleaved cleanup; splitting would obscure ownership"
+)]
+pub async fn mount_rootfs_owned(
+    vmid: &str,
+    rootfs: &Rootfs,
+    image: &PreparedImage,
+    owner: &mut Option<PreparedRootfs>,
+) -> Result<()> {
+    validate_vmid(vmid)?;
+    let state_lock = acquire_rootfs_lock(vmid).await?;
+    let manifest_digest = &image.digest;
+
     let runtime_dir = crate::ch_driver::VMInstance::runtime_dir_for(vmid);
     tokio::fs::create_dir_all(&runtime_dir).await?;
     tokio::fs::set_permissions(&runtime_dir, std::fs::Permissions::from_mode(0o700)).await?;
@@ -151,48 +242,24 @@ pub async fn mount_rootfs_owned(
             state.display()
         );
     }
-    // Materialize every cache entry before mounting anything, so extraction or
-    // integrity failures cannot strand a partial stack.
-    let mut caches = Vec::with_capacity(descriptors.len());
-    let mut directory_changes = Vec::with_capacity(descriptors.len());
-    let mut directory_resets = Vec::with_capacity(descriptors.len());
-    let mut unpacked_bytes = 0_u64;
-    let mut unpacked_entries = 0_u64;
-    let mut composefs_image_bytes = 0_u64;
-    let mut composefs_object_bytes = 0_u64;
-    let mut accounted_layers = std::collections::HashSet::new();
-    for desc in &descriptors {
-        let remaining_bytes = limits.max_image_bytes.saturating_sub(unpacked_bytes);
-        let remaining_entries = limits.max_image_entries.saturating_sub(unpacked_entries);
-        if remaining_bytes == 0 || remaining_entries == 0 {
-            bail!("OCI image exceeds configured aggregate extraction limits");
-        }
-        let layer_limit = limits.max_layer_bytes.min(remaining_bytes);
-        let (cache, stats) =
-            materialize_layer(&layout, desc, layer_limit, remaining_entries).await?;
-        unpacked_bytes = unpacked_bytes
-            .checked_add(stats.uncompressed_bytes)
-            .ok_or_else(|| eyre!("unpacked image size overflows"))?;
-        unpacked_entries = unpacked_entries
-            .checked_add(stats.entry_count)
-            .ok_or_else(|| eyre!("unpacked image entry count overflows"))?;
-        if accounted_layers.insert(&desc.digest) {
-            composefs_image_bytes = composefs_image_bytes
-                .checked_add(stats.composefs_image_bytes)
-                .ok_or_else(|| eyre!("composefs image cache size overflows"))?;
-            composefs_object_bytes = composefs_object_bytes
-                .checked_add(stats.object_store_bytes)
-                .ok_or_else(|| eyre!("composefs object cache size overflows"))?;
-        }
-        directory_changes.push(stats.explicit_directories);
-        directory_resets.push(stats.directory_resets);
-        caches.push(cache);
-    }
+    let directory_changes: Vec<Vec<PathBuf>> = image
+        .layers
+        .iter()
+        .map(|layer| layer.explicit_directories.clone())
+        .collect();
+    let directory_resets: Vec<Vec<DirectoryReset>> = image
+        .layers
+        .iter()
+        .map(|layer| layer.directory_resets.clone())
+        .collect();
     let layer_root = runtime_dir.join("rootfs-layers");
     tokio::fs::create_dir_all(&layer_root).await?;
-    let mut mount_specs = Vec::with_capacity(descriptors.len());
-    for (index, (desc, cache)) in descriptors.iter().zip(&caches).enumerate() {
-        let (_, hex) = desc.digest.split_once(':').expect("validated layer digest");
+    let mut mount_specs = Vec::with_capacity(image.layers.len());
+    for (index, layer) in image.layers.iter().enumerate() {
+        let (_, hex) = layer
+            .digest
+            .split_once(':')
+            .expect("validated layer digest");
         let layer_mount = layer_root.join(format!("{index}-{hex}"));
         tokio::fs::create_dir_all(&layer_mount).await?;
         if is_mountpoint(&layer_mount).await? {
@@ -201,11 +268,10 @@ pub async fn mount_rootfs_owned(
                 layer_mount.display()
             );
         }
-        let verity_digest = tokio::fs::read_to_string(cache.join("layer-digest")).await?;
         mount_specs.push((
-            desc.digest.clone(),
-            cache.clone(),
-            verity_digest.trim().to_owned(),
+            layer.digest.clone(),
+            layer.cache.clone(),
+            layer.verity_digest.clone(),
             layer_mount,
         ));
     }
@@ -292,7 +358,7 @@ pub async fn mount_rootfs_owned(
         prepared.persistent_state_mount = Some(state_path);
         prepared.rbd_image = Some(image);
     }
-    let upper_state = prepare_upper(vmid, rootfs.mode, &manifest_digest, &runtime_dir).await?;
+    let upper_state = prepare_upper(vmid, rootfs.mode, manifest_digest, &runtime_dir).await?;
     {
         let prepared = owner.as_mut().unwrap();
         prepared.upper.clone_from(&upper_state.upper);
@@ -360,7 +426,7 @@ pub async fn mount_rootfs_owned(
     } else {
         Vec::new()
     };
-    info!(vmid, %manifest_digest, layers=descriptors.len(), unique_layer_blob_bytes=compressed_bytes, composefs_image_bytes, composefs_object_bytes, mount=%root_mount.display(), "OCI rootfs mounted; referenced cache usage (compressed blobs / composefs metadata / composefs objects)");
+    info!(vmid, %manifest_digest, layers=image.layers.len(), unique_layer_blob_bytes=image.compressed_bytes, composefs_image_bytes=image.composefs_image_bytes, composefs_object_bytes=image.composefs_object_bytes, mount=%root_mount.display(), "OCI rootfs mounted; referenced cache usage (compressed blobs / composefs metadata / composefs objects)");
     owner.as_mut().unwrap().scratch_mounts = scratch_mounts;
     Ok(())
 }
@@ -834,8 +900,9 @@ mod tests {
             oci: oci_ref(&layout),
             mode: RootfsMode::ReadOnly,
         };
+        let image = prepare_image(&rootfs).await.unwrap();
         assert!(
-            mount_rootfs_owned(&vmid, &rootfs, &mut owner)
+            mount_rootfs_owned(&vmid, &rootfs, &image, &mut owner)
                 .await
                 .is_err()
         );

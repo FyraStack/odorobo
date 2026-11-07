@@ -216,19 +216,28 @@ mod tests {
         let prepared = super::VMActor::prepare();
         let actor = prepared.actor_ref().clone();
         let handle = prepared.spawn((vmid, Some(manifest)));
-        let failure = actor.ask(super::StartVM).await.unwrap_err().to_string();
+        actor.ask(super::StartVM).await.unwrap();
+        let mut info = None;
+        for _ in 0..200 {
+            let reply = actor
+                .ask(crate::messages::vm::GetVMInfo { vmid: Some(vmid) })
+                .await
+                .unwrap();
+            let observed = reply.observed.clone().unwrap();
+            if observed.status != crate::manifest::ObservedStatus::Pending {
+                info = Some((reply, observed));
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let (reply, observed) = info.expect("image preparation must finish");
+        assert_eq!(observed.status, crate::manifest::ObservedStatus::Error);
+        let failure = observed.error.unwrap_or_default();
         assert!(
             failure.contains("skopeo"),
             "fixture must reach OCI acquisition: {failure}"
         );
-        assert!(
-            actor
-                .ask(crate::messages::vm::GetVMInfo { vmid: Some(vmid) })
-                .await
-                .unwrap()
-                .config
-                .is_some()
-        );
+        assert!(reply.config.is_some());
         assert!(
             actor
                 .ask(crate::messages::vm::DeleteVM { vmid })
@@ -348,6 +357,7 @@ mod tests {
         let prepared = VMActor::prepare();
         let actor_ref = prepared.actor_ref().clone();
         let handle = prepared.spawn((vmid, Some(manifest)));
+        actor_ref.ask(super::StartVM).await.unwrap();
 
         // Require userspace execution, not merely a kernel driver log.
         let deadline = std::time::Instant::now()
@@ -418,6 +428,15 @@ mod tests {
             .ask(super::StartVM)
             .await
             .expect("restart after unblocking teardown");
+        let mut restarted = false;
+        for _ in 0..120 {
+            if actor_ref.ask(super::CheckRunning).await.is_ok() {
+                restarted = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        assert!(restarted, "restart must finish image preparation and boot");
         // Deliver a predecessor's queued exit only after replacement startup.
         actor_ref
             .ask(super::HypervisorExited { generation: 1 })
@@ -531,6 +550,9 @@ pub struct VMActor {
     /// immediately re-running the whole (possibly minutes-long) start.
     unreported_start_failure: Option<String>,
     started: bool,
+    /// Attempt number of an OCI image preparation still running off the mailbox.
+    starting: Option<u64>,
+    start_attempts: u64,
     /// Distinguishes queued exit notifications from previous VMM instances.
     generation: u64,
 }
@@ -604,25 +626,78 @@ pub struct StartVM;
 impl Message<StartVM> for VMActor {
     type Reply = Result<(), String>;
 
+    /// For OCI rootfs VMs this only starts image preparation; progress and
+    /// failures are reported through `GetVMInfo`'s observed state.
     async fn handle(&mut self, _msg: StartVM, ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
-        if self.started {
+        if self.started || self.starting.is_some() {
             return Ok(());
         }
         if let Some(message) = self.unreported_start_failure.take() {
             return Err(message);
         }
-        if let Err(err) = self.start(ctx.actor_ref().clone()).await {
-            let cleanup = async {
-                self.vm_instance.stop().await?;
-                teardown_rootfs(&mut self.virtiofs, &mut self.rootfs_mount).await?;
-                self.vm_instance.purge_instance_data()
+        if !self.has_rootfs() {
+            if let Err(err) = self.start(ctx.actor_ref().clone(), None).await {
+                return Err(self.rollback_start(&err).await);
             }
-            .await;
-            let message = format!("{err:#}; cleanup: {cleanup:?}");
+            return Ok(());
+        }
+        // Release any retained mounts now, so a blocked teardown fails this call instead of the boot.
+        let teardown = async {
+            self.vm_instance.stop().await?;
+            teardown_rootfs(&mut self.virtiofs, &mut self.rootfs_mount).await?;
+            self.vm_instance.purge_instance_data()
+        }
+        .await;
+        if let Err(err) = teardown {
+            let message = format!("retained rootfs teardown failed: {err:#}");
             self.startup_error = Some(message.clone());
             return Err(message);
         }
+        let Some(rootfs) = self
+            .manifest
+            .as_ref()
+            .and_then(|manifest| manifest.desired.rootfs.clone())
+        else {
+            return Err("rootfs VM has no rootfs intent".into());
+        };
+        self.start_attempts = self.start_attempts.saturating_add(1);
+        let attempt = self.start_attempts;
+        self.starting = Some(attempt);
+        self.startup_error = None;
+        let actor_ref = ctx.actor_ref().clone();
+        let vmid = self.vmid;
+        tokio::spawn(async move {
+            let image = crate::ch_driver::containers::prepare_image(&rootfs).await;
+            if actor_ref.tell(ImageReady { attempt, image }).await.is_err() {
+                debug!(%vmid, "VM actor stopped before its image was ready");
+            }
+        });
         Ok(())
+    }
+}
+
+struct ImageReady {
+    attempt: u64,
+    image: Result<crate::ch_driver::containers::PreparedImage>,
+}
+
+impl Message<ImageReady> for VMActor {
+    type Reply = ();
+
+    async fn handle(&mut self, msg: ImageReady, ctx: &mut Context<Self, Self::Reply>) {
+        // Shutdown, delete or a newer start cleared or replaced this attempt.
+        if self.starting != Some(msg.attempt) {
+            return;
+        }
+        self.starting = None;
+        let result = match msg.image {
+            Ok(image) => self.start(ctx.actor_ref().clone(), Some(image)).await,
+            Err(err) => Err(err.wrap_err("prepare OCI image")),
+        };
+        if let Err(err) = result {
+            let message = self.rollback_start(&err).await;
+            error!(vmid = %self.vmid, %message, "VM startup failed; retaining lifecycle owner for retry or delete");
+        }
     }
 }
 
@@ -644,7 +719,31 @@ async fn teardown_rootfs(
 }
 
 impl VMActor {
-    async fn start(&mut self, actor_ref: ActorRef<Self>) -> Result<()> {
+    fn has_rootfs(&self) -> bool {
+        self.manifest
+            .as_ref()
+            .is_some_and(|manifest| manifest.desired.rootfs.is_some())
+    }
+
+    /// Stop the VMM and release its rootfs; the error message is stored for `GetVMInfo`.
+    async fn rollback_start(&mut self, err: &stable_eyre::Report) -> String {
+        let cleanup = async {
+            self.vm_instance.stop().await?;
+            teardown_rootfs(&mut self.virtiofs, &mut self.rootfs_mount).await?;
+            self.vm_instance.purge_instance_data()
+        }
+        .await;
+        let message = format!("{err:#}; cleanup: {cleanup:?}");
+        self.startup_error = Some(message.clone());
+        message
+    }
+
+    /// `image` must be set for rootfs VMs; `prepare_image` builds it off the mailbox.
+    async fn start(
+        &mut self,
+        actor_ref: ActorRef<Self>,
+        image: Option<crate::ch_driver::containers::PreparedImage>,
+    ) -> Result<()> {
         // Clean any previous failed acquisition before trying again. Keep its
         // ownership inventory if teardown fails; never overwrite live mounts.
         self.vm_instance.stop().await?;
@@ -676,9 +775,11 @@ impl VMActor {
                     "virtiofsd not found (looked in PATH and /usr/libexec) — `dnf install virtiofsd`"
                 )
             })?;
+            let image = image.ok_or_else(|| eyre!("OCI image was not prepared before start"))?;
             crate::ch_driver::containers::mount_rootfs_owned(
                 &vmid.to_string(),
                 rootfs,
+                &image,
                 rootfs_mount,
             )
             .await?;
@@ -778,18 +879,17 @@ impl Actor for VMActor {
             unreported_start_failure: None,
             started: false,
             generation: 0,
+            starting: None,
+            start_attempts: 0,
         };
-        if let Err(err) = actor.start(actor_ref).await {
-            let cleanup = async {
-                actor.vm_instance.stop().await?;
-                teardown_rootfs(&mut actor.virtiofs, &mut actor.rootfs_mount).await?;
-                actor.vm_instance.purge_instance_data()
-            }
-            .await;
-            let message = format!("{err:#}; cleanup: {cleanup:?}");
+        // OCI rootfs VMs wait for StartVM, which prepares the image off the mailbox.
+        if actor.has_rootfs() {
+            return Ok(actor);
+        }
+        if let Err(err) = actor.start(actor_ref, None).await {
+            let message = actor.rollback_start(&err).await;
             error!(%vmid, %message, "VM startup failed; retaining lifecycle owner for retry or delete");
-            actor.unreported_start_failure = Some(message.clone());
-            actor.startup_error = Some(message);
+            actor.unreported_start_failure = Some(message);
         }
         Ok(actor)
     }
@@ -877,9 +977,24 @@ impl Message<GetVMInfo> for VMActor {
         _msg: GetVMInfo,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
+        use crate::manifest::{ObservedState, ObservedStatus};
+        let status = if self.started {
+            ObservedStatus::Running
+        } else if self.starting.is_some() {
+            ObservedStatus::Pending
+        } else if self.startup_error.is_some() {
+            ObservedStatus::Error
+        } else {
+            ObservedStatus::Stopped
+        };
         GetVMInfoReply {
             vmid: self.vmid,
             config: self.manifest.clone(),
+            observed: Some(ObservedState {
+                status,
+                error: self.startup_error.clone(),
+                ..Default::default()
+            }),
         }
     }
 }
@@ -1087,6 +1202,7 @@ impl Message<ShutdownVM> for VMActor {
         _msg: ShutdownVM,
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
+        self.starting = None;
         self.vm_instance
             .stop()
             .await
@@ -1123,6 +1239,7 @@ impl Message<DeleteVM> for VMActor {
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         trace!(vmid = %self.vmid, "Deleting VM actor and persistent rootfs state");
+        self.starting = None;
         if let Err(err) = self.vm_instance.stop().await {
             return DeleteVMReply {
                 error: Some(format!(

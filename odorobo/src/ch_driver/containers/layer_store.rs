@@ -9,7 +9,7 @@ use stable_eyre::{
 };
 
 use super::RemovePathOnDrop;
-use super::oci::{OciLayerDescriptor, digest_blob_path, hash_file};
+use super::oci::{OciLayerDescriptor, digest_blob_path};
 use super::process::Tool;
 use super::unpack::{LayerStats, compression_of_media_type, unpack_layer};
 
@@ -87,20 +87,7 @@ pub(super) async fn verify_cached_layer(
             root.display()
         );
     }
-    let measured = Tool::BULK
-        .run(
-            "composefs-info",
-            ["measure-file".to_owned()],
-            &[root.join("layer.cfs").as_path()],
-        )
-        .await?;
-    let expected = tokio::fs::read_to_string(root.join("layer-digest")).await?;
-    if measured.trim() != expected.trim() {
-        bail!(
-            "cached composefs layer {} failed digest verification",
-            root.display()
-        );
-    }
+    // The mount passes `digest=<layer-digest>,verity`, so the kernel checks the image itself.
     let stats: LayerStats =
         serde_json::from_slice(&tokio::fs::read(root.join("layer-stats.json")).await?)
             .wrap_err_with(|| format!("read cached layer stats for {}", root.display()))?;
@@ -152,31 +139,26 @@ pub(super) async fn materialize_layer_inner(
     let compression = compression_of_media_type(&desc.media_type)
         .ok_or_else(|| eyre!("unsupported OCI layer media type {:?}", desc.media_type))?;
     let blob = digest_blob_path(layout, &desc.digest)?;
-    let actual = hash_file(&blob)?;
-    if actual != desc.digest {
-        bail!(
-            "layer digest mismatch: expected {}, got {actual}",
-            desc.digest
-        );
-    }
-    if std::fs::metadata(&blob)?.len()
-        != desc
-            .size
-            .ok_or_else(|| eyre!("OCI layer is missing its size"))?
-    {
-        bail!("layer {} size does not match descriptor", desc.digest);
-    }
     let (_, hex) = desc
         .digest
         .split_once(':')
         .ok_or_else(|| eyre!("invalid layer digest"))?;
     let root = cache_root.join(hex);
+    let _build_guard = super::keyed_lock(root.clone()).await;
     if root.join("layer.cfs").is_file()
         && root.join("store").is_dir()
         && root.join("layer-stats.json").is_file()
     {
         let stats = verify_cached_layer(&root, desc, max_bytes, max_entries).await?;
         return Ok((root, stats));
+    }
+    // No blob hash here: the DiffID check below pins the uncompressed content to the config.
+    if std::fs::metadata(&blob)?.len()
+        != desc
+            .size
+            .ok_or_else(|| eyre!("OCI layer is missing its size"))?
+    {
+        bail!("layer {} size does not match descriptor", desc.digest);
     }
     tokio::fs::create_dir_all(cache_root).await?;
     let tmp = cache_root.join(format!(".layer-{}", ulid::Ulid::generate()));

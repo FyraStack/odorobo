@@ -159,10 +159,7 @@ impl Actor for AgentActor {
 
 #[remote_message]
 impl Message<CreateVM> for AgentActor {
-    // Startup (OCI pull, unpack, rootfs mount, virtiofsd) can take minutes.
-    // Inventory is updated synchronously; only the StartVM wait is delegated so
-    // the agent mailbox keeps serving other VMs. Concurrent lifecycle messages
-    // for the same VM are still ordered by that VM actor's own mailbox.
+    // StartVM returns once OCI image preparation is queued; boot progress is in GetVMInfo's observed state.
     type Reply = DelegatedReply<CreateVMReply>;
 
     async fn handle(&mut self, msg: CreateVM, ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
@@ -394,12 +391,17 @@ impl Message<GetVMInfo> for AgentActor {
             return ForwardedReply::from_ok(GetVMInfoReply {
                 vmid: Ulid::nil(),
                 config: None,
+                observed: None,
             });
         };
 
         let Some(actor_ref) = Self::lookup_vm_actor(vmid).await else {
             warn!(vm_id = %vmid, "VM actor not found for info lookup");
-            return ForwardedReply::from_ok(GetVMInfoReply { vmid, config: None });
+            return ForwardedReply::from_ok(GetVMInfoReply {
+                vmid,
+                config: None,
+                observed: None,
+            });
         };
 
         ctx.forward(&actor_ref, msg).await

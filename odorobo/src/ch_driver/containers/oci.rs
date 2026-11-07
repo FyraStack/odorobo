@@ -142,20 +142,20 @@ pub(super) fn globalize_layout_blobs_at(layout: &Path, cas_root: &Path) -> Resul
         }
         let digest = format!("sha256:{filename}");
         let blob = entry.path();
+        let cas = cas_root.join(&filename);
+        // CAS entries are hashed once on publish; a layout blob sharing that inode is already verified.
+        if std::fs::symlink_metadata(&cas).is_ok_and(|cas_meta| {
+            cas_meta.file_type().is_file() && cas_meta.ino() == metadata.ino()
+        }) {
+            continue;
+        }
         if hash_file(&blob)? != digest {
             bail!("OCI blob {filename} does not match its digest");
         }
-        let cas = cas_root.join(&filename);
         if cas.exists() {
             if !std::fs::symlink_metadata(&cas)?.file_type().is_file() {
                 bail!(
                     "node-local OCI CAS entry {} is not a regular file",
-                    cas.display()
-                );
-            }
-            if hash_file(&cas)? != digest {
-                bail!(
-                    "node-local OCI CAS entry {} failed digest verification",
                     cas.display()
                 );
             }
@@ -440,6 +440,7 @@ pub(super) async fn pull_oci_inner(image_ref: &str, max_compressed_bytes: u64) -
     let ref_hash = to_hex(&sha2::Sha256::digest(image_ref.as_bytes()));
     let dir =
         PathBuf::from(OCI_CACHE_ROOT).join(format!("{}-{ref_hash}", sanitize_image_ref(image_ref)));
+    let _pull_guard = super::keyed_lock(dir.clone()).await;
     if dir.join("index.json").exists() {
         let layout = dir.clone();
         let bytes = tokio::task::spawn_blocking(move || -> Result<_> {
