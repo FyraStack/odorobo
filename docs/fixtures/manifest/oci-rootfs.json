@@ -2,7 +2,7 @@
   "api_version": 1,
   "id": "01J00000000000000000000006",
   "desired": {
-    "metadata": { "name": "faas-function", "labels": {}, "annotations": {} },
+    "metadata": { "name": "oci-function", "labels": {}, "annotations": {} },
     "compute": { "vcpus": 1, "memory_bytes": 268435456 },
     "storage": [],
     "networks": [],

@@ -29,6 +29,7 @@ use ulid::Ulid;
 const DHCP_LEASE_FILE: &str = "dnsmasq.leases";
 const NFT_TABLE: &str = "odorobo";
 const NFT_DNAT_CHAIN: &str = "container_dnat";
+/// Chain name used before the rename; still swept at startup.
 const LEGACY_DNAT_CHAINS: &[&str] = &["faas_dnat"];
 const DNAT_PRIORITY: i32 = -100;
 const LEASE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -566,7 +567,7 @@ impl Actor for NetworkAgentActor {
             }
         }
 
-        Self::clear_port_rules().wrap_err("failed to clear stale FaaS port rules")?;
+        Self::clear_port_rules().wrap_err("failed to clear stale port rules")?;
 
         Ok(actor)
     }
@@ -722,8 +723,8 @@ impl Message<DetachTap> for NetworkAgentActor {
 
 impl NetworkAgentActor {
     fn ensure_port_forward_chain() -> Result<(), Report> {
-        let ruleset =
-            get_current_ruleset().wrap_err("failed to fetch nftables ruleset for FaaS ports")?;
+        let ruleset = get_current_ruleset()
+            .wrap_err("failed to fetch nftables ruleset for port publishing")?;
         let objects = ruleset.objects.as_ref();
         if Self::nft_chain_exists(objects, NFT_TABLE, NFT_DNAT_CHAIN) {
             return Ok(());
@@ -749,11 +750,12 @@ impl NetworkAgentActor {
             dev: None,
             policy: Some(NfChainPolicy::Accept),
         }));
-        apply_ruleset(&batch.to_nftables()).wrap_err("failed to create the FaaS DNAT chain")?;
+        apply_ruleset(&batch.to_nftables())
+            .wrap_err("failed to create the container DNAT chain")?;
         info!(
             table = NFT_TABLE,
             chain = NFT_DNAT_CHAIN,
-            "created FaaS DNAT chain"
+            "created container DNAT chain"
         );
         Ok(())
     }
@@ -784,7 +786,7 @@ impl NetworkAgentActor {
             .into(),
             handle: None,
             index: None,
-            comment: Some(format!("odorobo faas {vmid} {mapping}").into()),
+            comment: Some(format!("odorobo container {vmid} {mapping}").into()),
         }
     }
 
@@ -823,7 +825,7 @@ impl NetworkAgentActor {
             batch.add(NfListObject::Rule(Self::dnat_rule(vmid, *mapping, address)));
         }
         apply_ruleset(&batch.to_nftables())
-            .wrap_err_with(|| format!("failed to publish FaaS ports for {vmid} to {address}"))?;
+            .wrap_err_with(|| format!("failed to publish ports for {vmid} to {address}"))?;
         Ok(address)
     }
 
@@ -876,12 +878,11 @@ impl NetworkAgentActor {
             removed_chains = removed_chains.saturating_add(1);
         }
         if removed > 0 || removed_chains > 0 {
-            apply_ruleset(&batch.to_nftables())
-                .wrap_err("failed to clear stale FaaS port rules")?;
+            apply_ruleset(&batch.to_nftables()).wrap_err("failed to clear stale port rules")?;
             info!(
                 rules = removed,
                 chains = removed_chains,
-                "cleared stale FaaS port rules from previous run"
+                "cleared stale port-forward rules from a previous run"
             );
         }
         Ok(())
@@ -889,7 +890,7 @@ impl NetworkAgentActor {
 
     fn remove_port_rules(vmid: Ulid) -> Result<(), Report> {
         let ruleset = get_current_ruleset().wrap_err("failed to fetch nftables ruleset")?;
-        let prefix = format!("odorobo faas {vmid} ");
+        let prefix = format!("odorobo container {vmid} ");
         let mut batch = NftBatch::new();
         let mut removed = 0_u32;
         for object in ruleset.objects.as_ref() {
@@ -921,8 +922,8 @@ impl NetworkAgentActor {
         }
         if removed > 0 {
             apply_ruleset(&batch.to_nftables())
-                .wrap_err_with(|| format!("failed to remove FaaS port rules for {vmid}"))?;
-            info!(vmid = %vmid, rules = removed, "removed FaaS port rules");
+                .wrap_err_with(|| format!("failed to remove port rules for {vmid}"))?;
+            info!(vmid = %vmid, rules = removed, "removed port rules");
         }
         Ok(())
     }
@@ -952,9 +953,9 @@ impl Message<PublishPorts> for NetworkAgentActor {
                     vmid = %vmid,
                     guest_ip = %address,
                     ports = msg.ports.len(),
-                    "published FaaS ports"
+                    "published ports"
                 ),
-                Err(err) => error!(vmid = %vmid, ?err, "failed to publish FaaS ports"),
+                Err(err) => error!(vmid = %vmid, ?err, "failed to publish ports"),
             }
         });
         self.port_tasks.insert(vmid, task);

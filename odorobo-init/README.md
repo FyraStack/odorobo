@@ -103,6 +103,6 @@ archive holds only `init`. The root `justfile` has the same recipe.
 - Console (`console=ttyS0`): kernel messages, then `odorobo-init:` lines.
 - Input: `/run/odorobo/vms/<vmid>/config/config.json`.
 - Share log: `/run/odorobo/vms/<vmid>/virtiofsd-config.log`.
-- Boot test: `cargo test -p odorobo --bin odorobo faas_vm_boots -- --ignored --nocapture`.
+- Boot test: `cargo test -p odorobo --bin odorobo oci_rootfs_vm_boots -- --ignored --nocapture`.
   It uses a fixture image with `Entrypoint: ["/bin/sh"]` and needs `/dev/kvm` and
   root access to `/var/lib/odorobo`.

@@ -103,7 +103,7 @@ impl ProvisioningHook for NetworkProvisioningHook {
 
         // Remove published ports even if the TAP has already disappeared.
         if let Err(err) = network_actor.ask(UnpublishPorts { vmid }).await {
-            warn!(%vmid, ?err, "failed to remove published FaaS ports");
+            warn!(%vmid, ?err, "failed to remove published ports");
         }
 
         if taps.is_empty() {

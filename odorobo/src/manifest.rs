@@ -45,7 +45,7 @@ pub enum ManifestError {
 
     #[error("network {0} must define an id")]
     NetworkWithoutId(usize),
-    #[error("network {0} publishes ports, which requires a FaaS rootfs")]
+    #[error("network {0} publishes ports, which requires an OCI rootfs")]
     PortForwardingRequiresRootfs(usize),
     #[error("network {0} publishes ports but has no mac_address")]
     PortForwardingWithoutMac(usize),
@@ -377,7 +377,7 @@ pub struct Network {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mac_address: Option<String>,
-    /// FaaS-only published ports in `<host>:<guest>[/udp]` form.
+    /// Published ports for OCI-mode VMs, in `<host>:<guest>[/udp]` form.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(with = "Vec<String>")]
     pub ports: Vec<PortMapping>,

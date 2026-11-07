@@ -34,7 +34,7 @@ Odorobo should provision. It contains:
   translating the manifest. The control plane owns attachment identity and ordering; the
   provider driver/storage transform resolves the URI or volume ID to a node-local device path.
 - `networks`: stable network IDs, optional guest MAC addresses, and optional
-  published ports for FaaS VMs. The control plane owns the attachment identity
+  published ports for OCI-mode VMs. The control plane owns the attachment identity
   and requested MAC; the provider networking transform resolves the network to
   a host interface or tap device. `ports` entries use `<host>:<guest>`, with an
   optional `/udp` suffix (`8080:80`, `5353:53/udp`). Publishing requires both a

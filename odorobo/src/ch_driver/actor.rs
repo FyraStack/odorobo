@@ -267,17 +267,17 @@ mod tests {
         assert!(format!("{failure:?}").contains("identity"));
     }
 
-    /// Full OCI rootfs boot through the actor: OCI root -> composefs layer
-    /// mounts -> supervised virtiofsd -> CH direct kernel -> virtiofs root.
+    /// Full OCI rootfs boot through the actor: OCI root -> composefs image ->
+    /// supervised virtiofsd -> CH direct kernel -> virtiofs root.
     /// Requires nested KVM, the host tools, and Zig for a static init stub, so
-    /// it is ignored by default: `cargo test -p odorobo --bin odorobo faas_vm_boots -- --ignored --nocapture`
+    /// it is ignored by default: `cargo test -p odorobo --bin odorobo oci_rootfs_vm_boots -- --ignored --nocapture`
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "boots a real VM; needs /dev/kvm, cloud-hypervisor, virtiofsd, skopeo, composefs host support, and zig"]
     #[expect(
         clippy::too_many_lines,
         reason = "end-to-end test exercises one long scenario"
     )]
-    async fn faas_vm_boots_oci_rootfs_through_the_actor() {
+    async fn oci_rootfs_vm_boots_through_the_actor() {
         use crate::ch_driver::{VMInstance, actor::VMActor, containers};
         use crate::manifest::{
             Boot, Compute, DesiredState, MANIFEST_VERSION, Metadata, Placement, Rootfs, VmManifest,
@@ -325,7 +325,7 @@ mod tests {
             id: vmid,
             desired: DesiredState {
                 metadata: Metadata {
-                    name: "faas-boot-test".to_owned(),
+                    name: "oci-boot-test".to_owned(),
                     ..Default::default()
                 },
                 compute: Compute {
@@ -499,7 +499,7 @@ mod tests {
             .await
             .expect("actor task")
             .expect("actor stopped cleanly");
-        info!(?reason, "faas boot test actor stopped");
+        info!(?reason, "oci boot test actor stopped");
         tokio::time::sleep(Duration::from_secs(1)).await;
 
         let socket = containers::socket_path_for(&vmid.to_string());
@@ -529,7 +529,7 @@ pub struct VMActor {
     pub migration_state: Option<MigrationState>,
     pub console: Console,
     /// Supervised virtiofsd child (extra process supervised by this actor)
-    /// when the VM boots an OCI rootfs over virtiofs (`FaaS`, issue #112).
+    /// when the VM boots an OCI rootfs over virtiofs (issue #112).
     pub virtiofs: Option<VirtioFsSupervisor>,
     /// Second supervisor for the read-only OCI config share.
     pub config_virtiofs: Option<VirtioFsSupervisor>,
@@ -733,18 +733,18 @@ async fn teardown_rootfs(
 ///
 /// The actor resolves the guest address from the DHCP lease, so this only
 /// queues the mapping; the rule appears once the guest has a lease.
-async fn publish_faas_ports(vmid: ulid::Ulid, manifest: &VmManifest) {
+async fn publish_ports(vmid: ulid::Ulid, manifest: &VmManifest) {
     if manifest.desired.rootfs.is_none() {
         return;
     }
     let actor = match ActorRef::<NetworkAgentActor>::lookup("network_actor").await {
         Ok(Some(actor)) => actor,
         Ok(None) => {
-            warn!(%vmid, "network actor is not running; FaaS ports were not published");
+            warn!(%vmid, "network actor is not running; published ports were not created");
             return;
         }
         Err(err) => {
-            warn!(%vmid, ?err, "failed to look up network actor; FaaS ports were not published");
+            warn!(%vmid, ?err, "failed to look up network actor; published ports were not created");
             return;
         }
     };
@@ -763,7 +763,7 @@ async fn publish_faas_ports(vmid: ulid::Ulid, manifest: &VmManifest) {
             })
             .await
         {
-            warn!(%vmid, network = %network.id, ?err, "failed to request FaaS port publishing");
+            warn!(%vmid, network = %network.id, ?err, "failed to request port publishing");
         }
     }
 }
@@ -883,7 +883,7 @@ impl VMActor {
             .is_some_and(|manifest| manifest.desired.boot.start);
         let vm_config_for_ch = vm_config.as_ref().map(to_vm_config).transpose()?;
 
-        // FaaS rootfs (issue #112): the composefs mount and the supervised
+        // OCI rootfs (issue #112): the composefs mount and the supervised
         // virtiofsd processes must exist BEFORE Cloud Hypervisor creates the
         // VM; the fs devices connect at create time.
         if let Some(manifest) = &vm_config
@@ -929,7 +929,7 @@ impl VMActor {
         }
 
         if boot && let Some(manifest) = &vm_config {
-            publish_faas_ports(vmid, manifest).await;
+            publish_ports(vmid, manifest).await;
         }
 
         let generation = self.generation;
@@ -1131,7 +1131,7 @@ impl Message<MigrateVMReceive> for VMActor {
             };
         }
 
-        // FaaS rootfs VMs are not migratable: the virtiofs device is
+        // OCI rootfs VMs are not migratable: the virtiofs device is
         // vhost-user, whose device state cannot be serialized by CH's
         // migration stream (issue #112). Reschedule cold instead — the
         // destination can mount the same digest-pinned rootfs exactly.

@@ -1,6 +1,6 @@
 # Container support in Odorobo
 
-Odorobo runs OCI container workloads inside hardware-isolated microVMs: the image supplies the guest's root filesystem, while the host prepares and serves it over virtiofs. This document describes the container execution model and its storage behavior; it is not a general-purpose Docker-compatible runtime specification.
+Odorobo runs OCI container workloads inside hardware-isolated microVMs: the image supplies the guest's root filesystem, while the host prepares and serves it over virtiofs. The target use case is PaaS/FaaS-style hosting: OCI-compatible workloads that need a hardware virtualization boundary instead of a shared kernel, using the images as they are. This document describes the container execution model and its storage behavior; it is not a general-purpose Docker-compatible runtime specification.
 
 **Status:** Implemented for issues #112 and #113 on `caleb/containers`. Unit and privileged single-node integration tests cover image import and composition, write modes, and the disposable RBD lifecycle. Cross-node fencing/drain still requires a multi-host test. This is the single source of truth for container support, the composefs repository, write modes, and persistent state. Future distributed-storage exploration is separate in [future-distributed-storage-design.md](future-distributed-storage-design.md).
 
@@ -101,11 +101,11 @@ If the image has neither an entrypoint nor a command, the init falls back to `/s
 
 The console is the 16550 serial port (`ttyS0`). The agent exposes it as a socket and keeps a history, read through `GET /vms/{vmid}/console/history`. The virtio console (`hvc0`) is off.
 
-Rootfs VMs can publish guest ports on the host with `ports` on a manifest network. The host resolves the guest address from its DHCP lease and installs DNAT rules; see [networking.md](networking.md#publishing-faas-ports).
+Rootfs VMs can publish guest ports on the host with `ports` on a manifest network. The host resolves the guest address from its DHCP lease and installs DNAT rules; see [networking.md](networking.md#publishing-container-ports).
 
 **Overrides:** `boot.kernel` and `boot.initramfs` replace the defaults, and `boot.cmdline` replaces the whole command line. Overriding the initramfs means supplying another image that mounts the virtiofs root itself; overriding the kernel must keep built-in `virtiofs`, `overlayfs` and `devtmpfs`.
 
-The ignored KVM test (`faas_vm_boots_oci_rootfs_through_the_actor`) compiles a static C program with Zig, installs it as `/bin/sh` in a fixture image whose OCI config sets `Entrypoint: ["/bin/sh"]`, and boots it through the actor. The test passes when the console shows the program's message, which proves the config share, the initramfs and the virtiofs root all work together.
+The ignored KVM test (`oci_rootfs_vm_boots_through_the_actor`) compiles a static C program with Zig, installs it as `/bin/sh` in a fixture image whose OCI config sets `Entrypoint: ["/bin/sh"]`, and boots it through the actor. The test passes when the console shows the program's message, which proves the config share, the initramfs and the virtiofs root all work together.
 
 ## Integrity, isolation, and process model
 
@@ -130,7 +130,7 @@ Recorded on the development host with a rootful debug agent, plus the ignored pr
 - `cargo test -p odorobo`: 95 passed, 5 ignored (privileged/KVM/RBD). `cargo clippy -p odorobo -p odorobo-init --all-targets` and `cargo fmt --all --check` are clean apart from the pre-existing macro-semicolon warnings.
 - Boot, stop and delete end to end: an ephemeral `docker://traefik/whoami:latest` VM imported 347 objects / 12,890,895 bytes from 5,139,859 compressed bytes across 3 layers, created one EROFS image object, mounted it, and answered `whoami` over the guest network. Deleting both test VMs left no runtime directories, mounts, published-port rules or `virtiofsd` processes.
 - Deduplication boundary: re-importing the same image logged `new_objects: 0, new_bytes: 0` while the repository stayed at 14 MB / 358 objects.
-- The ignored KVM actor test (`faas_vm_boots_oci_rootfs_through_the_actor`) passes: the guest runs `/init` from the initramfs, mounts the composefs image over virtiofs, reads the OCI config share, executes the fixture entrypoint, then exercises busy-root teardown retention across `ShutdownVM`, restart, a hypervisor crash and `DeleteVM`.
+- The ignored KVM actor test (`oci_rootfs_vm_boots_through_the_actor`) passes: the guest runs `/init` from the initramfs, mounts the composefs image over virtiofs, reads the OCI config share, executes the fixture entrypoint, then exercises busy-root teardown retention across `ShutdownVM`, restart, a hypervisor crash and `DeleteVM`.
 - Privileged mount tests pass: write-mode isolation and removal for `read_only`, `ephemeral` and `persistent`, failed-start inventory retention, and purge protection while the root mount is busy.
 - The disposable per-VM RBD helper test (earlier run on the same host) passed formatting, filesystem check, exclusive-lock feature verification, unmount/unmap/remap, persisted-upper reattach, and explicit volume deletion.
 

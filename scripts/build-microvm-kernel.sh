@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build a tiny Linux kernel for odorobo FaaS microVMs (issue #112).
+# Build a tiny Linux kernel for odorobo OCI microVMs (issue #112).
 #
 # Boot path: Cloud Hypervisor direct kernel boot (PVH) of the vmlinux ELF,
 # no firmware, no GRUB. A tiny gzipped initramfs supplies PID 1, which mounts
@@ -87,7 +87,7 @@ CFG -d GDB_SCRIPTS
 CFG -d KALLSYMS_ALL
 CFG --set-str LOCALVERSION "-odorobo-microvm"
 CFG --set-str SYSTEM_TRUSTED_KEYS ""
-# subsystems a headless FaaS microVM never touches
+# subsystems a headless OCI microVM never touches
 CFG -d SOUND
 CFG -d DRM
 CFG -d USB
