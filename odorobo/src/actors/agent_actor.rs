@@ -1,11 +1,12 @@
 use crate::{
-    ch_driver::actor::VMActor,
+    ch_driver::actor::{GetRootfsDigest, VMActor},
     config::Config,
     manifest::VmManifest,
     messages::{
         Ping, Pong,
         agent::{
-            AgentStatus, AgentStatusUpdate, GetAgentStatus, MembershipChange,
+            AgentStatus, AgentStatusUpdate, CollectRepositoryGarbage,
+            CollectRepositoryGarbageReply, GetAgentStatus, MembershipChange, RepositoryGcReport,
             STATUS_CHANGE_HISTORY_LIMIT, StatusChangeHistory,
         },
         debug::PanicAgent,
@@ -22,7 +23,7 @@ use crate::{
 use ahash::AHashMap;
 use bytesize::ByteSize;
 use kameo::prelude::*;
-use stable_eyre::{Report, Result};
+use stable_eyre::{Report, Result, eyre::eyre};
 use std::ops::ControlFlow;
 use sysinfo::System;
 use tracing::{error, info, trace, warn};
@@ -431,6 +432,63 @@ impl Message<AgentListVMs> for AgentActor {
         // }
 
         AgentListVMsReply { vms }
+    }
+}
+
+/// Reclaims repository space after protecting every image still in use.
+///
+/// VM digests are gathered while the repository write guard is held, so an
+/// image that already mounted is never missed and one that is still importing
+/// is protected by its own guard. Persistent upper state pins its base digest
+/// independently of any VM actor.
+#[remote_message]
+impl Message<CollectRepositoryGarbage> for AgentActor {
+    type Reply = DelegatedReply<CollectRepositoryGarbageReply>;
+
+    async fn handle(
+        &mut self,
+        msg: CollectRepositoryGarbage,
+        ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let vm_actors: Vec<(Ulid, ActorRef<VMActor>)> = self
+            .vms
+            .iter()
+            .filter(|(_, cache)| cache.config.desired.rootfs.is_some())
+            .map(|(vmid, cache)| (*vmid, cache.actor_ref.clone()))
+            .collect();
+        let dry_run = msg.dry_run;
+        ctx.spawn(async move {
+            let gather = move || async move {
+                let mut digests = Vec::with_capacity(vm_actors.len());
+                for (vmid, actor_ref) in vm_actors {
+                    match actor_ref.ask(GetRootfsDigest).await {
+                        Ok(Some(digest)) => digests.push(digest),
+                        Ok(None) => {}
+                        Err(err) => {
+                            return Err(eyre!("VM {vmid} did not report its rootfs image: {err}"));
+                        }
+                    }
+                }
+                Ok(digests)
+            };
+            let result =
+                crate::ch_driver::containers::collect_repository_garbage(gather, dry_run).await;
+            match result {
+                Ok(gc) => CollectRepositoryGarbageReply {
+                    report: Some(RepositoryGcReport {
+                        objects_removed: gc.objects_removed,
+                        objects_bytes: gc.objects_bytes,
+                        images_pruned: gc.images_pruned,
+                        streams_pruned: gc.streams_pruned,
+                    }),
+                    error: None,
+                },
+                Err(err) => CollectRepositoryGarbageReply {
+                    report: None,
+                    error: Some(format!("{err:#}")),
+                },
+            }
+        })
     }
 }
 

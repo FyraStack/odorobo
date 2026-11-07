@@ -20,6 +20,10 @@ use crate::manifest::RootfsMode;
 /// backs an ephemeral root's `OverlayFS` upper and work directories.
 pub(super) const EPHEMERAL_STATE_DIR: &str = "rootfs-state";
 
+/// Pin metadata inside a persistent state directory: the base manifest digest
+/// this upper was created against, plus the backend and format version.
+const STATE_METADATA_FILE: &str = "rootfs-state.json";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum PersistentBackend {
     /// Plain directory under `PERSISTENT_ROOTFS_ROOT` on the host filesystem.
@@ -513,7 +517,7 @@ pub(super) async fn prepare_upper(
         let work = state_dir.join("rootfs.work");
         tokio::fs::create_dir_all(&upper).await?;
         if mode == RootfsMode::Persistent {
-            let metadata = state_dir.join("rootfs-state.json");
+            let metadata = state_dir.join(STATE_METADATA_FILE);
             let backend = if rbd_image.is_some() { "rbd" } else { "local" };
             let expected = serde_json::json!({"version":1,"vmid":vmid,"base_manifest_digest":manifest_digest,"overlay":"overlayfs-v1","backend":backend});
             if metadata.exists() {
@@ -559,6 +563,44 @@ pub(super) async fn prepare_upper(
         state_mount: rbd_image.as_ref().map(|_| state_dir),
         rbd_image,
     })
+}
+
+/// Manifest digests pinned by persistent upper state metadata.
+///
+/// Local backends keep the metadata on the host filesystem. An RBD volume
+/// exposes it only while attached, so an unmapped RBD base relies on its VM
+/// actor retaining the digest instead; GC treats a readable pin as
+/// authoritative and fails rather than guessing when one is unreadable.
+pub(super) async fn pinned_base_digests() -> Result<Vec<String>> {
+    pinned_base_digests_in(Path::new(PERSISTENT_ROOTFS_ROOT)).await
+}
+
+async fn pinned_base_digests_in(root: &Path) -> Result<Vec<String>> {
+    let mut digests = Vec::new();
+    let mut entries = match tokio::fs::read_dir(root).await {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(digests),
+        Err(err) => return Err(err).wrap_err_with(|| format!("listing {}", root.display())),
+    };
+    while let Some(entry) = entries.next_entry().await? {
+        let metadata_path = entry.path().join(STATE_METADATA_FILE);
+        let document = match tokio::fs::read(&metadata_path).await {
+            Ok(document) => document,
+            // An unmapped RBD mountpoint or unused state dir pins nothing.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(err).wrap_err_with(|| format!("reading {}", metadata_path.display()));
+            }
+        };
+        let document: serde_json::Value = serde_json::from_slice(&document)
+            .wrap_err_with(|| format!("parsing {}", metadata_path.display()))?;
+        let digest = document
+            .get("base_manifest_digest")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| eyre!("{} has no base_manifest_digest", metadata_path.display()))?;
+        digests.push(digest.to_owned());
+    }
+    Ok(digests)
 }
 
 pub(super) async fn release_persistent_backend(
@@ -668,6 +710,49 @@ pub async fn delete_persistent_rootfs(vmid: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn pinned_base_digests_read_state_metadata_only() {
+        let dir = crate::ch_driver::containers::test_support::TempDir::new("pinned-digests");
+        let digest = format!("sha256:{}", "b".repeat(64));
+        let vmid = "01arz3ndektsv4rrffq69g5fav";
+        let state = dir.join(vmid);
+        tokio::fs::create_dir_all(&state).await.unwrap();
+        tokio::fs::write(
+            state.join(STATE_METADATA_FILE),
+            serde_json::json!({
+                "version": 1,
+                "vmid": vmid,
+                "base_manifest_digest": digest,
+                "overlay": "overlayfs-v1",
+                "backend": "local"
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        // An unmapped RBD mountpoint or unused state dir has no metadata.
+        tokio::fs::create_dir_all(dir.join("01arz3ndektsv4rrffq69g5faw"))
+            .await
+            .unwrap();
+
+        assert_eq!(pinned_base_digests_in(&dir).await.unwrap(), vec![digest]);
+    }
+
+    #[tokio::test]
+    async fn pinned_base_digests_fail_closed_on_invalid_metadata() {
+        let dir = crate::ch_driver::containers::test_support::TempDir::new("pinned-broken");
+        let state = dir.join("01arz3ndektsv4rrffq69g5fav");
+        tokio::fs::create_dir_all(&state).await.unwrap();
+        tokio::fs::write(state.join(STATE_METADATA_FILE), b"{not json")
+            .await
+            .unwrap();
+
+        let error = pinned_base_digests_in(&dir)
+            .await
+            .expect_err("invalid pin metadata must fail the scan");
+        assert!(error.to_string().contains("rootfs-state.json"));
+    }
 
     #[test]
     fn persistent_rbd_lookup_matches_only_default_namespace_head() {

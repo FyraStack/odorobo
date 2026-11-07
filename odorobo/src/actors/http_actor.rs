@@ -1,3 +1,4 @@
+use crate::messages::agent::{CollectRepositoryGarbage, RepositoryGcReply};
 use crate::messages::vm::{
     AgentListVMs, AgentListVMsReply, CreateVM, CreateVMReply, DeleteVM, DeleteVMReply,
     GetConsoleHistory, GetConsoleHistoryReply, GetVMInfo, GetVMInfoReply, GetWorkloadLogs,
@@ -148,5 +149,21 @@ impl Message<AgentListVMs> for HTTPActor {
             .await
             .map_err(|err| eyre!(err.to_string()))
             .wrap_err("failed to list VMs via scheduler")
+    }
+}
+
+impl Message<CollectRepositoryGarbage> for HTTPActor {
+    type Reply = Result<RepositoryGcReply, Report>;
+
+    async fn handle(
+        &mut self,
+        msg: CollectRepositoryGarbage,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.scheduler
+            .ask(msg)
+            .await
+            .map_err(|err| eyre!(err.to_string()))
+            .wrap_err("failed to collect repository garbage via scheduler")
     }
 }

@@ -9,6 +9,9 @@ use stable_eyre::{Report, eyre::eyre};
 use tracing::{info, warn};
 
 use crate::ch_driver::actor::VMActor;
+use crate::messages::agent::{
+    AgentRepositoryGcOutcome, CollectRepositoryGarbage, RepositoryGcReply,
+};
 use crate::messages::vm::{
     AgentListVMs, AgentListVMsReply, CreateVM, CreateVMReply, DeleteVM, DeleteVMReply,
     GetConsoleHistory, GetConsoleHistoryReply, GetVMInfo, GetVMInfoReply, GetWorkloadLogs,
@@ -354,5 +357,43 @@ impl Message<Ping> for SchedulerActor {
 
     async fn handle(&mut self, _msg: Ping, _ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
         Pong
+    }
+}
+
+/// Fans a repository GC pass out to every known agent. One unreachable node
+/// does not stop the others; each outcome is reported separately.
+impl Message<CollectRepositoryGarbage> for SchedulerActor {
+    type Reply = Result<RepositoryGcReply, Report>;
+
+    async fn handle(
+        &mut self,
+        msg: CollectRepositoryGarbage,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let dry_run = msg.dry_run;
+        let outcomes = futures_util::future::join_all(
+            self.agent_data_cache
+                .values()
+                .map(|agent| (agent.data.hostname.clone(), agent.actor_ref.clone()))
+                .map(|(hostname, actor_ref)| async move {
+                    match actor_ref.ask(&CollectRepositoryGarbage { dry_run }).await {
+                        Ok(reply) => AgentRepositoryGcOutcome {
+                            hostname,
+                            report: reply.report,
+                            error: reply.error,
+                        },
+                        Err(err) => AgentRepositoryGcOutcome {
+                            hostname,
+                            report: None,
+                            error: Some(err.to_string()),
+                        },
+                    }
+                }),
+        )
+        .await;
+        Ok(RepositoryGcReply {
+            dry_run,
+            agents: outcomes,
+        })
     }
 }

@@ -12,7 +12,7 @@ The guest sees an ordinary virtiofs root and does not need composefs support.
 - **Write modes:** `read_only` allows only bounded VM-private scratch; `ephemeral` is a fully writable per-VM overlay removed at stop and is the default; `persistent` retains a per-VM writable upper across stop/restart.
 - **Storage:** the composefs repository stays node-local. Persistent state supports a local backend for development and testing, and an RBD backend for cross-node cold restart. Live migration remains unsupported.
 - **Digest pinning:** an import resolves the source reference to a manifest digest first and pulls that digest, so a mutable tag changes content only on a later import. Persistent state separately pins the selected manifest digest.
-- **No cleanup:** nothing evicts repository objects. Disk use only grows until an operator removes content that no mounted or persistent VM needs; there is no reference-aware garbage collector yet.
+- **Cleanup:** an operator-triggered, reference-aware garbage collector (`POST /repository/gc`, `odoroboctl gc [--dry-run]`) removes repository content that no live mount, known VM, or persistent base pins. Mounted images are protected by the kernel-held lock on their object file; a stopped VM keeps its image while its lifecycle owner exists.
 - **Init:** the guest boots a small initramfs whose PID 1 mounts the image's virtiofs root and runs the image's `ENTRYPOINT`/`CMD` with its `Env`, `WorkingDir` and `User`. `boot.cmdline` can still set `init=`. See [Guest boot and init](#guest-boot-and-init).
 - **Prerequisites:** the node needs the microVM kernel and initramfs built by `scripts/build-microvm-kernel.sh` and `just -f odorobo-init/justfile initramfs`, plus `skopeo` and `virtiofsd`. `/var/lib/odorobo` should be on an fs-verity filesystem such as ext4 or btrfs so mounts verify content; otherwise imports mount unverified.
 
@@ -48,7 +48,19 @@ Every image is imported into one node-local composefs repository at `/var/lib/od
 
 ### Deduplication boundary
 
-Deduplication is repository-wide: two images that share file payloads share those objects even when their layers are not byte-identical, and re-importing an image is idempotent. Each image still has its own EROFS metadata object, so a repository grows with the image count plus the union of distinct file payloads. The import logs the compressed bytes pulled and the objects/bytes actually added, so a warm re-import is visible as zero new objects. There is currently no reference-aware garbage collector: do not remove repository objects while any root is mounted or any persistent upper pins its base digest.
+Deduplication is repository-wide: two images that share file payloads share those objects even when their layers are not byte-identical, and re-importing an image is idempotent. Each image still has its own EROFS metadata object, so a repository grows with the image count plus the union of distinct file payloads. The import logs the compressed bytes pulled and the objects/bytes actually added, so a warm re-import is visible as zero new objects.
+
+### Garbage collection
+
+`POST /repository/gc` — `odoroboctl gc [--dry-run]` — reclaims repository content that no VM can still need. The repository is node-local, so the manager fans the request out to every node it knows and reports each node's `objects_removed`, `objects_bytes`, `images_pruned`, and `streams_pruned`; a dry run reports the same numbers without deleting. One unreachable node does not stop the others.
+
+A pass protects:
+
+1. **Mounted images.** The kernel holds a shared lock on every mounted EROFS object, and GC skips locked image objects and keeps everything they reference.
+2. **Images of every VM the agent still owns.** Each VM actor records the manifest digest of the rootfs image it last prepared. Digest and pass cannot race: an import holds the repository write guard from its first write until its image is mounted, and the pass takes that guard before it gathers digests, so an image is either already recorded or still guarded.
+3. **Persistent upper state.** Every `/var/lib/odorobo/persistent-rootfs/<vmid>/rootfs-state.json` pins its `base_manifest_digest`, so a cold-stopped persistent VM keeps its base even when its VM actor is gone. An RBD volume exposes that metadata only while attached, so an unmapped RBD base relies on its VM actor; there is no host-side record of it. An unreadable or malformed pin fails the pass instead of guessing.
+
+Each pinned manifest digest roots the image's manifest splitstream, which transitively keeps the OCI config, layer splitstreams, the EROFS metadata object, and the referenced file payloads. Everything else — images, streams, and content-addressed objects — is removed. Deleting a VM therefore makes its image collectable on the next pass unless another VM or persistent upper still pins it, and deduplication means only payload objects that no surviving image references are actually removed.
 
 ## Rootfs write modes
 
@@ -121,17 +133,18 @@ The ignored KVM test (`oci_rootfs_vm_boots_through_the_actor`) compiles a static
 - Persistent rootfs state supports both `local` and `rbd` backends. Use `local` for development and tests; use RBD when the persistent upper must follow a VM across nodes.
 - The composefs repository remains node-local for both backends.
 - CephFS, Ceph Object Gateway, Podman, and a custom distributed storage system are not dependencies of this work. Consider them only through the separate [future storage design](future-distributed-storage-design.md).
-- Reference-aware garbage collection for the repository is deferred; add only if measurements justify its complexity. Whole-image imports are already idempotent and payloads are shared across images.
+- Reference-aware garbage collection for the repository is implemented and operator-triggered (`POST /repository/gc`). It is not scheduled or automatic; run it after deleting VMs to reclaim their images.
 
 ## Verification results
 
 Recorded on the development host with a rootful debug agent, plus the ignored privileged tests run directly as root.
 
-- `cargo test -p odorobo`: 95 passed, 5 ignored (privileged/KVM/RBD). `cargo clippy -p odorobo -p odorobo-init --all-targets` and `cargo fmt --all --check` are clean apart from the pre-existing macro-semicolon warnings.
+- `cargo test -p odorobo`: 101 passed, 5 ignored (privileged/KVM/RBD). `cargo clippy -p odorobo -p odorobo-init --all-targets` and `cargo fmt --all --check` are clean apart from the pre-existing macro-semicolon warnings.
 - Boot, stop and delete end to end: an ephemeral `docker://traefik/whoami:latest` VM imported 347 objects / 12,890,895 bytes from 5,139,859 compressed bytes across 3 layers, created one EROFS image object, mounted it, and answered `whoami` over the guest network. Deleting both test VMs left no runtime directories, mounts, published-port rules or `virtiofsd` processes.
 - Deduplication boundary: re-importing the same image logged `new_objects: 0, new_bytes: 0` while the repository stayed at 14 MB / 358 objects.
+- Repository GC end to end: a repository with 23 images / 24 manifest streams was collected with four roots (a running `whoami` VM plus three local persistent base digests that had no VM actor). The dry run reported `201` objects / `17,532,643` bytes with `images_pruned: 0, streams_pruned: 0`; the real run removed exactly those `201` objects / `16.7 MiB`, pruned 19 images and 60 streams, and shrank the repository from 33,172,812 to 15,634,165 bytes while the VM kept running. A cold shutdown and restart through the retained owner then remounted the same image without re-downloading. After `DELETE`, a second pass with three roots removed the VM image too (356 objects / 12.4 MiB, 1 image, 5 streams), leaving only the pinned persistent bases.
 - The ignored KVM actor test (`oci_rootfs_vm_boots_through_the_actor`) passes: the guest runs `/init` from the initramfs, mounts the composefs image over virtiofs, reads the OCI config from `/.odorobo-config.json`, executes the fixture entrypoint, then exercises busy-root teardown retention across `ShutdownVM`, restart, a hypervisor crash and `DeleteVM`.
 - Privileged mount tests pass: write-mode isolation and removal for `read_only`, `ephemeral` and `persistent`, failed-start inventory retention, and purge protection while the root mount is busy.
 - The disposable per-VM RBD helper test (earlier run on the same host) passed formatting, filesystem check, exclusive-lock feature verification, unmount/unmap/remap, persisted-upper reattach, and explicit volume deletion.
 
-The Ceph environment has one node only: this verifies cold detach/reattach on one host but does not prove cross-node lock fencing or failover. The node-local backend remains node-affine. There is no automatic repository garbage collection; do not remove objects used by active mounts or persistent bases. The microVM kernel script resolves the latest kernel.org longterm release dynamically; the dev host already had the resulting `vmlinux` built.
+The Ceph environment has one node only: this verifies cold detach/reattach on one host but does not prove cross-node lock fencing or failover. The node-local backend remains node-affine. Repository garbage collection is explicit: runs are serialized against imports, and a pass never removes content pinned by a live mount, a known VM actor, or persistent state metadata. The microVM kernel script resolves the latest kernel.org longterm release dynamically; the dev host already had the resulting `vmlinux` built.

@@ -11,6 +11,7 @@ use stable_eyre::{
     eyre::{Context, bail},
 };
 use tokio::process::Command;
+use tokio::sync::OwnedMutexGuard;
 use tracing::info;
 
 use super::limits::{EPHEMERAL_STATE, MIB, RUN_SCRATCH, TMP_SCRATCH, VARTMP_SCRATCH};
@@ -106,12 +107,20 @@ pub struct PreparedImage {
     digest: String,
     image: Sha256HashValue,
     config: Vec<u8>,
+    /// Held until the image is mounted: repository GC waits on it, so a fresh
+    /// import cannot be collected before its first mount.
+    _write_guard: OwnedMutexGuard<()>,
 }
 
 impl PreparedImage {
     /// Raw OCI image config document, delivered to the guest init.
     pub fn config(&self) -> &[u8] {
         &self.config
+    }
+
+    /// OCI manifest digest the image was imported under.
+    pub fn digest(&self) -> &str {
+        &self.digest
     }
 }
 
@@ -120,11 +129,12 @@ impl PreparedImage {
 pub async fn prepare_image(rootfs: &Rootfs) -> Result<PreparedImage> {
     let limits = OciUnpackLimits::from_env()?;
     let imported = repo::import_image(&rootfs.oci, limits.max_compressed_bytes).await?;
-    let (digest, image, config) = imported.into_parts();
+    let (digest, image, config, write_guard) = imported.into_parts();
     Ok(PreparedImage {
         digest,
         image,
         config,
+        _write_guard: write_guard,
     })
 }
 

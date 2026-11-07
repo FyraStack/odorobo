@@ -24,6 +24,7 @@ mod virtiofs;
 
 pub use mount::{PreparedImage, mount_rootfs_owned, prepare_image, unmount_rootfs};
 pub use persistent::{PERSISTENT_OPERATIONS, RBD_RESERVATIONS, delete_persistent_rootfs};
+pub use repo::collect_repository_garbage;
 pub use virtiofs::{VirtioFsSupervisor, VirtiofsdSpec, socket_path_for, virtiofsd_path};
 
 use std::path::PathBuf;

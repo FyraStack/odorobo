@@ -569,6 +569,9 @@ pub struct VMActor {
     /// Desired provider-neutral intent retained for VM info and migration.
     /// The translated Cloud Hypervisor config lives only in `VMInstance`.
     pub manifest: Option<VmManifest>,
+    /// Manifest digest of the OCI image this VM's rootfs was last prepared
+    /// from. Repository GC keeps that image alive until the actor is deleted.
+    rootfs_digest: Option<String>,
     /// OCI lifecycle owners survive failed startup and cold stop, so cleanup
     /// remains reachable without pulling or booting the image again.
     startup_error: Option<String>,
@@ -665,6 +668,24 @@ impl Message<HypervisorExited> for VMActor {
 
 #[derive(Serialize, Deserialize)]
 pub struct StartVM;
+
+/// Manifest digest of the OCI image this VM's rootfs was last prepared from,
+/// if any. Repository GC pins that image as long as this actor exists.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct GetRootfsDigest;
+
+#[remote_message]
+impl Message<GetRootfsDigest> for VMActor {
+    type Reply = Option<String>;
+
+    async fn handle(
+        &mut self,
+        _msg: GetRootfsDigest,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.rootfs_digest.clone()
+    }
+}
 
 #[remote_message]
 impl Message<StartVM> for VMActor {
@@ -838,6 +859,8 @@ impl VMActor {
             eyre!("virtiofsd not found (looked in PATH and /usr/libexec) — `dnf install virtiofsd`")
         })?;
         let image = image.ok_or_else(|| eyre!("OCI image was not prepared before start"))?;
+        // Record before mounting: a retained VM keeps its image root on failure.
+        self.rootfs_digest = Some(image.digest().to_owned());
         crate::ch_driver::containers::mount_rootfs_owned(
             &vmid.to_string(),
             rootfs,
@@ -845,6 +868,8 @@ impl VMActor {
             rootfs_mount,
         )
         .await?;
+        // Release the GC guard once the mount can hold the image itself.
+        drop(image);
         let rootfs_spec = VirtiofsdSpec {
             program,
             socket: crate::ch_driver::containers::socket_path_for(&vmid.to_string()),
@@ -998,6 +1023,7 @@ impl Actor for VMActor {
             virtiofs: None,
             rootfs_mount: None,
             manifest,
+            rootfs_digest: None,
             startup_error: None,
             unreported_start_failure: None,
             started: false,
