@@ -10,6 +10,7 @@ use stable_eyre::{
     eyre::{Context, bail, eyre},
 };
 use tokio::process::{Child, Command};
+use tracing::debug;
 
 pub(super) fn set_child_file_size_limit(command: &mut Command, limit_bytes: u64) -> Result<()> {
     #[allow(
@@ -97,8 +98,12 @@ impl Tool {
         args: impl IntoIterator<Item = String>,
         extra: &[&Path],
     ) -> Result<String> {
+        let args: Vec<String> = args.into_iter().collect();
+        debug!(program, ?args, ?extra, "running external tool");
         let mut cmd = Command::new(program);
-        cmd.args(args).args(extra);
+        // libmount's fsconfig path rejects option strings over 256 bytes; overlay lowerdir lists exceed that.
+        cmd.env("LIBMOUNT_FORCE_MOUNT2", "always");
+        cmd.args(&args).args(extra);
         let output = self
             .output(cmd)
             .await

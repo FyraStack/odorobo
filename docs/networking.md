@@ -73,7 +73,7 @@ This is intended for host-only private guest networks where Odorobo owns the bri
 
 ## Debug NAT networking
 
-Host-only NAT is the default mode and is meant for development and debugging on a single machine. It works like libvirt's default network: a private bridge on the host, `dnsmasq` handing out addresses, and masquerade NAT out through the host's uplink. Guests can reach the host and the outside world; nothing outside can initiate connections to guests.
+Host-only NAT is the default mode and is meant for development and debugging on a single machine. It works like libvirt's default network: a private bridge on the host, `dnsmasq` handing out addresses, and masquerade NAT out through the host's uplink. Guests can reach the host and the outside world; without published ports, nothing outside can initiate connections to guests.
 
 ### What the agent sets up
 
@@ -82,7 +82,7 @@ On startup the network actor does the following, in order:
 1. Creates the bridge (`vmbr0` by default) if it does not exist and brings it up.
 2. Adds the gateway address (for example `10.10.100.1/24`) to the bridge. Other addresses already on the bridge are left alone.
 3. Creates an nftables table `ip odorobo` with a `guest_nat` postrouting chain and a rule `oifname "<upstream>" masquerade`. The rule matches all traffic leaving the upstream interface, not only traffic from the guest subnet.
-4. Starts `dnsmasq --interface <bridge> --bind-interfaces --dhcp-range ... --no-daemon` as a child process when `dhcp_config` is set. `dnsmasq` also serves DNS on the gateway address, and its DHCP log lines appear in the agent's journal.
+4. Starts `dnsmasq --interface <bridge> --bind-interfaces --dhcp-range ... --dhcp-leasefile <runtime>/dnsmasq.leases --no-daemon` as a child process when `dhcp_config` is set. `dnsmasq` also serves DNS on the gateway address, and its DHCP log lines appear in the agent's journal. The lease file is recreated on every agent start.
 
 When a VM boots, the transform names its TAP device `vmtap-<vmid suffix>-<network suffix>`. Cloud Hypervisor creates the TAP, then the after-boot hook enslaves it to the bridge and brings it up. The before-stop hook detaches it.
 
@@ -132,6 +132,33 @@ The agent configures only the host side. Something inside the guest must bring `
 ```
 
 The console then shows `IP-Config: Got DHCP answer from 10.10.100.1`, with the gateway and nameserver set to the bridge address. Images with their own network management do not need `ip=dhcp`.
+
+### Publishing FaaS ports
+
+FaaS VMs can publish guest ports on the host. Add `ports` to a network that already has a `mac_address`; entries use `<host>:<guest>` with an optional `/udp` suffix.
+
+```json
+"networks": [
+  {
+    "id": "devnet",
+    "mac_address": "46:59:52:67:67:67",
+    "ports": ["8080:80", "5353:53/udp"]
+  }
+]
+```
+
+Publishing only applies to VMs with a `rootfs`; a plain VM manifest that sets `ports` is rejected, as is a network without a MAC or a host port published twice for the same protocol. The same host port may be used by TCP and UDP independently.
+
+After the VM boots, the agent starts a background task that polls the dnsmasq lease file for the VM's MAC, then adds DNAT rules to a `faas_dnat` prerouting chain (`priority -100`) in the `ip odorobo` table. Publishing gives up after 15 seconds and logs a warning; the VM keeps running. Rules are tagged `odorobo faas <vmid> <mapping>` and are removed when the VM stops, even if its TAP already disappeared.
+
+The host still needs `net.ipv4.ip_forward=1` and a firewall that accepts forwarded traffic to the guest; the agent adds no accept rules. The guest must run a DHCP client so a lease exists, and guests with statically configured addresses are not supported. Host port availability is not checked before the rule is added.
+
+Debug with:
+
+```bash
+sudo nft list chain ip odorobo faas_dnat
+cat /run/odorobo/dnsmasq.leases
+```
 
 ### Inspecting and debugging
 

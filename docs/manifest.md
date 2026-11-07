@@ -33,9 +33,13 @@ Odorobo should provision. It contains:
   Cloud Hypervisor has no per-disk boot index, so providers must preserve this order when
   translating the manifest. The control plane owns attachment identity and ordering; the
   provider driver/storage transform resolves the URI or volume ID to a node-local device path.
-- `networks`: stable network IDs and optional guest MAC addresses. The control plane owns
-  the attachment identity and requested MAC; the provider networking transform resolves
-  the network to a host interface or tap device.
+- `networks`: stable network IDs, optional guest MAC addresses, and optional
+  published ports for FaaS VMs. The control plane owns the attachment identity
+  and requested MAC; the provider networking transform resolves the network to
+  a host interface or tap device. `ports` entries use `<host>:<guest>`, with an
+  optional `/udp` suffix (`8080:80`, `5353:53/udp`). Publishing requires both a
+  `rootfs` and a `mac_address`, because the host learns the guest address from
+  its DHCP lease.
 - `placement`: scheduling hints, including an optional node, required node labels,
   and affinity rules. Affinity rules support required or weighted-preferred
   VM/agent matching; `inverse` selects anti-affinity, with OR-ed
@@ -73,6 +77,8 @@ non-zero vCPUs and memory, and satisfy these relationships:
   their strictness, and `inverse` negates a rule's result. `lt` and `gt` comparisons require exactly one
   finite numeric value.
 - Every network must have a non-empty, non-whitespace ID.
+- Published ports require a `rootfs` and a `mac_address`; a host port may be
+  published only once per protocol.
 - Cloud-init must provide non-empty configuration with user-data and meta-data
   supplied together.
 - A vsock guest CID must be non-zero and its socket must be an absolute path.
