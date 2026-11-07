@@ -122,7 +122,7 @@ impl VirtioFsSupervisor {
                 let mut args = vec![
                     format!("--socket-path={}", task_spec.socket.display()),
                     format!("--shared-dir={}", task_spec.shared_dir.display()),
-                    "--sandbox=chroot".to_owned(),
+                    "--sandbox=namespace".to_owned(),
                     "--cache=auto".to_owned(),
                     "--xattr".to_owned(),
                     "--posix-acl".to_owned(),
@@ -277,6 +277,10 @@ mod tests {
         }
         let args = std::fs::read_to_string(&args_file).unwrap();
         assert!(args.lines().any(|arg| arg == "--readonly"), "{args}");
+        assert!(
+            args.lines().any(|arg| arg == "--sandbox=namespace"),
+            "the daemon must be confined to its own namespaces: {args}"
+        );
         supervisor.stop().await;
         std::fs::remove_dir_all(&base).unwrap();
     }
