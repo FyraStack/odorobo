@@ -4,12 +4,14 @@
 //! The manifest is the provider-neutral desired state exchanged with Odorobo;
 //! provider-specific configuration is produced by the driver.
 
-use std::{collections::BTreeMap, path::Path};
+use std::{collections::BTreeMap, collections::BTreeSet, path::Path};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::Error as DeError};
 use thiserror::Error;
 use ulid::Ulid;
+
+use crate::ports::PortMapping;
 
 /// Version of the provider-neutral manifest contract.
 ///
@@ -43,6 +45,12 @@ pub enum ManifestError {
 
     #[error("network {0} must define an id")]
     NetworkWithoutId(usize),
+    #[error("network {0} publishes ports, which requires a FaaS rootfs")]
+    PortForwardingRequiresRootfs(usize),
+    #[error("network {0} publishes ports but has no mac_address")]
+    PortForwardingWithoutMac(usize),
+    #[error("host port {0} is published more than once")]
+    DuplicatePublishedPort(u16),
     #[error("cloud-init user-data and meta-data must be supplied together")]
     IncompleteCloudInit,
     #[error("cloud-init user-data and meta-data must both be non-empty")]
@@ -178,11 +186,7 @@ impl DesiredState {
                 return Err(ManifestError::InvalidStorageSource(storage.id.clone()));
             }
         }
-        for (index, network) in self.networks.iter().enumerate() {
-            if network.id.trim().is_empty() {
-                return Err(ManifestError::NetworkWithoutId(index));
-            }
-        }
+        self.validate_networks()?;
         // A virtiofs rootfs needs an image to serve; an empty reference would
         // only fail later at pull time with a worse error.
         if self
@@ -233,6 +237,30 @@ impl DesiredState {
             }
             if vsock.socket.trim().is_empty() || !Path::new(&vsock.socket).is_absolute() {
                 return Err(ManifestError::InvalidVsockSocket);
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_networks(&self) -> Result<(), ManifestError> {
+        let mut published_ports = BTreeSet::new();
+        for (index, network) in self.networks.iter().enumerate() {
+            if network.id.trim().is_empty() {
+                return Err(ManifestError::NetworkWithoutId(index));
+            }
+            if network.ports.is_empty() {
+                continue;
+            }
+            if self.rootfs.is_none() {
+                return Err(ManifestError::PortForwardingRequiresRootfs(index));
+            }
+            if network.mac_address.is_none() {
+                return Err(ManifestError::PortForwardingWithoutMac(index));
+            }
+            for port in &network.ports {
+                if !published_ports.insert((port.protocol, port.host)) {
+                    return Err(ManifestError::DuplicatePublishedPort(port.host));
+                }
             }
         }
         Ok(())
@@ -349,6 +377,10 @@ pub struct Network {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mac_address: Option<String>,
+    /// FaaS-only published ports in `<host>:<guest>[/udp]` form.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(with = "Vec<String>")]
+    pub ports: Vec<PortMapping>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -728,6 +760,49 @@ mod tests {
             manifest.validate(),
             Err(ManifestError::EmptyMetadataName)
         ));
+    }
+
+    #[test]
+    fn validates_published_ports() {
+        let mut manifest = minimal_manifest();
+        manifest.desired.networks.push(Network {
+            id: "private".to_owned(),
+            mac_address: Some("02:00:00:00:00:01".to_owned()),
+            ports: vec!["8080:80".parse().expect("valid mapping")],
+        });
+        assert_eq!(
+            manifest.validate(),
+            Err(ManifestError::PortForwardingRequiresRootfs(0))
+        );
+
+        manifest.desired.rootfs = Some(crate::manifest::Rootfs {
+            oci: "docker://registry.fedoraproject.org/fedora:latest".to_owned(),
+            mode: RootfsMode::ReadOnly,
+        });
+        assert_eq!(manifest.validate(), Ok(()));
+
+        manifest.desired.networks[0]
+            .ports
+            .push("8080:80/udp".parse().expect("valid mapping"));
+        assert_eq!(manifest.validate(), Ok(()));
+
+        manifest.desired.networks[0]
+            .ports
+            .push("8080:81/tcp".parse().expect("valid mapping"));
+        assert_eq!(
+            manifest.validate(),
+            Err(ManifestError::DuplicatePublishedPort(8080))
+        );
+
+        manifest.desired.networks[0].ports.clear();
+        manifest.desired.networks[0].mac_address = None;
+        manifest.desired.networks[0]
+            .ports
+            .push("8080:80".parse().expect("valid mapping"));
+        assert_eq!(
+            manifest.validate(),
+            Err(ManifestError::PortForwardingWithoutMac(0))
+        );
     }
 
     #[test]

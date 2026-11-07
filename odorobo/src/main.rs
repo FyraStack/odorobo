@@ -8,6 +8,7 @@ pub mod http_api;
 mod manifest;
 pub mod messages;
 pub mod networking;
+pub mod ports;
 pub mod types;
 mod utils;
 

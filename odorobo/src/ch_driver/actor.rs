@@ -12,6 +12,7 @@ use crate::{
         manifest::to_vm_config,
     },
     manifest::VmManifest,
+    networking::{actor::NetworkAgentActor, messages::PublishPorts},
 };
 use cloud_hypervisor_client::models::VmConfig;
 use kameo::prelude::*;
@@ -735,6 +736,45 @@ async fn teardown_rootfs(
     Ok(())
 }
 
+/// Asks the network actor to publish this VM's FaaS ports.
+///
+/// The actor resolves the guest address from the DHCP lease, so this only
+/// queues the mapping; the rule appears once the guest has a lease.
+async fn publish_faas_ports(vmid: ulid::Ulid, manifest: &VmManifest) {
+    if manifest.desired.rootfs.is_none() {
+        return;
+    }
+    let actor = match ActorRef::<NetworkAgentActor>::lookup("network_actor").await {
+        Ok(Some(actor)) => actor,
+        Ok(None) => {
+            warn!(%vmid, "network actor is not running; FaaS ports were not published");
+            return;
+        }
+        Err(err) => {
+            warn!(%vmid, ?err, "failed to look up network actor; FaaS ports were not published");
+            return;
+        }
+    };
+    for network in &manifest.desired.networks {
+        if network.ports.is_empty() {
+            continue;
+        }
+        let Some(mac_address) = network.mac_address.as_deref() else {
+            continue;
+        };
+        if let Err(err) = actor
+            .ask(PublishPorts {
+                vmid,
+                mac_address: mac_address.to_owned(),
+                ports: network.ports.clone(),
+            })
+            .await
+        {
+            warn!(%vmid, network = %network.id, ?err, "failed to request FaaS port publishing");
+        }
+    }
+}
+
 impl VMActor {
     fn has_rootfs(&self) -> bool {
         self.manifest
@@ -880,6 +920,10 @@ impl VMActor {
                 .await;
                 return Err(err.wrap_err(format!("console startup rollback: {cleanup:?}")));
             }
+        }
+
+        if boot && let Some(manifest) = &vm_config {
+            publish_faas_ports(vmid, manifest).await;
         }
 
         let generation = self.generation;

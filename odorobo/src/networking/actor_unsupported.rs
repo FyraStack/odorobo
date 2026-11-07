@@ -1,5 +1,5 @@
 use crate::config::NetworkConfig;
-use crate::networking::messages::{AttachTap, DetachTap};
+use crate::networking::messages::{AttachTap, DetachTap, PublishPorts, UnpublishPorts};
 use kameo::{message::Context, prelude::*};
 use stable_eyre::Report;
 use stable_eyre::eyre::eyre;
@@ -40,17 +40,32 @@ impl Message<AttachTap> for NetworkAgentActor {
     }
 }
 
-impl Message<DetachTap> for NetworkAgentActor {
+impl Message<PublishPorts> for NetworkAgentActor {
     type Reply = Result<(), Report>;
 
     async fn handle(
         &mut self,
-        msg: DetachTap,
+        msg: PublishPorts,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         Err(eyre!(
-            "cannot detach TAP {} for VM {}: host networking management is only supported on Linux",
-            msg.tap_name,
+            "cannot publish {} port(s) for VM {}: host networking management is only supported on Linux",
+            msg.ports.len(),
+            msg.vmid
+        ))
+    }
+}
+
+impl Message<UnpublishPorts> for NetworkAgentActor {
+    type Reply = Result<(), Report>;
+
+    async fn handle(
+        &mut self,
+        msg: UnpublishPorts,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        Err(eyre!(
+            "cannot unpublish ports for VM {}: host networking management is only supported on Linux",
             msg.vmid
         ))
     }

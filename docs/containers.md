@@ -103,6 +103,8 @@ If the image has neither an entrypoint nor a command, the init falls back to `/s
 
 The console is the 16550 serial port (`ttyS0`). The agent exposes it as a socket and keeps a history, read through `GET /vms/{vmid}/console/history`. The virtio console (`hvc0`) is off.
 
+Rootfs VMs can publish guest ports on the host with `ports` on a manifest network. The host resolves the guest address from its DHCP lease and installs DNAT rules; see [networking.md](networking.md#publishing-faas-ports).
+
 **Overrides:** `boot.kernel` and `boot.initramfs` replace the defaults, and `boot.cmdline` replaces the whole command line. Overriding the initramfs means supplying another image that mounts the virtiofs root itself; overriding the kernel must keep built-in `virtiofs`, `overlayfs` and `devtmpfs`.
 
 The ignored KVM test (`faas_vm_boots_oci_rootfs_through_the_actor`) compiles a static C program with Zig, installs it as `/bin/sh` in a fixture image whose OCI config sets `Entrypoint: ["/bin/sh"]`, and boots it through the actor. The test passes when the console shows the program's message, which proves the config share, the initramfs and the virtiofs root all work together.

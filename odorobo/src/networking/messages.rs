@@ -1,5 +1,7 @@
 use ulid::Ulid;
 
+use crate::ports::PortMapping;
+
 /// Ensures the agent-global networking state is present and configured.
 ///
 /// This is intended for local actor-to-actor use inside the agent process and
@@ -30,6 +32,23 @@ pub struct DetachTap {
     pub vmid: Ulid,
     /// Host TAP device name previously attached for this VM.
     pub tap_name: String,
+}
+
+/// Publishes host ports to a booted FaaS guest.
+///
+/// The guest address is resolved from the dnsmasq lease for `mac_address`,
+/// so publishing completes once the guest has obtained its DHCP lease.
+#[derive(Debug, Clone)]
+pub struct PublishPorts {
+    pub vmid: Ulid,
+    pub mac_address: String,
+    pub ports: Vec<PortMapping>,
+}
+
+/// Removes every published port belonging to a VM.
+#[derive(Debug, Clone)]
+pub struct UnpublishPorts {
+    pub vmid: Ulid,
 }
 
 /// Requests a snapshot of the local networking actor state.

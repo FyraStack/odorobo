@@ -327,6 +327,7 @@ mod tests {
         manifest.desired.networks.push(crate::manifest::Network {
             id: "private".to_owned(),
             mac_address: Some("02:00:00:00:00:01".to_owned()),
+            ports: Vec::new(),
         });
         let config = to_vm_config(&manifest).expect("network manifest converts");
         let network = &config.net.expect("network config")[0];
