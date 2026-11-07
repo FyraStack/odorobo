@@ -29,8 +29,6 @@ use ulid::Ulid;
 const DHCP_LEASE_FILE: &str = "dnsmasq.leases";
 const NFT_TABLE: &str = "odorobo";
 const NFT_DNAT_CHAIN: &str = "container_dnat";
-/// Chain name used before the rename; still swept at startup.
-const LEGACY_DNAT_CHAINS: &[&str] = &["faas_dnat"];
 const DNAT_PRIORITY: i32 = -100;
 const LEASE_TIMEOUT: Duration = Duration::from_secs(15);
 const LEASE_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -217,10 +215,6 @@ impl NetworkAgentActor {
             }
             _ => false,
         })
-    }
-
-    fn is_port_forward_chain(chain: &str) -> bool {
-        chain == NFT_DNAT_CHAIN || LEGACY_DNAT_CHAINS.contains(&chain)
     }
 
     fn nft_postrouting_masquerade_exists(
@@ -831,16 +825,15 @@ impl NetworkAgentActor {
 
     fn clear_port_rules() -> Result<(), Report> {
         let ruleset = get_current_ruleset().wrap_err("failed to fetch nftables ruleset")?;
-        let objects = ruleset.objects.as_ref();
         let mut batch = NftBatch::new();
         let mut removed = 0_u32;
-        for object in objects {
+        for object in ruleset.objects.as_ref() {
             let NfObject::ListObject(NfListObject::Rule(rule)) = object else {
                 continue;
             };
             if rule.family != NfFamily::IP
                 || rule.table.as_ref() != NFT_TABLE
-                || !Self::is_port_forward_chain(rule.chain.as_ref())
+                || rule.chain.as_ref() != NFT_DNAT_CHAIN
             {
                 continue;
             }
@@ -858,30 +851,10 @@ impl NetworkAgentActor {
             }));
             removed = removed.saturating_add(1);
         }
-        let mut removed_chains = 0_u32;
-        for legacy in LEGACY_DNAT_CHAINS {
-            if !Self::nft_chain_exists(objects, NFT_TABLE, legacy) {
-                continue;
-            }
-            batch.delete(NfListObject::Chain(NftChain {
-                family: NfFamily::IP,
-                table: NFT_TABLE.into(),
-                name: (*legacy).into(),
-                newname: None,
-                handle: None,
-                _type: None,
-                hook: None,
-                prio: None,
-                dev: None,
-                policy: None,
-            }));
-            removed_chains = removed_chains.saturating_add(1);
-        }
-        if removed > 0 || removed_chains > 0 {
+        if removed > 0 {
             apply_ruleset(&batch.to_nftables()).wrap_err("failed to clear stale port rules")?;
             info!(
                 rules = removed,
-                chains = removed_chains,
                 "cleared stale port-forward rules from a previous run"
             );
         }

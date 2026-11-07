@@ -149,7 +149,7 @@ OCI-mode VMs can publish guest ports on the host. Add `ports` to a network that 
 
 Publishing only applies to VMs with a `rootfs`; a plain VM manifest that sets `ports` is rejected, as is a network without a MAC or a host port published twice for the same protocol. The same host port may be used by TCP and UDP independently.
 
-After the VM boots, the agent starts a background task that polls the dnsmasq lease file for the VM's MAC, then adds DNAT rules to a `container_dnat` prerouting chain (`priority -100`) in the `ip odorobo` table. Publishing gives up after 15 seconds and logs a warning; the VM keeps running. Rules are tagged `odorobo container <vmid> <mapping>` and are removed when the VM stops, even if its TAP already disappeared. Rules and chains left behind by a killed agent are cleared at startup; the pre-rename `faas_dnat` chain is removed at the same time.
+After the VM boots, the agent starts a background task that polls the dnsmasq lease file for the VM's MAC, then adds DNAT rules to a `container_dnat` prerouting chain (`priority -100`) in the `ip odorobo` table. Publishing gives up after 15 seconds and logs a warning; the VM keeps running. Rules are tagged `odorobo container <vmid> <mapping>` and are removed when the VM stops, even if its TAP already disappeared. Rules left behind by a killed agent are cleared at startup.
 
 The host still needs `net.ipv4.ip_forward=1` and a firewall that accepts forwarded traffic to the guest; the agent adds no accept rules. The guest must run a DHCP client so a lease exists, and guests with statically configured addresses are not supported. Host port availability is not checked before the rule is added.
 
