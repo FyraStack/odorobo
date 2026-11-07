@@ -23,6 +23,17 @@ pub struct ImageConfigDocument {
 struct OdoroboOptions {
     #[serde(default)]
     stdin: bool,
+    #[serde(default)]
+    rootfs: Option<RootfsOptions>,
+}
+
+/// Writable-layer contract for the guest root, sent for ephemeral roots.
+#[derive(Debug, Default, Deserialize)]
+struct RootfsOptions {
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    tmpfs_upper_bytes: Option<u64>,
 }
 
 /// The OCI `config` object, in the casing the image config uses.
@@ -50,6 +61,15 @@ impl ImageConfigDocument {
     /// Whether the workload's stdin is attached to the workload console.
     pub fn stdin(&self) -> bool {
         self.odorobo.stdin
+    }
+
+    /// Bytes of tmpfs the guest must provide as the ephemeral root's writable
+    /// upper; `None` mounts the image share as the workload root itself.
+    pub fn tmpfs_upper_bytes(&self) -> Option<u64> {
+        match self.odorobo.rootfs.as_ref() {
+            Some(rootfs) if rootfs.mode.as_deref() == Some("ephemeral") => rootfs.tmpfs_upper_bytes,
+            _ => None,
+        }
     }
 }
 
@@ -131,5 +151,18 @@ mod tests {
     fn rejects_non_json() {
         let err = ImageConfigDocument::parse(b"not json").unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn reads_the_ephemeral_rootfs_contract() {
+        let document = ImageConfigDocument::parse(
+            br#"{"config":{"Cmd":["/bin/x"]},"odorobo":{"rootfs":{"mode":"ephemeral","tmpfs_upper_bytes":67108864}}}"#,
+        )
+        .unwrap();
+        assert_eq!(document.tmpfs_upper_bytes(), Some(64 * 1024 * 1024));
+        assert!(!document.stdin());
+
+        let plain = ImageConfigDocument::parse(br#"{"config":{}}"#).unwrap();
+        assert_eq!(plain.tmpfs_upper_bytes(), None);
     }
 }

@@ -46,6 +46,9 @@ pub struct VirtiofsdSpec {
     pub shared_dir: PathBuf,
     /// Log file for virtiofsd stdout/stderr.
     pub log: PathBuf,
+    /// Deny the guest every write into the share (an ephemeral root writes to
+    /// its own tmpfs upper instead).
+    pub read_only: bool,
 }
 
 pub(super) struct SupState {
@@ -116,19 +119,23 @@ impl VirtioFsSupervisor {
                         break;
                     }
                 };
-                let mut cmd = Command::new(&task_spec.program);
-                cmd.args([
+                let mut args = vec![
                     format!("--socket-path={}", task_spec.socket.display()),
                     format!("--shared-dir={}", task_spec.shared_dir.display()),
                     "--sandbox=chroot".to_owned(),
                     "--cache=auto".to_owned(),
                     "--xattr".to_owned(),
                     "--posix-acl".to_owned(),
-                ])
-                .stdin(std::process::Stdio::null())
-                .stdout(log.try_clone().expect("log handle clone"))
-                .stderr(log)
-                .kill_on_drop(true);
+                ];
+                if task_spec.read_only {
+                    args.push("--readonly".to_owned());
+                }
+                let mut cmd = Command::new(&task_spec.program);
+                cmd.args(args)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(log.try_clone().expect("log handle clone"))
+                    .stderr(log)
+                    .kill_on_drop(true);
 
                 debug!(program = %task_spec.program.display(), "spawning virtiofsd");
                 match cmd.spawn() {
@@ -244,6 +251,37 @@ mod tests {
     use std::path::Path;
 
     #[tokio::test]
+    async fn read_only_specs_pass_the_virtiofsd_readonly_flag() {
+        let base = std::env::temp_dir().join(format!("odorobo-sup-ro-{}", ulid::Ulid::generate()));
+        std::fs::create_dir_all(&base).unwrap();
+        let script = base.join("virtiofsd-stub");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$(dirname \"$0\")/args\"\nexec sleep 100\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let supervisor = VirtioFsSupervisor::start(VirtiofsdSpec {
+            program: script,
+            socket: base.join("sock"),
+            shared_dir: base.clone(),
+            log: base.join("log"),
+            read_only: true,
+        });
+        let args_file = base.join("args");
+        for _ in 0..100 {
+            if args_file.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let args = std::fs::read_to_string(&args_file).unwrap();
+        assert!(args.lines().any(|arg| arg == "--readonly"), "{args}");
+        supervisor.stop().await;
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[tokio::test]
     async fn supervisor_replaces_stale_socket_generation() {
         let base =
             std::env::temp_dir().join(format!("odorobo-socket-restart-{}", ulid::Ulid::generate()));
@@ -256,6 +294,7 @@ mod tests {
             socket: base.join("sock"),
             shared_dir: base.clone(),
             log: base.join("log"),
+            read_only: false,
         });
         supervisor
             .wait_socket_ready(Duration::from_secs(2))
@@ -302,6 +341,7 @@ mod tests {
                 socket: "unused".into(),
                 shared_dir: "unused".into(),
                 log: "unused".into(),
+                read_only: false,
             },
             state,
             task: tokio::sync::Mutex::new(Some(task)),
@@ -326,6 +366,7 @@ mod tests {
             socket: base.join("sock"),
             shared_dir: base.clone(),
             log: base.join("log"),
+            read_only: false,
         });
 
         tokio::time::sleep(Duration::from_millis(2500)).await;
@@ -360,6 +401,7 @@ mod tests {
             socket: base2.join("sock"),
             shared_dir: base2.clone(),
             log: base2.join("log"),
+            read_only: false,
         });
         tokio::time::sleep(Duration::from_millis(300)).await;
         supervisor.stop().await;
@@ -377,6 +419,7 @@ mod tests {
             socket: base2.join("sock"),
             shared_dir: base2.clone(),
             log: base2.join("log"),
+            read_only: false,
         });
         tokio::time::sleep(Duration::from_millis(300)).await;
         let pid: u32 = std::fs::read_to_string(base2.join("pid"))

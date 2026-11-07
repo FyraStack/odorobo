@@ -73,8 +73,9 @@ pub(super) const MAX_COMPRESSED_BYTES: Limit =
 pub(super) const RBD_SIZE: Limit = Limit::size("ODOROBO_ROOTFS_RBD_SIZE", "1G", 64 * MIB, 64 * GIB);
 pub(super) const TMP_SCRATCH: Limit = Limit::size("ODOROBO_ROOTFS_TMP_SIZE", "64M", MIB, 2 * GIB);
 pub(super) const RUN_SCRATCH: Limit = Limit::size("ODOROBO_ROOTFS_RUN_SIZE", "32M", MIB, 2 * GIB);
-/// Bounds the tmpfs behind an ephemeral root's writable `OverlayFS` upper.
-pub(super) const EPHEMERAL_STATE: Limit =
+/// Bounds the guest-side tmpfs behind an ephemeral root's writable `OverlayFS`
+/// upper; the host passes the size to the guest init.
+pub(super) const EPHEMERAL_UPPER: Limit =
     Limit::size("ODOROBO_ROOTFS_EPHEMERAL_SIZE", "1G", 64 * MIB, 64 * GIB);
 pub(super) const VARTMP_SCRATCH: Limit =
     Limit::size("ODOROBO_ROOTFS_VARTMP_SIZE", "32M", MIB, 2 * GIB);
@@ -103,11 +104,11 @@ mod tests {
     }
 
     #[test]
-    fn ephemeral_state_size_policy_is_bounded_and_configurable() {
-        assert_eq!(EPHEMERAL_STATE.parse("1G").unwrap(), 1024 * MIB);
-        assert_eq!(EPHEMERAL_STATE.parse("512M").unwrap(), 512 * MIB);
+    fn ephemeral_upper_size_policy_is_bounded_and_configurable() {
+        assert_eq!(EPHEMERAL_UPPER.parse("1G").unwrap(), 1024 * MIB);
+        assert_eq!(EPHEMERAL_UPPER.parse("512M").unwrap(), 512 * MIB);
         for invalid in ["0M", "65G", "1T"] {
-            let _err = EPHEMERAL_STATE.parse(invalid).unwrap_err();
+            let _err = EPHEMERAL_UPPER.parse(invalid).unwrap_err();
         }
     }
 

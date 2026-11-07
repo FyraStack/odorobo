@@ -5,8 +5,9 @@
 //! Images are imported into a node-local composefs repository (see [`repo`]),
 //! which unpacks every layer into content-addressed fs-verity objects and links
 //! the image config to one EROFS metadata object. Each VM mounts that object
-//! through the kernel overlay with its own upper directory, and
-//! actor-supervised virtiofsd exports the result. Imports are digest-pinned:
+//! read-only through the kernel overlay and actor-supervised virtiofsd exports
+//! it; an ephemeral VM's writable layer is a tmpfs the guest init layers on top.
+//! Imports are digest-pinned:
 //! the mount verifies the image object against the fs-verity id recorded at
 //! import time, and the first pull of a tag is what a later tag repull compares
 //! against. The repository must live on an fs-verity-capable filesystem (ext4,
@@ -103,9 +104,9 @@ pub struct PreparedRootfs {
     pub digest: String,
     /// This VM's mount point of the rootfs (virtiofsd shared-dir).
     pub mount: PathBuf,
-    /// Per-VM overlayfs upper directory when the root is writable.
+    /// Per-VM overlayfs upper directory for a persistent root.
     pub upper: Option<PathBuf>,
-    /// Per-VM overlayfs work directory when the root is writable.
+    /// Per-VM overlayfs work directory for a persistent root.
     pub work: Option<PathBuf>,
     /// Persistent backend mount directory; populated only for RBD state.
     persistent_state_mount: Option<PathBuf>,
@@ -117,14 +118,25 @@ pub struct PreparedRootfs {
     pub mode: RootfsMode,
     /// Host tmpfs mounts used for the bounded read-only-mode scratch paths.
     scratch_mounts: Vec<PathBuf>,
-    /// VM-private size-bounded tmpfs holding the ephemeral upper and work.
-    ephemeral_state_mount: Option<PathBuf>,
+}
+
+/// Launch options odorobo adds next to the image's own OCI config.
+#[derive(Debug, Default)]
+pub(super) struct GuestLaunchOptions {
+    /// Attach the workload's stdin to the workload console.
+    pub stdin: bool,
+    /// Bytes of guest-side tmpfs holding an ephemeral root's writable layer;
+    /// `None` makes the image share the root itself.
+    pub ephemeral_upper_bytes: Option<u64>,
 }
 
 /// The guest-visible config document: the image's OCI config plus the launch
 /// options odorobo adds. An image without options keeps its bytes verbatim.
-pub(super) fn guest_config_document(config: &[u8], stdin: bool) -> Result<Vec<u8>> {
-    if !stdin {
+pub(super) fn guest_config_document(
+    config: &[u8],
+    options: &GuestLaunchOptions,
+) -> Result<Vec<u8>> {
+    if !options.stdin && options.ephemeral_upper_bytes.is_none() {
         return Ok(config.to_vec());
     }
     let mut document: serde_json::Value =
@@ -132,7 +144,19 @@ pub(super) fn guest_config_document(config: &[u8], stdin: bool) -> Result<Vec<u8
     let object = document
         .as_object_mut()
         .ok_or_else(|| eyre!("the imported OCI config document is not a JSON object"))?;
-    object.insert("odorobo".to_owned(), json!({ "stdin": true }));
+    let mut odorobo = serde_json::Map::new();
+    if options.stdin {
+        odorobo.insert("stdin".to_owned(), serde_json::Value::Bool(true));
+    }
+    // Only an ephemeral root needs guest action: the init builds the writable
+    // overlay layer itself, sized by node policy.
+    if let Some(bytes) = options.ephemeral_upper_bytes {
+        odorobo.insert(
+            "rootfs".to_owned(),
+            json!({ "mode": "ephemeral", "tmpfs_upper_bytes": bytes }),
+        );
+    }
+    object.insert("odorobo".to_owned(), serde_json::Value::Object(odorobo));
     serde_json::to_vec(&document).wrap_err("serializing the guest config document")
 }
 
@@ -159,12 +183,31 @@ mod tests {
     #[test]
     fn guest_config_document_adds_options_only_when_asked() {
         let image = br#"{"config":{"Entrypoint":["/bin/sh"]}}"#;
-        assert_eq!(guest_config_document(image, false).unwrap(), image);
+        assert_eq!(
+            guest_config_document(image, &GuestLaunchOptions::default()).unwrap(),
+            image
+        );
 
+        let options = GuestLaunchOptions {
+            stdin: true,
+            ephemeral_upper_bytes: Some(1024 * 1024),
+        };
         let document: serde_json::Value =
-            serde_json::from_slice(&guest_config_document(image, true).unwrap()).unwrap();
+            serde_json::from_slice(&guest_config_document(image, &options).unwrap()).unwrap();
         assert_eq!(document["odorobo"]["stdin"], serde_json::Value::Bool(true));
+        assert_eq!(document["odorobo"]["rootfs"]["mode"], "ephemeral");
+        assert_eq!(
+            document["odorobo"]["rootfs"]["tmpfs_upper_bytes"],
+            serde_json::Value::from(1024 * 1024)
+        );
         assert_eq!(document["config"]["Entrypoint"][0], "/bin/sh");
+
+        // A read-only or persistent root needs no guest-side overlay contract.
+        let options = GuestLaunchOptions {
+            stdin: false,
+            ephemeral_upper_bytes: None,
+        };
+        assert_eq!(guest_config_document(image, &options).unwrap(), image);
     }
 
     #[tokio::test]

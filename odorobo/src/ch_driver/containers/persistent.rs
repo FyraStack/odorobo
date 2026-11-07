@@ -11,14 +11,10 @@ use stable_eyre::{
 use tokio::process::Command;
 
 use super::limits::{MIB, RBD_SIZE};
-use super::mount::{is_mountpoint, mount_ephemeral_state, unmount_path};
+use super::mount::{is_mountpoint, unmount_path};
 use super::process::Tool;
 use super::{PERSISTENT_ROOTFS_ROOT, validate_vmid};
 use crate::manifest::RootfsMode;
-
-/// Runtime-dir subdirectory holding the VM-private, size-bounded tmpfs that
-/// backs an ephemeral root's `OverlayFS` upper and work directories.
-pub(super) const EPHEMERAL_STATE_DIR: &str = "rootfs-state";
 
 /// Pin metadata inside a persistent state directory: the base manifest digest
 /// this upper was created against, plus the backend and format version.
@@ -489,9 +485,10 @@ pub(super) async fn prepare_upper(
     vmid: &str,
     mode: RootfsMode,
     manifest_digest: &str,
-    runtime_dir: &Path,
 ) -> Result<UpperState> {
-    if mode == RootfsMode::ReadOnly {
+    // Only a persistent root keeps its writable layer on the host: a read-only
+    // root has none, and an ephemeral root's upper is a guest-side tmpfs.
+    if mode != RootfsMode::Persistent {
         return Ok(UpperState {
             upper: None,
             work: None,
@@ -499,38 +496,24 @@ pub(super) async fn prepare_upper(
             rbd_image: None,
         });
     }
-    let mut rbd_image = None;
-    let state_dir = if mode == RootfsMode::Persistent {
-        let (path, image) = mount_persistent_state(vmid).await?;
-        rbd_image = image;
-        path
-    } else {
-        // Never place guest-writable state directly in the runtime dir: it
-        // lives on host tmpfs (/run) and would let a guest exhaust host RAM.
-        // The caller records this mount in the owner before we get here.
-        let path = runtime_dir.join(EPHEMERAL_STATE_DIR);
-        mount_ephemeral_state(&path).await?;
-        path
-    };
+    let (state_dir, rbd_image) = mount_persistent_state(vmid).await?;
     let result: Result<(PathBuf, PathBuf)> = async {
         let upper = state_dir.join("rootfs.upper");
         let work = state_dir.join("rootfs.work");
         tokio::fs::create_dir_all(&upper).await?;
-        if mode == RootfsMode::Persistent {
-            let metadata = state_dir.join(STATE_METADATA_FILE);
-            let backend = if rbd_image.is_some() { "rbd" } else { "local" };
-            let expected = serde_json::json!({"version":1,"vmid":vmid,"base_manifest_digest":manifest_digest,"overlay":"overlayfs-v1","backend":backend});
-            if metadata.exists() {
-                let existing: serde_json::Value = serde_json::from_slice(&tokio::fs::read(&metadata).await?)
-                    .wrap_err("invalid persistent rootfs state metadata")?;
-                if existing != expected { bail!("persistent rootfs state for VM {vmid} is pinned to a different base/backend/format; refusing reuse"); }
-            } else {
-                let mut entries = tokio::fs::read_dir(&upper).await?;
-                if entries.next_entry().await?.is_some() { bail!("persistent upper for VM {vmid} lacks pin metadata; refusing unsafe adoption"); }
-                let tmp = state_dir.join(format!(".rootfs-state-{}.tmp", ulid::Ulid::generate()));
-                tokio::fs::write(&tmp, serde_json::to_vec_pretty(&expected)?).await?;
-                tokio::fs::rename(&tmp, &metadata).await?;
-            }
+        let metadata = state_dir.join(STATE_METADATA_FILE);
+        let backend = if rbd_image.is_some() { "rbd" } else { "local" };
+        let expected = serde_json::json!({"version":1,"vmid":vmid,"base_manifest_digest":manifest_digest,"overlay":"overlayfs-v1","backend":backend});
+        if metadata.exists() {
+            let existing: serde_json::Value = serde_json::from_slice(&tokio::fs::read(&metadata).await?)
+                .wrap_err("invalid persistent rootfs state metadata")?;
+            if existing != expected { bail!("persistent rootfs state for VM {vmid} is pinned to a different base/backend/format; refusing reuse"); }
+        } else {
+            let mut entries = tokio::fs::read_dir(&upper).await?;
+            if entries.next_entry().await?.is_some() { bail!("persistent upper for VM {vmid} lacks pin metadata; refusing unsafe adoption"); }
+            let tmp = state_dir.join(format!(".rootfs-state-{}.tmp", ulid::Ulid::generate()));
+            tokio::fs::write(&tmp, serde_json::to_vec_pretty(&expected)?).await?;
+            tokio::fs::rename(&tmp, &metadata).await?;
         }
         _ = tokio::fs::remove_dir_all(&work).await;
         tokio::fs::create_dir(&work).await?;
@@ -539,13 +522,6 @@ pub(super) async fn prepare_upper(
     let (upper, work) = match result {
         Ok(paths) => paths,
         Err(err) => {
-            if mode == RootfsMode::Ephemeral
-                && let Err(cleanup) = unmount_path(&state_dir).await
-            {
-                return Err(err.wrap_err(format!(
-                    "ephemeral rootfs preparation failed; rollback failed: {cleanup}"
-                )));
-            }
             if let Some(image) = &rbd_image
                 && let Err(cleanup) =
                     release_persistent_backend(Some(&state_dir), Some(image)).await
@@ -787,14 +763,9 @@ mod tests {
         let mut image = None;
         for expected in [None, Some(b"survives reattach")] {
             let lock = acquire_rootfs_lock(&vmid).await.unwrap();
-            let state = prepare_upper(
-                &vmid,
-                RootfsMode::Persistent,
-                &digest,
-                Path::new("/run/odorobo/test-runtime"),
-            )
-            .await
-            .unwrap();
+            let state = prepare_upper(&vmid, RootfsMode::Persistent, &digest)
+                .await
+                .unwrap();
             let marker = state.upper.as_ref().unwrap().join("persistent-marker");
             if let Some(expected) = expected {
                 assert_eq!(std::fs::read(marker).unwrap(), expected);

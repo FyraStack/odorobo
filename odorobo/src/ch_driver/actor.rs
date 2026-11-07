@@ -546,6 +546,158 @@ mod tests {
         );
         std::fs::remove_dir_all(fixture_dir).unwrap();
     }
+
+    /// Full ephemeral OCI boot through the actor: the host serves the composefs
+    /// image read-only and the guest init builds the root overlay from its own
+    /// tmpfs, so the fixture init's write to `/` must succeed there.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "boots a real VM; needs /dev/kvm, cloud-hypervisor, virtiofsd, skopeo, composefs host support, and zig"]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "end-to-end test exercises one long scenario"
+    )]
+    async fn oci_ephemeral_vm_writes_into_its_guest_tmpfs() {
+        use crate::ch_driver::VMInstance;
+        use crate::ch_driver::{actor::VMActor, containers};
+        use crate::manifest::{
+            Boot, Compute, DesiredState, MANIFEST_VERSION, Metadata, Placement, Rootfs, RootfsMode,
+            VmManifest,
+        };
+        use crate::messages::vm::{DeleteVM, GetConsoleHistory, GetWorkloadLogs};
+        use kameo::prelude::*;
+        use std::path::PathBuf;
+        use std::time::Duration;
+        use tracing::info;
+
+        _ = tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| "odorobo=debug,mk_compressfs=debug".into()),
+            )
+            .with_test_writer()
+            .try_init()
+            .map_err(|err| info!(?err, "tracing subscriber already set"));
+
+        let vmid = ulid::Ulid::generate();
+        let fixture_dir = PathBuf::from("/var/lib/odorobo/vm-boot-fixtures").join(vmid.to_string());
+        std::fs::create_dir_all(&fixture_dir).unwrap();
+        let init_source = fixture_dir.join("init.c");
+        let init_binary = fixture_dir.join("root-init");
+        std::fs::write(
+            &init_source,
+            "#include <fcntl.h>\n#include <unistd.h>\nint main(void) { static const char s[] = \"odorobo-ephemeral-init write=\"; write(1, s, sizeof(s)-1); int fd = open(\"/write-proof\", O_CREAT|O_WRONLY|O_TRUNC, 0644); if (fd < 0) { write(1, \"fail\\n\", 5); } else { write(fd, \"x\", 1); close(fd); write(1, \"ok\\n\", 3); } for (;;) pause(); }\n",
+        )
+        .unwrap();
+        let compiled = std::process::Command::new("zig")
+            .args(["cc", "-target", "x86_64-linux-musl", "-static", "-O2", "-o"])
+            .arg(&init_binary)
+            .arg(&init_source)
+            .output()
+            .expect("zig is required for a static guest init fixture");
+        assert!(
+            compiled.status.success(),
+            "zig init compile failed: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let oci_layout = crate::ch_driver::containers::test_support::OciFixture {
+            init_binary: Some(&init_binary),
+            ..Default::default()
+        }
+        .layout(&fixture_dir);
+        let manifest = VmManifest {
+            api_version: MANIFEST_VERSION,
+            id: vmid,
+            desired: DesiredState {
+                metadata: Metadata {
+                    name: "oci-ephemeral-test".to_owned(),
+                    ..Default::default()
+                },
+                compute: Compute {
+                    vcpus: 1,
+                    memory_bytes: 512 * 1024 * 1024,
+                    ..Default::default()
+                },
+                storage: vec![],
+                networks: vec![],
+                placement: Placement::default(),
+                boot: Boot {
+                    start: true,
+                    ..Default::default()
+                },
+                cloud_init: None,
+                vsock: None,
+                rootfs: Some(Rootfs {
+                    oci: format!("oci:{}:latest", oci_layout.display()),
+                    mode: RootfsMode::Ephemeral,
+                    stdin: false,
+                }),
+            },
+            observed: None,
+        };
+
+        let prepared = VMActor::prepare();
+        let actor_ref = prepared.actor_ref().clone();
+        let handle = prepared.spawn((vmid, Some(manifest)));
+        actor_ref.ask(super::StartVM).await.unwrap();
+
+        let deadline = std::time::Instant::now()
+            .checked_add(Duration::from_secs(120))
+            .expect("deadline in range");
+        let mut write_proof = false;
+        let mut last_console = Vec::new();
+        let mut last_logs = Vec::new();
+        while std::time::Instant::now() < deadline {
+            let console = actor_ref
+                .ask(GetConsoleHistory { vmid })
+                .await
+                .expect("console history ask");
+            last_console.clone_from(&console.history);
+            let logs = actor_ref
+                .ask(GetWorkloadLogs { vmid })
+                .await
+                .expect("workload logs ask");
+            last_logs.clone_from(&logs.logs);
+            if String::from_utf8_lossy(&logs.logs).contains("write=ok") {
+                write_proof = true;
+                break;
+            }
+            // A startup failure means the fixture init will never run.
+            if let Ok(Some(reason)) = actor_ref.ask(super::StartFailure).await {
+                panic!(
+                    "VM never started: {reason}; console:\n{}\nworkload logs:\n{}",
+                    String::from_utf8_lossy(&last_console),
+                    String::from_utf8_lossy(&last_logs)
+                );
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        assert!(
+            write_proof,
+            "guest init never wrote through its tmpfs overlay within 120s; console:\n{}\nworkload logs:\n{}\n(check that /var/lib/odorobo/microvm/initramfs.cpio.gz matches the crate: `just initramfs`)",
+            String::from_utf8_lossy(&last_console),
+            String::from_utf8_lossy(&last_logs)
+        );
+
+        // The host side stays read-only: writes only ever land in the guest.
+        let mount = containers::rootfs_mount_path_for(&vmid.to_string());
+        assert!(
+            std::fs::write(mount.join("host-write"), b"x").is_err(),
+            "ephemeral host mount must reject writes"
+        );
+        let state = VMInstance::runtime_dir_for(&vmid.to_string()).join("rootfs-state");
+        assert!(
+            !state.exists(),
+            "an ephemeral root must keep no host-side upper"
+        );
+
+        let deleted = actor_ref
+            .ask(DeleteVM { vmid })
+            .await
+            .expect("DeleteVM reply");
+        assert_eq!(deleted.error, None, "ephemeral VM must delete cleanly");
+        handle.await.unwrap().unwrap();
+        std::fs::remove_dir_all(fixture_dir).unwrap();
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -870,11 +1022,14 @@ impl VMActor {
         .await?;
         // Release the GC guard once the mount can hold the image itself.
         drop(image);
+        // An ephemeral root's writable layer is a guest-side tmpfs, so its
+        // share is served read-only; a persistent root keeps a host upper.
         let rootfs_spec = VirtiofsdSpec {
             program,
             socket: crate::ch_driver::containers::socket_path_for(&vmid.to_string()),
             shared_dir: crate::ch_driver::containers::rootfs_mount_path_for(&vmid.to_string()),
             log: runtime_dir.join("virtiofsd.log"),
+            read_only: rootfs.mode == crate::manifest::RootfsMode::Ephemeral,
         };
         let start = async {
             *virtiofs = Some(VirtioFsSupervisor::start(rootfs_spec));

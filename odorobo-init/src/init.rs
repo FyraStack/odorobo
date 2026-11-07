@@ -13,6 +13,16 @@ use crate::image::{ImageConfig, ImageConfigDocument};
 
 const ROOTFS_TAG: &CStr = c"rootfs";
 const ROOT_MOUNT: &str = "/newroot";
+/// Guest-private tmpfs holding an ephemeral root's writable overlay layer.
+const UPPER_MOUNT: &str = "/upper";
+const UPPER_DIR: &str = "/upper/rootfs.upper";
+const WORK_DIR: &str = "/upper/rootfs.work";
+/// Merged root of an ephemeral VM: the image share plus the tmpfs upper.
+const OVERLAY_MOUNT: &str = "/overlay";
+/// Directory the old (initramfs) root is parked on during the switch; it must
+/// be writable, so a read-only root parks it under its `/tmp` scratch mount.
+const OLD_ROOT: &str = ".odorobo-oldroot";
+const OLD_ROOT_SCRATCH: &str = "tmp/.odorobo-oldroot";
 /// The host writes the image's OCI config into the rootfs's writable layer.
 const CONFIG_FILE: &str = "/newroot/.odorobo-config.json";
 const MAX_CONFIG_BYTES: usize = 1 << 20;
@@ -316,15 +326,24 @@ struct Workload {
 fn mount_image() -> io::Result<Workload> {
     mount_fs(Some(ROOTFS_TAG), ROOT_MOUNT, Some(c"virtiofs"), 0, None)
         .map_err(|err| with_context(err, format!("mounting the image at {ROOT_MOUNT}")))?;
-    // The config file is part of the image root's writable layer; read it
-    // here, while the mount is still reachable from the initramfs root.
+    // The config document is part of the image root; read it here, while the
+    // mount is still reachable from the initramfs root. It also carries the
+    // writable-layer contract for an ephemeral root.
     let document =
         read_config().map_err(|err| with_context(err, format!("reading {CONFIG_FILE}")))?;
     let stdin = document.stdin();
+    let upper_bytes = document.tmpfs_upper_bytes();
     let config = document.config;
 
+    // The workload root: the image share itself, or an overlay that keeps the
+    // image read-only and puts every write in this VM's own tmpfs.
+    let root = match upper_bytes {
+        Some(bytes) => mount_ephemeral_root(bytes)?,
+        None => ROOT_MOUNT.to_owned(),
+    };
+
     for mount in ["/proc", "/sys", "/dev"] {
-        let target = format!("{ROOT_MOUNT}{mount}");
+        let target = format!("{root}{mount}");
         if let Err(err) = fs::create_dir_all(&target) {
             // A read-only image without these mount points cannot receive
             // them; warn and keep going rather than refusing to boot.
@@ -336,13 +355,7 @@ fn mount_image() -> io::Result<Workload> {
             .map_err(|err| with_context(err, format!("moving {mount} into the image")))?;
     }
 
-    std::env::set_current_dir(ROOT_MOUNT)
-        .map_err(|err| with_context(err, "entering the image root"))?;
-    // SAFETY: "." is the image root, with a NUL terminator added below.
-    if unsafe { libc::chroot(c".".as_ptr()) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    std::env::set_current_dir("/").map_err(|err| with_context(err, "setting / as cwd"))?;
+    switch_root(&root)?;
     let args = config.args();
     log!(
         "image mounted; running {} with {} environment entries",
@@ -359,6 +372,44 @@ fn mount_image() -> io::Result<Workload> {
     })
 }
 
+/// Builds the merged root of an ephemeral VM: the image share is the read-only
+/// overlay lower and a size-bounded tmpfs holds the writable upper, so guest
+/// writes are charged to this VM instead of host memory. `redirect_dir=on`
+/// keeps directory renames working against image content.
+fn mount_ephemeral_root(upper_bytes: u64) -> io::Result<String> {
+    for directory in [UPPER_MOUNT, OVERLAY_MOUNT] {
+        fs::create_dir_all(directory)
+            .map_err(|err| with_context(err, format!("creating {directory}")))?;
+    }
+    let options = cstring(&format!("size={upper_bytes},mode=0700"), "tmpfs options")?;
+    mount_fs(
+        Some(c"tmpfs"),
+        UPPER_MOUNT,
+        Some(c"tmpfs"),
+        libc::MS_NOSUID | libc::MS_NODEV,
+        Some(&options),
+    )
+    .map_err(|err| with_context(err, format!("mounting the {upper_bytes}-byte tmpfs upper")))?;
+    for directory in [UPPER_DIR, WORK_DIR] {
+        fs::create_dir_all(directory)
+            .map_err(|err| with_context(err, format!("creating {directory}")))?;
+    }
+    let data = cstring(
+        &format!("lowerdir={ROOT_MOUNT},upperdir={UPPER_DIR},workdir={WORK_DIR},redirect_dir=on"),
+        "overlay options",
+    )?;
+    mount_fs(
+        Some(c"overlay"),
+        OVERLAY_MOUNT,
+        Some(c"overlay"),
+        0,
+        Some(&data),
+    )
+    .map_err(|err| with_context(err, format!("mounting the overlay at {OVERLAY_MOUNT}")))?;
+    log!("ephemeral root merged from {ROOT_MOUNT} with a {upper_bytes}-byte tmpfs upper");
+    Ok(OVERLAY_MOUNT.to_owned())
+}
+
 fn read_config() -> io::Result<ImageConfigDocument> {
     let mut file = fs::File::open(CONFIG_FILE)?;
     let mut bytes = Vec::new();
@@ -372,6 +423,51 @@ fn read_config() -> io::Result<ImageConfigDocument> {
         ));
     }
     ImageConfigDocument::parse(&bytes)
+}
+
+/// Makes `root` the workload root: `pivot_root(2)` into it, then lazily
+/// unmount the old (initramfs) tree, which also takes the image share and an
+/// ephemeral root's tmpfs upper out of the workload's mount namespace.
+fn switch_root(root: &str) -> io::Result<()> {
+    std::env::set_current_dir(root)
+        .map_err(|err| with_context(err, format!("entering {root}")))?;
+    // pivot_root parks the old tree on a directory inside the new root, so
+    // that directory has to be writable: the /tmp scratch mount of a read-only
+    // root standing in for the image filesystem.
+    let parked = match fs::create_dir_all(OLD_ROOT) {
+        Ok(()) => OLD_ROOT,
+        Err(_) => {
+            fs::create_dir_all(OLD_ROOT_SCRATCH)
+                .map_err(|err| with_context(err, format!("creating {OLD_ROOT_SCRATCH}")))?;
+            OLD_ROOT_SCRATCH
+        }
+    };
+    let new_root = cstring(".", "pivot root")?;
+    let put_old = cstring(parked, "pivot root put_old")?;
+    // SAFETY: both pointers are valid NUL-terminated path strings, and the
+    // kernel only reads them for the duration of the call.
+    if unsafe { libc::syscall(libc::SYS_pivot_root, new_root.as_ptr(), put_old.as_ptr()) } < 0 {
+        let err = io::Error::last_os_error();
+        return Err(with_context(err, "pivoting into the workload root"));
+    }
+    unmount_lazy(parked)
+        .map_err(|err| with_context(err, format!("unmounting the old root at {parked}")))?;
+    // The old tree is out of the namespace; drop the parking directory.
+    _ = fs::remove_dir(parked);
+    std::env::set_current_dir("/").map_err(|err| with_context(err, "setting / as cwd"))?;
+    log!("pivoted into the workload root; the old root is detached");
+    Ok(())
+}
+
+/// `umount2(2)` with `MNT_DETACH`: the mount leaves the namespace now and is
+/// released once its last user (an overlay lower or upper, say) releases it.
+fn unmount_lazy(path: &str) -> io::Result<()> {
+    let target = cstring(path, "unmount target")?;
+    // SAFETY: the pointer is a valid NUL-terminated path string.
+    if unsafe { libc::umount2(target.as_ptr(), libc::MNT_DETACH) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn mount_fs(

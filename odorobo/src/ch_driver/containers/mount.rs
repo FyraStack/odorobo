@@ -1,5 +1,5 @@
-//! Per-VM rootfs assembly: mounting the imported composefs image with a
-//! per-VM overlay upper, scratch tmpfs mounts, and teardown.
+//! Per-VM rootfs assembly: mounting the imported composefs image read-only,
+//! read-only scratch tmpfs mounts, and teardown.
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -14,17 +14,17 @@ use tokio::process::Command;
 use tokio::sync::OwnedMutexGuard;
 use tracing::info;
 
-use super::limits::{EPHEMERAL_STATE, MIB, RUN_SCRATCH, TMP_SCRATCH, VARTMP_SCRATCH};
+use super::limits::{EPHEMERAL_UPPER, MIB, RUN_SCRATCH, TMP_SCRATCH, VARTMP_SCRATCH};
 use super::oci::OciUnpackLimits;
 use super::persistent::{
-    EPHEMERAL_STATE_DIR, PersistentBackend, acquire_rootfs_lock, persistent_backend, prepare_upper,
-    rbd_identity, rbd_lookup_device, release_persistent_backend,
+    PersistentBackend, acquire_rootfs_lock, persistent_backend, prepare_upper, rbd_identity,
+    rbd_lookup_device, release_persistent_backend,
 };
 use super::process::{TOOL_OPERATIONS, Tool};
 use super::repo;
 use super::{
-    CONFIG_FILE_NAME, PERSISTENT_ROOTFS_ROOT, PreparedRootfs, guest_config_document,
-    rootfs_mount_path_for, validate_vmid,
+    CONFIG_FILE_NAME, GuestLaunchOptions, PERSISTENT_ROOTFS_ROOT, PreparedRootfs,
+    guest_config_document, rootfs_mount_path_for, validate_vmid,
 };
 use crate::manifest::{Rootfs, RootfsMode};
 
@@ -161,17 +161,6 @@ pub async fn mount_rootfs_owned(
             root_mount.display()
         );
     }
-    // Refuse to adopt a pre-existing ephemeral state mount, like the root.
-    let ephemeral_state =
-        (rootfs.mode == RootfsMode::Ephemeral).then(|| runtime_dir.join(EPHEMERAL_STATE_DIR));
-    if let Some(state) = &ephemeral_state
-        && is_mountpoint(state).await?
-    {
-        bail!(
-            "ephemeral rootfs state {} is already mounted",
-            state.display()
-        );
-    }
     *owner = Some(PreparedRootfs {
         digest: manifest_digest.clone(),
         mount: root_mount.clone(),
@@ -182,9 +171,6 @@ pub async fn mount_rootfs_owned(
         _state_lock: state_lock,
         mode: rootfs.mode,
         scratch_mounts: Vec::new(),
-        // Recorded before prepare_upper mounts it, so a cancelled or failed
-        // start can still be torn down through the owner.
-        ephemeral_state_mount: ephemeral_state,
     });
     // Include persistence in inventory before attaching; failed formatting,
     // metadata validation or unmapping must remain reachable for cleanup.
@@ -198,7 +184,7 @@ pub async fn mount_rootfs_owned(
         prepared.persistent_state_mount = Some(state_path);
         prepared.rbd_image = Some(image);
     }
-    let upper_state = prepare_upper(vmid, rootfs.mode, manifest_digest, &runtime_dir).await?;
+    let upper_state = prepare_upper(vmid, rootfs.mode, manifest_digest).await?;
     {
         let prepared = owner.as_mut().unwrap();
         prepared.upper.clone_from(&upper_state.upper);
@@ -208,7 +194,14 @@ pub async fn mount_rootfs_owned(
     // second lower layer; a read-only VM then needs no writable layer at all.
     let config_dir = runtime_dir.join(CONFIG_DIR);
     create_private_dir(&config_dir).await?;
-    let document = guest_config_document(image.config(), rootfs.stdin)?;
+    let launch = GuestLaunchOptions {
+        stdin: rootfs.stdin,
+        // An ephemeral root's writable layer is a guest tmpfs the init mounts.
+        ephemeral_upper_bytes: (rootfs.mode == RootfsMode::Ephemeral)
+            .then(|| EPHEMERAL_UPPER.read_env())
+            .transpose()?,
+    };
+    let document = guest_config_document(image.config(), &launch)?;
     tokio::fs::write(config_dir.join(CONFIG_FILE_NAME), document).await?;
     let overlay = match (&upper_state.upper, &upper_state.work) {
         (Some(upper), Some(work)) => Some((upper.as_path(), work.as_path())),
@@ -219,7 +212,7 @@ pub async fn mount_rootfs_owned(
         &root_mount,
         &config_dir,
         overlay,
-        rootfs.mode != RootfsMode::ReadOnly,
+        rootfs.mode == RootfsMode::Persistent,
     )?;
     Tool::ORDERED
         .run(
@@ -251,59 +244,11 @@ pub async fn mount_rootfs_owned(
 pub async fn unmount_rootfs(prepared: &PreparedRootfs) -> Result<()> {
     unmount_scratch_mounts(&prepared.scratch_mounts).await?;
     unmount_path(&prepared.mount).await?;
-    if let Some(state) = &prepared.ephemeral_state_mount {
-        unmount_path(state)
-            .await
-            .wrap_err("ephemeral rootfs state unmount failed")?;
-    }
     release_persistent_backend(
         prepared.persistent_state_mount.as_deref(),
         prepared.rbd_image.as_deref(),
     )
     .await?;
-    if prepared.mode == RootfsMode::Ephemeral {
-        for path in [&prepared.upper, &prepared.work].into_iter().flatten() {
-            match tokio::fs::remove_dir_all(path).await {
-                Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => return Err(err.into()),
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Mount a fresh VM-private tmpfs for ephemeral `OverlayFS` upper/work state.
-/// Guest writes are bounded by its `size=` instead of consuming host /run.
-pub(super) async fn mount_ephemeral_state(path: &Path) -> Result<()> {
-    let options = format!(
-        "size={}m,mode=700,nosuid,nodev",
-        EPHEMERAL_STATE.read_env()? / MIB
-    );
-    tokio::fs::create_dir_all(path).await?;
-    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).await?;
-    if is_mountpoint(path).await? {
-        bail!(
-            "ephemeral rootfs state {} is already mounted",
-            path.display()
-        );
-    }
-    Tool::ORDERED
-        .run(
-            "mount",
-            [
-                "-t".into(),
-                "tmpfs".into(),
-                "-o".into(),
-                options,
-                "tmpfs".into(),
-            ],
-            &[path],
-        )
-        .await?;
-    Tool::ORDERED
-        .run("mount", ["--make-private".to_owned()], &[path])
-        .await?;
     Ok(())
 }
 
@@ -494,41 +439,32 @@ mod tests {
         let mut instance = VMInstance::new(&vmid, PathBuf::from("/unused"), None, None);
         let runtime = instance.runtime_dir();
         let root = runtime.join("rootfs");
-        let state = runtime.join(EPHEMERAL_STATE_DIR);
-        let upper = state.join("rootfs.upper");
-        for path in [&root, &state] {
-            std::fs::create_dir_all(path).unwrap();
-            mount("tmpfs", None, path).await;
-        }
-        std::fs::create_dir_all(&upper).unwrap();
-        std::fs::write(upper.join("keep"), b"persistent until detached").unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        mount("tmpfs", None, &root).await;
+        let scratch = root.join("tmp");
+        std::fs::create_dir_all(&scratch).unwrap();
+        mount("tmpfs", None, &scratch).await;
         let mut busy = hold_busy(&root);
         let prepared = PreparedRootfs {
             digest: "fixture".into(),
             mount: root.clone(),
-            upper: Some(upper.clone()),
+            upper: None,
             work: None,
             persistent_state_mount: None,
             rbd_image: None,
             _state_lock: acquire_rootfs_lock(&vmid).await.unwrap(),
-            mode: RootfsMode::Ephemeral,
-            scratch_mounts: vec![],
-            ephemeral_state_mount: Some(state.clone()),
+            mode: RootfsMode::ReadOnly,
+            scratch_mounts: vec![scratch.clone()],
         };
         async {
             assert!(unmount_rootfs(&prepared).await.is_err());
             assert!(is_mountpoint(&root).await.unwrap());
-            assert!(
-                is_mountpoint(&state).await.unwrap(),
-                "ephemeral state must outlive a failed root teardown"
-            );
             assert!(instance.purge_instance_data().is_err());
-            assert!(upper.join("keep").exists());
             busy.kill().await.unwrap();
             unmount_rootfs(&prepared).await.unwrap();
             unmount_rootfs(&prepared).await.unwrap();
-            assert!(!is_mountpoint(&state).await.unwrap());
-            assert!(!upper.exists());
+            assert!(!is_mountpoint(&root).await.unwrap());
+            assert!(!is_mountpoint(&scratch).await.unwrap());
             instance.purge_instance_data().unwrap();
         }
         .await;
@@ -562,37 +498,33 @@ mod tests {
             persistent,
         ] = std::array::from_fn(|_| ulid::Ulid::generate().to_string());
 
+        // An ephemeral root is served read-only: the writable layer is the
+        // guest init's tmpfs, so the host side rejects writes and keeps no
+        // per-VM upper.
         let a = mount_image(&ephemeral_a, &image, RootfsMode::Ephemeral)
             .await
             .unwrap();
         let b = mount_image(&ephemeral_b, &image, RootfsMode::Ephemeral)
             .await
             .unwrap();
-        std::fs::write(a.mount.join("etc/only-a"), b"a").unwrap();
-        let a_state = VMInstance::runtime_dir_for(&ephemeral_a).join(EPHEMERAL_STATE_DIR);
         assert!(
-            is_mountpoint(&a_state).await.unwrap()
-                && a.upper.as_ref().unwrap().starts_with(&a_state),
-            "ephemeral upper must live on its bounded VM-private tmpfs"
+            std::fs::write(a.mount.join("etc/only-a"), b"a").is_err(),
+            "ephemeral host mount must reject writes"
         );
+        assert!(a.upper.is_none() && a.work.is_none(), "no host upper");
+        assert!(b.upper.is_none() && b.work.is_none(), "no host upper");
+        let contract: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(a.mount.join(".odorobo-config.json")).unwrap())
+                .unwrap();
+        assert_eq!(contract["odorobo"]["rootfs"]["mode"], "ephemeral");
         assert!(
-            !b.mount.join("etc/only-a").exists(),
-            "ephemeral upper must be VM-private"
+            contract["odorobo"]["rootfs"]["tmpfs_upper_bytes"].is_u64(),
+            "the guest must receive the tmpfs upper size"
         );
         unmount_rootfs(&a).await.unwrap();
         unmount_rootfs(&b).await.unwrap();
-        assert!(!is_mountpoint(&a_state).await.unwrap());
         drop(a);
         drop(b);
-        let a = mount_image(&ephemeral_a, &image, RootfsMode::Ephemeral)
-            .await
-            .unwrap();
-        assert!(
-            !a.mount.join("etc/only-a").exists(),
-            "ephemeral writes must disappear at stop"
-        );
-        unmount_rootfs(&a).await.unwrap();
-        drop(a);
 
         let ro_a = mount_image(&readonly_a, &image, RootfsMode::ReadOnly)
             .await
@@ -608,6 +540,14 @@ mod tests {
         assert!(
             std::fs::write(ro_a.mount.join("etc/denied"), b"no").is_err(),
             "read-only root writes outside scratch must fail"
+        );
+        let contract: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(ro_a.mount.join(".odorobo-config.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            contract.get("odorobo").is_none(),
+            "a read-only root must not ask the guest for a writable layer"
         );
         let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
         for path in &ro_a.scratch_mounts {
