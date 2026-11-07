@@ -54,7 +54,7 @@ tower = "0.5"
 # composefs repository, which is mounted as the guest root.
 composefs = "0.10"
 composefs-oci = "0.10"
-rustix = { version = "1", features = ["fs"] }
+rustix = { version = "1", features = ["fs", "mount"] }
 sha2 = "0.10"
 
 aide = { version = "0.16.0-alpha.4", features = [

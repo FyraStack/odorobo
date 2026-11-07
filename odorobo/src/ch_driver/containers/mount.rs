@@ -21,8 +21,20 @@ use super::persistent::{
 };
 use super::process::{TOOL_OPERATIONS, Tool};
 use super::repo;
-use super::{PERSISTENT_ROOTFS_ROOT, PreparedRootfs, ROOTFS_TAG, validate_vmid};
+use super::{
+    CONFIG_FILE_NAME, PERSISTENT_ROOTFS_ROOT, PreparedRootfs, rootfs_mount_path_for, validate_vmid,
+};
 use crate::manifest::{Rootfs, RootfsMode};
+
+/// Host-only directory under a VM's runtime dir holding the OCI config
+/// document as a lower layer of the root overlay.
+const CONFIG_DIR: &str = "config";
+
+async fn create_private_dir(path: &Path) -> Result<()> {
+    tokio::fs::create_dir_all(path).await?;
+    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).await?;
+    Ok(())
+}
 
 pub(super) async fn is_mountpoint(path: &Path) -> Result<bool> {
     match tokio::fs::symlink_metadata(path).await {
@@ -130,7 +142,7 @@ pub async fn mount_rootfs_owned(
     let runtime_dir = crate::ch_driver::VMInstance::runtime_dir_for(vmid);
     tokio::fs::create_dir_all(&runtime_dir).await?;
     tokio::fs::set_permissions(&runtime_dir, std::fs::Permissions::from_mode(0o700)).await?;
-    let root_mount = runtime_dir.join(ROOTFS_TAG);
+    let root_mount = rootfs_mount_path_for(vmid);
     tokio::fs::create_dir_all(&root_mount).await?;
     if is_mountpoint(&root_mount).await? {
         bail!(
@@ -181,24 +193,26 @@ pub async fn mount_rootfs_owned(
         prepared.upper.clone_from(&upper_state.upper);
         prepared.work.clone_from(&upper_state.work);
     };
+    // The image carries no config document of its own, so the OCI config is a
+    // second lower layer; a read-only VM then needs no writable layer at all.
+    let config_dir = runtime_dir.join(CONFIG_DIR);
+    create_private_dir(&config_dir).await?;
+    tokio::fs::write(config_dir.join(CONFIG_FILE_NAME), image.config()).await?;
     let overlay = match (&upper_state.upper, &upper_state.work) {
         (Some(upper), Some(work)) => Some((upper.as_path(), work.as_path())),
         _ => None,
     };
-    repo::mount_image(&image.image, &root_mount, overlay)?;
+    repo::mount_image(
+        &image.image,
+        &root_mount,
+        &config_dir,
+        overlay,
+        rootfs.mode != RootfsMode::ReadOnly,
+    )?;
     Tool::ORDERED
         .run(
             "mount",
             ["--make-rprivate".to_owned()],
-            &[root_mount.as_path()],
-        )
-        .await?;
-    // composefs mounts carry only the read-only attribute; keep the root as
-    // restricted as the overlay options it replaces.
-    Tool::ORDERED
-        .run(
-            "mount",
-            ["-o".into(), "remount,bind,nosuid,nodev".into()],
             &[root_mount.as_path()],
         )
         .await?;
@@ -612,9 +626,8 @@ mod tests {
         let _err = mount_image(&failed_scratch, &oci_ref(&incomplete), RootfsMode::ReadOnly)
             .await
             .unwrap_err();
-        let failed_runtime = VMInstance::runtime_dir_for(&failed_scratch);
         assert!(
-            !is_mountpoint(&failed_runtime.join(ROOTFS_TAG))
+            !is_mountpoint(&rootfs_mount_path_for(&failed_scratch))
                 .await
                 .unwrap()
         );

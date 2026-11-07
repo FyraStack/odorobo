@@ -41,8 +41,8 @@ Every image is imported into one node-local composefs repository at `/var/lib/od
 
 1. **Preflight:** resolve the reference with `skopeo inspect --raw` to a concrete manifest digest and the platform selected for the guest kernel, and check its compressed size against the cap. A mutable tag is an input alias, not an identity: the import pulls the exact digest that was just inspected and verified.
 2. **Import:** pull that digest into the repository through `containers-image-proxy`. The importer applies OCI changeset semantics itself and merges the image's layers in order into one EROFS metadata object; file payloads become repository objects, so identical content anywhere in the repository is stored once. Re-importing an image whose objects are already present adds nothing. The importer copies the root directory metadata from `/usr` for deterministic digests, so an image without a `/usr` directory is rejected.
-3. **Mount:** the mount target is that EROFS metadata object. `read_only` mounts the composefs filesystem directly; `ephemeral` and `persistent` mount it as an OverlayFS lower with a per-VM upper/work. Whiteouts and opaque directories are resolved inside the imported image, so nothing layer-shaped reaches the guest and no `lowerdir` list, empty-lower workaround, or layer-count cap is involved.
-4. **Config:** the image's OCI config document is read back from the repository as a content stream and written to the VM's config share for the guest init.
+3. **Mount:** every VM gets one OverlayFS mount whose lowers are that EROFS metadata object plus a per-VM directory holding the image's OCI config document. `read_only` mounts those two lowers with no writable layer; `ephemeral` and `persistent` add the per-VM upper/work. Whiteouts and opaque directories are resolved inside the imported image, so nothing layer-shaped reaches the guest and no `lowerdir` list, empty-lower workaround, or layer-count cap is involved.
+4. **Config:** the image's OCI config document is read back from the repository as a content stream, written into the per-VM config directory, and shows up in the guest as `/.odorobo-config.json`.
 
 `ODOROBO_ROOTFS_ALLOW_LOCAL_TRANSPORTS=1` additionally allows local transports such as `oci:` and `docker-archive:` for development.
 
@@ -92,12 +92,12 @@ Cloud Hypervisor direct-boots the node's microVM kernel (`/var/lib/odorobo/micro
 The initramfs contains a single static `odorobo-init` binary as `/init`. As PID 1 it:
 
 1. mounts `devtmpfs`, `proc` and `sysfs`;
-2. mounts the read-only virtiofs share tagged `odorobo-config` at `/run/.odorobo` and reads the image's OCI config document from `/run/.odorobo/config.json`;
-3. mounts the virtiofs share tagged `rootfs` at `/newroot`, moves the pseudo-filesystems in, and `chroot`s into it;
+2. mounts the virtiofs share tagged `rootfs` at `/newroot` and reads the image's OCI config document from `/.odorobo-config.json` inside it;
+3. creates the scratch mount points, moves the pseudo-filesystems into `/newroot`, and `chroot`s into it;
 4. resolves the config's `User` against the image's `/etc/passwd` and `/etc/group`, applies `setgroups`/`setgid`/`setuid`, builds `Env` plus the entrypoint and command, and `execve`s it in the config's `WorkingDir`;
 5. reaps zombies, forwards `SIGTERM`/`SIGINT`/`SIGQUIT`/`SIGHUP` to the workload's process group, and powers the VM off when the workload exits.
 
-If the image has neither an entrypoint nor a command, the init falls back to `/sbin/init`, `/etc/init`, `/bin/init` and then `/bin/sh`. Unknown or missing config fields are ignored; an unreadable config is fatal. The agent writes `config.json` into the VM runtime directory before start, so the guest never sees the network or the host filesystem.
+If the image has neither an entrypoint nor a command, the init falls back to `/sbin/init`, `/etc/init`, `/bin/init` and then `/bin/sh`. Unknown or missing config fields are ignored; an unreadable config is fatal. The agent writes `.odorobo-config.json` into `/run/odorobo/vms/<vmid>/config` and mounts that directory as a lower layer before start, so the guest never sees the network or the host filesystem.
 
 The console is the 16550 serial port (`ttyS0`). The agent exposes it as a socket and keeps a history, read through `GET /vms/{vmid}/console/history`. The virtio console (`hvc0`) is off.
 
@@ -105,14 +105,14 @@ Rootfs VMs can publish guest ports on the host with `ports` on a manifest networ
 
 **Overrides:** `boot.kernel` and `boot.initramfs` replace the defaults, and `boot.cmdline` replaces the whole command line. Overriding the initramfs means supplying another image that mounts the virtiofs root itself; overriding the kernel must keep built-in `virtiofs`, `overlayfs` and `devtmpfs`.
 
-The ignored KVM test (`oci_rootfs_vm_boots_through_the_actor`) compiles a static C program with Zig, installs it as `/bin/sh` in a fixture image whose OCI config sets `Entrypoint: ["/bin/sh"]`, and boots it through the actor. The test passes when the console shows the program's message, which proves the config share, the initramfs and the virtiofs root all work together.
+The ignored KVM test (`oci_rootfs_vm_boots_through_the_actor`) compiles a static C program with Zig, installs it as `/bin/sh` in a fixture image whose OCI config sets `Entrypoint: ["/bin/sh"]`, and boots it through the actor. The test passes when the console shows the program's message, which proves the config lower, the initramfs and the virtiofs root all work together.
 
 ## Integrity, isolation, and process model
 
 - Imports are digest-pinned: `skopeo inspect --raw` resolves the platform manifest first and the pull copies exactly that digest, so a tag that moves mid-import cannot substitute content. Defaults bound downloaded compressed data to 16 GiB per image (`ODOROBO_ROOTFS_MAX_COMPRESSED_BYTES`, `M`/`G`/`T`). The older per-layer, aggregate-uncompressed and tar-entry limits were removed together with the host-side unpacking path, since nothing is unpacked into a host-visible tree anymore. `composefs-oci` materializes the merged image: file metadata, xattrs and directory structure live in the EROFS metadata object, and file payloads become repository objects. fs-verity covers metadata and payloads when the repository filesystem supports it, and mounts verify the image object digest; a repository on a filesystem without fs-verity mounts unverified.
 - The composefs image mount and every exported root are read-only. A VM can only write to its own upper or explicitly allowed scratch tmpfs paths.
 - Each VM's writable upper/work is distinct, including VMs with the same OCI manifest digest.
-- The VM actor supervises two virtiofsd processes with `--sandbox=chroot` (the rootfs store and the read-only config directory), starts them before Cloud Hypervisor connects, stops the config share first, then the root share before unmount, and cleans up partial startup failures.
+- The VM actor supervises one virtiofsd process with `--sandbox=chroot` over the mounted root, starts it before Cloud Hypervisor connects, stops it before unmounting the root and its lowers, and cleans up partial startup failures.
 - Rootfs VMs require shared guest memory for the vhost-user virtiofs device. The direct-boot kernel/cmdline and `ttyS0` UART console remain as documented for issue #112. The guest does not need composefs support.
 - Rootfs VMs reject live migration. Planned host drain uses clean cold restart with the same persistent upper and pinned OCI base digest.
 
@@ -130,7 +130,7 @@ Recorded on the development host with a rootful debug agent, plus the ignored pr
 - `cargo test -p odorobo`: 95 passed, 5 ignored (privileged/KVM/RBD). `cargo clippy -p odorobo -p odorobo-init --all-targets` and `cargo fmt --all --check` are clean apart from the pre-existing macro-semicolon warnings.
 - Boot, stop and delete end to end: an ephemeral `docker://traefik/whoami:latest` VM imported 347 objects / 12,890,895 bytes from 5,139,859 compressed bytes across 3 layers, created one EROFS image object, mounted it, and answered `whoami` over the guest network. Deleting both test VMs left no runtime directories, mounts, published-port rules or `virtiofsd` processes.
 - Deduplication boundary: re-importing the same image logged `new_objects: 0, new_bytes: 0` while the repository stayed at 14 MB / 358 objects.
-- The ignored KVM actor test (`oci_rootfs_vm_boots_through_the_actor`) passes: the guest runs `/init` from the initramfs, mounts the composefs image over virtiofs, reads the OCI config share, executes the fixture entrypoint, then exercises busy-root teardown retention across `ShutdownVM`, restart, a hypervisor crash and `DeleteVM`.
+- The ignored KVM actor test (`oci_rootfs_vm_boots_through_the_actor`) passes: the guest runs `/init` from the initramfs, mounts the composefs image over virtiofs, reads the OCI config from `/.odorobo-config.json`, executes the fixture entrypoint, then exercises busy-root teardown retention across `ShutdownVM`, restart, a hypervisor crash and `DeleteVM`.
 - Privileged mount tests pass: write-mode isolation and removal for `read_only`, `ephemeral` and `persistent`, failed-start inventory retention, and purge protection while the root mount is busy.
 - The disposable per-VM RBD helper test (earlier run on the same host) passed formatting, filesystem check, exclusive-lock feature verification, unmount/unmap/remap, persisted-upper reattach, and explicit volume deletion.
 

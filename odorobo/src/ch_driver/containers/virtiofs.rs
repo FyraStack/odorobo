@@ -10,18 +10,13 @@ use tokio::process::Command;
 use tokio::sync::{Mutex, Notify};
 use tracing::{debug, warn};
 
-use super::{CONFIG_TAG, ROOTFS_TAG};
+use super::ROOTFS_TAG;
 
 /// vhost-user socket path for a VM's rootfs device. Single source of truth
 /// shared with the manifest conversion's `FsConfig` so the actor's virtiofsd
 /// supervisor and the CH fs device config always agree.
 pub fn socket_path_for(vmid: &str) -> PathBuf {
     crate::ch_driver::VMInstance::runtime_dir_for(vmid).join(format!("{ROOTFS_TAG}.sock"))
-}
-
-/// vhost-user socket for the read-only OCI config share.
-pub fn config_socket_path_for(vmid: &str) -> PathBuf {
-    crate::ch_driver::VMInstance::runtime_dir_for(vmid).join(format!("{CONFIG_TAG}.sock"))
 }
 
 /// Resolve the virtiofsd binary (Fedora ships it in /usr/libexec, not PATH).

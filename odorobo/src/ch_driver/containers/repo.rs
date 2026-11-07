@@ -11,17 +11,19 @@
 //! as trustworthy as its filesystem, which must support fs-verity (ext4,
 //! btrfs, erofs); a repository without verity metadata mounts unverified.
 
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
 use composefs::{
     fsverity::{Algorithm, FsVerityHashValue, Sha256HashValue},
-    mount::{MountOptions, mount_at},
+    mount::{FsHandle, erofs_mount, mount_at},
+    mountcompat::{overlayfs_set_fd, prepare_mount},
     repository::{Repository, RepositoryConfig},
 };
 use composefs_oci::{OciDigest, PullOptions, open_config, pull};
 use rustix::fs::CWD;
+use rustix::mount::{FsMountFlags, MountAttrFlags, fsconfig_create, fsconfig_set_string, fsmount};
 use stable_eyre::{
     Result,
     eyre::{Context, eyre},
@@ -160,32 +162,85 @@ async fn import_image_inner(image_ref: &str, max_compressed_bytes: u64) -> Resul
     })
 }
 
-/// Mount the image's EROFS object at `mountpoint`, optionally through a
-/// per-VM overlay upper/work pair (which makes the mount writable).
+/// Mount the composed root for a VM at `mountpoint` with one overlayfs mount:
+/// the image's EROFS metadata object and `config_dir` are the lower layers and
+/// the repository's object store supplies file data. `overlay_upper` adds the
+/// per-VM writable directories, and `read_write` only matters with them.
 pub(super) fn mount_image(
     image: &Sha256HashValue,
     mountpoint: &Path,
+    config_dir: &Path,
     overlay_upper: Option<(&Path, &Path)>,
+    read_write: bool,
 ) -> Result<()> {
     let repository = repository()?;
-    let mut options = MountOptions::default();
-    if let Some((upper, work)) = overlay_upper {
-        options.set_overlay(open_overlay_dir(upper)?, open_overlay_dir(work)?);
-        options.set_read_write(true);
+    let (image_fd, enable_verity) = repository
+        .open_digest(image)
+        .map_err(|error| eyre!("opening the composed image object failed: {error:#}"))?;
+    let objects = repository
+        .objects_dir()
+        .map_err(|error| eyre!("opening the repository object store failed: {error:#}"))?;
+    let erofs = erofs_mount(image_fd)
+        .map_err(|error| eyre!("mounting the image metadata failed: {error:#}"))?;
+    let erofs = prepare_mount(erofs)
+        .map_err(|error| eyre!("preparing the image metadata mount failed: {error:#}"))?;
+    let overlayfs = FsHandle::open("overlay")
+        .map_err(|error| eyre!("opening an overlayfs context failed: {error:#}"))?;
+    set_overlay_option(
+        &overlayfs,
+        "source",
+        &format!("composefs:{}", image.to_hex()),
+    )?;
+    set_overlay_option(&overlayfs, "metacopy", "on")?;
+    set_overlay_option(&overlayfs, "redirect_dir", "on")?;
+    if enable_verity {
+        set_overlay_option(&overlayfs, "verity", "require")?;
     }
-    let fd = repository.mount_digest(image, &options).map_err(|error| {
+    // The config directory is the first lower, so the kernel prefers it over
+    // the image for paths that exist in both.
+    set_overlay_fd(&overlayfs, "lowerdir+", &open_overlay_dir(config_dir)?)?;
+    set_overlay_fd(&overlayfs, "lowerdir+", &erofs)?;
+    set_overlay_fd(&overlayfs, "datadir+", objects)?;
+    if let Some((upper, work)) = overlay_upper {
+        set_overlay_fd(&overlayfs, "upperdir", &open_overlay_dir(upper)?)?;
+        set_overlay_fd(&overlayfs, "workdir", &open_overlay_dir(work)?)?;
+    }
+    fsconfig_create(overlayfs.as_fd()).map_err(|error| {
         eyre!(
-            "assembling the composefs root of {} failed: {error:#}",
+            "assembling the composed root of {} failed: {error}",
             mountpoint.display()
         )
     })?;
+    let attributes = if read_write {
+        MountAttrFlags::empty()
+    } else {
+        MountAttrFlags::MOUNT_ATTR_RDONLY
+    } | MountAttrFlags::MOUNT_ATTR_NOSUID
+        | MountAttrFlags::MOUNT_ATTR_NODEV;
+    let fd =
+        fsmount(overlayfs.as_fd(), FsMountFlags::FSMOUNT_CLOEXEC, attributes).map_err(|error| {
+            eyre!(
+                "mounting the composed root of {} failed: {error}",
+                mountpoint.display()
+            )
+        })?;
     mount_at(fd, CWD, mountpoint).map_err(|error| {
         eyre!(
-            "attaching the composefs root at {} failed: {error:#}",
+            "attaching the composed root at {} failed: {error}",
             mountpoint.display()
         )
     })?;
     Ok(())
+}
+
+fn set_overlay_option(handle: &FsHandle, key: &str, value: &str) -> Result<()> {
+    fsconfig_set_string(handle.as_fd(), key, value)
+        .map_err(|error| eyre!("setting overlayfs {key}={value} failed: {error}"))
+}
+
+fn set_overlay_fd(handle: &FsHandle, key: &str, fd: impl std::os::fd::AsFd) -> Result<()> {
+    overlayfs_set_fd(handle.as_fd(), key, fd.as_fd())
+        .map_err(|error| eyre!("setting overlayfs {key} failed: {error}"))
 }
 
 fn open_overlay_dir(path: &Path) -> Result<OwnedFd> {

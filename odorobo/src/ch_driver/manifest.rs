@@ -77,15 +77,7 @@ pub fn to_vm_config(manifest: &VmManifest) -> Result<VmConfig> {
             1024,
         );
         rootfs.id = Some("odorobo-rootfs".to_owned());
-        let config_socket = containers::config_socket_path_for(&manifest.id.to_string());
-        let mut config = FsConfig::new(
-            containers::CONFIG_TAG.to_owned(),
-            config_socket.display().to_string(),
-            1,
-            1024,
-        );
-        config.id = Some("odorobo-config".to_owned());
-        vec![rootfs, config]
+        vec![rootfs]
     });
     let kernel = desired
         .boot
@@ -254,20 +246,15 @@ mod tests {
         });
         let config = to_vm_config(&manifest).expect("rootfs manifest converts");
 
-        // fs devices: rootfs + config, both sockets in the runtime dir
+        // one fs device: the share carries the rootfs and the image config
         let fs = config.fs.as_ref().expect("fs device for rootfs");
-        assert_eq!(fs.len(), 2);
+        assert_eq!(fs.len(), 1);
         assert_eq!(fs[0].tag, "rootfs");
         assert_eq!(
             fs[0].socket,
             format!("/run/odorobo/vms/{}/rootfs.sock", manifest.id)
         );
         assert_eq!(fs[0].num_queues, 1);
-        assert_eq!(fs[1].tag, "odorobo-config");
-        assert_eq!(
-            fs[1].socket,
-            format!("/run/odorobo/vms/{}/odorobo-config.sock", manifest.id)
-        );
 
         // vhost-user requires shared guest memory
         assert_eq!(config.memory.expect("memory").shared, Some(true));

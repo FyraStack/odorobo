@@ -8,22 +8,23 @@ the init mounts the root filesystem itself.
 
 ## How the OCI config reaches the guest
 
-Cloud Hypervisor has no payload channel besides the initramfs, so the config
-arrives on a second read-only virtiofs share.
+The config is part of the guest's root filesystem, so it needs no share of its
+own: the host writes it as the second lower layer of the composefs overlay it
+mounts for the VM.
 
-1. Image preparation reads the config blob (`read_oci_manifest` in
-   `odorobo/src/ch_driver/containers/oci.rs`) and keeps the bytes in
-   `PreparedImage::config`.
-2. `VMActor::start` writes them to
-   `/run/odorobo/vms/<vmid>/config/config.json` before creating the VM
-   (`odorobo/src/ch_driver/actor.rs`).
-3. A second `virtiofsd` serves that directory with tag `odorobo-config` and
-   socket `/run/odorobo/vms/<vmid>/odorobo-config.sock`.
-4. `odorobo/src/ch_driver/manifest.rs` adds the matching `FsConfig`, so the
-   guest sees two shares: `rootfs` and `odorobo-config`.
-5. The init mounts the config share read-only at `/run/.odorobo`, reads
-   `/run/.odorobo/config.json` (1 MiB limit), and parses it before mounting the
-   image at `/newroot`.
+1. Image preparation reads the config blob through the composefs repository
+   (`read_config` in `odorobo/src/ch_driver/containers/repo.rs`) and keeps the
+   bytes in `PreparedImage::config`.
+2. `mount_rootfs_owned` writes them to `/run/odorobo/vms/<vmid>/config/` and
+   passes that directory to `repo::mount_image`, which builds one overlayfs
+   mount out of the image's EROFS object, this directory, and the repository's
+   object store (`odorobo/src/ch_driver/containers/repo.rs`).
+3. A writable mode adds the per-VM upper and work directories; `read_only`
+   mounts only the two lowers.
+4. One `virtiofsd` serves the mounted root with tag `rootfs` and socket
+   `/run/odorobo/vms/<vmid>/rootfs.sock`, so the guest sees a single share.
+5. The init mounts that share at `/newroot`, reads `/.odorobo-config.json`
+   (1 MiB limit) from it, and parses it before chrooting into the same root.
 
 The bytes are not rewritten. The init uses only the `config` object and ignores
 `architecture`, `os`, `rootfs`, and `history`. A missing share, unreadable file,
@@ -80,9 +81,8 @@ No manifest field overrides the image's `Env`, `Cmd`, or `User` yet.
 
 1. The kernel runs `/init`; it recreates `/dev/console` and takes over stdio.
 2. It marks its mounts private, then mounts `devtmpfs`, `proc`, and `sysfs`.
-3. It mounts `odorobo-config` and parses `config.json`.
-4. It mounts `rootfs` at `/newroot`, moves the pseudo filesystems in, and
-   chroots to `/`.
+3. It mounts the `rootfs` share at `/newroot` and parses `.odorobo-config.json`.
+4. It moves the pseudo filesystems into `/newroot` and chroots to `/`.
 5. It forks, applies `User`, and execs `Entrypoint` + `Cmd`.
 6. It reaps children, forwards `SIGTERM`, `SIGINT`, `SIGQUIT`, and `SIGHUP` to
    the process group, and powers off when the main child exits. The child's
@@ -101,8 +101,9 @@ archive holds only `init`. The root `justfile` has the same recipe.
 ## Debugging
 
 - Console (`console=ttyS0`): kernel messages, then `odorobo-init:` lines.
-- Input: `/run/odorobo/vms/<vmid>/config/config.json`.
-- Share log: `/run/odorobo/vms/<vmid>/virtiofsd-config.log`.
+- Input: `/run/odorobo/vms/<vmid>/config/.odorobo-config.json`, visible to the
+  guest as `/.odorobo-config.json`.
+- Share log: `/run/odorobo/vms/<vmid>/virtiofsd.log`.
 - Boot test: `cargo test -p odorobo --bin odorobo oci_rootfs_vm_boots -- --ignored --nocapture`.
   It uses a fixture image with `Entrypoint: ["/bin/sh"]` and needs `/dev/kvm` and
   root access to `/var/lib/odorobo`.

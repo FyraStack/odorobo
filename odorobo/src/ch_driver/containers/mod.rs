@@ -24,9 +24,7 @@ mod virtiofs;
 
 pub use mount::{PreparedImage, mount_rootfs_owned, prepare_image, unmount_rootfs};
 pub use persistent::{PERSISTENT_OPERATIONS, RBD_RESERVATIONS, delete_persistent_rootfs};
-pub use virtiofs::{
-    VirtioFsSupervisor, VirtiofsdSpec, config_socket_path_for, socket_path_for, virtiofsd_path,
-};
+pub use virtiofs::{VirtioFsSupervisor, VirtiofsdSpec, socket_path_for, virtiofsd_path};
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -38,9 +36,14 @@ use crate::manifest::RootfsMode;
 /// virtiofs mount tag the guest root is served under.
 pub const ROOTFS_TAG: &str = "rootfs";
 
-/// virtiofs share carrying the OCI image config document (`config.json`) to
-/// the guest init, which applies its entrypoint, env, workdir and user.
-pub const CONFIG_TAG: &str = "odorobo-config";
+/// File the host writes into a VM's writable rootfs layer; the guest init
+/// reads the image's OCI config document from it.
+pub const CONFIG_FILE_NAME: &str = ".odorobo-config.json";
+
+/// Guest root mount point, also the directory served by the rootfs virtiofsd.
+pub fn rootfs_mount_path_for(vmid: &str) -> PathBuf {
+    crate::ch_driver::VMInstance::runtime_dir_for(vmid).join(ROOTFS_TAG)
+}
 
 /// The tiny custom microvm kernel built by
 /// `scripts/build-microvm-kernel.sh` (issue #112 buildconfig).

@@ -12,10 +12,9 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use crate::image::{ImageConfig, ImageConfigDocument};
 
 const ROOTFS_TAG: &CStr = c"rootfs";
-const CONFIG_TAG: &CStr = c"odorobo-config";
-const CONFIG_MOUNT: &str = "/run/.odorobo";
-const CONFIG_FILE: &str = "/run/.odorobo/config.json";
 const ROOT_MOUNT: &str = "/newroot";
+/// The host writes the image's OCI config into the rootfs's writable layer.
+const CONFIG_FILE: &str = "/newroot/.odorobo-config.json";
 const MAX_CONFIG_BYTES: usize = 1 << 20;
 const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
@@ -135,7 +134,7 @@ fn child_main(config: &ImageConfig) -> ! {
 /// Mounts the pseudo filesystems and the image, reads the workload config,
 /// then makes the image root this process's root.
 fn mount_image() -> io::Result<ImageConfig> {
-    for directory in ["/proc", "/sys", "/dev", CONFIG_MOUNT, ROOT_MOUNT] {
+    for directory in ["/proc", "/sys", "/dev", ROOT_MOUNT] {
         fs::create_dir_all(directory)
             .map_err(|err| with_context(err, format!("creating {directory}")))?;
     }
@@ -157,21 +156,12 @@ fn mount_image() -> io::Result<ImageConfig> {
         None,
     )?;
 
-    // The config share is small and read-only; read it before chroot, since
-    // it stays outside the new root.
-    mount_fs(
-        Some(CONFIG_TAG),
-        CONFIG_MOUNT,
-        Some(c"virtiofs"),
-        libc::MS_RDONLY,
-        None,
-    )
-    .map_err(|err| with_context(err, format!("mounting the {CONFIG_MOUNT} share")))?;
-    let config =
-        read_config().map_err(|err| with_context(err, format!("reading {CONFIG_FILE}")))?;
-
     mount_fs(Some(ROOTFS_TAG), ROOT_MOUNT, Some(c"virtiofs"), 0, None)
         .map_err(|err| with_context(err, format!("mounting the image at {ROOT_MOUNT}")))?;
+    // The config file is part of the image root's writable layer; read it
+    // here, while the mount is still reachable from the initramfs root.
+    let config =
+        read_config().map_err(|err| with_context(err, format!("reading {CONFIG_FILE}")))?;
 
     for mount in ["/proc", "/sys", "/dev"] {
         let target = format!("{ROOT_MOUNT}{mount}");
