@@ -1,34 +1,35 @@
+//! Local messages handled by the network actor.
+
+use std::net::Ipv4Addr;
+
+use kameo::Reply;
 use ulid::Ulid;
 
+use crate::network::{Network, NetworkProvider};
 use crate::ports::PortMapping;
 
-/// Ensures the agent-global networking state is present and configured.
+/// Attaches a NIC TAP device to a network.
 ///
-/// This is intended for local actor-to-actor use inside the agent process and
-/// should not be exposed as a remote/shared message.
-#[derive(Debug, Clone, Default)]
-pub struct EnsureHostNetwork;
-
-/// Attaches a Cloud Hypervisor-created TAP device to the agent-managed network.
-///
-/// The TAP device is expected to already exist by the time this message is sent,
-/// typically from a post-boot provisioning hook once runtime interface details
-/// are known.
+/// The TAP device is created by Cloud Hypervisor when the VM boots and is
+/// configured by the network actor.
 #[derive(Debug, Clone)]
-pub struct AttachTap {
-    /// VM identifier for logging and future bookkeeping.
+pub struct AttachNic {
+    /// VM identifier for logging and bookkeeping.
     pub vmid: Ulid,
+    /// Network the NIC joins.
+    pub network_id: String,
     /// Host TAP device name created for this VM by Cloud Hypervisor.
     pub tap_name: String,
+    /// MAC address used for DHCP lease lookups on bridged networks.
+    pub mac_address: Option<String>,
+    /// Static guest address; required on routed networks.
+    pub address: Option<Ipv4Addr>,
 }
 
-/// Detaches a TAP device from the agent-managed network.
-///
-/// This is optional for now, but defining it up front keeps the local message
-/// API stable when stop-time cleanup is added later.
+/// Detaches a NIC TAP device from whichever network holds it.
 #[derive(Debug, Clone)]
-pub struct DetachTap {
-    /// VM identifier for logging and future bookkeeping.
+pub struct DetachNic {
+    /// VM identifier for logging and bookkeeping.
     pub vmid: Ulid,
     /// Host TAP device name previously attached for this VM.
     pub tap_name: String,
@@ -36,8 +37,9 @@ pub struct DetachTap {
 
 /// Publishes host ports to a booted guest.
 ///
-/// The guest address is resolved from the dnsmasq lease for `mac_address`,
-/// so publishing completes once the guest has obtained its DHCP lease.
+/// The guest address comes from the attached NIC on a routed network, or from
+/// the dnsmasq lease for `mac_address` on a bridged network. Publishing
+/// completes once the address is known.
 #[derive(Debug, Clone)]
 pub struct PublishPorts {
     pub vmid: Ulid,
@@ -51,26 +53,48 @@ pub struct UnpublishPorts {
     pub vmid: Ulid,
 }
 
+/// Looks up a network object on the local agent.
+#[derive(Debug, Clone)]
+pub struct LookupNetwork {
+    /// Network identifier.
+    pub id: String,
+}
+
+/// Reply to [`LookupNetwork`].
+#[derive(Debug, Clone, Reply)]
+pub struct LookupNetworkReply {
+    pub network: Option<Network>,
+}
+
 /// Requests a snapshot of the local networking actor state.
 #[derive(Debug, Clone, Default)]
 pub struct Status;
 
 /// Local networking status snapshot returned by the networking actor.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Reply)]
 pub struct NetworkStatus {
-    /// Whether host-global networking initialization has completed successfully.
-    pub initialized: bool,
-    /// Configured bridge device managed by the actor, if any.
-    pub bridge: Option<String>,
-    /// TAP devices currently tracked as attached to the managed bridge.
-    pub attached_taps: Vec<AttachedTap>,
+    /// Realized networks.
+    pub networks: Vec<NetworkSummary>,
 }
 
-/// Bookkeeping entry for an attached TAP device.
+/// Bookkeeping for one realized network.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AttachedTap {
-    /// VM identifier associated with the TAP.
+pub struct NetworkSummary {
+    /// Network identifier.
+    pub id: String,
+    /// Realization mode.
+    pub provider: NetworkProvider,
+    /// NICs currently attached to the network.
+    pub members: Vec<AttachedNic>,
+}
+
+/// Bookkeeping entry for an attached NIC.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachedNic {
+    /// VM identifier associated with the NIC.
     pub vmid: Ulid,
     /// Host TAP device name.
     pub tap_name: String,
+    /// Static guest address, if any.
+    pub address: Option<Ipv4Addr>,
 }

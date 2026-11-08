@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::image::{ImageConfig, ImageConfigDocument};
+use crate::net;
 use tracing::{error, info, warn};
 
 const ROOTFS_TAG: &CStr = c"rootfs";
@@ -113,6 +114,20 @@ fn run_pid1() -> io::Result<i32> {
         dump_kernel_log();
     }
     let workload = mount_image()?;
+    if let Err(err) = net::configure(&workload.network) {
+        warn!(%err, "static network configuration failed; continuing without it");
+    } else if !workload.network.is_empty() {
+        info!(
+            interfaces = workload.network.len(),
+            "applied static network configuration"
+        );
+    }
+    if let Some(hostname) = &workload.hostname {
+        match set_hostname(hostname) {
+            Ok(()) => info!(hostname, "hostname set"),
+            Err(err) => warn!(%err, hostname, "cannot set the hostname"),
+        }
+    }
     let read_fd = signal_pipe()?;
     install_signal_handlers()?;
 
@@ -356,6 +371,55 @@ fn mount_early_filesystems() -> io::Result<()> {
 struct Workload {
     process: ImageConfig,
     stdin: bool,
+    network: Vec<net::InterfaceConfig>,
+    hostname: Option<String>,
+}
+
+/// Sets the UTS hostname the workload and its children see.
+fn set_hostname(name: &str) -> io::Result<()> {
+    // SAFETY: the name is a valid byte slice and its length is passed.
+    let result = unsafe { libc::sethostname(name.as_ptr().cast(), name.len()) };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Parses the document's static interface configuration.
+fn interface_configs(document: &ImageConfigDocument) -> io::Result<Vec<net::InterfaceConfig>> {
+    document
+        .network()
+        .iter()
+        .map(|nic| {
+            let addresses = nic
+                .addresses
+                .iter()
+                .map(|address| {
+                    address.parse().map_err(|err| {
+                        with_context(err, format!("address {address:?} on {}", nic.mac))
+                    })
+                })
+                .collect::<io::Result<Vec<_>>>()?;
+            let gateway = nic
+                .gateway
+                .as_deref()
+                .map(|gateway| {
+                    gateway.parse::<std::net::IpAddr>().map_err(|err| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("invalid gateway {gateway:?} on {}: {err}", nic.mac),
+                        )
+                    })
+                })
+                .transpose()?;
+            Ok(net::InterfaceConfig {
+                mac: nic.mac.clone(),
+                addresses,
+                gateway,
+                mtu: nic.mtu,
+            })
+        })
+        .collect()
 }
 
 fn mount_image() -> io::Result<Workload> {
@@ -368,6 +432,13 @@ fn mount_image() -> io::Result<Workload> {
         read_config().map_err(|err| with_context(err, format!("reading {CONFIG_FILE}")))?;
     let stdin = document.stdin();
     let upper_bytes = document.tmpfs_upper_bytes();
+    let network = interface_configs(&document).map_err(|err| {
+        with_context(
+            err,
+            format!("reading the static network configuration from {CONFIG_FILE}"),
+        )
+    })?;
+    let hostname = document.hostname().map(str::to_owned);
     let config = document.config;
 
     // The workload root: the image share itself, or an overlay that keeps the
@@ -395,6 +466,8 @@ fn mount_image() -> io::Result<Workload> {
     Ok(Workload {
         process: config,
         stdin,
+        network,
+        hostname,
     })
 }
 

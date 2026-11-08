@@ -350,6 +350,7 @@ fn vm_cleanup_unplaces_vm_without_another_discovered_actor() {
         agent_vm_index: AHashMap::new(),
         actor_kinds: AHashMap::new(),
         cache_actor_finder: None,
+        networks: AHashMap::new(),
     };
 
     scheduler.cleanup_vm_actor(vm_actor_id);
@@ -429,6 +430,7 @@ fn explicit_stop_removes_vm_intent_and_actor_mapping() {
         agent_vm_index: AHashMap::from([(agent_id, AHashSet::from([vmid]))]),
         actor_kinds: AHashMap::new(),
         cache_actor_finder: None,
+        networks: AHashMap::new(),
     };
 
     scheduler.suppress_vm_intent(vmid);
@@ -478,6 +480,7 @@ fn agent_cleanup_does_not_remove_unrelated_vm_state() {
         agent_vm_index: AHashMap::new(),
         actor_kinds: AHashMap::from([(agent_id, CachedActorKind::Agent)]),
         cache_actor_finder: None,
+        networks: AHashMap::new(),
     };
 
     scheduler.cleanup_agent_actor(agent_id);
@@ -507,6 +510,7 @@ fn vm_cleanup_does_not_remove_unrelated_agent_state() {
         agent_vm_index: AHashMap::new(),
         actor_kinds: AHashMap::from([(agent_id, CachedActorKind::Agent)]),
         cache_actor_finder: None,
+        networks: AHashMap::new(),
     };
 
     scheduler.cleanup_vm_actor(vm_actor_id);

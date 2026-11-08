@@ -1,3 +1,4 @@
+pub mod networks;
 pub mod nodes;
 pub mod repository;
 pub mod vms;
@@ -41,6 +42,7 @@ where
         .api_route("/health", get(health))
         .api_route("/swagger", Swagger::new("/openapi.json").axum_route())
         .api_route("/openapi.json", get(serve_api))
+        .nest("/networks", networks::router().with_state(state.clone()))
         .nest("/nodes", nodes::router().with_state(state.clone()))
         .nest(
             "/repository",

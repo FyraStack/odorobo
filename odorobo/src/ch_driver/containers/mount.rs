@@ -23,7 +23,7 @@ use super::persistent::{
 use super::process::{TOOL_OPERATIONS, Tool};
 use super::repo;
 use super::{
-    CONFIG_FILE_NAME, GuestLaunchOptions, PERSISTENT_ROOTFS_ROOT, PreparedRootfs,
+    CONFIG_FILE_NAME, GuestLaunchOptions, GuestNicOptions, PERSISTENT_ROOTFS_ROOT, PreparedRootfs,
     guest_config_document, rootfs_mount_path_for, validate_vmid,
 };
 use crate::manifest::{Rootfs, RootfsMode};
@@ -90,7 +90,7 @@ pub(super) async fn mount_rootfs(vmid: &str, rootfs: &Rootfs) -> Result<Prepared
     let pin = pinned_image_digest(vmid, rootfs).await?;
     let image = prepare_image(rootfs, pin.as_deref()).await?;
     let mut owner = None;
-    match mount_rootfs_owned(vmid, rootfs, &image, &mut owner).await {
+    match mount_rootfs_owned(vmid, rootfs, &image, &[], &mut owner).await {
         Ok(()) => Ok(owner.unwrap()),
         Err(err) => {
             if let Some(prepared) = owner.as_ref() {
@@ -162,6 +162,7 @@ pub async fn mount_rootfs_owned(
     vmid: &str,
     rootfs: &Rootfs,
     image: &PreparedImage,
+    network: &[GuestNicOptions],
     owner: &mut Option<PreparedRootfs>,
 ) -> Result<()> {
     let (runtime_dir, root_mount) = claim_rootfs(vmid, rootfs, image, owner).await?;
@@ -172,7 +173,7 @@ pub async fn mount_rootfs_owned(
     prepared.upper.clone_from(&upper.upper);
     prepared.work.clone_from(&upper.work);
 
-    let config_dir = write_guest_config(image, rootfs, &runtime_dir).await?;
+    let config_dir = write_guest_config(vmid, image, rootfs, network, &runtime_dir).await?;
     mount_layers(image, rootfs, &root_mount, &config_dir, &upper).await?;
     mount_scratch(rootfs, &root_mount, owner).await?;
     info!(
@@ -245,8 +246,10 @@ async fn record_rbd_inventory(
 /// Compose the guest config document and return the directory serving it as
 /// the root's second lower layer.
 async fn write_guest_config(
+    vmid: &str,
     image: &PreparedImage,
     rootfs: &Rootfs,
+    network: &[GuestNicOptions],
     runtime_dir: &Path,
 ) -> Result<PathBuf> {
     // The image carries no config document of its own, so the OCI config is a
@@ -260,6 +263,8 @@ async fn write_guest_config(
             .then(|| policy().ephemeral_upper.as_u64()),
         entrypoint: rootfs.entrypoint.clone(),
         cmd: rootfs.cmd.clone(),
+        network: network.to_vec(),
+        hostname: Some(vmid.to_owned()),
     };
     let document = guest_config_document(image.config(), &launch)?;
     tokio::fs::write(config_dir.join(CONFIG_FILE_NAME), document).await?;
@@ -711,7 +716,7 @@ mod tests {
         };
         let image = prepare_image(&rootfs, None).await.unwrap();
         assert!(
-            mount_rootfs_owned(&vmid, &rootfs, &image, &mut owner)
+            mount_rootfs_owned(&vmid, &rootfs, &image, &[], &mut owner)
                 .await
                 .is_err()
         );

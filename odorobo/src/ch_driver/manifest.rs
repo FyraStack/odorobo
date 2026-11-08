@@ -314,9 +314,10 @@ mod tests {
     #[test]
     fn converts_networks_for_the_transform_pipeline() {
         let mut manifest = minimal();
-        manifest.desired.networks.push(crate::manifest::Network {
+        manifest.desired.networks.push(crate::manifest::Nic {
             id: "private".to_owned(),
             mac_address: Some("02:00:00:00:00:01".to_owned()),
+            address: None,
             ports: Vec::new(),
         });
         let config = to_vm_config(&manifest).expect("network manifest converts");

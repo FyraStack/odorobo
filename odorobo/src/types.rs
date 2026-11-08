@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::manifest::VmManifest;
+use crate::network::Network;
 
 mod bytesize_as_u64 {
     use bytesize::ByteSize;
@@ -44,6 +45,18 @@ mod opt_bytesize_as_u64 {
 #[repr(transparent)]
 #[derive(Serialize, Deserialize, Debug, JsonSchema, OperationIo, Default, Clone)]
 pub struct VmId(#[schemars(with = "String")] pub Ulid);
+
+/// Network ID, as defined on the network object
+#[repr(transparent)]
+#[derive(Serialize, Deserialize, Debug, JsonSchema, OperationIo, Default, Clone)]
+pub struct NetworkId(pub String);
+
+/// Request body for creating a network object
+#[derive(Serialize, Deserialize, Debug, JsonSchema, OperationIo, Clone)]
+pub struct CreateNetworkRequest {
+    /// The network to create.
+    pub network: Network,
+}
 
 /// Volume ID, in the format of ULID
 #[repr(transparent)]

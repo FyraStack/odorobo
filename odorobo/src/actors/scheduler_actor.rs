@@ -18,6 +18,7 @@
 mod cache;
 mod discovery;
 mod handlers;
+mod networks;
 mod scheduling;
 
 #[cfg(test)]
@@ -35,6 +36,7 @@ use crate::ch_driver::actor::VMActor;
 use crate::manifest::VmManifest;
 use crate::messages::agent::{AgentStatus, AgentStatusUpdate};
 use crate::messages::vm::GetVMInfoReply;
+use crate::network::Network;
 
 /// Internal discovery event that starts VM polling for a newly found actor.
 #[derive(Debug)]
@@ -163,6 +165,10 @@ pub struct SchedulerActor {
     agent_vm_index: AHashMap<ActorId, AHashSet<Ulid>>,
     /// Classifies linked actors so link-death cleanup affects the owning cache only.
     actor_kinds: AHashMap<ActorId, CachedActorKind>,
+    /// Network objects created through the manager API, keyed by network ID.
+    ///
+    /// Ephemeral process memory, not a durable source of truth.
+    pub networks: AHashMap<String, Network>,
     /// Background discovery and reconciliation task.
     pub cache_actor_finder: Option<JoinHandle<()>>,
 }

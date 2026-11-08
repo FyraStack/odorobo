@@ -187,7 +187,7 @@ At the moment, the `net://` transformer is intentionally conservative:
 
 - It only interprets `net://<network_id>` in the network device `id` field.
 - It does not currently resolve arbitrary remote or provider-backed virtual networks.
-- It does not currently create a higher-level virtual network inventory or multi-tenant network object model.
+- It does not currently create a higher-level virtual network inventory or multi-tenant network object model. The design for that model lives in `docs/network.md`.
 - It relies on deterministic TAP naming instead of Cloud Hypervisor runtime TAP discovery, because Cloud Hypervisor does not reliably reflect auto-generated TAP device names back into VM info after boot.
 
 This makes the current networking integration a practical first step: Odorobo can transform user-friendly network references into stable Cloud Hypervisor network config while keeping host-side naming deterministic and debuggable.

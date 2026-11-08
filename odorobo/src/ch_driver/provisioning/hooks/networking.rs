@@ -11,13 +11,16 @@ use ulid::Ulid;
 
 use crate::networking::{
     actor::NetworkAgentActor,
-    messages::{AttachTap, DetachTap, UnpublishPorts},
+    messages::{DetachNic, UnpublishPorts},
 };
 
 use super::ProvisioningHook;
 
-/// Provisioning hook that attaches Cloud Hypervisor TAP devices to the
-/// agent-managed bridge after the VM has booted.
+/// Provisioning hook that releases network resources before a VM stops.
+///
+/// TAP attachment happens in the VM actor: Cloud Hypervisor creates the TAP
+/// while booting and the agent asks the network actor to configure it right
+/// after boot, before the guest can transmit.
 pub struct NetworkProvisioningHook;
 
 async fn network_agent() -> Result<ActorRef<NetworkAgentActor>> {
@@ -42,43 +45,8 @@ fn tap_names(info: &VmInfo) -> Vec<String> {
 
 #[async_trait]
 impl ProvisioningHook for NetworkProvisioningHook {
-    // Only Odorobo-managed `net://` network IDs participate in bridge attach/detach
+    // Only Odorobo-managed `net://` network IDs participate in NIC detach
     // handling here. Other network devices are left alone.
-    async fn after_boot(&self, vmid: &str, config: &VmInfo) -> Result<()> {
-        let vmid = Ulid::from_string(vmid)
-            .map_err(|err| eyre!("invalid vmid {vmid}: {err}"))
-            .wrap_err("failed to parse vmid for networking hook")?;
-
-        let taps = tap_names(config);
-        info!(
-            vmid = %vmid,
-            tap_count = taps.len(),
-            "networking after_boot hook invoked for Odorobo-managed net:// TAP devices"
-        );
-        if taps.is_empty() {
-            info!(vmid = %vmid, "no TAP devices present after boot, skipping network attach");
-            return Ok(());
-        }
-
-        let network_actor = network_agent()
-            .await
-            .wrap_err("failed to look up network actor")?;
-
-        for tap_name in taps {
-            info!(vmid = %vmid, tap = %tap_name, "sending AttachTap to network actor");
-            network_actor
-                .ask(AttachTap {
-                    vmid,
-                    tap_name: tap_name.clone(),
-                })
-                .await
-                .map_err(|err| eyre!(err))
-                .wrap_err_with(|| format!("failed to send AttachTap for tap {tap_name}"))?;
-        }
-
-        Ok(())
-    }
-
     async fn before_stop(&self, vmid: &str, config: &VmInfo) -> Result<()> {
         let vmid = Ulid::from_string(vmid)
             .map_err(|err| eyre!("invalid vmid {vmid}: {err}"))
@@ -107,20 +75,20 @@ impl ProvisioningHook for NetworkProvisioningHook {
         }
 
         if taps.is_empty() {
-            info!(vmid = %vmid, "no TAP devices present before stop, skipping network detach");
+            info!(vmid = %vmid, "no TAP devices present before stop, skipping NIC detach");
             return Ok(());
         }
 
         for tap_name in taps {
-            info!(vmid = %vmid, tap = %tap_name, "sending DetachTap to network actor");
+            info!(vmid = %vmid, tap = %tap_name, "sending DetachNic to network actor");
             network_actor
-                .ask(DetachTap {
+                .ask(DetachNic {
                     vmid,
                     tap_name: tap_name.clone(),
                 })
                 .await
                 .map_err(|err| eyre!(err))
-                .wrap_err_with(|| format!("failed to send DetachTap for tap {tap_name}"))?;
+                .wrap_err_with(|| format!("failed to send DetachNic for tap {tap_name}"))?;
         }
 
         Ok(())

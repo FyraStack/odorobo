@@ -48,6 +48,7 @@ impl Actor for SchedulerActor {
             pending_resources_cache: None,
             agent_vm_index: AHashMap::new(),
             actor_kinds: AHashMap::new(),
+            networks: AHashMap::new(),
             cache_actor_finder: None,
         };
 

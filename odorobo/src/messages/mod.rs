@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod agent;
 pub mod debug;
+pub mod network;
 pub mod vm;
 
 /// A request to ping the server (keepalive)

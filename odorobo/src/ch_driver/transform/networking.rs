@@ -75,23 +75,10 @@ fn rewrite_net_config(vmid: &str, net: &mut NetConfig) -> Result<()> {
 }
 
 fn validate_network_id(network_id: &str) -> Result<()> {
-    if network_id.is_empty() {
-        return Err(eyre!("network id must not be empty"));
-    }
-
-    if !network_id
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
-        return Err(eyre!(
-            "network id must contain only ASCII alphanumeric characters, '-' or '_'"
-        ));
-    }
-
-    Ok(())
+    crate::network::validate_network_id(network_id).map_err(|err| eyre!(err.to_string()))
 }
 
-fn deterministic_tap_name(vmid: &str, network_id: &str) -> String {
+pub fn deterministic_tap_name(vmid: &str, network_id: &str) -> String {
     let mut vmid_part = sanitize_component(vmid);
     let mut network_part = sanitize_component(network_id);
 

@@ -9,6 +9,7 @@
 
 mod image;
 mod init;
+mod net;
 
 use std::process::ExitCode;
 

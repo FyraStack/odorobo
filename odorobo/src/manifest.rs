@@ -140,7 +140,7 @@ pub struct DesiredState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rootfs: Option<Rootfs>,
     #[serde(default)]
-    pub networks: Vec<Network>,
+    pub networks: Vec<Nic>,
     #[serde(default)]
     pub placement: Placement,
     pub boot: Boot,
@@ -305,27 +305,27 @@ impl DesiredState {
     fn validate_networks(&self) -> Result<(), ManifestError> {
         trace!(networks = self.networks.len(), "validating networks");
         let mut published_ports = BTreeSet::new();
-        for (index, network) in self.networks.iter().enumerate() {
+        for (index, nic) in self.networks.iter().enumerate() {
             trace!(
                 index,
-                id = %network.id,
-                ports = network.ports.len(),
-                mac = network.mac_address.is_some(),
+                id = %nic.id,
+                ports = nic.ports.len(),
+                mac = nic.mac_address.is_some(),
                 "validating network"
             );
-            if network.id.trim().is_empty() {
+            if nic.id.trim().is_empty() {
                 return Err(ManifestError::NetworkWithoutId(index));
             }
-            if network.ports.is_empty() {
+            if nic.ports.is_empty() {
                 continue;
             }
             if self.rootfs.is_none() {
                 return Err(ManifestError::PortForwardingRequiresRootfs(index));
             }
-            if network.mac_address.is_none() {
+            if nic.mac_address.is_none() {
                 return Err(ManifestError::PortForwardingWithoutMac(index));
             }
-            for port in &network.ports {
+            for port in &nic.ports {
                 if !published_ports.insert((port.protocol, port.host)) {
                     return Err(ManifestError::DuplicatePublishedPort(port.host));
                 }
@@ -461,10 +461,14 @@ pub enum RootfsMode {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct Network {
+pub struct Nic {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mac_address: Option<String>,
+    /// Static guest address for routed networks; allocated by the control plane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<String>")]
+    pub address: Option<std::net::Ipv4Addr>,
     /// Published ports for OCI-mode VMs, in `<host>:<guest>[/udp]` form.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(with = "Vec<String>")]
@@ -859,9 +863,10 @@ mod tests {
     #[test]
     fn validates_published_ports() {
         let mut manifest = minimal_manifest();
-        manifest.desired.networks.push(Network {
+        manifest.desired.networks.push(Nic {
             id: "private".to_owned(),
             mac_address: Some("02:00:00:00:00:01".to_owned()),
+            address: None,
             ports: vec!["8080:80".parse().expect("valid mapping")],
         });
         assert_eq!(
@@ -905,7 +910,7 @@ mod tests {
     #[test]
     fn rejects_invalid_network_and_cloud_init() {
         let mut manifest = minimal_manifest();
-        manifest.desired.networks.push(Network {
+        manifest.desired.networks.push(Nic {
             id: "  ".to_owned(),
             ..Default::default()
         });
