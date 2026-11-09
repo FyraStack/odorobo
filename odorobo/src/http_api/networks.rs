@@ -41,15 +41,15 @@ async fn create_network(
     Json(request): Json<CreateNetworkRequest>,
 ) -> Result<impl IntoApiResponse, OdoroboError> {
     let network = request.network;
-
-    let reply = state
-        .ask(CreateNetwork {
-            network: network.clone(),
-        })
-        .await?;
+    let reply = state.ask(CreateNetwork { network }).await?;
     if let Some(error) = reply.error {
         return Err(OdoroboError::BadRequest(error));
     }
+    let Some(network) = reply.network else {
+        return Err(OdoroboError::Report(stable_eyre::Report::msg(
+            "the manager created no network",
+        )));
+    };
 
     Ok(Json(network))
 }

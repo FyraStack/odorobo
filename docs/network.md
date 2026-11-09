@@ -23,11 +23,11 @@ The guest-side contract keeps production's shapes, split by what the address is:
 | `mtu` | default `1450` (VXLAN tax), must reach the guest NIC |
 | `bridge`, `dhcp`, `upstream` | bridged networks only: bridge name, DHCP pool, NAT upstream |
 
-The VNI is **not** desired state. The manager assigns it to routed networks and reports it as status, the way a scheduler reports a binding; operators never supply it. Every reference to a network — VM attachments, logs, API paths, labels — uses its ULID (`id`), never the VNI. Nothing durable may depend on a VNI value: it is cluster-wide runtime state that can be re-created, and if a number is re-assigned, agents rebuild their local realization from scratch.
+The VNI is **not** desired state. The manager assigns it to routed networks and reports it as status, the way a scheduler reports a binding; operators never supply it. The assignment is a hash of the network `id` with linear probing over `20000-29999`, chosen clear of PVE SDN's `10001-11002`; agents take the assigned number from the network object and rebuild their local realization when it changes. Every reference to a network — VM attachments, logs, API paths, labels — uses its ULID (`id`), never the VNI. Nothing durable may depend on a VNI value: it is cluster-wide runtime state that can be re-created, and if a number is re-assigned, agents rebuild their local realization from scratch.
 
 No derived number may reach stored user state: VM manifests carry the network `id` and the resolved address, the guest config carries no numbers, and persistent rootfs state carries none. That is what keeps a renumber a rebuild instead of a migration.
 
-The manager knows networks through an ephemeral in-process registry (like VM intent today): `POST /networks` creates, `GET /networks` lists, `GET /networks/{id}` reads, `DELETE /networks/{id}` removes. Create fans the object out to every known agent and records it only once all of them accepted; delete refuses while any agent still has NICs attached. Persistence arrives with the rest of agent/manager state.
+The manager knows networks through an ephemeral in-process registry (like VM intent today): `POST /networks` creates, `GET /networks` lists, `GET /networks/{id}` reads, `DELETE /networks/{id}` removes. Create ignores any `state` the caller sent, assigns one for routed networks, returns the assigned object, fans it out to every known agent, and records it only once all of them accepted; delete refuses while any agent still has NICs attached. Persistence arrives with the rest of agent/manager state.
 
 **Per-VM attachment:** the existing manifest `networks[]` entry (today's `Network` struct) stays the per-VM NIC description and references the network object by ID. It carries resolved values only: MAC, addresses, delegated prefixes, ports. The agent never allocates addresses. The attachment struct should be renamed so it stops colliding with the new network object.
 
@@ -92,10 +92,9 @@ Rules:
 
 ## Open questions
 
-1. VNI allocation authority and range. The manager assigns them: hashed from the network id with a collision path, or allocated once and stored as status. The range must avoid PVE SDN's `10001-11002`. Re-assignment is legal because agents rebuild their realization and nothing outside the datapath refers to the number.
-2. Whether the network subnet is also advertised as an aggregate (for the edge to blackhole and for reachability when every VM of a network is off-node), or only per-VM routes.
-3. IPv6 model: per-VM `/128` plus delegated `/64`s (what production does today) versus one prefix per network.
-4. Egress and ingress: how a VPC reaches the internet, and how public `/32`s map to VPC addresses. Published ports do not reach routed VMs today: DNAT happens at prerouting, but the route lookup that follows uses the main table, which has no route into the VRF (it sends the packet out the default route). Either the edge handles ingress for routed tenants, or published addresses get a main-table route via the VRF master.
-5. How the edge routers (router-01/02) learn tenant networks, and what changes in `stack/ansible`.
-6. Whether realized-but-memberless networks are ever collected automatically, or only by an operator-triggered pass like repository GC.
-7. When to add kernel-state observation and drift reporting.
+1. Whether the network subnet is also advertised as an aggregate (for the edge to blackhole and for reachability when every VM of a network is off-node), or only per-VM routes.
+2. IPv6 model: per-VM `/128` plus delegated `/64`s (what production does today) versus one prefix per network.
+3. Egress and ingress: how a VPC reaches the internet, and how public `/32`s map to VPC addresses. Published ports do not reach routed VMs today: DNAT happens at prerouting, but the route lookup that follows uses the main table, which has no route into the VRF (it sends the packet out the default route). Either the edge handles ingress for routed tenants, or published addresses get a main-table route via the VRF master.
+4. How the edge routers (router-01/02) learn tenant networks, and what changes in `stack/ansible`.
+5. Whether realized-but-memberless networks are ever collected automatically, or only by an operator-triggered pass like repository GC.
+6. When to add kernel-state observation and drift reporting.

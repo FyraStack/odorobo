@@ -39,8 +39,10 @@ use ulid::Ulid;
 const NFT_TABLE: &str = "odorobo";
 const NFT_DNAT_CHAIN: &str = "container_dnat";
 const NFT_NIC_GUARD_CHAIN: &str = "nic_guard";
+const NFT_GUEST_NAT_CHAIN: &str = "guest_nat";
 const DNAT_PRIORITY: i32 = -100;
 const ANTISPOOF_PRIORITY: i32 = -150;
+const GUEST_NAT_PRIORITY: i32 = 100;
 const LEASE_TIMEOUT: Duration = Duration::from_secs(15);
 const LEASE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -154,6 +156,12 @@ struct NetworkEntry {
 }
 
 impl NetworkEntry {
+    fn has_member(&self, vmid: Ulid, tap_name: &str) -> bool {
+        self.members()
+            .iter()
+            .any(|member| member.vmid == vmid && member.tap_name == tap_name)
+    }
+
     fn members(&self) -> &[Member] {
         match &self.realized {
             Realized::Routed(state) => &state.members,
@@ -195,7 +203,7 @@ fn legacy_network(config: &NetworkConfig) -> Network {
         subnet,
         gateway: Some(gateway),
         provider: NetworkProvider::Bridged,
-        vni: None,
+        state: None,
         mtu: None,
         bridge: Some(bridge),
         dhcp: config.dhcp_config.as_ref().map(|dhcp| DhcpPool {
@@ -442,12 +450,18 @@ impl NetworkAgentActor {
         network.validate().map_err(|err| eyre!("{err}"))?;
 
         if let Some(existing) = self.networks.get(&network.id) {
-            if existing.network != network {
+            if !existing.network.same_desired(&network) {
                 return Err(eyre!(
                     "network {:?} already exists with different desired state",
                     network.id
                 ));
             }
+            if existing.network.vni() == network.vni() {
+                return Ok(());
+            }
+            // The manager reassigns VNIs per process lifetime; migrate the
+            // realization to the new VRF and re-attach the members.
+            self.reassign_vni(&network).await?;
             return Ok(());
         }
 
@@ -469,9 +483,103 @@ impl NetworkAgentActor {
         Ok(())
     }
 
+    /// Re-realizes a routed network under a newly assigned VNI.
+    async fn reassign_vni(&mut self, network: &Network) -> Result<(), Report> {
+        let Some(entry) = self.networks.remove(&network.id) else {
+            return Err(eyre!("network {:?} is not realized", network.id));
+        };
+        let Realized::Routed(state) = entry.realized else {
+            return Err(eyre!(
+                "network {:?} is bridged; its vni cannot change",
+                network.id
+            ));
+        };
+
+        for member in &state.members {
+            Self::detach_tap(&self.netlink_handle, &member.tap_name).await?;
+        }
+        Self::delete_vrf(&self.netlink_handle, &state).await?;
+
+        let realized = Realized::Routed(self.realize_routed(network).await?);
+        self.networks.insert(
+            network.id.clone(),
+            NetworkEntry {
+                network: network.clone(),
+                realized,
+            },
+        );
+
+        self.reattach_members(&network.id, &state.members).await?;
+
+        info!(
+            network_id = %network.id,
+            vni = ?network.vni(),
+            "reassigned network vni"
+        );
+        Ok(())
+    }
+
+    /// Detaches one tap, tolerating a tap that is already gone.
+    async fn detach_tap(handle: &Handle, tap_name: &str) -> Result<(), Report> {
+        Self::remove_antispoof_rules(tap_name)?;
+        if let Some(tap) = lookup_link(handle, tap_name).await? {
+            handle
+                .link()
+                .set(
+                    LinkUnspec::new_with_index(tap.header.index)
+                        .nocontroller()
+                        .build(),
+                )
+                .execute()
+                .await
+                .wrap_err_with(|| format!("failed to detach tap {tap_name}"))?;
+        }
+        Ok(())
+    }
+
+    async fn delete_vrf(handle: &Handle, state: &RoutedState) -> Result<(), Report> {
+        handle
+            .link()
+            .del(state.vrf_index)
+            .execute()
+            .await
+            .wrap_err_with(|| format!("failed to delete vrf device {}", state.vrf))?;
+        Ok(())
+    }
+
+    /// Re-attaches recorded members, skipping taps that no longer exist.
+    async fn reattach_members(
+        &mut self,
+        network_id: &str,
+        members: &[Member],
+    ) -> Result<(), Report> {
+        for member in members {
+            if lookup_link(&self.netlink_handle, &member.tap_name)
+                .await?
+                .is_none()
+            {
+                warn!(
+                    vmid = %member.vmid,
+                    tap = %member.tap_name,
+                    "tap is gone; not re-attaching it to the new vrf"
+                );
+                continue;
+            }
+            self.attach_nic(AttachNic {
+                vmid: member.vmid,
+                network_id: network_id.to_owned(),
+                tap_name: member.tap_name.clone(),
+                mac_address: member.mac_address.clone(),
+                address: member.address,
+            })
+            .await?;
+        }
+        Ok(())
+    }
+
     async fn realize_routed(&self, network: &Network) -> Result<RoutedState, Report> {
         let vni = network
-            .vni
+            .vni()
             .ok_or_else(|| eyre!("routed network {:?} requires a vni", network.id))?;
         let vrf = format!("vrf{vni}");
 
@@ -517,6 +625,22 @@ impl NetworkAgentActor {
         actor_ref: &ActorRef<Self>,
         network: &Network,
     ) -> Result<BridgedState, Report> {
+        let bridge = self.prepare_bridge(network).await?;
+        let lease_file = self.lease_file_for(&network.id);
+        if let Some(upstream) = &network.upstream {
+            Self::ensure_nat_rules(upstream)?;
+        }
+        let dhcp_actor = Self::start_dhcp(actor_ref, network, &bridge, &lease_file).await;
+
+        Ok(BridgedState {
+            bridge,
+            dhcp_actor,
+            lease_file,
+            members: Vec::new(),
+        })
+    }
+
+    async fn prepare_bridge(&self, network: &Network) -> Result<String, Report> {
         let bridge = network
             .bridge
             .clone()
@@ -530,31 +654,28 @@ impl NetworkAgentActor {
             network.subnet.prefix_len(),
         )
         .await?;
+        Ok(bridge)
+    }
 
-        let lease_file = self.lease_file_for(&network.id);
-        if let Some(upstream) = &network.upstream {
-            Self::ensure_nat_rules(&bridge, &network.subnet.to_string(), upstream)?;
-        }
-        let dhcp_actor = if let Some(dhcp) = &network.dhcp {
-            let config = DhcpConfig {
-                range: (dhcp.start, dhcp.end),
-                subnet: network.subnet,
-                lease_time: dhcp.lease_time.clone(),
-            };
-            Some(
-                DhcpActor::spawn_link(actor_ref, (config, bridge.clone(), lease_file.clone()))
-                    .await,
-            )
-        } else {
-            None
+    async fn start_dhcp(
+        actor_ref: &ActorRef<Self>,
+        network: &Network,
+        bridge: &str,
+        lease_file: &Path,
+    ) -> Option<ActorRef<DhcpActor>> {
+        let dhcp = network.dhcp.as_ref()?;
+        let config = DhcpConfig {
+            range: (dhcp.start, dhcp.end),
+            subnet: network.subnet,
+            lease_time: dhcp.lease_time.clone(),
         };
-
-        Ok(BridgedState {
-            bridge,
-            dhcp_actor,
-            lease_file,
-            members: Vec::new(),
-        })
+        Some(
+            DhcpActor::spawn_link(
+                actor_ref,
+                (config, bridge.to_owned(), lease_file.to_owned()),
+            )
+            .await,
+        )
     }
 
     async fn remove_network(&mut self, id: &str) -> Result<(), Report> {
@@ -577,12 +698,7 @@ impl NetworkAgentActor {
                 info!(network_id = %id, bridge = %state.bridge, "removed bridged network");
             }
             Realized::Routed(state) => {
-                self.netlink_handle
-                    .link()
-                    .del(state.vrf_index)
-                    .execute()
-                    .await
-                    .wrap_err_with(|| format!("failed to delete vrf device {}", state.vrf))?;
+                Self::delete_vrf(&self.netlink_handle, &state).await?;
                 info!(network_id = %id, vrf = %state.vrf, "removed routed network");
             }
         }
@@ -591,16 +707,10 @@ impl NetworkAgentActor {
     }
 
     async fn attach_nic(&mut self, msg: AttachNic) -> Result<(), Report> {
-        let alias = format!("odorobo {} {}", msg.vmid, msg.network_id);
         let Some(entry) = self.networks.get_mut(&msg.network_id) else {
             return Err(eyre!("unknown network {}", msg.network_id));
         };
-
-        if entry
-            .members()
-            .iter()
-            .any(|member| member.vmid == msg.vmid && member.tap_name == msg.tap_name)
-        {
+        if entry.has_member(msg.vmid, &msg.tap_name) {
             info!(
                 vmid = %msg.vmid,
                 tap = %msg.tap_name,
@@ -610,14 +720,7 @@ impl NetworkAgentActor {
             return Ok(());
         }
 
-        match &mut entry.realized {
-            Realized::Routed(state) => {
-                Self::attach_routed(&self.netlink_handle, state, &msg, &alias).await?;
-            }
-            Realized::Bridged(state) => {
-                Self::attach_bridged(&self.netlink_handle, state, &msg, &alias).await?;
-            }
-        }
+        Self::attach_to_network(&self.netlink_handle, entry, &msg).await?;
 
         info!(
             vmid = %msg.vmid,
@@ -628,11 +731,34 @@ impl NetworkAgentActor {
         Ok(())
     }
 
+    async fn attach_to_network(
+        handle: &Handle,
+        entry: &mut NetworkEntry,
+        msg: &AttachNic,
+    ) -> Result<(), Report> {
+        let address = match &entry.realized {
+            Realized::Routed(state) => {
+                Self::attach_routed(handle, state, msg).await?;
+                msg.address
+            }
+            Realized::Bridged(state) => {
+                Self::attach_bridged(handle, state, msg).await?;
+                None
+            }
+        };
+        entry.members_mut().push(Member {
+            vmid: msg.vmid,
+            tap_name: msg.tap_name.clone(),
+            mac_address: msg.mac_address.clone(),
+            address,
+        });
+        Ok(())
+    }
+
     async fn attach_routed(
         handle: &Handle,
-        state: &mut RoutedState,
+        state: &RoutedState,
         msg: &AttachNic,
-        alias: &str,
     ) -> Result<(), Report> {
         let address = msg.address.ok_or_else(|| {
             eyre!(
@@ -641,66 +767,27 @@ impl NetworkAgentActor {
                 msg.vmid
             )
         })?;
-
         let tap = lookup_link(handle, &msg.tap_name)
             .await?
             .ok_or_else(|| eyre!("tap {} not found", msg.tap_name))?;
         let tap_index = tap.header.index;
 
-        handle
-            .link()
-            .set(
-                LinkUnspec::new_with_index(tap_index)
-                    .alias(alias.to_owned())
-                    .controller(state.vrf_index)
-                    .mtu(u32::from(state.mtu))
-                    .up()
-                    .build(),
-            )
-            .execute()
+        Self::configure_tap(handle, tap_index, msg, state.vrf_index, Some(state.mtu))
             .await
             .wrap_err_with(|| {
                 format!("failed to attach tap {} to vrf {}", msg.tap_name, state.vrf)
             })?;
-
         ensure_address(handle, tap_index, &msg.tap_name, state.gateway, 32).await?;
-
-        handle
-            .route()
-            .add(
-                RouteMessageBuilder::<Ipv4Addr>::new()
-                    .table_id(state.table_id)
-                    .output_interface(tap_index)
-                    .scope(RouteScope::Link)
-                    .destination_prefix(address, 32)
-                    .build(),
-            )
-            .execute()
-            .await
-            .wrap_err_with(|| {
-                format!(
-                    "failed to add route {address}/32 via tap {} to table {}",
-                    msg.tap_name, state.table_id
-                )
-            })?;
-
+        Self::add_vm_route(handle, tap_index, &msg.tap_name, address, state.table_id).await?;
         write_tap_sysctls(&msg.tap_name)?;
         Self::ensure_antispoof_rule(&msg.tap_name, address)?;
-
-        state.members.push(Member {
-            vmid: msg.vmid,
-            tap_name: msg.tap_name.clone(),
-            mac_address: msg.mac_address.clone(),
-            address: Some(address),
-        });
         Ok(())
     }
 
     async fn attach_bridged(
         handle: &Handle,
-        state: &mut BridgedState,
+        state: &BridgedState,
         msg: &AttachNic,
-        alias: &str,
     ) -> Result<(), Report> {
         let bridge = lookup_link(handle, &state.bridge)
             .await?
@@ -709,16 +796,7 @@ impl NetworkAgentActor {
             .await?
             .ok_or_else(|| eyre!("tap {} not found", msg.tap_name))?;
 
-        handle
-            .link()
-            .set(
-                LinkUnspec::new_with_index(tap.header.index)
-                    .alias(alias.to_owned())
-                    .controller(bridge.header.index)
-                    .up()
-                    .build(),
-            )
-            .execute()
+        Self::configure_tap(handle, tap.header.index, msg, bridge.header.index, None)
             .await
             .wrap_err_with(|| {
                 format!(
@@ -726,13 +804,48 @@ impl NetworkAgentActor {
                     msg.tap_name, state.bridge
                 )
             })?;
+        Ok(())
+    }
 
-        state.members.push(Member {
-            vmid: msg.vmid,
-            tap_name: msg.tap_name.clone(),
-            mac_address: msg.mac_address.clone(),
-            address: None,
-        });
+    async fn configure_tap(
+        handle: &Handle,
+        tap_index: u32,
+        msg: &AttachNic,
+        controller_index: u32,
+        mtu: Option<u16>,
+    ) -> Result<(), NetlinkError> {
+        let mut link = LinkUnspec::new_with_index(tap_index)
+            .alias(format!("odorobo {} {}", msg.vmid, msg.network_id))
+            .controller(controller_index)
+            .up();
+        if let Some(mtu) = mtu {
+            link = link.mtu(u32::from(mtu));
+        }
+        handle.link().set(link.build()).execute().await
+    }
+
+    async fn add_vm_route(
+        handle: &Handle,
+        tap_index: u32,
+        tap_name: &str,
+        address: Ipv4Addr,
+        table_id: u32,
+    ) -> Result<(), Report> {
+        handle
+            .route()
+            .add(
+                RouteMessageBuilder::<Ipv4Addr>::new()
+                    .table_id(table_id)
+                    .output_interface(tap_index)
+                    .scope(RouteScope::Link)
+                    .destination_prefix(address, 32)
+                    .build(),
+            )
+            .execute()
+            .await
+            .wrap_err_with(|| {
+                format!("failed to add route {address}/32 via tap {tap_name} to table {table_id}")
+            })?;
         Ok(())
     }
 
@@ -758,21 +871,7 @@ impl NetworkAgentActor {
             return Ok(());
         };
 
-        Self::remove_antispoof_rules(&member.tap_name)?;
-
-        let tap = lookup_link(&self.netlink_handle, &member.tap_name).await?;
-        if let Some(tap) = tap {
-            self.netlink_handle
-                .link()
-                .set(
-                    LinkUnspec::new_with_index(tap.header.index)
-                        .nocontroller()
-                        .build(),
-                )
-                .execute()
-                .await
-                .wrap_err_with(|| format!("failed to detach tap {}", member.tap_name))?;
-        }
+        Self::detach_tap(&self.netlink_handle, &member.tap_name).await?;
 
         info!(
             vmid = %msg.vmid,
@@ -832,24 +931,30 @@ impl NetworkAgentActor {
         chain: &str,
         upstream_iface: &str,
     ) -> bool {
-        objects.iter().any(|object| match object {
-            NfObject::ListObject(NfListObject::Rule(existing)) => {
-                existing.family == NfFamily::IP
-                    && existing.table.as_ref() == table
-                    && existing.chain.as_ref() == chain
-                    && matches!(
-                        existing.expr.as_ref(),
-                        [Statement::Match(NftMatch { left, right, op }), Statement::Masquerade(_)]
-                            if *op == Operator::EQ
-                                && matches!(
-                                    left,
-                                    Expression::Named(NamedExpression::Meta(Meta { key: MetaKey::Oifname }))
-                                )
-                                && matches!(right, Expression::String(iface) if iface.as_ref() == upstream_iface)
-                    )
-            }
-            _ => false,
+        objects.iter().any(|object| {
+            let NfObject::ListObject(NfListObject::Rule(existing)) = object else {
+                return false;
+            };
+            existing.family == NfFamily::IP
+                && existing.table.as_ref() == table
+                && existing.chain.as_ref() == chain
+                && Self::is_upstream_masquerade(existing.expr.as_ref(), upstream_iface)
         })
+    }
+
+    fn is_upstream_masquerade(expr: &[Statement<'_>], upstream_iface: &str) -> bool {
+        let [Statement::Match(condition), Statement::Masquerade(_)] = expr else {
+            return false;
+        };
+        let Expression::Named(NamedExpression::Meta(meta)) = &condition.left else {
+            return false;
+        };
+        let Expression::String(iface) = &condition.right else {
+            return false;
+        };
+        condition.op == Operator::EQ
+            && meta.key == MetaKey::Oifname
+            && iface.as_ref() == upstream_iface
     }
 
     /// Ensures the host-only NAT masquerade rule exists for the configured
@@ -858,92 +963,31 @@ impl NetworkAgentActor {
     /// This is intentionally IPv4-only for now: guest subnet config uses
     /// `Ipv4Net`, bridge gateways use `Ipv4Addr`, and switching the masquerade
     /// rule to dual-stack would implicitly opt into IPv6 NAT policy.
-    fn ensure_nat_rules(_bridge: &str, _subnet: &str, upstream_iface: &str) -> Result<(), Report> {
-        const TABLE_NAME: &str = "odorobo";
-        const CHAIN_NAME: &str = "guest_nat";
-
-        info!(
-            table = TABLE_NAME,
-            chain = CHAIN_NAME,
-            upstream_iface = upstream_iface,
-            "ensuring host-only NAT masquerade rule exists"
-        );
-
+    fn ensure_nat_rules(upstream_iface: &str) -> Result<(), Report> {
         let ruleset = get_current_ruleset().wrap_err("failed to fetch current nftables ruleset")?;
-        let objects = ruleset.objects.as_ref();
-
-        let table_exists = Self::nft_table_exists(objects, TABLE_NAME);
-        let chain_exists = Self::nft_chain_exists(objects, TABLE_NAME, CHAIN_NAME);
-        let rule_exists = Self::nft_postrouting_masquerade_exists(
-            objects,
-            TABLE_NAME,
-            CHAIN_NAME,
+        if Self::nft_postrouting_masquerade_exists(
+            ruleset.objects.as_ref(),
+            NFT_TABLE,
+            NFT_GUEST_NAT_CHAIN,
             upstream_iface,
-        );
-
-        if rule_exists {
+        ) {
             info!(
-                table = TABLE_NAME,
-                chain = CHAIN_NAME,
                 upstream_iface = upstream_iface,
                 "existing NAT masquerade rule already present"
             );
             return Ok(());
         }
 
+        Self::ensure_base_chain(
+            NFT_GUEST_NAT_CHAIN,
+            NfChainType::NAT,
+            NfHook::Postrouting,
+            GUEST_NAT_PRIORITY,
+        )?;
+
         let mut batch = NftBatch::new();
-
-        if !table_exists {
-            info!(table = TABLE_NAME, "creating odorobo nftables table");
-            batch.add(NfListObject::Table(NftTable {
-                family: NfFamily::IP,
-                name: TABLE_NAME.into(),
-                handle: None,
-            }));
-        }
-
-        if !chain_exists {
-            info!(
-                table = TABLE_NAME,
-                chain = CHAIN_NAME,
-                "creating odorobo nftables chain"
-            );
-            batch.add(NfListObject::Chain(NftChain {
-                family: NfFamily::IP,
-                table: TABLE_NAME.into(),
-                name: CHAIN_NAME.into(),
-                newname: None,
-                handle: None,
-                _type: Some(NfChainType::NAT),
-                hook: Some(NfHook::Postrouting),
-                prio: Some(100),
-                dev: None,
-                policy: Some(NfChainPolicy::Accept),
-            }));
-        }
-
-        batch.add(NfListObject::Rule(NftRule {
-            family: NfFamily::IP,
-            table: TABLE_NAME.into(),
-            chain: CHAIN_NAME.into(),
-            expr: vec![
-                Statement::Match(NftMatch {
-                    left: Expression::Named(NamedExpression::Meta(Meta {
-                        key: MetaKey::Oifname,
-                    })),
-                    right: Expression::String(upstream_iface.into()),
-                    op: Operator::EQ,
-                }),
-                Statement::Masquerade(None),
-            ]
-            .into(),
-            handle: None,
-            index: None,
-            comment: Some("odorobo host-only NAT".into()),
-        }));
-
-        let batch = batch.to_nftables();
-        apply_ruleset(&batch).wrap_err_with(|| {
+        batch.add(NfListObject::Rule(Self::masquerade_rule(upstream_iface)));
+        apply_ruleset(&batch.to_nftables()).wrap_err_with(|| {
             format!(
                 "failed to apply nftables postrouting masquerade for upstream interface {upstream_iface}"
             )
@@ -952,11 +996,39 @@ impl NetworkAgentActor {
         Ok(())
     }
 
-    fn ensure_antispoof_chain() -> Result<(), Report> {
-        let ruleset =
-            get_current_ruleset().wrap_err("failed to fetch nftables ruleset for NIC guard")?;
+    /// Build NAT masquerade rule for the given upstream interface.
+    fn masquerade_rule(upstream_iface: &str) -> NftRule<'static> {
+        NftRule {
+            family: NfFamily::IP,
+            table: NFT_TABLE.into(),
+            chain: NFT_GUEST_NAT_CHAIN.into(),
+            expr: vec![
+                Statement::Match(NftMatch {
+                    left: Expression::Named(NamedExpression::Meta(Meta {
+                        key: MetaKey::Oifname,
+                    })),
+                    right: Expression::String(upstream_iface.to_owned().into()),
+                    op: Operator::EQ,
+                }),
+                Statement::Masquerade(None),
+            ]
+            .into(),
+            handle: None,
+            index: None,
+            comment: Some("odorobo host-only NAT".into()),
+        }
+    }
+
+    /// Ensures the shared `odorobo` table and a base chain exist.
+    fn ensure_base_chain(
+        chain: &str,
+        chain_type: NfChainType,
+        hook: NfHook,
+        priority: i32,
+    ) -> Result<(), Report> {
+        let ruleset = get_current_ruleset().wrap_err("failed to fetch current nftables ruleset")?;
         let objects = ruleset.objects.as_ref();
-        if Self::nft_chain_exists(objects, NFT_TABLE, NFT_NIC_GUARD_CHAIN) {
+        if Self::nft_chain_exists(objects, NFT_TABLE, chain) {
             return Ok(());
         }
 
@@ -971,22 +1043,51 @@ impl NetworkAgentActor {
         batch.add(NfListObject::Chain(NftChain {
             family: NfFamily::IP,
             table: NFT_TABLE.into(),
-            name: NFT_NIC_GUARD_CHAIN.into(),
+            name: chain.into(),
             newname: None,
             handle: None,
-            _type: Some(NfChainType::Filter),
-            hook: Some(NfHook::Prerouting),
-            prio: Some(ANTISPOOF_PRIORITY),
+            _type: Some(chain_type),
+            hook: Some(hook),
+            prio: Some(priority),
             dev: None,
             policy: Some(NfChainPolicy::Accept),
         }));
-        apply_ruleset(&batch.to_nftables()).wrap_err("failed to create the NIC guard chain")?;
-        info!(
-            table = NFT_TABLE,
-            chain = NFT_NIC_GUARD_CHAIN,
-            "created NIC guard chain"
-        );
+        apply_ruleset(&batch.to_nftables())
+            .wrap_err_with(|| format!("failed to create the {chain} chain"))?;
+        info!(table = NFT_TABLE, chain = chain, "created nftables chain");
         Ok(())
+    }
+
+    /// Yields the rules of one `odorobo` chain.
+    fn rules_in_chain<'a>(
+        objects: &'a [NfObject<'static>],
+        chain: &str,
+    ) -> impl Iterator<Item = &'a NftRule<'static>> {
+        objects.iter().filter_map(move |object| {
+            let NfObject::ListObject(NfListObject::Rule(rule)) = object else {
+                return None;
+            };
+            (rule.family == NfFamily::IP
+                && rule.table.as_ref() == NFT_TABLE
+                && rule.chain.as_ref() == chain)
+                .then_some(rule)
+        })
+    }
+
+    fn delete_nft_rule(batch: &mut NftBatch<'static>, rule: &NftRule<'static>) -> bool {
+        let Some(handle) = rule.handle else {
+            return false;
+        };
+        batch.delete(NfListObject::Rule(NftRule {
+            family: rule.family,
+            table: rule.table.clone(),
+            chain: rule.chain.clone(),
+            expr: Vec::new().into(),
+            handle: Some(handle),
+            index: None,
+            comment: None,
+        }));
+        true
     }
 
     /// Deletes anti-spoof rules whose TAP no longer exists (rules outlive process restarts).
@@ -994,16 +1095,7 @@ impl NetworkAgentActor {
         let ruleset = get_current_ruleset()
             .wrap_err("failed to fetch nftables ruleset for stale anti-spoof rules")?;
         let mut batch = NftBatch::new();
-        for object in ruleset.objects.as_ref() {
-            let NfObject::ListObject(NfListObject::Rule(rule)) = object else {
-                continue;
-            };
-            if rule.family != NfFamily::IP
-                || rule.table.as_ref() != NFT_TABLE
-                || rule.chain.as_ref() != NFT_NIC_GUARD_CHAIN
-            {
-                continue;
-            }
+        for rule in Self::rules_in_chain(ruleset.objects.as_ref(), NFT_NIC_GUARD_CHAIN) {
             let Some(tap_name) = rule
                 .comment
                 .as_deref()
@@ -1012,24 +1104,35 @@ impl NetworkAgentActor {
             else {
                 continue;
             };
-            if lookup_link(handle, tap_name).await?.is_some() {
-                continue;
+            if lookup_link(handle, tap_name).await?.is_none()
+                && Self::delete_nft_rule(&mut batch, rule)
+            {
+                info!(tap = tap_name, "pruned stale anti-spoof rule");
             }
-            let Some(rule_handle) = rule.handle else {
-                continue;
-            };
-            batch.delete(NfListObject::Rule(NftRule {
-                family: NfFamily::IP,
-                table: NFT_TABLE.into(),
-                chain: rule.chain.clone(),
-                expr: Vec::new().into(),
-                handle: Some(rule_handle),
-                index: None,
-                comment: None,
-            }));
-            info!(tap = tap_name, "pruned stale anti-spoof rule");
         }
         apply_ruleset(&batch.to_nftables()).wrap_err("failed to prune stale anti-spoof rules")
+    }
+
+    fn match_incoming_tap(tap_name: &str) -> Statement<'static> {
+        Statement::Match(NftMatch {
+            left: Expression::Named(NamedExpression::Meta(Meta {
+                key: MetaKey::Iifname,
+            })),
+            right: Expression::String(tap_name.to_owned().into()),
+            op: Operator::EQ,
+        })
+    }
+
+    fn match_spoofed_ipv4_source(address: Ipv4Addr) -> Statement<'static> {
+        let source = PayloadField {
+            protocol: "ip".into(),
+            field: "saddr".into(),
+        };
+        Statement::Match(NftMatch {
+            left: Expression::Named(NamedExpression::Payload(Payload::PayloadField(source))),
+            right: Expression::String(address.to_string().into()),
+            op: Operator::NEQ,
+        })
     }
 
     fn antispoof_rule(tap_name: &str, address: Ipv4Addr) -> NftRule<'static> {
@@ -1038,23 +1141,8 @@ impl NetworkAgentActor {
             table: NFT_TABLE.into(),
             chain: NFT_NIC_GUARD_CHAIN.into(),
             expr: vec![
-                Statement::Match(NftMatch {
-                    left: Expression::Named(NamedExpression::Meta(Meta {
-                        key: MetaKey::Iifname,
-                    })),
-                    right: Expression::String(tap_name.to_owned().into()),
-                    op: Operator::EQ,
-                }),
-                Statement::Match(NftMatch {
-                    left: Expression::Named(NamedExpression::Payload(Payload::PayloadField(
-                        PayloadField {
-                            protocol: "ip".into(),
-                            field: "saddr".into(),
-                        },
-                    ))),
-                    right: Expression::String(address.to_string().into()),
-                    op: Operator::NEQ,
-                }),
+                Self::match_incoming_tap(tap_name),
+                Self::match_spoofed_ipv4_source(address),
                 Statement::Counter(Counter::Anonymous(None)),
                 Statement::Drop(None),
             ]
@@ -1067,7 +1155,12 @@ impl NetworkAgentActor {
 
     /// Replaces the anti-spoof rules of a TAP with a rule for `address`.
     fn ensure_antispoof_rule(tap_name: &str, address: Ipv4Addr) -> Result<(), Report> {
-        Self::ensure_antispoof_chain()?;
+        Self::ensure_base_chain(
+            NFT_NIC_GUARD_CHAIN,
+            NfChainType::Filter,
+            NfHook::Prerouting,
+            ANTISPOOF_PRIORITY,
+        )?;
 
         let ruleset =
             get_current_ruleset().wrap_err("failed to fetch nftables ruleset for NIC guard")?;
@@ -1075,38 +1168,15 @@ impl NetworkAgentActor {
         let expected = format!("odorobo antispoof {tap_name} {address}");
         let mut batch = NftBatch::new();
         let mut present = false;
-        for object in ruleset.objects.as_ref() {
-            let NfObject::ListObject(NfListObject::Rule(rule)) = object else {
-                continue;
-            };
-            if rule.family != NfFamily::IP
-                || rule.table.as_ref() != NFT_TABLE
-                || rule.chain.as_ref() != NFT_NIC_GUARD_CHAIN
-            {
-                continue;
-            }
+        for rule in Self::rules_in_chain(ruleset.objects.as_ref(), NFT_NIC_GUARD_CHAIN) {
             let Some(comment) = rule.comment.as_deref() else {
                 continue;
             };
             if comment == expected {
                 present = true;
-                continue;
+            } else if comment.starts_with(&prefix) {
+                Self::delete_nft_rule(&mut batch, rule);
             }
-            if !comment.starts_with(&prefix) {
-                continue;
-            }
-            let Some(handle) = rule.handle else {
-                continue;
-            };
-            batch.delete(NfListObject::Rule(NftRule {
-                family: NfFamily::IP,
-                table: NFT_TABLE.into(),
-                chain: rule.chain.clone(),
-                expr: Vec::new().into(),
-                handle: Some(handle),
-                index: None,
-                comment: None,
-            }));
         }
 
         if !present {
@@ -1123,77 +1193,21 @@ impl NetworkAgentActor {
         let prefix = format!("odorobo antispoof {tap_name} ");
         let mut batch = NftBatch::new();
         let mut removed = 0_u32;
-        for object in ruleset.objects.as_ref() {
-            let NfObject::ListObject(NfListObject::Rule(rule)) = object else {
-                continue;
-            };
-            if rule.family != NfFamily::IP
-                || rule.table.as_ref() != NFT_TABLE
-                || rule.chain.as_ref() != NFT_NIC_GUARD_CHAIN
-                || !rule
-                    .comment
-                    .as_deref()
-                    .is_some_and(|comment| comment.starts_with(&prefix))
+        for rule in Self::rules_in_chain(ruleset.objects.as_ref(), NFT_NIC_GUARD_CHAIN) {
+            if rule
+                .comment
+                .as_deref()
+                .is_some_and(|comment| comment.starts_with(&prefix))
+                && Self::delete_nft_rule(&mut batch, rule)
             {
-                continue;
+                removed = removed.saturating_add(1);
             }
-            let Some(handle) = rule.handle else {
-                continue;
-            };
-            batch.delete(NfListObject::Rule(NftRule {
-                family: NfFamily::IP,
-                table: NFT_TABLE.into(),
-                chain: rule.chain.clone(),
-                expr: Vec::new().into(),
-                handle: Some(handle),
-                index: None,
-                comment: None,
-            }));
-            removed = removed.saturating_add(1);
         }
         if removed > 0 {
             apply_ruleset(&batch.to_nftables())
                 .wrap_err_with(|| format!("failed to remove anti-spoof rules for {tap_name}"))?;
             info!(tap = tap_name, rules = removed, "removed anti-spoof rules");
         }
-        Ok(())
-    }
-
-    fn ensure_port_forward_chain() -> Result<(), Report> {
-        let ruleset = get_current_ruleset()
-            .wrap_err("failed to fetch nftables ruleset for port publishing")?;
-        let objects = ruleset.objects.as_ref();
-        if Self::nft_chain_exists(objects, NFT_TABLE, NFT_DNAT_CHAIN) {
-            return Ok(());
-        }
-
-        let mut batch = NftBatch::new();
-        if !Self::nft_table_exists(objects, NFT_TABLE) {
-            batch.add(NfListObject::Table(NftTable {
-                family: NfFamily::IP,
-                name: NFT_TABLE.into(),
-                handle: None,
-            }));
-        }
-        batch.add(NfListObject::Chain(NftChain {
-            family: NfFamily::IP,
-            table: NFT_TABLE.into(),
-            name: NFT_DNAT_CHAIN.into(),
-            newname: None,
-            handle: None,
-            _type: Some(NfChainType::NAT),
-            hook: Some(NfHook::Prerouting),
-            prio: Some(DNAT_PRIORITY),
-            dev: None,
-            policy: Some(NfChainPolicy::Accept),
-        }));
-        apply_ruleset(&batch.to_nftables())
-            .wrap_err("failed to create the container DNAT chain")?;
-        info!(
-            table = NFT_TABLE,
-            chain = NFT_DNAT_CHAIN,
-            "created container DNAT chain"
-        );
         Ok(())
     }
 
@@ -1249,7 +1263,12 @@ impl NetworkAgentActor {
     }
 
     fn publish_ports(vmid: Ulid, ports: &[PortMapping], address: Ipv4Addr) -> Result<(), Report> {
-        Self::ensure_port_forward_chain()?;
+        Self::ensure_base_chain(
+            NFT_DNAT_CHAIN,
+            NfChainType::NAT,
+            NfHook::Prerouting,
+            DNAT_PRIORITY,
+        )?;
 
         let mut batch = NftBatch::new();
         for mapping in ports {
@@ -1264,29 +1283,10 @@ impl NetworkAgentActor {
         let ruleset = get_current_ruleset().wrap_err("failed to fetch nftables ruleset")?;
         let mut batch = NftBatch::new();
         let mut removed = 0_u32;
-        for object in ruleset.objects.as_ref() {
-            let NfObject::ListObject(NfListObject::Rule(rule)) = object else {
-                continue;
-            };
-            if rule.family != NfFamily::IP
-                || rule.table.as_ref() != NFT_TABLE
-                || rule.chain.as_ref() != NFT_DNAT_CHAIN
-            {
-                continue;
+        for rule in Self::rules_in_chain(ruleset.objects.as_ref(), NFT_DNAT_CHAIN) {
+            if Self::delete_nft_rule(&mut batch, rule) {
+                removed = removed.saturating_add(1);
             }
-            let Some(handle) = rule.handle else {
-                continue;
-            };
-            batch.delete(NfListObject::Rule(NftRule {
-                family: NfFamily::IP,
-                table: NFT_TABLE.into(),
-                chain: rule.chain.clone(),
-                expr: Vec::new().into(),
-                handle: Some(handle),
-                index: None,
-                comment: None,
-            }));
-            removed = removed.saturating_add(1);
         }
         if removed > 0 {
             apply_ruleset(&batch.to_nftables()).wrap_err("failed to clear stale port rules")?;
@@ -1303,32 +1303,15 @@ impl NetworkAgentActor {
         let prefix = format!("odorobo container {vmid} ");
         let mut batch = NftBatch::new();
         let mut removed = 0_u32;
-        for object in ruleset.objects.as_ref() {
-            let NfObject::ListObject(NfListObject::Rule(rule)) = object else {
-                continue;
-            };
-            if rule.family != NfFamily::IP
-                || rule.table.as_ref() != NFT_TABLE
-                || !rule
-                    .comment
-                    .as_deref()
-                    .is_some_and(|comment| comment.starts_with(&prefix))
+        for rule in Self::rules_in_chain(ruleset.objects.as_ref(), NFT_DNAT_CHAIN) {
+            if rule
+                .comment
+                .as_deref()
+                .is_some_and(|comment| comment.starts_with(&prefix))
+                && Self::delete_nft_rule(&mut batch, rule)
             {
-                continue;
+                removed = removed.saturating_add(1);
             }
-            let Some(handle) = rule.handle else {
-                continue;
-            };
-            batch.delete(NfListObject::Rule(NftRule {
-                family: NfFamily::IP,
-                table: NFT_TABLE.into(),
-                chain: rule.chain.clone(),
-                expr: Vec::new().into(),
-                handle: Some(handle),
-                index: None,
-                comment: None,
-            }));
-            removed = removed.saturating_add(1);
         }
         if removed > 0 {
             apply_ruleset(&batch.to_nftables())

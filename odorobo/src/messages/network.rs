@@ -35,13 +35,15 @@ pub struct RemoveNetworkReply {
 /// Creates or updates a network in the manager.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CreateNetwork {
-    /// Desired state for the network.
+    /// Desired state for the network
     pub network: Network,
 }
 
-/// Reply to [`CreateNetwork`]. A non-empty `error` means nothing was changed.
+/// Reply to [`CreateNetwork`]. A non-empty `error` means nothing was created.
 #[derive(Serialize, Deserialize, Reply, Debug, Clone, Default)]
 pub struct CreateNetworkReply {
+    /// The network with its assigned runtime state.
+    pub network: Option<Network>,
     pub error: Option<String>,
 }
 

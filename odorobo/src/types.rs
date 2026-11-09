@@ -54,7 +54,6 @@ pub struct NetworkId(pub String);
 /// Request body for creating a network object
 #[derive(Serialize, Deserialize, Debug, JsonSchema, OperationIo, Clone)]
 pub struct CreateNetworkRequest {
-    /// The network to create.
     pub network: Network,
 }
 
