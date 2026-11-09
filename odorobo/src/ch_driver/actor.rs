@@ -410,12 +410,9 @@ mod tests {
             }
             // A startup failure means the fixture init will never run; report
             // the console now instead of waiting out the boot deadline.
-            match actor_ref.ask(super::StartFailure).await {
-                Ok(Some(reason)) => {
-                    stopped = Some(reason);
-                    break;
-                }
-                Ok(None) | Err(_) => {}
+            if let Ok(Some(reason)) = actor_ref.ask(super::StartFailure).await {
+                stopped = Some(reason);
+                break;
             }
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
