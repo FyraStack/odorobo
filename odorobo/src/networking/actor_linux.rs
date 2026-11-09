@@ -1,20 +1,37 @@
+use std::{
+    collections::HashMap,
+    net::Ipv4Addr,
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
 use crate::config::{DhcpConfig, NetworkConfig, NetworkMode};
-use crate::networking::messages::{AttachTap, DetachTap};
+use crate::networking::messages::{AttachTap, DetachTap, PublishPorts, UnpublishPorts};
+use crate::ports::{PortMapping, lease_ip};
 use futures_util::{StreamExt, TryStreamExt};
 
 use kameo::{message::Context, prelude::*};
 use nftables::{
     batch::Batch as NftBatch,
-    expr::{Expression, Meta, MetaKey, NamedExpression},
+    expr::{Expression, Meta, MetaKey, NamedExpression, Payload, PayloadField},
     helper::{apply_ruleset, get_current_ruleset},
     schema::{Chain as NftChain, NfListObject, NfObject, Rule as NftRule, Table as NftTable},
-    stmt::{Match as NftMatch, Operator, Statement},
+    stmt::{Match as NftMatch, NAT, NATFamily, Operator, Statement},
     types::{NfChainPolicy, NfChainType, NfFamily, NfHook},
 };
 use rtnetlink::{Error as NetlinkError, Handle, LinkBridge, LinkUnspec};
 use stable_eyre::Report;
 use stable_eyre::eyre::{Context as EyreContext, eyre};
-use tracing::info;
+use tokio::time::sleep;
+use tracing::{error, info};
+use ulid::Ulid;
+
+const DHCP_LEASE_FILE: &str = "dnsmasq.leases";
+const NFT_TABLE: &str = "odorobo";
+const NFT_DNAT_CHAIN: &str = "container_dnat";
+const DNAT_PRIORITY: i32 = -100;
+const LEASE_TIMEOUT: Duration = Duration::from_secs(15);
+const LEASE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 pub struct DhcpActor {
     pub config: DhcpConfig,
@@ -30,10 +47,10 @@ pub struct NetworkConfigCommon {
 
 #[allow(clippy::unused_async_trait_impl)]
 impl Actor for DhcpActor {
-    type Args = (DhcpConfig, String);
+    type Args = (DhcpConfig, String, PathBuf);
     type Error = Report;
     async fn on_start(args: Self::Args, _actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
-        let (config, bridge) = args;
+        let (config, bridge, lease_file) = args;
         let dhcp_range = format!(
             "{},{},{},{}",
             config.range.0,
@@ -41,6 +58,13 @@ impl Actor for DhcpActor {
             config.subnet.netmask(),
             config.lease_time
         );
+        if let Some(parent) = lease_file.parent() {
+            std::fs::create_dir_all(parent).wrap_err_with(|| {
+                format!("failed to create lease directory {}", parent.display())
+            })?;
+        }
+        // Stale leases from a previous agent run must not publish old addresses.
+        std::fs::remove_file(&lease_file).ok();
 
         info!(
             bridge = %bridge,
@@ -48,6 +72,7 @@ impl Actor for DhcpActor {
             range_end = %config.range.1,
             subnet = %config.subnet,
             lease_time = %config.lease_time,
+            lease_file = %lease_file.display(),
             "starting dnsmasq for guest DHCP"
         );
 
@@ -57,6 +82,7 @@ impl Actor for DhcpActor {
             .arg("--bind-interfaces")
             .arg("--dhcp-range")
             .arg(&dhcp_range)
+            .arg(format!("--dhcp-leasefile={}", lease_file.display()))
             .arg("--no-daemon")
             .spawn()
             .wrap_err_with(|| format!("failed to start dnsmasq on bridge {bridge}"))?;
@@ -148,6 +174,8 @@ pub struct NetworkAgentActor {
     pub config: NetworkConfig,
     common: NetworkConfigCommon,
     pub dhcp_actor: Option<ActorRef<DhcpActor>>,
+    lease_file: PathBuf,
+    port_tasks: HashMap<Ulid, tokio::task::JoinHandle<()>>,
     // netlink_handle:
     netlink_thread: tokio::task::JoinHandle<()>,
     netlink_handle: Handle,
@@ -420,10 +448,19 @@ impl Actor for NetworkAgentActor {
             }
         };
 
+        let lease_file =
+            crate::ch_driver::instance::VMInstance::configured_runtime_root().join(DHCP_LEASE_FILE);
         let dhcp_actor = if let Some(dhcp_config) = &args.dhcp_config {
             Some(
-                DhcpActor::spawn_link(&actor_ref, (dhcp_config.clone(), common.bridge.clone()))
-                    .await,
+                DhcpActor::spawn_link(
+                    &actor_ref,
+                    (
+                        dhcp_config.clone(),
+                        common.bridge.clone(),
+                        lease_file.clone(),
+                    ),
+                )
+                .await,
             )
         } else {
             None
@@ -433,6 +470,8 @@ impl Actor for NetworkAgentActor {
             config: args,
             common,
             dhcp_actor,
+            lease_file,
+            port_tasks: HashMap::new(),
             netlink_thread,
             netlink_handle: handle,
         };
@@ -521,6 +560,8 @@ impl Actor for NetworkAgentActor {
                 })?;
             }
         }
+
+        Self::clear_port_rules().wrap_err("failed to clear stale port rules")?;
 
         Ok(actor)
     }
@@ -671,5 +712,242 @@ impl Message<DetachTap> for NetworkAgentActor {
         );
 
         Ok(())
+    }
+}
+
+impl NetworkAgentActor {
+    fn ensure_port_forward_chain() -> Result<(), Report> {
+        let ruleset = get_current_ruleset()
+            .wrap_err("failed to fetch nftables ruleset for port publishing")?;
+        let objects = ruleset.objects.as_ref();
+        if Self::nft_chain_exists(objects, NFT_TABLE, NFT_DNAT_CHAIN) {
+            return Ok(());
+        }
+
+        let mut batch = NftBatch::new();
+        if !Self::nft_table_exists(objects, NFT_TABLE) {
+            batch.add(NfListObject::Table(NftTable {
+                family: NfFamily::IP,
+                name: NFT_TABLE.into(),
+                handle: None,
+            }));
+        }
+        batch.add(NfListObject::Chain(NftChain {
+            family: NfFamily::IP,
+            table: NFT_TABLE.into(),
+            name: NFT_DNAT_CHAIN.into(),
+            newname: None,
+            handle: None,
+            _type: Some(NfChainType::NAT),
+            hook: Some(NfHook::Prerouting),
+            prio: Some(DNAT_PRIORITY),
+            dev: None,
+            policy: Some(NfChainPolicy::Accept),
+        }));
+        apply_ruleset(&batch.to_nftables())
+            .wrap_err("failed to create the container DNAT chain")?;
+        info!(
+            table = NFT_TABLE,
+            chain = NFT_DNAT_CHAIN,
+            "created container DNAT chain"
+        );
+        Ok(())
+    }
+
+    fn dnat_rule(vmid: Ulid, mapping: PortMapping, address: Ipv4Addr) -> NftRule<'static> {
+        NftRule {
+            family: NfFamily::IP,
+            table: NFT_TABLE.into(),
+            chain: NFT_DNAT_CHAIN.into(),
+            expr: vec![
+                Statement::Match(NftMatch {
+                    left: Expression::Named(NamedExpression::Payload(Payload::PayloadField(
+                        PayloadField {
+                            protocol: mapping.protocol.as_str().into(),
+                            field: "dport".into(),
+                        },
+                    ))),
+                    right: Expression::Number(u32::from(mapping.host)),
+                    op: Operator::EQ,
+                }),
+                Statement::DNAT(Some(NAT {
+                    addr: Some(Expression::String(address.to_string().into())),
+                    family: Some(NATFamily::IP),
+                    port: Some(Expression::Number(u32::from(mapping.guest))),
+                    flags: None,
+                })),
+            ]
+            .into(),
+            handle: None,
+            index: None,
+            comment: Some(format!("odorobo container {vmid} {mapping}").into()),
+        }
+    }
+
+    async fn wait_for_lease(path: &Path, mac_address: &str) -> Result<Ipv4Addr, Report> {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(LEASE_TIMEOUT)
+            .expect("deadline in range");
+        loop {
+            if let Ok(contents) = tokio::fs::read_to_string(path).await
+                && let Some(address) = lease_ip(&contents, mac_address)
+            {
+                return Ok(address);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(eyre!(
+                    "no DHCP lease for {mac_address} in {} after {}s",
+                    path.display(),
+                    LEASE_TIMEOUT.as_secs()
+                ));
+            }
+            sleep(LEASE_POLL_INTERVAL).await;
+        }
+    }
+
+    async fn publish_ports(
+        vmid: Ulid,
+        mac_address: &str,
+        ports: &[PortMapping],
+        lease_file: &Path,
+    ) -> Result<Ipv4Addr, Report> {
+        let address = Self::wait_for_lease(lease_file, mac_address).await?;
+        Self::ensure_port_forward_chain()?;
+
+        let mut batch = NftBatch::new();
+        for mapping in ports {
+            batch.add(NfListObject::Rule(Self::dnat_rule(vmid, *mapping, address)));
+        }
+        apply_ruleset(&batch.to_nftables())
+            .wrap_err_with(|| format!("failed to publish ports for {vmid} to {address}"))?;
+        Ok(address)
+    }
+
+    fn clear_port_rules() -> Result<(), Report> {
+        let ruleset = get_current_ruleset().wrap_err("failed to fetch nftables ruleset")?;
+        let mut batch = NftBatch::new();
+        let mut removed = 0_u32;
+        for object in ruleset.objects.as_ref() {
+            let NfObject::ListObject(NfListObject::Rule(rule)) = object else {
+                continue;
+            };
+            if rule.family != NfFamily::IP
+                || rule.table.as_ref() != NFT_TABLE
+                || rule.chain.as_ref() != NFT_DNAT_CHAIN
+            {
+                continue;
+            }
+            let Some(handle) = rule.handle else {
+                continue;
+            };
+            batch.delete(NfListObject::Rule(NftRule {
+                family: NfFamily::IP,
+                table: NFT_TABLE.into(),
+                chain: rule.chain.clone(),
+                expr: Vec::new().into(),
+                handle: Some(handle),
+                index: None,
+                comment: None,
+            }));
+            removed = removed.saturating_add(1);
+        }
+        if removed > 0 {
+            apply_ruleset(&batch.to_nftables()).wrap_err("failed to clear stale port rules")?;
+            info!(
+                rules = removed,
+                "cleared stale port-forward rules from a previous run"
+            );
+        }
+        Ok(())
+    }
+
+    fn remove_port_rules(vmid: Ulid) -> Result<(), Report> {
+        let ruleset = get_current_ruleset().wrap_err("failed to fetch nftables ruleset")?;
+        let prefix = format!("odorobo container {vmid} ");
+        let mut batch = NftBatch::new();
+        let mut removed = 0_u32;
+        for object in ruleset.objects.as_ref() {
+            let NfObject::ListObject(NfListObject::Rule(rule)) = object else {
+                continue;
+            };
+            if rule.family != NfFamily::IP
+                || rule.table.as_ref() != NFT_TABLE
+                || !rule
+                    .comment
+                    .as_deref()
+                    .is_some_and(|comment| comment.starts_with(&prefix))
+            {
+                continue;
+            }
+            let Some(handle) = rule.handle else {
+                continue;
+            };
+            batch.delete(NfListObject::Rule(NftRule {
+                family: NfFamily::IP,
+                table: NFT_TABLE.into(),
+                chain: rule.chain.clone(),
+                expr: Vec::new().into(),
+                handle: Some(handle),
+                index: None,
+                comment: None,
+            }));
+            removed = removed.saturating_add(1);
+        }
+        if removed > 0 {
+            apply_ruleset(&batch.to_nftables())
+                .wrap_err_with(|| format!("failed to remove port rules for {vmid}"))?;
+            info!(vmid = %vmid, rules = removed, "removed port rules");
+        }
+        Ok(())
+    }
+}
+
+impl Message<PublishPorts> for NetworkAgentActor {
+    type Reply = Result<(), Report>;
+
+    async fn handle(
+        &mut self,
+        msg: PublishPorts,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        if let Some(previous) = self.port_tasks.remove(&msg.vmid) {
+            previous.abort();
+            _ = previous.await;
+        }
+        if msg.ports.is_empty() {
+            return Ok(());
+        }
+
+        let lease_file = self.lease_file.clone();
+        let vmid = msg.vmid;
+        let task = tokio::spawn(async move {
+            match Self::publish_ports(vmid, &msg.mac_address, &msg.ports, &lease_file).await {
+                Ok(address) => info!(
+                    vmid = %vmid,
+                    guest_ip = %address,
+                    ports = msg.ports.len(),
+                    "published ports"
+                ),
+                Err(err) => error!(vmid = %vmid, ?err, "failed to publish ports"),
+            }
+        });
+        self.port_tasks.insert(vmid, task);
+        Ok(())
+    }
+}
+
+impl Message<UnpublishPorts> for NetworkAgentActor {
+    type Reply = Result<(), Report>;
+
+    async fn handle(
+        &mut self,
+        msg: UnpublishPorts,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        if let Some(task) = self.port_tasks.remove(&msg.vmid) {
+            task.abort();
+            _ = task.await;
+        }
+        Self::remove_port_rules(msg.vmid)
     }
 }

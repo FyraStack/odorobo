@@ -1,4 +1,5 @@
 use ahash::AHashMap;
+use bytesize::ByteSize;
 use clap::Parser;
 use ipnet::Ipv4Net;
 use serde::{Deserialize, Serialize};
@@ -147,6 +148,28 @@ pub struct Config {
     #[clap(skip)]
     #[serde(default)]
     pub network: NetworkConfig,
+
+    /// Maximum compressed bytes pulled for one OCI image (`16GiB`).
+    #[clap(long)]
+    pub rootfs_max_compressed_bytes: Option<ByteSize>,
+    /// Size of the RBD image backing a persistent rootfs.
+    #[clap(long)]
+    pub rootfs_rbd_size: Option<ByteSize>,
+    /// Size of the read-only-mode `/tmp` scratch tmpfs.
+    #[clap(long)]
+    pub rootfs_tmp_size: Option<ByteSize>,
+    /// Size of the read-only-mode `/run` scratch tmpfs.
+    #[clap(long)]
+    pub rootfs_run_size: Option<ByteSize>,
+    /// Size of the read-only-mode `/var/tmp` scratch tmpfs.
+    #[clap(long)]
+    pub rootfs_vartmp_size: Option<ByteSize>,
+    /// Size of the guest tmpfs holding an ephemeral rootfs writable layer.
+    #[clap(long)]
+    pub rootfs_ephemeral_size: Option<ByteSize>,
+    /// Allow manifests to name host-local skopeo transports (`oci:`, `dir:`).
+    #[clap(long)]
+    pub rootfs_allow_local_transports: Option<bool>,
 
     /// Ignore lockfiles and do not create a lockfile
     #[clap(long, action = clap::ArgAction::SetTrue)]

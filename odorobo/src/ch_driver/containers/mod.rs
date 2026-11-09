@@ -1,0 +1,333 @@
+//! OCI container microVM roots served over virtiofs. All OCI, composefs,
+//! `OverlayFS`, fs-verity, and persistence preparation happens on the host; the
+//! guest sees an ordinary virtiofs root and does not need composefs support.
+//!
+//! Images are imported into a node-local composefs repository (see [`repo`]),
+//! which unpacks every layer into content-addressed fs-verity objects and links
+//! the image config to one EROFS metadata object. Each VM mounts that object
+//! read-only through the kernel overlay and actor-supervised virtiofsd exports
+//! it; an ephemeral VM's writable layer is a tmpfs the guest init layers on top.
+//! Imports are digest-pinned:
+//! the mount verifies the image object against the fs-verity id recorded at
+//! import time, and the first pull of a tag is what a later tag repull compares
+//! against. The repository must live on an fs-verity-capable filesystem (ext4,
+//! btrfs, erofs) for verified mounts; otherwise imports mount unverified.
+
+mod limits;
+mod mount;
+mod oci;
+mod persistent;
+mod process;
+mod repo;
+#[cfg(test)]
+pub mod test_support;
+mod virtiofs;
+
+pub use mount::{
+    PreparedImage, mount_rootfs_owned, pinned_image_digest, prepare_image, unmount_rootfs,
+};
+pub use persistent::{PERSISTENT_OPERATIONS, RBD_RESERVATIONS, delete_persistent_rootfs};
+pub use repo::collect_repository_garbage;
+pub use virtiofs::{VirtioFsSupervisor, VirtiofsdSpec, socket_path_for, virtiofsd_path};
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use serde_json::json;
+use stable_eyre::{
+    Result,
+    eyre::{WrapErr, bail, eyre},
+};
+
+use crate::config::Config;
+use crate::manifest::RootfsMode;
+
+/// Parse and install the node-wide rootfs policy from the agent config.
+pub fn install_limits(config: &Config) -> Result<()> {
+    limits::install(limits::RootfsLimits::from_config(config)?)
+}
+
+/// virtiofs mount tag the guest root is served under.
+pub const ROOTFS_TAG: &str = "rootfs";
+
+/// File the host writes into a VM's writable rootfs layer; the guest init
+/// reads the image's OCI config document from it.
+pub const CONFIG_FILE_NAME: &str = ".odorobo-config.json";
+
+/// Guest root mount point, also the directory served by the rootfs virtiofsd.
+pub fn rootfs_mount_path_for(vmid: &str) -> PathBuf {
+    crate::ch_driver::VMInstance::runtime_dir_for(vmid).join(ROOTFS_TAG)
+}
+
+/// The tiny custom microvm kernel built by
+/// `scripts/build-microvm-kernel.sh` (issue #112 buildconfig).
+pub const MICROVM_KERNEL_PATH: &str = "/var/lib/odorobo/microvm/vmlinux";
+
+/// PID 1 initramfs packed by `just --justfile odorobo-init/justfile`.
+pub const MICROVM_INITRAMFS_PATH: &str = "/var/lib/odorobo/microvm/initramfs.cpio.gz";
+
+/// Direct-kernel-boot cmdline for a composefs/virtiofs root. The guest init
+/// from [`MICROVM_INITRAMFS_PATH`] mounts the virtiofs root itself, so the
+/// kernel gets no `root=`; the init then execs the image's process config.
+/// console=ttyS0 (the 16550 UART) because the driver's `ConsoleTransform`
+/// sockets it; the virtio console carries only the workload's stdio, which the
+/// init attaches to `/dev/hvc0`.
+pub const DEFAULT_ROOTFS_CMDLINE: &str = "console=ttyS0";
+
+const PERSISTENT_ROOTFS_ROOT: &str = "/var/lib/odorobo/persistent-rootfs";
+
+/// Remove temporary external-tool artifacts even if their async operation is
+/// cancelled. Large directory cleanup is moved to Tokio's blocking pool.
+struct RemovePathOnDrop(Option<PathBuf>);
+
+impl RemovePathOnDrop {
+    const fn new(path: PathBuf) -> Self {
+        Self(Some(path))
+    }
+}
+
+impl Drop for RemovePathOnDrop {
+    fn drop(&mut self) {
+        let Some(path) = self.0.take() else {
+            return;
+        };
+        let cleanup = move || match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(path),
+            Ok(_) => std::fs::remove_file(path),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err),
+        };
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            _ = handle.spawn_blocking(cleanup);
+        } else {
+            _ = cleanup();
+        }
+    }
+}
+
+/// A rootfs made ready for a specific VM.
+#[derive(Debug)]
+pub struct PreparedRootfs {
+    /// OCI manifest digest identifying the immutable base.
+    pub digest: String,
+    /// This VM's mount point of the rootfs (virtiofsd shared-dir).
+    pub mount: PathBuf,
+    /// Per-VM overlayfs upper directory for a persistent root.
+    pub upper: Option<PathBuf>,
+    /// Per-VM overlayfs work directory for a persistent root.
+    pub work: Option<PathBuf>,
+    /// Persistent backend mount directory; populated only for RBD state.
+    persistent_state_mount: Option<PathBuf>,
+    /// RBD image identity for explicit deletion.
+    rbd_image: Option<String>,
+    /// Node-local flock prevents duplicate actor instances for this VM id.
+    _state_lock: Arc<std::fs::File>,
+    /// Persistence policy controls cleanup and writable scratch behavior.
+    pub mode: RootfsMode,
+    /// Host tmpfs mounts used for the bounded read-only-mode scratch paths.
+    scratch_mounts: Vec<PathBuf>,
+}
+
+/// Launch options odorobo adds next to the image's own OCI config.
+#[derive(Debug, Default)]
+pub(super) struct GuestLaunchOptions {
+    /// Attach the workload's stdin to the workload console.
+    pub stdin: bool,
+    /// Bytes of guest-side tmpfs holding an ephemeral root's writable layer;
+    /// `None` makes the image share the root itself.
+    pub ephemeral_upper_bytes: Option<u64>,
+    /// Replace the image's entrypoint; an empty list clears it.
+    pub entrypoint: Option<Vec<String>>,
+    /// Replace the image's command; an empty list clears it.
+    pub cmd: Option<Vec<String>>,
+}
+
+/// The guest-visible config document: the image's OCI config plus the launch
+/// options odorobo adds. An image without options keeps its bytes verbatim.
+pub(super) fn guest_config_document(
+    config: &[u8],
+    options: &GuestLaunchOptions,
+) -> Result<Vec<u8>> {
+    if !options.stdin
+        && options.ephemeral_upper_bytes.is_none()
+        && options.entrypoint.is_none()
+        && options.cmd.is_none()
+    {
+        return Ok(config.to_vec());
+    }
+    let mut document: serde_json::Value =
+        serde_json::from_slice(config).wrap_err("parsing the imported OCI config document")?;
+    let object = document
+        .as_object_mut()
+        .ok_or_else(|| eyre!("the imported OCI config document is not a JSON object"))?;
+    if options.entrypoint.is_some() || options.cmd.is_some() {
+        let config_value = object
+            .entry("config")
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        if !config_value.is_object() {
+            *config_value = serde_json::Value::Object(serde_json::Map::new());
+        }
+        if let Some(config_object) = config_value.as_object_mut() {
+            if let Some(entrypoint) = &options.entrypoint {
+                config_object.insert("Entrypoint".to_owned(), json!(entrypoint));
+            }
+            if let Some(cmd) = &options.cmd {
+                config_object.insert("Cmd".to_owned(), json!(cmd));
+            }
+        }
+    }
+    let mut odorobo = serde_json::Map::new();
+    if options.stdin {
+        odorobo.insert("stdin".to_owned(), serde_json::Value::Bool(true));
+    }
+    // Only an ephemeral root needs guest action: the init builds the writable
+    // overlay layer itself, sized by node policy.
+    if let Some(bytes) = options.ephemeral_upper_bytes {
+        odorobo.insert(
+            "rootfs".to_owned(),
+            json!({ "mode": "ephemeral", "tmpfs_upper_bytes": bytes }),
+        );
+    }
+    if !odorobo.is_empty() {
+        object.insert("odorobo".to_owned(), serde_json::Value::Object(odorobo));
+    }
+    serde_json::to_vec(&document).wrap_err("serializing the guest config document")
+}
+
+fn to_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes.iter().fold(String::new(), |mut out, byte| {
+        write!(out, "{byte:02x}").expect("writing to a String cannot fail");
+        out
+    })
+}
+
+fn validate_vmid(vmid: &str) -> Result<()> {
+    if vmid.is_empty() || !vmid.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        bail!("unsafe VM id for rootfs state path");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn guest_config_document_adds_options_only_when_asked() {
+        let image = br#"{"config":{"Entrypoint":["/bin/sh"]}}"#;
+        assert_eq!(
+            guest_config_document(image, &GuestLaunchOptions::default()).unwrap(),
+            image
+        );
+
+        let options = GuestLaunchOptions {
+            stdin: true,
+            ephemeral_upper_bytes: Some(1024 * 1024),
+            ..GuestLaunchOptions::default()
+        };
+        let document: serde_json::Value =
+            serde_json::from_slice(&guest_config_document(image, &options).unwrap()).unwrap();
+        assert_eq!(document["odorobo"]["stdin"], serde_json::Value::Bool(true));
+        assert_eq!(document["odorobo"]["rootfs"]["mode"], "ephemeral");
+        assert_eq!(
+            document["odorobo"]["rootfs"]["tmpfs_upper_bytes"],
+            serde_json::Value::from(1024 * 1024)
+        );
+        assert_eq!(document["config"]["Entrypoint"][0], "/bin/sh");
+
+        // A read-only or persistent root needs no guest-side overlay contract.
+        let options = GuestLaunchOptions {
+            stdin: false,
+            ephemeral_upper_bytes: None,
+            ..GuestLaunchOptions::default()
+        };
+        assert_eq!(guest_config_document(image, &options).unwrap(), image);
+    }
+
+    #[test]
+    fn guest_config_document_applies_launch_overrides() {
+        let image = br#"{"config":{"Entrypoint":["/docker-entrypoint.sh"],"Cmd":["nginx","-g","daemon off;"]}}"#;
+        let options = GuestLaunchOptions {
+            entrypoint: Some(Vec::new()),
+            cmd: Some(vec!["sh".to_owned(), "-c".to_owned(), "sleep 1".to_owned()]),
+            ..GuestLaunchOptions::default()
+        };
+        let document: serde_json::Value =
+            serde_json::from_slice(&guest_config_document(image, &options).unwrap()).unwrap();
+        assert_eq!(document["config"]["Entrypoint"], json!([]));
+        assert_eq!(document["config"]["Cmd"], json!(["sh", "-c", "sleep 1"]));
+        assert!(document.get("odorobo").is_none());
+    }
+
+    #[test]
+    fn guest_config_document_creates_a_missing_config_object() {
+        let options = GuestLaunchOptions {
+            cmd: Some(vec!["/bin/true".to_owned()]),
+            ..GuestLaunchOptions::default()
+        };
+        let document: serde_json::Value = serde_json::from_slice(
+            &guest_config_document(br#"{"config":null}"#, &options).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(document["config"]["Cmd"], json!(["/bin/true"]));
+    }
+
+    #[tokio::test]
+    async fn cancelled_builder_does_not_remove_a_live_staging_writer() {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        let path = std::env::temp_dir().join(format!(
+            "odorobo-extraction-cancel-{}",
+            ulid::Ulid::generate()
+        ));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .unwrap();
+        let cleanup = RemovePathOnDrop::new(path.clone());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let writer_path = path.clone();
+        let builder = tokio::spawn(async move {
+            tokio::task::spawn_blocking(move || {
+                let cleanup = cleanup;
+                started_tx.send(()).unwrap();
+                resume_rx.recv().unwrap();
+                std::fs::create_dir_all(writer_path.join("tree/children")).unwrap();
+                std::fs::write(
+                    writer_path.join("tree/children/payload"),
+                    b"privileged payload",
+                )
+                .unwrap();
+                ((), cleanup)
+            })
+            .await
+            .unwrap()
+        });
+        started_rx.await.unwrap();
+        builder.abort();
+        _ = builder.await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        resume_tx.send(()).unwrap();
+        for _ in 0..100 {
+            if !path.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!path.exists(), "last writer must remove abandoned staging");
+    }
+
+    #[test]
+    fn temporary_pull_guard_removes_cancelled_artifact_path() {
+        let dir = test_support::TempDir::new("cancel-cleanup");
+        std::fs::write(dir.join("partial"), b"partial").unwrap();
+        drop(RemovePathOnDrop::new(dir.to_path_buf()));
+        assert!(!dir.exists());
+    }
+}

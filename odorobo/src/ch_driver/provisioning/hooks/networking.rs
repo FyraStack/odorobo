@@ -6,12 +6,12 @@ use stable_eyre::{
     Result,
     eyre::{WrapErr, eyre},
 };
-use tracing::info;
+use tracing::{info, warn};
 use ulid::Ulid;
 
 use crate::networking::{
     actor::NetworkAgentActor,
-    messages::{AttachTap, DetachTap},
+    messages::{AttachTap, DetachTap, UnpublishPorts},
 };
 
 use super::ProvisioningHook;
@@ -90,14 +90,26 @@ impl ProvisioningHook for NetworkProvisioningHook {
             tap_count = taps.len(),
             "networking before_stop hook invoked for Odorobo-managed net:// TAP devices"
         );
+        let network_actor = match network_agent().await {
+            Ok(actor) => actor,
+            Err(err) if taps.is_empty() => {
+                // A stop must not hang on a network actor that is not there;
+                // there is nothing to detach and no ports left to unpublish.
+                warn!(%vmid, ?err, "no network actor during stop; skipping port unpublish");
+                return Ok(());
+            }
+            Err(err) => return Err(err.wrap_err("failed to look up network actor")),
+        };
+
+        // Remove published ports even if the TAP has already disappeared.
+        if let Err(err) = network_actor.ask(UnpublishPorts { vmid }).await {
+            warn!(%vmid, ?err, "failed to remove published ports");
+        }
+
         if taps.is_empty() {
             info!(vmid = %vmid, "no TAP devices present before stop, skipping network detach");
             return Ok(());
         }
-
-        let network_actor = network_agent()
-            .await
-            .wrap_err("failed to look up network actor")?;
 
         for tap_name in taps {
             info!(vmid = %vmid, tap = %tap_name, "sending DetachTap to network actor");

@@ -1,5 +1,7 @@
 //! VM management API handlers.
-use crate::messages::vm::{AgentListVMs, DeleteVM, GetConsoleHistory, GetVMInfo, ShutdownVM};
+use crate::messages::vm::{
+    AgentListVMs, DeleteVM, GetConsoleHistory, GetVMInfo, GetWorkloadLogs, ShutdownVM,
+};
 use crate::{
     actors::http_actor::HTTPActor,
     messages::vm::CreateVM,
@@ -27,6 +29,7 @@ pub fn router() -> ApiRouter<ActorRef<HTTPActor>> {
         .api_route("/{vmid}", delete(delete_vm))
         .api_route("/{vmid}/shutdown", put(shutdown_vm))
         .api_route("/{vmid}/console/history", get(console_history))
+        .api_route("/{vmid}/logs", get(workload_logs))
 }
 
 async fn list_vms(
@@ -97,6 +100,19 @@ async fn console_history(
     Ok((
         [(header::CONTENT_TYPE, "application/octet-stream")],
         reply.history,
+    ))
+}
+
+/// The workload's own output: its stdin/stdout/stderr stream.
+async fn workload_logs(
+    State(state): State<ActorRef<HTTPActor>>,
+    Path(VmId(vmid)): Path<VmId>,
+) -> Result<impl IntoApiResponse, OdoroboError> {
+    let reply = state.ask(GetWorkloadLogs { vmid }).await?;
+
+    Ok((
+        [(header::CONTENT_TYPE, "application/octet-stream")],
+        reply.logs,
     ))
 }
 

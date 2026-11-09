@@ -1,7 +1,8 @@
+use crate::messages::agent::{CollectRepositoryGarbage, RepositoryGcReply};
 use crate::messages::vm::{
     AgentListVMs, AgentListVMsReply, CreateVM, CreateVMReply, DeleteVM, DeleteVMReply,
-    GetConsoleHistory, GetConsoleHistoryReply, GetVMInfo, GetVMInfoReply, ShutdownVM,
-    ShutdownVMReply,
+    GetConsoleHistory, GetConsoleHistoryReply, GetVMInfo, GetVMInfoReply, GetWorkloadLogs,
+    GetWorkloadLogsReply, ShutdownVM, ShutdownVMReply,
 };
 use kameo::prelude::*;
 use stable_eyre::{
@@ -87,6 +88,22 @@ impl Message<GetConsoleHistory> for HTTPActor {
     }
 }
 
+impl Message<GetWorkloadLogs> for HTTPActor {
+    type Reply = Result<GetWorkloadLogsReply, Report>;
+
+    async fn handle(
+        &mut self,
+        msg: GetWorkloadLogs,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.scheduler
+            .ask(msg)
+            .await
+            .map_err(|err| eyre!(err.to_string()))
+            .wrap_err("failed to retrieve VM workload logs via scheduler")
+    }
+}
+
 impl Message<ShutdownVM> for HTTPActor {
     type Reply = Result<ShutdownVMReply, Report>;
 
@@ -132,5 +149,21 @@ impl Message<AgentListVMs> for HTTPActor {
             .await
             .map_err(|err| eyre!(err.to_string()))
             .wrap_err("failed to list VMs via scheduler")
+    }
+}
+
+impl Message<CollectRepositoryGarbage> for HTTPActor {
+    type Reply = Result<RepositoryGcReply, Report>;
+
+    async fn handle(
+        &mut self,
+        msg: CollectRepositoryGarbage,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.scheduler
+            .ask(msg)
+            .await
+            .map_err(|err| eyre!(err.to_string()))
+            .wrap_err("failed to collect repository garbage via scheduler")
     }
 }

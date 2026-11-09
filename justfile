@@ -21,6 +21,10 @@ build_cli:
 build_debug:
     cargo build -p odorobo
 
+# Build the guest PID 1 and install /var/lib/odorobo/microvm/initramfs.cpio.gz
+initramfs:
+    just -f odorobo-init/justfile initramfs
+
 debug *args: build_debug
     sudo target/debug/odorobo {{ args }}
 

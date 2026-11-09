@@ -1,4 +1,5 @@
 pub mod nodes;
+pub mod repository;
 pub mod vms;
 pub mod volumes;
 use aide::{
@@ -41,6 +42,10 @@ where
         .api_route("/swagger", Swagger::new("/openapi.json").axum_route())
         .api_route("/openapi.json", get(serve_api))
         .nest("/nodes", nodes::router().with_state(state.clone()))
+        .nest(
+            "/repository",
+            repository::router().with_state(state.clone()),
+        )
         .nest("/vms", vms::router().with_state(state.clone()))
         .nest("/volumes", volumes::router().with_state(state.clone()))
         .with_state(state)

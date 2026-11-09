@@ -8,6 +8,7 @@ pub mod http_api;
 mod manifest;
 pub mod messages;
 pub mod networking;
+pub mod ports;
 pub mod types;
 mod utils;
 
@@ -26,6 +27,7 @@ use crate::utils::{connect_to_swarm, init};
 
 fn main() -> Result<()> {
     let config = Config::init();
+    ch_driver::containers::install_limits(&config)?;
     let _sentry_guard = init_sentry(config.sentry_dsn.as_deref());
 
     init(Some("odorobo"))?;
@@ -65,6 +67,7 @@ fn mainloop(term: &Arc<AtomicBool>, config: Config) -> Result<()> {
             handle.abort();
             stable_eyre::eyre::bail!("Exit due to termination signal");
         }
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
 

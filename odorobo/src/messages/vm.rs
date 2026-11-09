@@ -5,7 +5,7 @@ use kameo::prelude::*;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use crate::manifest::VmManifest;
+use crate::manifest::{ObservedState, VmManifest};
 
 /// Message to create a new VM
 ///
@@ -69,7 +69,10 @@ pub struct DeleteVM {
 }
 
 #[derive(Serialize, Deserialize, Reply, Debug, Clone)]
-pub struct DeleteVMReply;
+pub struct DeleteVMReply {
+    /// Persistent rootfs teardown or deletion error, if actor cleanup failed.
+    pub error: Option<String>,
+}
 
 /// Shuts down a VM temporarily
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -100,6 +103,9 @@ pub struct GetVMInfo {
 pub struct GetVMInfoReply {
     pub vmid: Ulid,
     pub config: Option<VmManifest>,
+    /// Lifecycle as seen by the VM actor; kept out of `config`, which mirrors desired intent.
+    #[serde(default)]
+    pub observed: Option<ObservedState>,
 }
 
 /// Lightweight VM liveness check used by the scheduler heartbeat.
@@ -111,7 +117,7 @@ pub struct GetVMHeartbeatReply {
     pub vmid: Ulid,
 }
 
-/// Retrieve the retained serial-console output for a VM.
+/// Retrieve the retained serial-console output for a VM: kernel and init logs.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct GetConsoleHistory {
     pub vmid: Ulid,
@@ -122,7 +128,19 @@ pub struct GetConsoleHistoryReply {
     pub history: Vec<u8>,
 }
 
-/// Send raw input bytes to a VM's serial console.
+/// Retrieve the retained workload output for a VM: the stdin/stdout/stderr
+/// stream of the OCI workload on the virtio console.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct GetWorkloadLogs {
+    pub vmid: Ulid,
+}
+
+#[derive(Serialize, Deserialize, Reply, Debug, Clone)]
+pub struct GetWorkloadLogsReply {
+    pub logs: Vec<u8>,
+}
+
+/// Send raw input bytes to a VM's console.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SendConsoleInput {
     pub vmid: Ulid,

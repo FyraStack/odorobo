@@ -2,6 +2,7 @@ use bytesize::ByteSize;
 use clap::{Parser, Subcommand};
 use odorobo::{
     manifest::{Boot, Compute, DesiredState, Metadata, Storage, VmManifest},
+    messages::agent::RepositoryGcReply,
     types::CreateVMRequest,
 };
 use reqwest::{Client, Response};
@@ -58,6 +59,13 @@ pub enum Command {
     Shutdown {
         /// VM ID in ULID format
         vmid: String,
+    },
+
+    /// Reclaim composefs image repository space on every known node.
+    Gc {
+        /// Report what would be removed without deleting anything.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -179,9 +187,49 @@ pub async fn run_command(cli: Cli) -> Result<()> {
 
             print_message_response(response, "VM shutdown request sent successfully").await?;
         }
+        Command::Gc { dry_run } => {
+            let url = format!("{base_url}/repository/gc");
+            let response = client
+                .post(&url)
+                .json(&serde_json::json!({ "dry_run": dry_run }))
+                .send()
+                .await?;
+
+            if response.status().is_success() {
+                let reply: RepositoryGcReply = response.json().await?;
+                print_gc_reply(&reply);
+            } else {
+                print_api_error(response).await?;
+            }
+        }
     }
 
     Ok(())
+}
+
+fn print_gc_reply(reply: &RepositoryGcReply) {
+    let verb = if reply.dry_run {
+        "would remove"
+    } else {
+        "removed"
+    };
+    if reply.agents.is_empty() {
+        println!("no agents known; nothing to collect");
+    }
+    for agent in &reply.agents {
+        match (&agent.report, &agent.error) {
+            (Some(report), _) => println!(
+                "{}: {verb} {} objects ({}), pruned {} images and {} streams",
+                agent.hostname,
+                report.objects_removed,
+                ByteSize::b(report.objects_bytes),
+                report.images_pruned,
+                report.streams_pruned
+            ),
+            (None, Some(error)) => eprintln!("{}: {error}", agent.hostname),
+            (None, None) => eprintln!("{}: no result", agent.hostname),
+        }
+    }
 }
 
 #[cfg(test)]

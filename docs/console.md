@@ -1,27 +1,30 @@
 # Console Integration
 
-Odorobo configures the guest serial console as a UNIX socket owned by the agent rather than relying on a host PTY allocated by Cloud Hypervisor.
-This gives each VM a stable, deterministic host-side serial endpoint under the VM runtime directory.
+Odorobo configures the guest console as a UNIX socket owned by the agent rather than relying on a host PTY allocated by Cloud Hypervisor.
+This gives each VM a stable, deterministic host-side endpoint under the VM runtime directory.
+
+OCI rootfs VMs have two streams: kernel and init output on the 16550 serial port (`ttyS0`) at `console.sock`, and the workload's stdout/stderr on the virtio console (`hvc0`) at `workload.sock` (its stdin too when the manifest sets `rootfs.stdin`). Disk VMs keep only the serial console.
 
 Currently, Odorobo's console integration supports the following access patterns:
 
 - **Direct host-side serial socket access**: Each VM's serial console is configured as a UNIX socket at `/run/odorobo/vms/<vmid>/console.sock`. This can be connected to directly from the host with tools such as `socat`.
 - **WebSocket console bridge**: The agent exposes a WebSocket endpoint at `GET /vms/{vmid}/console` and proxies the VM's serial socket in both directions for browser or CLI clients.
 
-## Serial socket configuration
+## Console socket configuration
 
-During VM config transformation, Odorobo rewrites the serial console configuration to use Cloud Hypervisor's socket-backed serial mode.
-For a VM with ID `01KPBBXKK0R0M09VN7G6R6R3JF`, the serial console socket will be created at:
+During VM config transformation, Odorobo rewrites the console configuration to use Cloud Hypervisor's socket-backed mode. OCI rootfs VMs get the serial console plus the virtio console; disk VMs get only the serial console.
+For a VM with ID `01KPBBXKK0R0M09VN7G6R6R3JF`, the sockets are created at:
 
 ```text
-/run/odorobo/vms/01KPBBXKK0R0M09VN7G6R6R3JF/console.sock
+/run/odorobo/vms/01KPBBXKK0R0M09VN7G6R6R3JF/console.sock   # serial: kernel and init
+/run/odorobo/vms/01KPBBXKK0R0M09VN7G6R6R3JF/workload.sock  # virtio: the workload's stdio
 ```
 
-This path is stable for the lifetime of the VM runtime directory and is derived from the VM ID.
+These paths are stable for the lifetime of the VM runtime directory and are derived from the VM ID. The agent keeps a 1 MiB history of each, served as `GET /vms/{vmid}/console/history` and `GET /vms/{vmid}/logs`.
 
-## Why a serial socket
+## Why a socket
 
-Odorobo uses Cloud Hypervisor's socket-backed serial mode rather than host TTY
+Odorobo uses Cloud Hypervisor's socket-backed console mode rather than host TTY
 passthrough. TTY passthrough does not work reliably with systemd-managed VM
 processes and is incompatible with live migration. A graphical console is not
 an alternative because Cloud Hypervisor does not provide QXL or virtio-gpu
