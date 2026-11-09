@@ -2,6 +2,8 @@
 
 **Status:** Implemented on branch `cappy/networking-evpn` for the local routed and bridged paths: network objects with validation, the manager API, the agent registry, per-tap gateways, per-VM routes, VRF isolation, nftables policy, and the L3 VNI devices (`vrfbr<vni>`/`vrfvx<vni>`) on nodes with `network.evpn` configured. Still to come: FRR/EVPN advertisement and control-plane IPAM. Until the branch lands, released behavior is the `net://` transform, Host-only NAT / Bridged modes, dnsmasq, and TAPs created by Cloud Hypervisor (`docs/networking.md`).
 
+Operator setup for nodes (underlay, `config.json`, discovery, bring-up order) is in `docs/node-networking.md`.
+
 The per-tap gateway and filtering model is exercised by `dev/netns-gateway-harness.sh` (scratch, gitignored on the dev machine); its assertions are the spec the Rust reconciler has to reproduce.
 
 ## Goal
@@ -51,16 +53,17 @@ Per node, per network with members:
 
 - VRF named `vrf<vni>` with table ID = VNI, matching PVE's `vrf-vxlan` convention. Table IDs and device names are node-local: they may follow the VNI, but only the object `id` is a stable reference. L3 VNI devices follow the PVE/FRR idiom: `vrfvx<vni>` (VXLAN device) in `vrfbr<vni>` (bridge). Interface names stay under the 15-character limit and derive from the VNI, so no hashing scheme is needed for them.
 - The node joins the fabric through `config.json` `network.evpn.vtep`, its underlay address; without it routed networks stay node-local VRFs. The agent uses the address as the VXLAN `local` and does not assign it; the operator keeps it routable.
-- `vrfbr<vni>` is enslaved to the VRF with no addresses (`addrgenmode none`), the network's MTU, and a router MAC derived from the VTEP (`02:00:<vtep octets>`), so it is unique per node and stable across restarts. `vrfvx<vni>` uses dstport 4789, `nolearning`, and is the bridge's only port, with bridge-port `learning off` and `neigh_suppress on`; remote router MACs and VTEPs come from FRR. Devices that already exist are adopted, and their controller, MTU, MAC, VTEP and link state are reapplied.
-- Removing a routed network deletes `vrfvx<vni>`, `vrfbr<vni>` and the VRF.
+- `vrfbr<vni>` is enslaved to the VRF with no addresses (`addrgenmode none`), the network's MTU, and a router MAC derived from the VTEP (`02:00:<vtep octets>`), so it is unique per node and stable across restarts. `vrfvx<vni>` uses dstport 4789, `nolearning`, and is the bridge's only port, with bridge-port `learning off` and `neigh_suppress on`; remote router MACs and VTEPs come from FRR. If the devices already exist, the agent reuses them and reapplies their controller, MTU, MAC, VTEP and link state.
+- Every VRF table ends in `unreachable default metric 4278198272` (IPv4 and IPv6). Without it, a lookup that misses the VRF table continues to the next `ip rule`. The packet then leaves through the host's main-table default route with the tenant source address. The high metric lets any learned default, such as an edge's EVPN `0.0.0.0/0`, win.
+- Removing a routed network deletes `vrfvx<vni>`, `vrfbr<vni>`, the VRF, and the unreachable defaults. The defaults sit on `lo`, so they outlive the VRF device unless the agent deletes them.
 - Per-VM routes live in the VRF table: `10.0.0.5/32 dev vmtap-…` and the IPv6 equivalent. These routes are what gets advertised, not the subnet, so remote hosts send a VM's traffic to the host holding that VM. Their absence is what would make a subnet aggregate blackhole traffic.
-- FRR is driven by vtysh deltas only: `vrf <name>` + `vni <n>`, a per-VRF BGP instance with `redistribute kernel` and `advertise ipv4/ipv6 unicast`. Zebra imports routes the agent installs as kernel routes whatever their `proto` (only FRR's own protocols are read back as theirs), so `redistribute static` would match nothing; inside a tenant VRF the only kernel routes are the per-VM `/32`s. `frr.conf` stays a boot-time cache; the agent never regenerates the daemon config.
+- FRR is driven by vtysh deltas only: `vrf <name>` + `vni <n>`, a per-VRF BGP instance with `redistribute kernel` and `advertise ipv4/ipv6 unicast`. Zebra imports routes the agent installs as kernel routes whatever their `proto` (only FRR's own protocols are read back as theirs), so `redistribute static` would match nothing. Zebra also imports the unreachable defaults as kernel routes. The redistribution therefore needs a route-map that passes only `/32`s; without it, every node advertises an unreachable `0.0.0.0/0`. `frr.conf` stays a boot-time cache; the agent never regenerates the daemon config.
 - Firewalld (Fedora default) rejects forwarded traffic in `filter_FORWARD`; the reconciler has to install an accept path for tenant interfaces as part of its bootstrap. Docker and Tailscale also add forward chains on hosts that have them.
 - MTU: shared devices, routed taps and the guest NIC get the network's MTU.
 
 ## Enforcement
 
-- Isolation is the VRF. Cross-network traffic has no route.
+- Isolation is the VRF. Cross-network traffic has no route, and the unreachable default keeps unmatched traffic from falling through to the main table.
 - Per-VM policy is nftables on the tap, evaluated at **prerouting**. At the forward hook, `iifname` is the VRF master for traffic arriving on a slave tap, so per-tap rules placed there silently match nothing; a forward chain can only filter per tenant. This was a real false pass in the first harness version; the harness now asserts both halves (`vrf<vni>` counter moves, tap counter stays zero).
 - IPv4 anti-spoof: drop when `iifname <tap>` and `ip saddr != <this VM's address>`.
 - IPv6 anti-spoof needs `{ <this VM's address>, fe80::/10, :: }` as the allowed source set, because DAD, neighbour discovery, and MLD use `::` and link-local sources. A bare `!= <address>` breaks the guest's own gateway ping.

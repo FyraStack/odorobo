@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    net::Ipv4Addr,
+    net::{Ipv4Addr, Ipv6Addr},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -28,7 +28,7 @@ use nftables::{
 };
 use rtnetlink::packet_route::{
     link::{AfSpecInet6, AfSpecUnspec, In6AddrGenMode, LinkAttribute, LinkMessage},
-    route::RouteScope,
+    route::{RouteMessage, RouteScope, RouteType},
 };
 use rtnetlink::{
     Error as NetlinkError, Handle, LinkBridge, LinkBridgePort, LinkMessageBuilder, LinkUnspec,
@@ -48,6 +48,8 @@ const DNAT_PRIORITY: i32 = -100;
 const ANTISPOOF_PRIORITY: i32 = -150;
 const GUEST_NAT_PRIORITY: i32 = 100;
 const VXLAN_PORT: u16 = 4789;
+/// Metric of a VRF's unreachable default, high enough for any learned default to win.
+const VRF_UNREACHABLE_METRIC: u32 = 4_278_198_272;
 const LEASE_TIMEOUT: Duration = Duration::from_secs(15);
 const LEASE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -293,6 +295,37 @@ async fn ensure_link(handle: &Handle, name: &str, link: LinkMessage) -> Result<u
         .await?
         .ok_or_else(|| eyre!("link {name} was not found after creation"))?;
     Ok(created.header.index)
+}
+
+/// Without these, a lookup that misses the VRF table falls through to the main table.
+fn unreachable_defaults(table_id: u32) -> [RouteMessage; 2] {
+    [
+        RouteMessageBuilder::<Ipv4Addr>::new()
+            .table_id(table_id)
+            .kind(RouteType::Unreachable)
+            .priority(VRF_UNREACHABLE_METRIC)
+            .build(),
+        RouteMessageBuilder::<Ipv6Addr>::new()
+            .table_id(table_id)
+            .kind(RouteType::Unreachable)
+            .priority(VRF_UNREACHABLE_METRIC)
+            .build(),
+    ]
+}
+
+async fn ensure_unreachable_default(handle: &Handle, table_id: u32) -> Result<(), Report> {
+    for route in unreachable_defaults(table_id) {
+        handle
+            .route()
+            .add(route)
+            .replace()
+            .execute()
+            .await
+            .wrap_err_with(|| {
+                format!("failed to add the unreachable default to table {table_id}")
+            })?;
+    }
+    Ok(())
 }
 
 /// Router MAC of this node's L3 VNI bridges: locally administered and derived from the VTEP.
@@ -654,6 +687,22 @@ impl NetworkAgentActor {
                 Ok(()) => {}
             }
         }
+        // The defaults sit on lo, so deleting the VRF leaves them in its table.
+        for route in unreachable_defaults(state.table_id) {
+            match handle.route().del(route).execute().await {
+                Err(NetlinkError::NetlinkError(err)) if err.raw_code() == -libc::ESRCH => {}
+                Err(err) => {
+                    error!(table = state.table_id, %err, "failed to delete the unreachable default");
+                    first_error.get_or_insert_with(|| {
+                        eyre!(
+                            "failed to delete the unreachable default from table {}: {err}",
+                            state.table_id
+                        )
+                    });
+                }
+                Ok(()) => {}
+            }
+        }
         first_error.map_or(Ok(()), Err)
     }
 
@@ -698,6 +747,7 @@ impl NetworkAgentActor {
             LinkVrf::new(&vrf, vni).up().build(),
         )
         .await?;
+        ensure_unreachable_default(&self.netlink_handle, vni).await?;
 
         let l3vni = match &self.config.evpn {
             Some(evpn) => Some(
