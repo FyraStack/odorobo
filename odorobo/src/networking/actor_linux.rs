@@ -26,9 +26,13 @@ use nftables::{
     stmt::{Counter, Match as NftMatch, NAT, NATFamily, Operator, Statement},
     types::{NfChainPolicy, NfChainType, NfFamily, NfHook},
 };
-use rtnetlink::packet_route::{link::LinkMessage, route::RouteScope};
+use rtnetlink::packet_route::{
+    link::{AfSpecInet6, AfSpecUnspec, In6AddrGenMode, LinkAttribute, LinkMessage},
+    route::RouteScope,
+};
 use rtnetlink::{
-    Error as NetlinkError, Handle, LinkBridge, LinkUnspec, LinkVrf, RouteMessageBuilder,
+    Error as NetlinkError, Handle, LinkBridge, LinkBridgePort, LinkMessageBuilder, LinkUnspec,
+    LinkVrf, LinkVxlan, RouteMessageBuilder,
 };
 use stable_eyre::Report;
 use stable_eyre::eyre::{Context as EyreContext, eyre};
@@ -43,6 +47,7 @@ const NFT_GUEST_NAT_CHAIN: &str = "guest_nat";
 const DNAT_PRIORITY: i32 = -100;
 const ANTISPOOF_PRIORITY: i32 = -150;
 const GUEST_NAT_PRIORITY: i32 = 100;
+const VXLAN_PORT: u16 = 4789;
 const LEASE_TIMEOUT: Duration = Duration::from_secs(15);
 const LEASE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -129,12 +134,21 @@ struct Member {
     address: Option<Ipv4Addr>,
 }
 
+/// The bridge and VXLAN devices that carry a routed network across the EVPN fabric.
+struct L3Vni {
+    bridge: String,
+    bridge_index: u32,
+    vxlan: String,
+    vxlan_index: u32,
+}
+
 struct RoutedState {
     vrf: String,
     vrf_index: u32,
     table_id: u32,
     gateway: Ipv4Addr,
     mtu: u16,
+    l3vni: Option<L3Vni>,
     members: Vec<Member>,
 }
 
@@ -261,23 +275,107 @@ async fn lookup_link(handle: &Handle, link_name: &str) -> Result<Option<LinkMess
     }
 }
 
-async fn ensure_bridge(handle: &Handle, name: &str) -> Result<u32, Report> {
-    if let Some(link) = lookup_link(handle, name).await? {
-        return Ok(link.header.index);
+/// Returns the index of link `name`, creating it from `link` when it is missing.
+async fn ensure_link(handle: &Handle, name: &str, link: LinkMessage) -> Result<u32, Report> {
+    if let Some(existing) = lookup_link(handle, name).await? {
+        return Ok(existing.header.index);
     }
 
-    info!(bridge = name, "bridge not found, creating it");
+    info!(link = name, "link not found, creating it");
     handle
         .link()
-        .add(LinkBridge::new(name).up().build())
+        .add(link)
         .execute()
         .await
-        .wrap_err_with(|| format!("failed to create bridge {name}"))?;
+        .wrap_err_with(|| format!("failed to create link {name}"))?;
 
-    let link = lookup_link(handle, name)
+    let created = lookup_link(handle, name)
         .await?
-        .ok_or_else(|| eyre!("bridge {name} was not found after creation"))?;
-    Ok(link.header.index)
+        .ok_or_else(|| eyre!("link {name} was not found after creation"))?;
+    Ok(created.header.index)
+}
+
+/// Router MAC of this node's L3 VNI bridges: locally administered and derived from the VTEP.
+fn router_mac(vtep: Ipv4Addr) -> Vec<u8> {
+    let [a, b, c, d] = vtep.octets();
+    vec![0x02, 0x00, a, b, c, d]
+}
+
+/// Creates or reconciles `vrfbr<vni>` in the VRF with `vrfvx<vni>` as its only port.
+async fn ensure_l3vni(
+    handle: &Handle,
+    vni: u32,
+    vrf_index: u32,
+    vtep: Ipv4Addr,
+    mtu: u16,
+) -> Result<L3Vni, Report> {
+    let bridge = format!("vrfbr{vni}");
+    let bridge_index = ensure_link(
+        handle,
+        &bridge,
+        LinkMessageBuilder::<LinkBridge>::new(&bridge).build(),
+    )
+    .await?;
+    let no_link_local =
+        LinkAttribute::AfSpecUnspec(vec![AfSpecUnspec::Inet6(vec![AfSpecInet6::AddrGenMode(
+            In6AddrGenMode::None,
+        )])]);
+    handle
+        .link()
+        .change(
+            LinkUnspec::new_with_index(bridge_index)
+                .address(router_mac(vtep))
+                .mtu(u32::from(mtu))
+                .controller(vrf_index)
+                .append_extra_attribute(no_link_local)
+                .up()
+                .build(),
+        )
+        .execute()
+        .await
+        .wrap_err_with(|| format!("failed to configure bridge {bridge}"))?;
+
+    let vxlan = format!("vrfvx{vni}");
+    let vxlan_index = ensure_link(
+        handle,
+        &vxlan,
+        LinkVxlan::new(&vxlan, vni)
+            .local(vtep)
+            .port(VXLAN_PORT)
+            .learning(false)
+            .build(),
+    )
+    .await?;
+    // Separate messages: the VXLAN changelink rejects IFLA_MTU.
+    let vxlan_settings = [
+        LinkMessageBuilder::<LinkVxlan>::new(&vxlan)
+            .local(vtep)
+            .build(),
+        LinkUnspec::new_with_index(vxlan_index)
+            .mtu(u32::from(mtu))
+            .controller(bridge_index)
+            .up()
+            .build(),
+        LinkBridgePort::new(vxlan_index)
+            .learning(false)
+            .neigh_suppress(true)
+            .build(),
+    ];
+    for settings in vxlan_settings {
+        handle
+            .link()
+            .change(settings)
+            .execute()
+            .await
+            .wrap_err_with(|| format!("failed to configure vxlan {vxlan}"))?;
+    }
+
+    Ok(L3Vni {
+        bridge,
+        bridge_index,
+        vxlan,
+        vxlan_index,
+    })
 }
 
 async fn ensure_address(
@@ -498,7 +596,7 @@ impl NetworkAgentActor {
         for member in &state.members {
             Self::detach_tap(&self.netlink_handle, &member.tap_name).await?;
         }
-        Self::delete_vrf(&self.netlink_handle, &state).await?;
+        Self::delete_routed(&self.netlink_handle, &state).await?;
 
         let realized = Realized::Routed(self.realize_routed(network).await?);
         self.networks.insert(
@@ -537,14 +635,26 @@ impl NetworkAgentActor {
         Ok(())
     }
 
-    async fn delete_vrf(handle: &Handle, state: &RoutedState) -> Result<(), Report> {
-        handle
-            .link()
-            .del(state.vrf_index)
-            .execute()
-            .await
-            .wrap_err_with(|| format!("failed to delete vrf device {}", state.vrf))?;
-        Ok(())
+    /// Deletes the L3 VNI devices and the VRF; enslaved taps are released, not deleted.
+    async fn delete_routed(handle: &Handle, state: &RoutedState) -> Result<(), Report> {
+        let l3vni_links = state.l3vni.iter().flat_map(|l3vni| {
+            [
+                (l3vni.vxlan_index, &l3vni.vxlan),
+                (l3vni.bridge_index, &l3vni.bridge),
+            ]
+        });
+        let mut first_error = None;
+        for (index, name) in l3vni_links.chain([(state.vrf_index, &state.vrf)]) {
+            match handle.link().del(index).execute().await {
+                Err(NetlinkError::NetlinkError(err)) if err.raw_code() == -libc::ENODEV => {}
+                Err(err) => {
+                    error!(link = %name, %err, "failed to delete link");
+                    first_error.get_or_insert_with(|| eyre!("failed to delete link {name}: {err}"));
+                }
+                Ok(()) => {}
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     /// Re-attaches recorded members, skipping taps that no longer exist.
@@ -582,23 +692,25 @@ impl NetworkAgentActor {
             .vni()
             .ok_or_else(|| eyre!("routed network {:?} requires a vni", network.id))?;
         let vrf = format!("vrf{vni}");
+        let vrf_index = ensure_link(
+            &self.netlink_handle,
+            &vrf,
+            LinkVrf::new(&vrf, vni).up().build(),
+        )
+        .await?;
 
-        let vrf_index = if let Some(link) = lookup_link(&self.netlink_handle, &vrf).await? {
-            link.header.index
-        } else {
-            info!(vrf = %vrf, table = vni, "creating vrf device for routed network");
-            self.netlink_handle
-                .link()
-                .add(LinkVrf::new(&vrf, vni).up().build())
-                .execute()
-                .await
-                .wrap_err_with(|| format!("failed to create vrf device {vrf}"))?;
-
-            lookup_link(&self.netlink_handle, &vrf)
-                .await?
-                .ok_or_else(|| eyre!("vrf device {vrf} was not found after creation"))?
-                .header
-                .index
+        let l3vni = match &self.config.evpn {
+            Some(evpn) => Some(
+                ensure_l3vni(
+                    &self.netlink_handle,
+                    vni,
+                    vrf_index,
+                    evpn.vtep,
+                    network.mtu(),
+                )
+                .await?,
+            ),
+            None => None,
         };
 
         let state = RoutedState {
@@ -607,6 +719,7 @@ impl NetworkAgentActor {
             table_id: vni,
             gateway: network.gateway(),
             mtu: network.mtu(),
+            l3vni,
             members: Vec::new(),
         };
 
@@ -615,6 +728,7 @@ impl NetworkAgentActor {
             vrf = %state.vrf,
             table = vni,
             gateway = %state.gateway,
+            vxlan = ?state.l3vni.as_ref().map(|l3vni| &l3vni.vxlan),
             "routed network realized"
         );
         Ok(state)
@@ -645,7 +759,12 @@ impl NetworkAgentActor {
             .bridge
             .clone()
             .ok_or_else(|| eyre!("bridged network {:?} requires a bridge", network.id))?;
-        let bridge_index = ensure_bridge(&self.netlink_handle, &bridge).await?;
+        let bridge_index = ensure_link(
+            &self.netlink_handle,
+            &bridge,
+            LinkBridge::new(&bridge).up().build(),
+        )
+        .await?;
         ensure_address(
             &self.netlink_handle,
             bridge_index,
@@ -698,7 +817,7 @@ impl NetworkAgentActor {
                 info!(network_id = %id, bridge = %state.bridge, "removed bridged network");
             }
             Realized::Routed(state) => {
-                Self::delete_vrf(&self.netlink_handle, &state).await?;
+                Self::delete_routed(&self.netlink_handle, &state).await?;
                 info!(network_id = %id, vrf = %state.vrf, "removed routed network");
             }
         }
@@ -1520,6 +1639,7 @@ mod tests {
                 gateway: "10.10.100.1".parse().unwrap(),
                 upstream_iface: "enp4s0".to_owned(),
             },
+            evpn: None,
         };
 
         let network = legacy_network(&config);
@@ -1542,6 +1662,7 @@ mod tests {
                 subnet: "10.20.0.0/24".parse().unwrap(),
                 gateway: "10.20.0.1".parse().unwrap(),
             },
+            evpn: None,
         };
 
         let network = legacy_network(&config);

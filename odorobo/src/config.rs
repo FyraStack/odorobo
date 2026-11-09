@@ -61,10 +61,19 @@ pub struct DhcpConfig {
     pub lease_time: String,
 }
 
+/// EVPN fabric membership for routed networks.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct EvpnConfig {
+    /// Underlay address VXLAN tunnels originate from; the operator keeps it routable.
+    pub vtep: Ipv4Addr,
+}
+
 #[derive(Serialize, Deserialize, Default, Clone, Debug)]
 pub struct NetworkConfig {
     pub dhcp_config: Option<DhcpConfig>,
     pub network_mode: NetworkMode,
+    /// Without it, routed networks stay node-local VRFs.
+    pub evpn: Option<EvpnConfig>,
 }
 
 /// L3 routing configuration for guests
@@ -241,6 +250,7 @@ mod tests {
                     subnet: Ipv4Net::new(Ipv4Addr::new(10, 10, 100, 0), 24).unwrap(),
                     upstream_iface: "test0".to_owned(),
                 },
+                evpn: None,
             },
             ..Default::default()
         };
