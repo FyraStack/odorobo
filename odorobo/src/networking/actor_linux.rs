@@ -10,6 +10,7 @@ use crate::messages::network::{
     EnsureNetwork, EnsureNetworkReply, RemoveNetwork, RemoveNetworkReply,
 };
 use crate::network::{DhcpPool, Network, NetworkProvider};
+use crate::networking::fabric::Fabric;
 use crate::networking::messages::{
     AttachNic, AttachedNic, DetachNic, LookupNetwork, LookupNetworkReply, NetworkStatus,
     NetworkSummary, PublishPorts, Status, UnpublishPorts,
@@ -515,8 +516,8 @@ pub struct NetworkAgentActor {
     port_tasks: HashMap<Ulid, tokio::task::JoinHandle<()>>,
     netlink_thread: tokio::task::JoinHandle<()>,
     netlink_handle: Handle,
-    /// This node's VTEP when the node is part of an EVPN fabric.
-    vtep: Option<Ipv4Addr>,
+    /// Set when the node is part of an EVPN fabric.
+    fabric: Option<Fabric>,
 }
 
 impl Actor for NetworkAgentActor {
@@ -527,11 +528,13 @@ impl Actor for NetworkAgentActor {
         let (connection, handle, _) = rtnetlink::new_connection()?;
         let netlink_thread = tokio::spawn(connection);
 
-        let vtep = match &config.evpn {
+        let fabric = match &config.evpn {
             Some(evpn) => {
                 let vtep = underlay_address(&handle, evpn.underlay).await?;
-                info!(%vtep, underlay = %evpn.underlay, asn = evpn.asn, "joining the EVPN fabric");
-                Some(vtep)
+                let fabric = Fabric::new(vtep, evpn.underlay, evpn.asn);
+                fabric.ensure_bgp().await?;
+                info!(%vtep, underlay = %evpn.underlay, asn = evpn.asn, "joined the EVPN fabric");
+                Some(fabric)
             }
             None => None,
         };
@@ -552,7 +555,7 @@ impl Actor for NetworkAgentActor {
             port_tasks: HashMap::new(),
             netlink_thread,
             netlink_handle: handle,
-            vtep,
+            fabric,
         };
 
         actor
@@ -672,7 +675,9 @@ impl NetworkAgentActor {
         for member in &state.members {
             Self::detach_tap(&self.netlink_handle, &member.tap_name).await?;
         }
-        Self::delete_routed(&self.netlink_handle, &state).await?;
+        if let Err(err) = self.delete_routed(&state).await {
+            warn!(network_id = %network.id, vrf = %state.vrf, ?err, "old vrf not fully removed; realizing the new vni anyway");
+        }
 
         let realized = Realized::Routed(self.realize_routed(network).await?);
         self.networks.insert(
@@ -711,15 +716,26 @@ impl NetworkAgentActor {
         Ok(())
     }
 
-    /// Deletes the L3 VNI devices and the VRF; enslaved taps are released, not deleted.
-    async fn delete_routed(handle: &Handle, state: &RoutedState) -> Result<(), Report> {
+    /// Withdraws the network from FRR and deletes its devices; taps are released, not deleted.
+    async fn delete_routed(&self, state: &RoutedState) -> Result<(), Report> {
+        let handle = &self.netlink_handle;
+        let mut first_error = match &self.fabric {
+            Some(fabric) => fabric
+                .withdraw_network(&state.vrf, state.table_id)
+                .await
+                .err(),
+            None => None,
+        };
+        if let Some(err) = &first_error {
+            error!(vrf = %state.vrf, ?err, "failed to remove the network from FRR");
+        }
+
         let l3vni_links = state.l3vni.iter().flat_map(|l3vni| {
             [
                 (l3vni.vxlan_index, &l3vni.vxlan),
                 (l3vni.bridge_index, &l3vni.bridge),
             ]
         });
-        let mut first_error = None;
         for (index, name) in l3vni_links.chain([(state.vrf_index, &state.vrf)]) {
             match handle.link().del(index).execute().await {
                 Err(NetlinkError::NetlinkError(err)) if err.raw_code() == -libc::ENODEV => {}
@@ -745,6 +761,12 @@ impl NetworkAgentActor {
                 }
                 Ok(()) => {}
             }
+        }
+        if let Some(fabric) = &self.fabric
+            && let Err(err) = fabric.forget_vrf(&state.vrf).await
+        {
+            error!(vrf = %state.vrf, ?err, "failed to remove the VRF from FRR");
+            first_error.get_or_insert(err);
         }
         first_error.map_or(Ok(()), Err)
     }
@@ -792,9 +814,18 @@ impl NetworkAgentActor {
         .await?;
         ensure_unreachable_default(&self.netlink_handle, vni).await?;
 
-        let l3vni = match self.vtep {
-            Some(vtep) => {
-                Some(ensure_l3vni(&self.netlink_handle, vni, vrf_index, vtep, network.mtu()).await?)
+        let l3vni = match &self.fabric {
+            Some(fabric) => {
+                let l3vni = ensure_l3vni(
+                    &self.netlink_handle,
+                    vni,
+                    vrf_index,
+                    fabric.vtep,
+                    network.mtu(),
+                )
+                .await?;
+                fabric.ensure_network(&vrf, vni).await?;
+                Some(l3vni)
             }
             None => None,
         };
@@ -890,6 +921,10 @@ impl NetworkAgentActor {
         if !entry.members().is_empty() {
             return Err(eyre!("network {id} still has attached NICs"));
         }
+        // Keep the entry until cleanup succeeds so a failed removal can be retried.
+        if let Realized::Routed(state) = &entry.realized {
+            self.delete_routed(state).await?;
+        }
 
         let Some(entry) = self.networks.remove(id) else {
             return Err(eyre!("unknown network {id}"));
@@ -903,7 +938,6 @@ impl NetworkAgentActor {
                 info!(network_id = %id, bridge = %state.bridge, "removed bridged network");
             }
             Realized::Routed(state) => {
-                Self::delete_routed(&self.netlink_handle, &state).await?;
                 info!(network_id = %id, vrf = %state.vrf, "removed routed network");
             }
         }
