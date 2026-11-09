@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    net::{Ipv4Addr, Ipv6Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -17,6 +17,7 @@ use crate::networking::messages::{
 use crate::ports::{PortMapping, lease_ip};
 use futures_util::{StreamExt, TryStreamExt};
 
+use ipnet::Ipv4Net;
 use kameo::{message::Context, prelude::*};
 use nftables::{
     batch::Batch as NftBatch,
@@ -27,6 +28,7 @@ use nftables::{
     types::{NfChainPolicy, NfChainType, NfFamily, NfHook},
 };
 use rtnetlink::packet_route::{
+    address::AddressAttribute,
     link::{AfSpecInet6, AfSpecUnspec, In6AddrGenMode, LinkAttribute, LinkMessage},
     route::{RouteMessage, RouteScope, RouteType},
 };
@@ -278,6 +280,36 @@ async fn lookup_link(handle: &Handle, link_name: &str) -> Result<Option<LinkMess
 }
 
 /// Returns the index of link `name`, creating it from `link` when it is missing.
+/// The one local IPv4 address inside `underlay`, which becomes this node's VTEP.
+async fn underlay_address(handle: &Handle, underlay: Ipv4Net) -> Result<Ipv4Addr, Report> {
+    let mut messages = handle.address().get().execute();
+    let mut found = Vec::new();
+    while let Some(message) = messages
+        .try_next()
+        .await
+        .wrap_err("failed to list local addresses")?
+    {
+        for attribute in message.attributes {
+            if let AddressAttribute::Local(IpAddr::V4(address)) = attribute
+                && underlay.contains(&address)
+                && !found.contains(&address)
+            {
+                found.push(address);
+            }
+        }
+    }
+
+    match found.as_slice() {
+        [vtep] => Ok(*vtep),
+        [] => Err(eyre!(
+            "no local address is inside the EVPN underlay {underlay}"
+        )),
+        many => Err(eyre!(
+            "several local addresses are inside the EVPN underlay {underlay}: {many:?}"
+        )),
+    }
+}
+
 async fn ensure_link(handle: &Handle, name: &str, link: LinkMessage) -> Result<u32, Report> {
     if let Some(existing) = lookup_link(handle, name).await? {
         return Ok(existing.header.index);
@@ -430,9 +462,8 @@ async fn ensure_address(
         }
 
         let already_present = address_msg.attributes.iter().any(|attr| match attr {
-            rtnetlink::packet_route::address::AddressAttribute::Address(ip)
-            | rtnetlink::packet_route::address::AddressAttribute::Local(ip) => {
-                matches!(ip, std::net::IpAddr::V4(existing_ip) if *existing_ip == address)
+            AddressAttribute::Address(ip) | AddressAttribute::Local(ip) => {
+                matches!(ip, IpAddr::V4(existing_ip) if *existing_ip == address)
             }
             _ => false,
         });
@@ -484,6 +515,8 @@ pub struct NetworkAgentActor {
     port_tasks: HashMap<Ulid, tokio::task::JoinHandle<()>>,
     netlink_thread: tokio::task::JoinHandle<()>,
     netlink_handle: Handle,
+    /// This node's VTEP when the node is part of an EVPN fabric.
+    vtep: Option<Ipv4Addr>,
 }
 
 impl Actor for NetworkAgentActor {
@@ -493,6 +526,15 @@ impl Actor for NetworkAgentActor {
         let (config, runtime_root) = args;
         let (connection, handle, _) = rtnetlink::new_connection()?;
         let netlink_thread = tokio::spawn(connection);
+
+        let vtep = match &config.evpn {
+            Some(evpn) => {
+                let vtep = underlay_address(&handle, evpn.underlay).await?;
+                info!(%vtep, underlay = %evpn.underlay, asn = evpn.asn, "joining the EVPN fabric");
+                Some(vtep)
+            }
+            None => None,
+        };
 
         let legacy = legacy_network(&config);
         info!(
@@ -510,6 +552,7 @@ impl Actor for NetworkAgentActor {
             port_tasks: HashMap::new(),
             netlink_thread,
             netlink_handle: handle,
+            vtep,
         };
 
         actor
@@ -749,17 +792,10 @@ impl NetworkAgentActor {
         .await?;
         ensure_unreachable_default(&self.netlink_handle, vni).await?;
 
-        let l3vni = match &self.config.evpn {
-            Some(evpn) => Some(
-                ensure_l3vni(
-                    &self.netlink_handle,
-                    vni,
-                    vrf_index,
-                    evpn.vtep,
-                    network.mtu(),
-                )
-                .await?,
-            ),
+        let l3vni = match self.vtep {
+            Some(vtep) => {
+                Some(ensure_l3vni(&self.netlink_handle, vni, vrf_index, vtep, network.mtu()).await?)
+            }
             None => None,
         };
 

@@ -33,8 +33,10 @@ when a NIC attaches.
 
 The underlay is the network VXLAN traffic crosses between nodes.
 
-- Give every node one address on it. That address is the node's **VTEP**. Configure it on an
-  interface yourself: the agent uses the address but never assigns it.
+- Pick one underlay CIDR for the fabric, for example `10.77.0.0/24`. Give every node exactly one
+  address inside it, on any interface. Configure the address yourself; the agent never assigns it.
+- At start, the agent finds that address and uses it as the node's **VTEP**. The agent refuses to
+  start if it finds no address inside the CIDR, or more than one.
 - VTEPs must reach each other, and UDP **4789** must be open between them.
 - Underlay MTU must be at least **1500**. Tenant networks default to MTU 1450, and VXLAN adds 50
   bytes.
@@ -67,7 +69,7 @@ environment variables override it (for example `--manager-enabled true`).
       "subnet": "10.10.100.0/24",
       "lease_time": "12h"
     },
-    "evpn": { "vtep": "10.77.0.11" }
+    "evpn": { "underlay": "10.77.0.0/24", "asn": 65000 }
   }
 }
 ```
@@ -76,9 +78,10 @@ environment variables override it (for example `--manager-enabled true`).
 |---|---|
 | `network.network_mode` | the node-local `default` network: `HostonlyNat` (private bridge, NAT out `upstream_iface`, which defaults to the default-route interface) or `Bridged` (operator-managed bridge with an uplink; `bridge`, `subnet`, `gateway`) |
 | `network.dhcp_config` | optional dnsmasq pool on that bridge |
-| `network.evpn.vtep` | this node's underlay address. Without `evpn`, routed networks stay node-local VRFs with no VXLAN devices |
+| `network.evpn.underlay` | the fabric's underlay CIDR; the node's one local address inside it becomes its VTEP. Without `evpn`, routed networks stay node-local VRFs with no VXLAN devices |
+| `network.evpn.asn` | BGP autonomous system of the fabric, default `65000`. Every node uses the same value |
 
-All other keys can be the same on every node. `vtep` must be unique per node, it being the node's underlay address.
+The whole file can be the same on every node; the VTEP comes from each node's own interfaces.
 
 Run the agent from the directory holding `config.json`, for example as a unit:
 
@@ -142,6 +145,5 @@ journalctl -u odorobo                             # "mDNS discovered peer", "Con
 ## Not yet available
 
 - Cross-node routes (FRR BGP EVPN type-5 via vtysh, or the agent mesh).
-- VTEP derived from an underlay CIDR instead of a per-node address.
 - Swarm pre-shared key, seed peers for routed underlays, network persistence and re-sync.
 - Internet egress for routed tenants.

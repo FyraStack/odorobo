@@ -61,11 +61,18 @@ pub struct DhcpConfig {
     pub lease_time: String,
 }
 
+const fn default_evpn_asn() -> u32 {
+    65_000
+}
+
 /// EVPN fabric membership for routed networks.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct EvpnConfig {
-    /// Underlay address VXLAN tunnels originate from; the operator keeps it routable.
-    pub vtep: Ipv4Addr,
+    /// Underlay network; this node's VTEP is its one local address inside it.
+    pub underlay: Ipv4Net,
+    /// BGP autonomous system shared by the fabric.
+    #[serde(default = "default_evpn_asn")]
+    pub asn: u32,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, Debug)]
