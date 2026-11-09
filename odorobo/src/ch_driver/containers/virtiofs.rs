@@ -1,6 +1,6 @@
 //! Actor-owned virtiofsd supervision.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
@@ -91,102 +91,7 @@ impl VirtioFsSupervisor {
             restarts: AtomicU32::new(0),
             ready: AtomicBool::new(false),
         });
-        let task_state = Arc::clone(&state);
-        let task_spec = spec.clone();
-
-        let handle = tokio::spawn(async move {
-            let mut backoff_secs: u64 = 1;
-            loop {
-                if task_state.shutdown.load(Ordering::Relaxed) {
-                    break;
-                }
-                task_state.ready.store(false, Ordering::Relaxed);
-                // Only the previous child has owned this private VM socket.
-                // Remove it after exit, before each replacement generation.
-                std::fs::remove_file(&task_spec.socket).ok();
-                let log = match std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&task_spec.log)
-                {
-                    Ok(log) => log,
-                    Err(err) => {
-                        warn!(
-                            error = ?err,
-                            log = %task_spec.log.display(),
-                            "cannot open virtiofsd log; stopping supervisor"
-                        );
-                        break;
-                    }
-                };
-                let mut args = vec![
-                    format!("--socket-path={}", task_spec.socket.display()),
-                    format!("--shared-dir={}", task_spec.shared_dir.display()),
-                    "--sandbox=namespace".to_owned(),
-                    "--cache=auto".to_owned(),
-                    "--xattr".to_owned(),
-                    "--posix-acl".to_owned(),
-                ];
-                if task_spec.read_only {
-                    args.push("--readonly".to_owned());
-                }
-                let mut cmd = Command::new(&task_spec.program);
-                cmd.args(args)
-                    .stdin(std::process::Stdio::null())
-                    .stdout(log.try_clone().expect("log handle clone"))
-                    .stderr(log)
-                    .kill_on_drop(true);
-
-                debug!(program = %task_spec.program.display(), "spawning virtiofsd");
-                match cmd.spawn() {
-                    Ok(mut child) => {
-                        let exit = loop {
-                            match child.try_wait() {
-                                Ok(Some(status)) => break Ok(status),
-                                Err(err) => break Err(err),
-                                Ok(None) => {}
-                            }
-                            // A pathname from an exited generation is never
-                            // readiness. Only the current live child publishes it.
-                            task_state
-                                .ready
-                                .store(task_spec.socket.exists(), Ordering::Relaxed);
-                            tokio::select! {
-                                () = tokio::time::sleep(Duration::from_millis(50)) => {}
-                                () = task_state.notify.notified() => {
-                                    _ = child.start_kill();
-                                    break child.wait().await;
-                                }
-                            }
-                        };
-                        task_state.ready.store(false, Ordering::Relaxed);
-                        std::fs::remove_file(&task_spec.socket).ok();
-                        if task_state.shutdown.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        warn!(?exit, "virtiofsd exited unexpectedly, restarting");
-                    }
-                    Err(err) => {
-                        warn!(
-                            error = ?err,
-                            program = %task_spec.program.display(),
-                            "failed to spawn virtiofsd"
-                        );
-                    }
-                }
-                let restarts = task_state.restarts.fetch_add(1, Ordering::Relaxed);
-                warn!(
-                    restarts,
-                    backoff_secs, "virtiofsd backing off before restart"
-                );
-                tokio::select! {
-                    () = tokio::time::sleep(Duration::from_secs(backoff_secs)) => {}
-                    () = task_state.notify.notified() => {}
-                }
-                backoff_secs = backoff_secs.saturating_mul(2).min(30);
-            }
-            debug!("virtiofsd supervisor loop exiting");
-        });
+        let handle = tokio::spawn(supervise_virtiofsd(spec.clone(), Arc::clone(&state)));
 
         Self {
             spec,
@@ -244,111 +149,254 @@ impl VirtioFsSupervisor {
     }
 }
 
+/// Spawn, reap and restart virtiofsd until the shutdown flag is set.
+async fn supervise_virtiofsd(spec: VirtiofsdSpec, state: Arc<SupState>) {
+    // Backoff doubles from one second up to 30 so a crash loop stays cheap.
+    let mut backoff_secs: u64 = 1;
+    loop {
+        if state.shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+        let Some(mut cmd) = virtiofsd_command(&spec) else {
+            break;
+        };
+        debug!(program = %spec.program.display(), "spawning virtiofsd");
+        match cmd.spawn() {
+            Ok(child) => {
+                let exit = wait_for_exit(child, &state, &spec.socket).await;
+                if state.shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
+                warn!(?exit, "virtiofsd exited unexpectedly, restarting");
+            }
+            Err(err) => {
+                warn!(
+                    error = ?err,
+                    program = %spec.program.display(),
+                    "failed to spawn virtiofsd"
+                );
+            }
+        }
+        let restarts = state.restarts.fetch_add(1, Ordering::Relaxed);
+        warn!(
+            restarts,
+            backoff_secs, "virtiofsd backing off before restart"
+        );
+        tokio::select! {
+            () = tokio::time::sleep(Duration::from_secs(backoff_secs)) => {}
+            () = state.notify.notified() => {}
+        }
+        backoff_secs = backoff_secs.saturating_mul(2).min(30);
+    }
+    debug!("virtiofsd supervisor loop exiting");
+}
+
+/// Build the virtiofsd command with its log attached; `None` means the log
+/// cannot be opened and the supervisor must stop.
+fn virtiofsd_command(spec: &VirtiofsdSpec) -> Option<Command> {
+    let log = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&spec.log)
+    {
+        Ok(log) => log,
+        Err(err) => {
+            warn!(
+                error = ?err,
+                log = %spec.log.display(),
+                "cannot open virtiofsd log; stopping supervisor"
+            );
+            return None;
+        }
+    };
+    let mut args = vec![
+        format!("--socket-path={}", spec.socket.display()),
+        format!("--shared-dir={}", spec.shared_dir.display()),
+        "--sandbox=namespace".to_owned(),
+        "--cache=auto".to_owned(),
+        "--xattr".to_owned(),
+        "--posix-acl".to_owned(),
+    ];
+    if spec.read_only {
+        args.push("--readonly".to_owned());
+    }
+    let mut cmd = Command::new(&spec.program);
+    cmd.args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(log.try_clone().expect("log handle clone"))
+        .stderr(log)
+        .kill_on_drop(true);
+    Some(cmd)
+}
+
+/// Reap the child and drop its socket generation, so the next one starts
+/// clean and ready only describes the live child.
+async fn wait_for_exit(
+    mut child: tokio::process::Child,
+    state: &SupState,
+    socket: &Path,
+) -> std::io::Result<std::process::ExitStatus> {
+    let result = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Err(err) => break Err(err),
+            Ok(None) => {}
+        }
+        // A pathname from an exited generation is never readiness.
+        state.ready.store(socket.exists(), Ordering::Relaxed);
+        tokio::select! {
+            () = tokio::time::sleep(Duration::from_millis(50)) => {}
+            () = state.notify.notified() => {
+                _ = child.start_kill();
+                break child.wait().await;
+            }
+        }
+    };
+    state.ready.store(false, Ordering::Relaxed);
+    std::fs::remove_file(socket).ok();
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
-    use std::path::Path;
 
-    #[tokio::test]
-    async fn read_only_specs_pass_the_virtiofsd_readonly_flag() {
-        let base = std::env::temp_dir().join(format!("odorobo-sup-ro-{}", ulid::Ulid::generate()));
-        std::fs::create_dir_all(&base).unwrap();
-        let script = base.join("virtiofsd-stub");
-        std::fs::write(
-            &script,
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$(dirname \"$0\")/args\"\nexec sleep 100\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let supervisor = VirtioFsSupervisor::start(VirtiofsdSpec {
-            program: script,
-            socket: base.join("sock"),
-            shared_dir: base.clone(),
-            log: base.join("log"),
-            read_only: true,
-        });
-        let args_file = base.join("args");
+    /// Scratch directory removed on drop, including when the test panics.
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new(prefix: &str) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("odorobo-{prefix}-{}", ulid::Ulid::generate()));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).ok();
+        }
+    }
+
+    /// Poll `condition` every 10 ms for a second, then fail with `description`.
+    async fn eventually(description: &str, mut condition: impl FnMut() -> bool) {
         for _ in 0..100 {
-            if args_file.exists() {
-                break;
+            if condition() {
+                return;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let args = std::fs::read_to_string(&args_file).unwrap();
+        panic!("timed out waiting for {description}");
+    }
+
+    /// Write an executable stub and return its path.
+    fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    }
+
+    /// Spec whose socket, share and log all live in `dir`.
+    fn spec_in(dir: &Path, program: PathBuf) -> VirtiofsdSpec {
+        VirtiofsdSpec {
+            program,
+            socket: dir.join("sock"),
+            shared_dir: dir.to_path_buf(),
+            log: dir.join("log"),
+            read_only: false,
+        }
+    }
+
+    fn read_pid(path: &Path) -> u32 {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    fn process_alive(pid: u32) -> bool {
+        Path::new("/proc").join(pid.to_string()).exists()
+    }
+
+    #[tokio::test]
+    async fn read_only_specs_pass_the_virtiofsd_readonly_flag() {
+        let dir = TestDir::new("sup-ro");
+        let program = script(
+            dir.path(),
+            "virtiofsd-stub",
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$(dirname \"$0\")/args\"\nexec sleep 100\n",
+        );
+        let mut spec = spec_in(dir.path(), program);
+        spec.read_only = true;
+        let supervisor = VirtioFsSupervisor::start(spec);
+
+        let args = dir.path().join("args");
+        eventually("virtiofsd arguments to be recorded", || args.exists()).await;
+        let args = std::fs::read_to_string(&args).unwrap();
         assert!(args.lines().any(|arg| arg == "--readonly"), "{args}");
         assert!(
             args.lines().any(|arg| arg == "--sandbox=namespace"),
             "the daemon must be confined to its own namespaces: {args}"
         );
         supervisor.stop().await;
-        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[tokio::test]
     async fn supervisor_replaces_stale_socket_generation() {
-        let base =
-            std::env::temp_dir().join(format!("odorobo-socket-restart-{}", ulid::Ulid::generate()));
-        std::fs::create_dir_all(&base).unwrap();
-        let script = base.join("stub");
-        std::fs::write(&script, "#!/usr/bin/python3\nimport socket,sys,time,pathlib\np=pathlib.Path(__file__).parent\ns=socket.socket(socket.AF_UNIX)\ns.bind(str(p/'sock'))\nf=p/'generation'\nn=int(f.read_text())+1 if f.exists() else 1\nf.write_text(str(n))\ntime.sleep(0.15 if n==1 else 100)\n").unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let supervisor = VirtioFsSupervisor::start(VirtiofsdSpec {
-            program: script,
-            socket: base.join("sock"),
-            shared_dir: base.clone(),
-            log: base.join("log"),
-            read_only: false,
-        });
+        let dir = TestDir::new("socket-restart");
+        // Only the socket pathname matters here, so a touched file stands in
+        // for a bound socket; no guest connects in this test.
+        let program = script(
+            dir.path(),
+            "stub",
+            r#"#!/bin/sh
+dir=$(dirname "$0")
+count=$(( $(cat "$dir/generation" 2>/dev/null || echo 0) + 1 ))
+printf '%s' "$count" > "$dir/generation"
+: > "$dir/sock"
+if [ "$count" -eq 1 ]; then sleep 0.15; else sleep 100; fi
+"#,
+        );
+        let supervisor = VirtioFsSupervisor::start(spec_in(dir.path(), program));
+
         supervisor
             .wait_socket_ready(Duration::from_secs(2))
             .await
             .unwrap();
-        for _ in 0..100 {
-            if supervisor.restarts() > 0 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(supervisor.restarts() > 0);
-        assert!(
-            !supervisor
-                .state
-                .ready
-                .load(std::sync::atomic::Ordering::Relaxed)
-        );
+        eventually("the first generation to exit", || supervisor.restarts() > 0).await;
+        assert!(!supervisor.state.ready.load(Ordering::Relaxed));
         supervisor
             .wait_socket_ready(Duration::from_secs(3))
             .await
             .unwrap();
         assert_eq!(
-            std::fs::read_to_string(base.join("generation")).unwrap(),
+            std::fs::read_to_string(dir.path().join("generation")).unwrap(),
             "2"
         );
         supervisor.stop().await;
-        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[tokio::test]
     async fn supervisor_timeout_aborts_and_joins_task() {
-        let state = std::sync::Arc::new(super::SupState {
-            shutdown: std::sync::atomic::AtomicBool::new(false),
-            notify: tokio::sync::Notify::new(),
-            restarts: std::sync::atomic::AtomicU32::new(0),
-            ready: std::sync::atomic::AtomicBool::new(false),
-        });
         let task = tokio::spawn(std::future::pending::<()>());
         let abort = task.abort_handle();
         let supervisor = VirtioFsSupervisor {
-            spec: VirtiofsdSpec {
-                program: "/bin/false".into(),
-                socket: "unused".into(),
-                shared_dir: "unused".into(),
-                log: "unused".into(),
-                read_only: false,
-            },
-            state,
-            task: tokio::sync::Mutex::new(Some(task)),
+            spec: spec_in(Path::new("unused"), "/bin/false".into()),
+            state: Arc::new(SupState {
+                shutdown: AtomicBool::new(false),
+                notify: Notify::new(),
+                restarts: AtomicU32::new(0),
+                ready: AtomicBool::new(false),
+            }),
+            task: Mutex::new(Some(task)),
             abort: abort.clone(),
         };
         supervisor.stop_with_timeout(Duration::from_millis(1)).await;
@@ -360,25 +408,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn supervisor_restarts_dead_processes_and_stops_cleanly() {
-        let base = std::env::temp_dir().join(format!("odorobo-sup-{}", ulid::Ulid::generate()));
-        std::fs::create_dir_all(&base).unwrap();
-        let supervisor = VirtioFsSupervisor::start(VirtiofsdSpec {
-            // /bin/false exits instantly -> the supervisor should keep
-            // restarting it with backoff.
-            program: "/bin/false".into(),
-            socket: base.join("sock"),
-            shared_dir: base.clone(),
-            log: base.join("log"),
-            read_only: false,
-        });
+    async fn supervisor_restarts_dead_processes_and_stop_is_final() {
+        let dir = TestDir::new("sup-restart");
+        // /bin/false rejects virtiofsd's arguments and exits instantly.
+        let supervisor = VirtioFsSupervisor::start(spec_in(dir.path(), "/bin/false".into()));
 
-        tokio::time::sleep(Duration::from_millis(2500)).await;
+        eventually("the dead process to be restarted", || {
+            supervisor.restarts() >= 1
+        })
+        .await;
         assert!(
-            supervisor.restarts() >= 1,
-            "dead process should be restarted"
+            !dir.path().join("sock").exists(),
+            "no socket from /bin/false"
         );
-        assert!(!base.join("sock").exists(), "no socket from /bin/false");
 
         supervisor.stop().await;
         let restarts_at_stop = supervisor.restarts();
@@ -388,63 +430,31 @@ mod tests {
             restarts_at_stop,
             "no restarts after stop"
         );
+    }
 
-        // Use a script that accepts virtiofsd's arguments and execs a real
-        // long-running child. /bin/sleep rejects those arguments immediately.
-        let base2 = std::env::temp_dir().join(format!("odorobo-sup2-{}", ulid::Ulid::generate()));
-        std::fs::create_dir_all(&base2).unwrap();
-        let script = base2.join("virtiofsd-stub");
-        std::fs::write(
-            &script,
+    #[tokio::test]
+    async fn supervisor_stops_and_drops_the_child() {
+        let dir = TestDir::new("sup-child");
+        let program = script(
+            dir.path(),
+            "virtiofsd-stub",
             "#!/bin/sh\necho $$ > \"$(dirname \"$0\")/pid\"\nexec sleep 100\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let supervisor = VirtioFsSupervisor::start(VirtiofsdSpec {
-            program: script.clone(),
-            socket: base2.join("sock"),
-            shared_dir: base2.clone(),
-            log: base2.join("log"),
-            read_only: false,
-        });
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        supervisor.stop().await;
-        let pid: u32 = std::fs::read_to_string(base2.join("pid"))
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        assert!(
-            !Path::new(&format!("/proc/{pid}")).exists(),
-            "child leaked after stop"
         );
-        let supervisor = VirtioFsSupervisor::start(VirtiofsdSpec {
-            program: script,
-            socket: base2.join("sock"),
-            shared_dir: base2.clone(),
-            log: base2.join("log"),
-            read_only: false,
-        });
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let pid: u32 = std::fs::read_to_string(base2.join("pid"))
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        assert!(Path::new(&format!("/proc/{pid}")).exists());
-        drop(supervisor);
-        for _ in 0..100 {
-            if !Path::new(&format!("/proc/{pid}")).exists() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(
-            !Path::new(&format!("/proc/{pid}")).exists(),
-            "child leaked after drop"
-        );
+        let spec = spec_in(dir.path(), program);
+        let pid_file = dir.path().join("pid");
 
-        std::fs::remove_dir_all(&base).ok();
-        std::fs::remove_dir_all(&base2).ok();
+        let supervisor = VirtioFsSupervisor::start(spec.clone());
+        eventually("the stub to record its pid", || pid_file.exists()).await;
+        let pid = read_pid(&pid_file);
+        supervisor.stop().await;
+        eventually("the stopped child to exit", || !process_alive(pid)).await;
+
+        std::fs::remove_file(&pid_file).unwrap();
+        let supervisor = VirtioFsSupervisor::start(spec);
+        eventually("the restarted stub to record its pid", || pid_file.exists()).await;
+        let pid = read_pid(&pid_file);
+        assert!(process_alive(pid));
+        drop(supervisor);
+        eventually("the dropped child to exit", || !process_alive(pid)).await;
     }
 }
