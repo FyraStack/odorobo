@@ -16,10 +16,10 @@ const SUBNET_PREFIX_RANGE: RangeInclusive<u8> = 1..=30;
 /// MTU range for network TAPs; 576 is the minimum IPv4 hosts must accept.
 const MTU_RANGE: RangeInclusive<u16> = 576..=65_535;
 
-/// Usable VXLAN network identifiers: the 24-bit VXLAN field, less the reserved values.
-const VNI_RANGE: RangeInclusive<u32> = 1..=0x00ff_ffff;
+/// Nonzero identifiers in VXLAN's 24-bit field.
+pub(crate) const VNI_RANGE: RangeInclusive<u32> = 1..=0x00ff_ffff;
 
-/// VNI values excluded from [`VNI_RANGE`].
+/// Legacy VNI reservations for Linux's default, main and local table numbers.
 const RESERVED_VNI_RANGE: RangeInclusive<u32> = 253..=255;
 
 /// How a network is realized on a node.
@@ -89,7 +89,7 @@ pub struct NetworkState {
 }
 
 /// Usable VXLAN network identifiers, excluding the reserved values.
-fn vni_valid(vni: u32) -> bool {
+pub(crate) fn vni_valid(vni: u32) -> bool {
     VNI_RANGE.contains(&vni) && !RESERVED_VNI_RANGE.contains(&vni)
 }
 

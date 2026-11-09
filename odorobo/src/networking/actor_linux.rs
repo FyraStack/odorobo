@@ -30,7 +30,10 @@ use nftables::{
 };
 use rtnetlink::packet_route::{
     address::AddressAttribute,
-    link::{AfSpecInet6, AfSpecUnspec, In6AddrGenMode, LinkAttribute, LinkMessage},
+    link::{
+        AfSpecInet6, AfSpecUnspec, In6AddrGenMode, InfoData, InfoVrf, LinkAttribute, LinkInfo,
+        LinkMessage,
+    },
     route::{RouteMessage, RouteScope, RouteType},
 };
 use rtnetlink::{
@@ -51,8 +54,12 @@ const DNAT_PRIORITY: i32 = -100;
 const ANTISPOOF_PRIORITY: i32 = -150;
 const GUEST_NAT_PRIORITY: i32 = 100;
 const VXLAN_PORT: u16 = 4789;
+/// Tenant routing tables sit above the 24-bit VNI range.
+const VRF_TABLE_BASE: u32 = 0x0100_0000;
 /// Metric of a VRF's unreachable default, high enough for any learned default to win.
 const VRF_UNREACHABLE_METRIC: u32 = 4_278_198_272;
+/// How often the agent re-applies its FRR configuration, which FRR loses when it restarts.
+const FABRIC_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 const LEASE_TIMEOUT: Duration = Duration::from_secs(15);
 const LEASE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -150,6 +157,7 @@ struct L3Vni {
 struct RoutedState {
     vrf: String,
     vrf_index: u32,
+    vni: u32,
     table_id: u32,
     gateway: Ipv4Addr,
     mtu: u16,
@@ -309,6 +317,23 @@ async fn underlay_address(handle: &Handle, underlay: Ipv4Net) -> Result<Ipv4Addr
             "several local addresses are inside the EVPN underlay {underlay}: {many:?}"
         )),
     }
+}
+
+fn vrf_table_id(link: &LinkMessage) -> Option<u32> {
+    link.attributes.iter().find_map(|attribute| {
+        let LinkAttribute::LinkInfo(info) = attribute else {
+            return None;
+        };
+        info.iter().find_map(|info| {
+            let LinkInfo::Data(InfoData::Vrf(data)) = info else {
+                return None;
+            };
+            data.iter().find_map(|data| match data {
+                InfoVrf::TableId(table_id) => Some(*table_id),
+                _ => None,
+            })
+        })
+    })
 }
 
 async fn ensure_link(handle: &Handle, name: &str, link: LinkMessage) -> Result<u32, Report> {
@@ -518,7 +543,11 @@ pub struct NetworkAgentActor {
     netlink_handle: Handle,
     /// Set when the node is part of an EVPN fabric.
     fabric: Option<Fabric>,
+    fabric_reconciler: Option<tokio::task::JoinHandle<()>>,
 }
+
+/// Re-applies this node's FRR configuration.
+struct ReconcileFabric;
 
 impl Actor for NetworkAgentActor {
     type Args = (NetworkConfig, PathBuf);
@@ -555,6 +584,9 @@ impl Actor for NetworkAgentActor {
             port_tasks: HashMap::new(),
             netlink_thread,
             netlink_handle: handle,
+            fabric_reconciler: fabric
+                .is_some()
+                .then(|| spawn_fabric_reconciler(&actor_ref)),
             fabric,
         };
 
@@ -602,6 +634,10 @@ impl Actor for NetworkAgentActor {
         }
 
         for (_, task) in self.port_tasks.drain() {
+            task.abort();
+            _ = task.await;
+        }
+        if let Some(task) = self.fabric_reconciler.take() {
             task.abort();
             _ = task.await;
         }
@@ -720,10 +756,7 @@ impl NetworkAgentActor {
     async fn delete_routed(&self, state: &RoutedState) -> Result<(), Report> {
         let handle = &self.netlink_handle;
         let mut first_error = match &self.fabric {
-            Some(fabric) => fabric
-                .withdraw_network(&state.vrf, state.table_id)
-                .await
-                .err(),
+            Some(fabric) => fabric.withdraw_network(&state.vrf, state.vni).await.err(),
             None => None,
         };
         if let Some(err) = &first_error {
@@ -805,14 +838,22 @@ impl NetworkAgentActor {
         let vni = network
             .vni()
             .ok_or_else(|| eyre!("routed network {:?} requires a vni", network.id))?;
+        let table_id = VRF_TABLE_BASE.saturating_add(vni);
         let vrf = format!("vrf{vni}");
+        if let Some(link) = lookup_link(&self.netlink_handle, &vrf).await?
+            && vrf_table_id(&link) != Some(table_id)
+        {
+            return Err(eyre!(
+                "vrf device {vrf} does not use routing table {table_id}; remove it before retrying"
+            ));
+        }
         let vrf_index = ensure_link(
             &self.netlink_handle,
             &vrf,
-            LinkVrf::new(&vrf, vni).up().build(),
+            LinkVrf::new(&vrf, table_id).up().build(),
         )
         .await?;
-        ensure_unreachable_default(&self.netlink_handle, vni).await?;
+        ensure_unreachable_default(&self.netlink_handle, table_id).await?;
 
         let l3vni = match &self.fabric {
             Some(fabric) => {
@@ -833,7 +874,8 @@ impl NetworkAgentActor {
         let state = RoutedState {
             vrf,
             vrf_index,
-            table_id: vni,
+            vni,
+            table_id,
             gateway: network.gateway(),
             mtu: network.mtu(),
             l3vni,
@@ -843,7 +885,8 @@ impl NetworkAgentActor {
         info!(
             network_id = %network.id,
             vrf = %state.vrf,
-            table = vni,
+            vni,
+            table = table_id,
             gateway = %state.gateway,
             vxlan = ?state.l3vni.as_ref().map(|l3vni| &l3vni.vxlan),
             "routed network realized"
@@ -1712,6 +1755,41 @@ impl Message<UnpublishPorts> for NetworkAgentActor {
     }
 }
 
+fn spawn_fabric_reconciler(actor_ref: &ActorRef<NetworkAgentActor>) -> tokio::task::JoinHandle<()> {
+    let actor_ref = actor_ref.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(FABRIC_RECONCILE_INTERVAL);
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            if actor_ref.tell(ReconcileFabric).send().await.is_err() {
+                return;
+            }
+        }
+    })
+}
+
+impl Message<ReconcileFabric> for NetworkAgentActor {
+    type Reply = ();
+
+    async fn handle(&mut self, _msg: ReconcileFabric, _ctx: &mut Context<Self, Self::Reply>) {
+        let Some(fabric) = &self.fabric else {
+            return;
+        };
+        let routed: Vec<(&str, u32)> = self
+            .networks
+            .values()
+            .filter_map(|entry| match &entry.realized {
+                Realized::Routed(state) => Some((state.vrf.as_str(), state.vni)),
+                Realized::Bridged(_) => None,
+            })
+            .collect();
+        if let Err(err) = fabric.reconcile(&routed).await {
+            warn!(?err, "failed to reconcile the FRR configuration");
+        }
+    }
+}
+
 impl Message<Status> for NetworkAgentActor {
     type Reply = NetworkStatus;
 
@@ -1741,6 +1819,111 @@ impl Message<Status> for NetworkAgentActor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::network::{NetworkState, VNI_RANGE};
+    use rtnetlink::packet_route::route::RouteAttribute;
+    use std::net::Ipv6Addr;
+
+    async fn routes_in_table(handle: &Handle, table_id: u32) -> Result<Vec<RouteMessage>, Report> {
+        let mut routes = Vec::new();
+        for query in [
+            RouteMessageBuilder::<Ipv4Addr>::new().build(),
+            RouteMessageBuilder::<Ipv6Addr>::new().build(),
+        ] {
+            let mut stream = handle.route().get(query).execute();
+            while let Some(route) = stream.try_next().await? {
+                let table = route
+                    .attributes
+                    .iter()
+                    .find_map(|attribute| match attribute {
+                        RouteAttribute::Table(table) => Some(*table),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| u32::from(route.header.table));
+                if table == table_id {
+                    routes.push(route);
+                }
+            }
+        }
+        Ok(routes)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires root and an isolated network namespace"]
+    async fn routed_vnis_do_not_reuse_host_tables() -> Result<(), Report> {
+        let (connection, handle, _) = rtnetlink::new_connection()?;
+        let actor = NetworkAgentActor {
+            config: NetworkConfig::default(),
+            runtime_root: PathBuf::new(),
+            networks: HashMap::new(),
+            port_tasks: HashMap::new(),
+            netlink_thread: tokio::spawn(connection),
+            netlink_handle: handle,
+            fabric_reconciler: None,
+            fabric: None,
+        };
+        let handle = &actor.netlink_handle;
+        let mut network = Network {
+            id: "table-test".to_owned(),
+            subnet: "10.40.10.0/24".parse()?,
+            gateway: None,
+            provider: NetworkProvider::Routed,
+            state: Some(NetworkState { vni: 52 }),
+            mtu: None,
+            bridge: None,
+            dhcp: None,
+            upstream: None,
+        };
+
+        ensure_unreachable_default(handle, 52).await?;
+        let host_routes = routes_in_table(handle, 52).await?;
+        assert_eq!(host_routes.len(), 2);
+        let host_vrf = ensure_link(handle, "vrf52", LinkVrf::new("vrf52", 52).up().build()).await?;
+        assert!(actor.realize_routed(&network).await.is_err());
+        let host_link = lookup_link(handle, "vrf52")
+            .await?
+            .ok_or_else(|| eyre!("host VRF disappeared"))?;
+        assert_eq!(vrf_table_id(&host_link), Some(52));
+        handle.link().del(host_vrf).execute().await?;
+
+        for vni in [52, 252, *VNI_RANGE.end()] {
+            network.state = Some(NetworkState { vni });
+            let mut state = actor.realize_routed(&network).await?;
+            let link = lookup_link(handle, &state.vrf)
+                .await?
+                .ok_or_else(|| eyre!("tenant VRF disappeared"))?;
+            assert_eq!(
+                vrf_table_id(&link),
+                Some(VRF_TABLE_BASE.saturating_add(vni))
+            );
+            assert_ne!(state.table_id, vni);
+            assert_eq!(
+                actor.realize_routed(&network).await?.vrf_index,
+                state.vrf_index
+            );
+
+            state.l3vni = Some(
+                ensure_l3vni(
+                    handle,
+                    vni,
+                    state.vrf_index,
+                    "192.0.2.1".parse()?,
+                    state.mtu,
+                )
+                .await?,
+            );
+            actor.delete_routed(&state).await?;
+            assert!(lookup_link(handle, &state.vrf).await?.is_none());
+            assert_eq!(
+                routes_in_table(handle, state.table_id).await?,
+                Vec::<RouteMessage>::new()
+            );
+            assert_eq!(routes_in_table(handle, 52).await?, host_routes);
+        }
+
+        actor.netlink_thread.abort();
+        _ = actor.netlink_thread.await;
+        Ok(())
+    }
 
     #[test]
     fn legacy_network_maps_hostonly_nat_config() {

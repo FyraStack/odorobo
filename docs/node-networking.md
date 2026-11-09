@@ -157,8 +157,8 @@ sudo vtysh -c 'configure terminal' -c 'router bgp 65000' -c 'neighbor 10.77.0.11
 Cautions:
 
 - Restarting FRR drops everything the agent configured, because it lives only in the running
-  configuration. Restart the agent afterwards. An agent restart also forgets the node's networks, and
-  the manager does not resend them yet: restart the manager as well and create the networks again.
+  configuration. The agent re-applies its configuration every 30 seconds, so it comes back on its
+  own. Manual `neighbor` lines do not; add them again.
 - Do not run `write memory` on these nodes: it would store per-network state in `frr.conf`, and FRR
   would load stale VRFs at its next start.
 - Keep your own FRR configuration out of `router bgp <asn>` and the `odorobo-vm-routes` names. The
@@ -182,26 +182,36 @@ Agents and the manager find each other with libp2p mDNS and connect over TCP on 
 1. Configure the underlay on every node and check that the VTEPs ping each other.
 2. Start the agent on every node, in any order. Wait until the manager node's log shows
    `Connected to <peer id>` once per other node.
-3. Create networks. The manager sends a network to the agents once, when you create it, so a node
-   whose agent starts later never receives it. Restarting the manager forgets all networks.
+3. Create networks. The manager sends each network to every agent it knows. When it finds an agent
+   it has not seen before (a new node, or a restarted agent), it sends that agent every network in
+   its registry. Restarting the manager forgets all networks.
 
 ```bash
 curl -X POST http://<manager>:3000/networks -H 'content-type: application/json' \
     -d '{"network":{"id":"vmnet1","subnet":"10.40.10.0/24","provider":"routed"}}'
-# reply includes the assigned "state":{"vni":<n>} (pool 20000-29999)
+# reply includes the assigned "state":{"vni":<n>}
 ```
 
+The manager allocates from `1-16777215`, excluding the legacy VNIs `253-255` and PVE SDN's
+`10001-11002`. The pool holds 16,776,210 VNIs; node capacity is lower because each network creates
+interfaces and an FRR VRF on every agent.
+
 ## What a node builds
+
+Reserve routing tables `16777217-33554431` for odorobo on every node. Tenant table IDs are
+`16777216 + VNI`, not the VNI itself; host services such as Tailscale keep their own low-numbered
+tables. Before upgrading from the old table-equals-VNI layout, stop its VMs and delete the networks
+with the old agent. The new agent rejects leftover VRFs with the wrong table mapping.
 
 For a routed network with VNI `<n>`, each node creates:
 
 | Object | Details |
 |---|---|
-| `vrf<n>` | VRF, routing table `<n>` |
-| table `<n>` | `unreachable default metric 4278198272` (IPv4 and IPv6), so unmatched tenant traffic never falls through to the host's main table |
+| `vrf<n>` | VRF, routing table `16777216 + <n>` |
+| table `16777216 + <n>` | `unreachable default metric 4278198272` (IPv4 and IPv6), so unmatched tenant traffic never falls through to the host's main table |
 | `vrfbr<n>` | bridge in the VRF, no addresses, MTU = network MTU, MAC `02:00:<VTEP octets>` (this node's EVPN router MAC) |
 | `vrfvx<n>` | VXLAN `id <n> local <VTEP> dstport 4789 nolearning`, only port of `vrfbr<n>`, `learning off`, `neigh_suppress on` |
-| per VM NIC | tap `vmtap-<vm4>-<net4>` in the VRF, gateway `/32` on the tap, `/32` route to the VM in table `<n>`, anti-spoof rule in nft chain `nic_guard` |
+| per VM NIC | tap `vmtap-<vm4>-<net4>` in the VRF, gateway `/32` on the tap, `/32` route to the VM in table `16777216 + <n>`, anti-spoof rule in nft chain `nic_guard` |
 | FRR | `vrf vrf<n>` with `vni <n>`, and `router bgp <asn> vrf vrf<n>` advertising the VRF's `/32`s as EVPN type-5 routes |
 
 For each remote VM, FRR installs a route `via <remote VTEP> dev vrfbr<n> onlink proto bgp`, a
@@ -227,5 +237,6 @@ sudo vtysh -c 'show bgp l2vpn evpn route type prefix'  # type-5 routes from ever
 ## Not yet available
 
 - Automatic BGP peering: agents exchanging VTEPs over the swarm and adding neighbors themselves.
-- Swarm pre-shared key, seed peers for routed underlays, network persistence and re-sync.
+- Swarm pre-shared key, seed peers for routed underlays, and manager persistence (a manager restart
+  forgets every network).
 - Internet egress for routed tenants.

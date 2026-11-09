@@ -42,12 +42,37 @@ impl Fabric {
     /// Configures the fabric BGP instance, its peer group and the VM route filter.
     #[tracing::instrument(level = "debug", skip(self), fields(vtep = %self.vtep, asn = self.asn))]
     pub async fn ensure_bgp(&self) -> Result<(), Report> {
+        vtysh(&self.bgp_commands())
+            .await
+            .wrap_err("failed to configure the EVPN fabric in FRR")
+    }
+
+    /// Maps the VRF to its L3 VNI and advertises the VRF's per-VM routes.
+    #[tracing::instrument(level = "debug", skip(self))]
+    pub async fn ensure_network(&self, vrf: &str, vni: u32) -> Result<(), Report> {
+        vtysh(&self.network_commands(vrf, vni))
+            .await
+            .wrap_err_with(|| format!("failed to configure {vrf} in FRR"))
+    }
+
+    /// Re-applies the whole configuration in one vtysh run, restoring it after an FRR restart.
+    pub async fn reconcile(&self, networks: &[(&str, u32)]) -> Result<(), Report> {
+        let mut commands = self.bgp_commands();
+        for (vrf, vni) in networks {
+            commands.extend(self.network_commands(vrf, *vni));
+        }
+        vtysh(&commands)
+            .await
+            .wrap_err("failed to reconcile the FRR configuration")
+    }
+
+    fn bgp_commands(&self) -> Vec<String> {
         let Self {
             vtep,
             underlay,
             asn,
         } = self;
-        vtysh(&[
+        vec![
             format!("ip prefix-list {VM_ROUTES} seq 10 permit 0.0.0.0/0 ge 32"),
             format!("route-map {VM_ROUTES} permit 10"),
             format!("match ip address prefix-list {VM_ROUTES}"),
@@ -63,16 +88,13 @@ impl Fabric {
             format!("neighbor {PEER_GROUP} activate"),
             "advertise-all-vni".to_owned(),
             "exit-address-family".to_owned(),
-        ])
-        .await
-        .wrap_err("failed to configure the EVPN fabric in FRR")
+            "exit".to_owned(),
+        ]
     }
 
-    /// Maps the VRF to its L3 VNI and advertises the VRF's per-VM routes.
-    #[tracing::instrument(level = "debug", skip(self))]
-    pub async fn ensure_network(&self, vrf: &str, vni: u32) -> Result<(), Report> {
+    fn network_commands(&self, vrf: &str, vni: u32) -> Vec<String> {
         let Self { vtep, asn, .. } = self;
-        vtysh(&[
+        vec![
             format!("vrf {vrf}"),
             format!("vni {vni}"),
             "exit-vrf".to_owned(),
@@ -84,9 +106,8 @@ impl Fabric {
             "address-family l2vpn evpn".to_owned(),
             "advertise ipv4 unicast".to_owned(),
             "exit-address-family".to_owned(),
-        ])
-        .await
-        .wrap_err_with(|| format!("failed to configure {vrf} in FRR"))
+            "exit".to_owned(),
+        ]
     }
 
     /// Unmaps the VRF's VNI and withdraws its routes; a missing configuration is not an error.

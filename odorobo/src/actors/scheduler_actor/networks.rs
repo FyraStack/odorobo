@@ -4,42 +4,46 @@
 //! by the scheduler today: agents are told the desired state, and the manager
 //! keeps the authoritative view for the lifetime of the process.
 
+use ahash::AHashSet;
 use kameo::prelude::*;
-use tracing::info;
+use tracing::{info, warn};
+
+use crate::actors::agent_actor::AgentActor;
 
 use crate::messages::network::{
     CreateNetwork, CreateNetworkReply, DeleteNetwork, DeleteNetworkReply, EnsureNetwork,
     GetNetwork, GetNetworkReply, ListNetworks, ListNetworksReply, RemoveNetwork,
 };
-use crate::network::{Network, NetworkProvider, NetworkState};
-use std::hash::{Hash, Hasher};
+use crate::network::{Network, NetworkProvider, NetworkState, VNI_RANGE, vni_valid};
+use std::{
+    hash::{Hash, Hasher},
+    ops::RangeInclusive,
+};
 
 use super::SchedulerActor;
 
-/// VNI pool the manager assigns from, avoiding PVE SDN's 10001-11002.
-const VNI_POOL_START: u32 = 20_000;
-const VNI_POOL_END: u32 = 29_999;
-const VNI_POOL_SIZE: u32 = 10_000;
+const VNI_POOL_SIZE: u32 = VNI_RANGE
+    .end()
+    .saturating_sub(*VNI_RANGE.start())
+    .saturating_add(1);
 
-/// Picks a VNI for a network id: a hash of the id, then linear probing on
-/// collision. The assignment is process-local; nothing durable stores it.
+/// VNIs used by the existing PVE SDN fabric.
+const PVE_VNI_RANGE: RangeInclusive<u32> = 10_001..=11_002;
+
+fn vni_allocatable(vni: u32) -> bool {
+    vni_valid(vni) && !PVE_VNI_RANGE.contains(&vni)
+}
+
+/// Hashes the network ID, then probes for a usable free VNI with wraparound.
 fn assign_vni(id: &str, taken: impl Fn(u32) -> bool) -> Option<u32> {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     id.hash(&mut hasher);
     let span = u64::from(VNI_POOL_SIZE);
     let offset = u32::try_from(hasher.finish().checked_rem(span).unwrap_or(0)).unwrap_or(0);
-    let mut candidate = VNI_POOL_START.saturating_add(offset);
-    for _ in 0..VNI_POOL_SIZE {
-        if !taken(candidate) {
-            return Some(candidate);
-        }
-        candidate = if candidate == VNI_POOL_END {
-            VNI_POOL_START
-        } else {
-            candidate.saturating_add(1)
-        };
-    }
-    None
+    let candidate = VNI_RANGE.start().saturating_add(offset);
+    (candidate..=*VNI_RANGE.end())
+        .chain(*VNI_RANGE.start()..candidate)
+        .find(|&candidate| vni_allocatable(candidate) && !taken(candidate))
 }
 
 /// Pushes one network to every known agent, returning per-agent failures.
@@ -63,6 +67,33 @@ async fn ensure_on_agents(scheduler: &SchedulerActor, network: &Network) -> Vec<
     .into_iter()
     .flatten()
     .collect()
+}
+
+/// Replays the registry onto an agent the manager has just found, such as a late joiner or a
+/// restarted agent; failures are logged, not retried.
+pub(super) fn sync_networks_to(
+    scheduler: &SchedulerActor,
+    hostname: String,
+    actor_ref: RemoteActorRef<AgentActor>,
+) {
+    let networks: Vec<Network> = scheduler.networks.values().cloned().collect();
+    if networks.is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        for network in networks {
+            let network_id = network.id.clone();
+            let error = match actor_ref.ask(&EnsureNetwork { network }).await {
+                Ok(reply) => reply.error,
+                Err(err) => Some(err.to_string()),
+            };
+            if let Some(error) = error {
+                warn!(%hostname, %network_id, %error, "agent did not take a network");
+            } else {
+                info!(%hostname, %network_id, "synced network to agent");
+            }
+        }
+    });
 }
 
 /// Removes one network from every known agent, returning per-agent failures.
@@ -119,15 +150,14 @@ impl Message<CreateNetwork> for SchedulerActor {
         // The VNI is derived runtime state: the manager assigns it, agents
         // realize it, and nothing durable stores it.
         if network.provider == NetworkProvider::Routed {
-            let Some(vni) = assign_vni(&network.id, |candidate| {
-                self.networks
-                    .values()
-                    .any(|existing| existing.vni() == Some(candidate))
-            }) else {
+            let taken: AHashSet<u32> = self.networks.values().filter_map(Network::vni).collect();
+            let Some(vni) = assign_vni(&network.id, |candidate| taken.contains(&candidate)) else {
                 return CreateNetworkReply {
                     network: None,
                     error: Some(format!(
-                        "the VNI pool {VNI_POOL_START}-{VNI_POOL_END} is exhausted"
+                        "the VNI pool {}-{} is exhausted",
+                        VNI_RANGE.start(),
+                        VNI_RANGE.end()
                     )),
                 };
             };
@@ -222,5 +252,19 @@ mod tests {
         let first = assign_vni("devnet", |_| false).unwrap();
         let second = assign_vni("devnet", |candidate| candidate == first).unwrap();
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn assign_vni_skips_reserved_ranges_when_probing_wraps() {
+        let target = PVE_VNI_RANGE.end().saturating_add(1);
+        let first = assign_vni("devnet", |_| false).unwrap();
+        assert!(first > target);
+
+        let assigned = assign_vni("devnet", |candidate| {
+            assert!(vni_valid(candidate));
+            assert!(!PVE_VNI_RANGE.contains(&candidate));
+            candidate != target
+        });
+        assert_eq!(assigned, Some(target));
     }
 }

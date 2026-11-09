@@ -13,6 +13,7 @@ use crate::messages::agent::{AgentStatusUpdate, GetAgentStatus, apply_status_upd
 use crate::messages::vm::{GetVMHeartbeat, GetVMInfo};
 use crate::utils::actor_names::{AGENT, VM};
 
+use super::networks;
 use super::{
     AgentActorDiscovered, AgentUpdated, AgentUpdaterStopped, CachedActorKind, CachedAgentActor,
     CachedVMActor, ReconcileVmPlacements, SchedulerActor, VmActorDiscovered, VmUpdated,
@@ -321,6 +322,7 @@ impl Message<AgentUpdated> for SchedulerActor {
                     &mut self.vm_placements,
                 );
                 self.invalidate_pending_resources();
+                networks::sync_networks_to(self, status.hostname.clone(), msg.actor_ref.clone());
                 self.agent_data_cache.insert(
                     msg.actor_id,
                     CachedAgentActor {
