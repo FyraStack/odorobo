@@ -10,7 +10,6 @@ use stable_eyre::{
 };
 use tokio::process::Command;
 
-use super::limits;
 use super::process::{Tool, set_child_file_size_limit};
 use super::{RemovePathOnDrop, to_hex};
 
@@ -30,7 +29,7 @@ pub(super) fn normalize_image_ref(image_ref: &str, allow_local: bool) -> Result<
     } else if LOCAL_TRANSPORTS.iter().any(|t| image_ref.starts_with(t)) {
         if !allow_local {
             bail!(
-                "image reference {image_ref:?} uses a host-local transport; set ODOROBO_ROOTFS_ALLOW_LOCAL_TRANSPORTS=1 to permit it"
+                "image reference {image_ref:?} uses a host-local transport; set rootfs_allow_local_transports=true (or ODOROBO_ROOTFS_ALLOW_LOCAL_TRANSPORTS=true) to permit it"
             );
         }
         Ok(image_ref.to_owned())
@@ -38,19 +37,6 @@ pub(super) fn normalize_image_ref(image_ref: &str, allow_local: bool) -> Result<
         bail!("unsupported image transport in {image_ref:?}");
     } else {
         Ok(format!("docker://{image_ref}"))
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(super) struct OciUnpackLimits {
-    pub max_compressed_bytes: u64,
-}
-
-impl OciUnpackLimits {
-    pub(super) fn from_env() -> Result<Self> {
-        Ok(Self {
-            max_compressed_bytes: limits::MAX_COMPRESSED_BYTES.read_env()?,
-        })
     }
 }
 
@@ -252,8 +238,7 @@ mod tests {
         ] {
             let err = normalize_image_ref(local, false).unwrap_err();
             assert!(
-                err.to_string()
-                    .contains("ODOROBO_ROOTFS_ALLOW_LOCAL_TRANSPORTS"),
+                err.to_string().contains("rootfs_allow_local_transports"),
                 "{local}: {err}"
             );
             assert_eq!(normalize_image_ref(local, true).unwrap(), local);

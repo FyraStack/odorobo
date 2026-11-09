@@ -33,7 +33,7 @@ use stable_eyre::{
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use tracing::info;
 
-use super::limits::local_transports_allowed;
+use super::limits::policy;
 use super::oci::{normalize_image_ref, preflight_compressed_size};
 
 /// Node-local store of fs-verity objects shared by every OCI image.
@@ -130,7 +130,7 @@ fn import_image_blocking(image_ref: &str, max_compressed_bytes: u64) -> Result<I
     reason = "the importer runs on the dedicated single-threaded runtime"
 )]
 async fn import_image_inner(image_ref: &str, max_compressed_bytes: u64) -> Result<ImportedImage> {
-    let normalized = normalize_image_ref(image_ref, local_transports_allowed())?;
+    let normalized = normalize_image_ref(image_ref, policy().allow_local_transports)?;
     let preflight = preflight_compressed_size(image_ref, &normalized, max_compressed_bytes).await?;
     let repository = repository()?;
     // Wait out a running GC; the guard travels with the result to first mount.

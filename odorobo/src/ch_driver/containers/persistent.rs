@@ -4,13 +4,14 @@ use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use bytesize::MIB;
 use stable_eyre::{
     Result,
     eyre::{Context, bail, eyre},
 };
 use tokio::process::Command;
 
-use super::limits::{MIB, RBD_SIZE};
+use super::limits::policy;
 use super::mount::{is_mountpoint, unmount_path};
 use super::process::Tool;
 use super::{PERSISTENT_ROOTFS_ROOT, validate_vmid};
@@ -110,8 +111,8 @@ pub(super) fn match_rbd_head_device(
 }
 
 /// `rbd create --size` argument, canonicalised to MiB.
-pub(super) fn rbd_size() -> Result<String> {
-    Ok(format!("{}M", RBD_SIZE.read_env()? / MIB))
+pub(super) fn rbd_size() -> String {
+    format!("{}M", policy().rbd_size.as_u64() / MIB)
 }
 
 pub(super) fn rbd_identity(vmid: &str) -> Result<String> {
@@ -263,7 +264,7 @@ pub(super) async fn mount_persistent_state_inner(vmid: &str) -> Result<(PathBuf,
         let create = rbd_output(&[
             "create".into(),
             "--size".into(),
-            rbd_size()?,
+            rbd_size(),
             "--image-feature".into(),
             "exclusive-lock".into(),
             staging_image.clone(),

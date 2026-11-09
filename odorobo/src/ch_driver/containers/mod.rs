@@ -37,7 +37,13 @@ use stable_eyre::{
     eyre::{WrapErr, bail, eyre},
 };
 
+use crate::config::Config;
 use crate::manifest::RootfsMode;
+
+/// Parse and install the node-wide rootfs policy from the agent config.
+pub fn install_limits(config: &Config) -> Result<()> {
+    limits::install(limits::RootfsLimits::from_config(config)?)
+}
 
 /// virtiofs mount tag the guest root is served under.
 pub const ROOTFS_TAG: &str = "rootfs";

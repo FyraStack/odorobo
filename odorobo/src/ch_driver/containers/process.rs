@@ -47,7 +47,7 @@ pub(super) static TOOL_OPERATIONS: tokio::sync::Mutex<()> = tokio::sync::Mutex::
 /// it; on timeout the whole group is killed and the child reaped first.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Tool {
-    timeout: Option<Duration>,
+    timeout: Duration,
     serialize: bool,
 }
 
@@ -55,7 +55,7 @@ impl Tool {
     /// Mount table and RBD mapping changes (and RBD state reads that must
     /// observe them): serialized on [`TOOL_OPERATIONS`] with a short timeout.
     pub(super) const ORDERED: Self = Self {
-        timeout: Some(Duration::from_secs(120)),
+        timeout: Duration::from_secs(120),
         serialize: true,
     };
     /// Work that scales with data size (composefs builds, fs-verity, mkfs,
@@ -64,14 +64,14 @@ impl Tool {
     /// wedged tool (which would otherwise hold its caller's lock forever);
     /// data volume is already bounded by the node size limits.
     pub(super) const BULK: Self = Self {
-        timeout: Some(Duration::from_hours(1)),
+        timeout: Duration::from_hours(1),
         serialize: false,
     };
 
     /// Unserialized command with a deadline, for queries.
     pub(super) const fn bounded(timeout: Duration) -> Self {
         Self {
-            timeout: Some(timeout),
+            timeout,
             serialize: false,
         }
     }
@@ -144,10 +144,7 @@ impl Tool {
                 .ok_or_else(|| eyre!("external tool child has no PID"))?;
             let wait = wait(child);
             tokio::pin!(wait);
-            let Some(limit) = self.timeout else {
-                return wait.await.wrap_err("external tool operation failed");
-            };
-            if let Ok(result) = tokio::time::timeout(limit, &mut wait).await {
+            if let Ok(result) = tokio::time::timeout(self.timeout, &mut wait).await {
                 return result.wrap_err("external tool operation failed");
             }
             // SAFETY: child is still owned by the pinned wait future and
@@ -156,11 +153,10 @@ impl Tool {
             _ = wait.await;
             bail!(
                 "external tool timed out after {}s; process group killed and child reaped",
-                limit.as_secs()
+                self.timeout.as_secs()
             );
         });
-        task.await
-            .map_err(|err| eyre!("external tool task failed: {err}"))?
+        task.await.wrap_err("external tool task failed")?
     }
 }
 

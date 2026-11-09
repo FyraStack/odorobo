@@ -27,6 +27,7 @@ use crate::utils::{connect_to_swarm, init};
 
 fn main() -> Result<()> {
     let config = Config::init();
+    ch_driver::containers::install_limits(&config)?;
     let _sentry_guard = init_sentry(config.sentry_dsn.as_deref());
 
     init(Some("odorobo"))?;

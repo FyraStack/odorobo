@@ -5,6 +5,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use bytesize::MIB;
 use composefs::fsverity::{FsVerityHashValue, Sha256HashValue};
 use stable_eyre::{
     Result,
@@ -14,11 +15,10 @@ use tokio::process::Command;
 use tokio::sync::OwnedMutexGuard;
 use tracing::info;
 
-use super::limits::{EPHEMERAL_UPPER, MIB, RUN_SCRATCH, TMP_SCRATCH, VARTMP_SCRATCH};
-use super::oci::OciUnpackLimits;
+use super::limits::policy;
 use super::persistent::{
-    PersistentBackend, acquire_rootfs_lock, persistent_backend, prepare_upper, rbd_identity,
-    rbd_lookup_device, release_persistent_backend,
+    PersistentBackend, UpperState, acquire_rootfs_lock, persistent_backend, prepare_upper,
+    rbd_identity, rbd_lookup_device, release_persistent_backend,
 };
 use super::process::{TOOL_OPERATIONS, Tool};
 use super::repo;
@@ -127,8 +127,7 @@ impl PreparedImage {
 /// Import the image into the shared composefs repository. Holds no per-VM
 /// state, so it can run off the VM actor.
 pub async fn prepare_image(rootfs: &Rootfs) -> Result<PreparedImage> {
-    let limits = OciUnpackLimits::from_env()?;
-    let imported = repo::import_image(&rootfs.oci, limits.max_compressed_bytes).await?;
+    let imported = repo::import_image(&rootfs.oci, policy().max_compressed_bytes.as_u64()).await?;
     let (digest, image, config, write_guard) = imported.into_parts();
     Ok(PreparedImage {
         digest,
@@ -146,9 +145,37 @@ pub async fn mount_rootfs_owned(
     image: &PreparedImage,
     owner: &mut Option<PreparedRootfs>,
 ) -> Result<()> {
+    let (runtime_dir, root_mount) = claim_rootfs(vmid, rootfs, image, owner).await?;
+    record_rbd_inventory(vmid, rootfs, owner).await?;
+
+    let upper = prepare_upper(vmid, rootfs.mode, &image.digest).await?;
+    let prepared = owner.as_mut().unwrap();
+    prepared.upper.clone_from(&upper.upper);
+    prepared.work.clone_from(&upper.work);
+
+    let config_dir = write_guest_config(image, rootfs, &runtime_dir).await?;
+    mount_layers(image, rootfs, &root_mount, &config_dir, &upper).await?;
+    mount_scratch(rootfs, &root_mount, owner).await?;
+    info!(
+        vmid,
+        %image.digest,
+        image_object = %image.image.to_hex(),
+        mount = %root_mount.display(),
+        "OCI rootfs mounted from the composefs repository"
+    );
+    Ok(())
+}
+
+/// Create the per-VM directories and publish the teardown inventory before
+/// anything below can fail half-way.
+async fn claim_rootfs(
+    vmid: &str,
+    rootfs: &Rootfs,
+    image: &PreparedImage,
+    owner: &mut Option<PreparedRootfs>,
+) -> Result<(PathBuf, PathBuf)> {
     validate_vmid(vmid)?;
     let state_lock = acquire_rootfs_lock(vmid).await?;
-    let manifest_digest = &image.digest;
 
     let runtime_dir = crate::ch_driver::VMInstance::runtime_dir_for(vmid);
     tokio::fs::create_dir_all(&runtime_dir).await?;
@@ -162,7 +189,7 @@ pub async fn mount_rootfs_owned(
         );
     }
     *owner = Some(PreparedRootfs {
-        digest: manifest_digest.clone(),
+        digest: image.digest.clone(),
         mount: root_mount.clone(),
         upper: None,
         work: None,
@@ -172,24 +199,37 @@ pub async fn mount_rootfs_owned(
         mode: rootfs.mode,
         scratch_mounts: Vec::new(),
     });
-    // Include persistence in inventory before attaching; failed formatting,
-    // metadata validation or unmapping must remain reachable for cleanup.
-    if rootfs.mode == RootfsMode::Persistent && persistent_backend()? == PersistentBackend::Rbd {
-        let image = rbd_identity(vmid)?;
-        let state_path = Path::new(PERSISTENT_ROOTFS_ROOT).join(vmid);
-        if rbd_lookup_device(&image).await?.is_some() || is_mountpoint(&state_path).await? {
-            bail!("persistent RBD state already attached; refusing ownership adoption");
-        }
-        let prepared = owner.as_mut().unwrap();
-        prepared.persistent_state_mount = Some(state_path);
-        prepared.rbd_image = Some(image);
+    Ok((runtime_dir, root_mount))
+}
+
+/// Record the RBD volume and its state mount before attaching; failed
+/// formatting, metadata validation or unmapping must stay reachable for cleanup.
+async fn record_rbd_inventory(
+    vmid: &str,
+    rootfs: &Rootfs,
+    owner: &mut Option<PreparedRootfs>,
+) -> Result<()> {
+    if rootfs.mode != RootfsMode::Persistent || persistent_backend()? != PersistentBackend::Rbd {
+        return Ok(());
     }
-    let upper_state = prepare_upper(vmid, rootfs.mode, manifest_digest).await?;
-    {
-        let prepared = owner.as_mut().unwrap();
-        prepared.upper.clone_from(&upper_state.upper);
-        prepared.work.clone_from(&upper_state.work);
-    };
+    let image = rbd_identity(vmid)?;
+    let state_path = Path::new(PERSISTENT_ROOTFS_ROOT).join(vmid);
+    if rbd_lookup_device(&image).await?.is_some() || is_mountpoint(&state_path).await? {
+        bail!("persistent RBD state already attached; refusing ownership adoption");
+    }
+    let prepared = owner.as_mut().unwrap();
+    prepared.persistent_state_mount = Some(state_path);
+    prepared.rbd_image = Some(image);
+    Ok(())
+}
+
+/// Compose the guest config document and return the directory serving it as
+/// the root's second lower layer.
+async fn write_guest_config(
+    image: &PreparedImage,
+    rootfs: &Rootfs,
+    runtime_dir: &Path,
+) -> Result<PathBuf> {
     // The image carries no config document of its own, so the OCI config is a
     // second lower layer; a read-only VM then needs no writable layer at all.
     let config_dir = runtime_dir.join(CONFIG_DIR);
@@ -198,44 +238,51 @@ pub async fn mount_rootfs_owned(
         stdin: rootfs.stdin,
         // An ephemeral root's writable layer is a guest tmpfs the init mounts.
         ephemeral_upper_bytes: (rootfs.mode == RootfsMode::Ephemeral)
-            .then(|| EPHEMERAL_UPPER.read_env())
-            .transpose()?,
+            .then(|| policy().ephemeral_upper.as_u64()),
     };
     let document = guest_config_document(image.config(), &launch)?;
     tokio::fs::write(config_dir.join(CONFIG_FILE_NAME), document).await?;
-    let overlay = match (&upper_state.upper, &upper_state.work) {
+    Ok(config_dir)
+}
+
+async fn mount_layers(
+    image: &PreparedImage,
+    rootfs: &Rootfs,
+    root_mount: &Path,
+    config_dir: &Path,
+    upper: &UpperState,
+) -> Result<()> {
+    let overlay = match (&upper.upper, &upper.work) {
         (Some(upper), Some(work)) => Some((upper.as_path(), work.as_path())),
         _ => None,
     };
     repo::mount_image(
         &image.image,
-        &root_mount,
-        &config_dir,
+        root_mount,
+        config_dir,
         overlay,
         rootfs.mode == RootfsMode::Persistent,
     )?;
     Tool::ORDERED
-        .run(
-            "mount",
-            ["--make-rprivate".to_owned()],
-            &[root_mount.as_path()],
-        )
+        .run("mount", ["--make-rprivate".to_owned()], &[root_mount])
         .await?;
-    // Record scratch targets before mounting so even failed scratch rollback
-    // can be retried through the owner.
-    if rootfs.mode == RootfsMode::ReadOnly {
-        owner.as_mut().unwrap().scratch_mounts = validate_scratch_targets(&root_mount)?
-            .into_iter()
-            .map(|(path, _)| path)
-            .collect();
+    Ok(())
+}
+
+/// Attach the read-only scratch tmpfs. Targets are recorded before mounting
+/// so a failed rollback can be retried through the owner.
+async fn mount_scratch(
+    rootfs: &Rootfs,
+    root_mount: &Path,
+    owner: &mut Option<PreparedRootfs>,
+) -> Result<()> {
+    if rootfs.mode != RootfsMode::ReadOnly {
+        return Ok(());
     }
-    let scratch_mounts = if rootfs.mode == RootfsMode::ReadOnly {
-        mount_readonly_scratch(&root_mount).await?
-    } else {
-        Vec::new()
-    };
-    info!(vmid, %manifest_digest, image_object = %image.image.to_hex(), mount=%root_mount.display(), "OCI rootfs mounted from the composefs repository");
-    owner.as_mut().unwrap().scratch_mounts = scratch_mounts;
+    let targets = validate_scratch_targets(root_mount)?;
+    owner.as_mut().unwrap().scratch_mounts = targets.iter().map(|(path, _)| path.clone()).collect();
+    let mounted = mount_readonly_scratch(root_mount, &targets).await?;
+    owner.as_mut().unwrap().scratch_mounts = mounted;
     Ok(())
 }
 
@@ -252,30 +299,30 @@ pub async fn unmount_rootfs(prepared: &PreparedRootfs) -> Result<()> {
     Ok(())
 }
 
-/// Resolve the three scratch locations completely before mounting any tmpfs.
-/// This avoids leaving an earlier scratch mount behind when a later path is
-/// absent, a symlink, or not a directory in the immutable image.
-pub(super) fn validate_scratch_targets(root: &Path) -> Result<Vec<(PathBuf, String)>> {
+/// Resolve the three scratch locations before mounting any tmpfs. The image is
+/// untrusted: a symlinked `/tmp`, `/run` or `/var/tmp` would make the mount
+/// resolve outside the image, so every component must be a real directory.
+fn validate_scratch_targets(root: &Path) -> Result<Vec<(PathBuf, String)>> {
     let paths = [
         (
             "tmp",
             format!(
                 "size={}m,mode=1777,nosuid,nodev",
-                TMP_SCRATCH.read_env()? / MIB
+                policy().tmp_scratch.as_u64() / MIB
             ),
         ),
         (
             "run",
             format!(
                 "size={}m,mode=755,nosuid,nodev",
-                RUN_SCRATCH.read_env()? / MIB
+                policy().run_scratch.as_u64() / MIB
             ),
         ),
         (
             "var/tmp",
             format!(
                 "size={}m,mode=1777,nosuid,nodev",
-                VARTMP_SCRATCH.read_env()? / MIB
+                policy().vartmp_scratch.as_u64() / MIB
             ),
         ),
     ];
@@ -306,7 +353,7 @@ pub(super) fn validate_scratch_targets(root: &Path) -> Result<Vec<(PathBuf, Stri
     Ok(validated)
 }
 
-pub(super) async fn unmount_scratch_mounts(mounts: &[PathBuf]) -> Result<()> {
+async fn unmount_scratch_mounts(mounts: &[PathBuf]) -> Result<()> {
     unmount_layer_mounts(mounts)
         .await
         .wrap_err("scratch unmount failed")
@@ -314,8 +361,10 @@ pub(super) async fn unmount_scratch_mounts(mounts: &[PathBuf]) -> Result<()> {
 
 /// Read-only root supports only bounded volatile scratch: /tmp, /run, /var/tmp.
 /// Sizes are node policy via `ODOROBO_ROOTFS_{TMP,RUN,VARTMP}_SIZE` (M/G).
-pub(super) async fn mount_readonly_scratch(root: &Path) -> Result<Vec<PathBuf>> {
-    let targets = validate_scratch_targets(root)?;
+async fn mount_readonly_scratch(
+    root: &Path,
+    targets: &[(PathBuf, String)],
+) -> Result<Vec<PathBuf>> {
     // Private propagation prevents nested per-VM tmpfs mounts escaping through
     // shared host mount trees or appearing in another VM's mount view.
     Tool::ORDERED
@@ -330,7 +379,7 @@ pub(super) async fn mount_readonly_scratch(root: &Path) -> Result<Vec<PathBuf>> 
                     "-t".into(),
                     "tmpfs".into(),
                     "-o".into(),
-                    options,
+                    options.clone(),
                     "tmpfs".into(),
                 ],
                 &[target.as_path()],
@@ -343,7 +392,7 @@ pub(super) async fn mount_readonly_scratch(root: &Path) -> Result<Vec<PathBuf>> 
                 target.display()
             )));
         }
-        mounted.push(target);
+        mounted.push(target.clone());
     }
     Ok(mounted)
 }
