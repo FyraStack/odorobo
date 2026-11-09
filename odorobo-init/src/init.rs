@@ -216,6 +216,8 @@ fn attach_workload_console(attach_stdin: bool) {
 /// the cmdline the console then carries the whole boot log in order, ahead of
 /// the init's own lines and the workload.
 fn dump_kernel_log() {
+    use std::io::Write as _;
+
     const SYSLOG_ACTION_READ_ALL: libc::c_int = 3;
     const SYSLOG_ACTION_SIZE_BUFFER: libc::c_int = 10;
     const MAX_KERNEL_LOG_BYTES: usize = 1 << 20;
@@ -246,12 +248,12 @@ fn dump_kernel_log() {
     for line in buffer[..read].split_inclusive(|byte| *byte == b'\n') {
         text.extend_from_slice(strip_level_prefix(line));
     }
-    use std::io::Write as _;
+
     #[expect(
         clippy::let_underscore_must_use,
         reason = "a missing console must not stop the init"
     )]
-    let _ = std::io::stdout().write_all(&text);
+    let _: io::Result<()> = std::io::stdout().write_all(&text);
 }
 
 fn strip_level_prefix(line: &[u8]) -> &[u8] {
