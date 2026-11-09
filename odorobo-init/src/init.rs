@@ -8,6 +8,7 @@ use std::io::{self, Read as _};
 use std::os::fd::RawFd;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicI32, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::image::{ImageConfig, ImageConfigDocument};
 use tracing::{error, info, warn};
@@ -35,6 +36,10 @@ const HANDLED_SIGNALS: [libc::c_int; 5] = [
     libc::SIGQUIT,
     libc::SIGHUP,
 ];
+
+/// How long a forwarded termination signal may take before the workload is
+/// killed with SIGKILL.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 
 /// Write end of the self-pipe the signal handler reports through.
 static SIGNAL_FD: AtomicI32 = AtomicI32::new(-1);
@@ -110,6 +115,17 @@ fn run_pid1() -> io::Result<i32> {
     let workload = mount_image()?;
     let read_fd = signal_pipe()?;
     install_signal_handlers()?;
+
+    // The workload runs as PID 1 in its own PID namespace, so images that ship
+    // an init (systemd, s6, tini) find the environment they expect. This process
+    // stays the global PID 1 and keeps reaping, signaling and powering off.
+    // SAFETY: unshare takes plain flags and the process is single-threaded.
+    if unsafe { libc::unshare(libc::CLONE_NEWPID) } < 0 {
+        return Err(with_context(
+            io::Error::last_os_error(),
+            "creating the workload PID namespace",
+        ));
+    }
 
     // SAFETY: the process is single-threaded here, so fork is safe.
     let child = unsafe { libc::fork() };
@@ -281,6 +297,7 @@ fn child_main(workload: &Workload) -> ! {
         // SAFETY: restoring the default disposition is always valid.
         unsafe { libc::signal(signal, libc::SIG_DFL) };
     }
+    mount_workload_proc();
     match exec_workload(&workload.process) {
         Ok(never) => match never {},
         Err(err) => {
@@ -288,6 +305,23 @@ fn child_main(workload: &Workload) -> ! {
             // SAFETY: _exit terminates the child without running destructors.
             unsafe { libc::_exit(127) }
         }
+    }
+}
+
+/// The initramfs `/proc` belongs to the outer PID namespace; the workload needs
+/// one that shows its own processes, with the workload as PID 1.
+fn mount_workload_proc() {
+    let mounted = mount_fs(
+        Some(c"proc"),
+        "/proc",
+        Some(c"proc"),
+        libc::MS_NOSUID | libc::MS_NOEXEC | libc::MS_NODEV,
+        None,
+    );
+    if let Err(err) = mounted {
+        // A boot without /proc is degraded but still better than not starting
+        // the workload at all.
+        warn!(error = %err, "cannot mount the workload's /proc");
     }
 }
 
@@ -556,24 +590,40 @@ extern "C" fn handle_signal(signal: libc::c_int) {
 fn supervise(child: libc::pid_t, read_fd: RawFd) -> io::Result<ExitInfo> {
     let mut status = None;
     let mut buffer = [0_u8; 64];
+    let mut kill_at: Option<Instant> = None;
     loop {
         reap_children(child, &mut status)?;
         if let Some(info) = status {
             return Ok(info);
         }
+        let timeout = kill_at.map_or(-1, |deadline| {
+            i32::try_from(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_millis(),
+            )
+            .unwrap_or(i32::MAX)
+        });
         let mut poll_fd = libc::pollfd {
             fd: read_fd,
             events: libc::POLLIN,
             revents: 0,
         };
         // SAFETY: poll_fd is one initialized pollfd and poll writes only to it.
-        let ready = unsafe { libc::poll(std::ptr::from_mut(&mut poll_fd), 1, -1) };
+        let ready = unsafe { libc::poll(std::ptr::from_mut(&mut poll_fd), 1, timeout) };
         if ready < 0 {
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::Interrupted {
                 continue;
             }
             return Err(err);
+        }
+        if ready == 0 {
+            // The workload ignored the forwarded termination signal; SIGKILL
+            // cannot be ignored by a namespace init.
+            signal_workload(child, libc::SIGKILL);
+            kill_at = None;
+            continue;
         }
         // SAFETY: buffer is valid for buffer.len() bytes of writes.
         let count = unsafe { libc::read(read_fd, buffer.as_mut_ptr().cast(), buffer.len()) };
@@ -589,7 +639,11 @@ fn supervise(child: libc::pid_t, read_fd: RawFd) -> io::Result<ExitInfo> {
         }
         let count = usize::try_from(count).unwrap_or(0);
         for &signal in &buffer[..count] {
-            handle_pending_signal(libc::c_int::from(signal), child);
+            let signal = libc::c_int::from(signal);
+            if matches!(signal, libc::SIGTERM | libc::SIGINT | libc::SIGQUIT) {
+                kill_at = Instant::now().checked_add(SHUTDOWN_GRACE);
+            }
+            handle_pending_signal(signal, child);
         }
     }
 }
@@ -598,6 +652,10 @@ fn handle_pending_signal(signal: libc::c_int, child: libc::pid_t) {
     if signal == libc::SIGCHLD {
         return;
     }
+    signal_workload(child, signal);
+}
+
+fn signal_workload(child: libc::pid_t, signal: libc::c_int) {
     #[expect(
         clippy::arithmetic_side_effects,
         reason = "a child pid always fits a negated pid_t"

@@ -108,8 +108,10 @@ The initramfs contains a single static `odorobo-init` binary as `/init`. As PID 
 1. mounts `devtmpfs`, `proc` and `sysfs`;
 2. mounts the virtiofs share tagged `rootfs` at `/newroot` and reads the image's OCI config document from `/.odorobo-config.json` inside it, mounting a size-bounded tmpfs plus overlay first when the document asks for an ephemeral root;
 3. moves the pseudo-filesystems into the new root, overmounts the initramfs root with it (`mount --move` onto `/`) and chroots into it. `pivot_root` cannot be used here: the initramfs root is `rootfs`, which the kernel refuses to pivot away from and cannot be unmounted, so the documented handoff leaves it hidden underneath rather than detached;
-4. resolves the config's `User` against the image's `/etc/passwd` and `/etc/group`, applies `setgroups`/`setgid`/`setuid`, builds `Env` plus the entrypoint and command, and `execve`s it in the config's `WorkingDir`;
-5. reaps zombies, forwards `SIGTERM`/`SIGINT`/`SIGQUIT`/`SIGHUP` to the workload's process group, and powers the VM off when the workload exits.
+4. creates a PID namespace and forks; the child is PID 1 of that namespace, mounts its own `/proc`, resolves the config's `User` against the image's `/etc/passwd` and `/etc/group`, applies `setgroups`/`setgid`/`setuid`, builds `Env` plus the entrypoint and command, and `execve`s it in the config's `WorkingDir`;
+5. the outer PID 1 reaps the namespace init, forwards `SIGTERM`/`SIGINT`/`SIGQUIT`/`SIGHUP` to its process group, escalates to `SIGKILL` after 10 seconds, and powers the VM off when the workload exits.
+
+Because the workload is PID 1 in its own namespace, images that ship an init (systemd, s6, tini) see the environment they expect while the outer init keeps the VM lifecycle duties.
 
 If the image has neither an entrypoint nor a command, the init falls back to `/sbin/init`, `/etc/init`, `/bin/init` and then `/bin/sh`. Unknown or missing config fields are ignored; an unreadable config is fatal. The agent writes `.odorobo-config.json` into `/run/odorobo/vms/<vmid>/config` and mounts that directory as a lower layer before start, so the guest never sees the network or the host filesystem.
 

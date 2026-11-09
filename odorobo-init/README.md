@@ -96,13 +96,19 @@ No manifest field overrides the image's `Env`, `Cmd`, or `User` yet.
    not an option: the initramfs root is `rootfs`, which the kernel refuses to
    pivot away from and cannot be unmounted, so the old tree stays hidden
    underneath instead of being detached.
-5. It forks; the child opens `/dev/hvc0` (the virtio console) as its
-   stdout/stderr with a controlling terminal, applies `User`, and execs
+5. It creates a PID namespace and forks; the child is PID 1 of that namespace,
+   opens `/dev/hvc0` (the virtio console) as its stdout/stderr with a
+   controlling terminal, mounts its own `/proc`, applies `User`, and execs
    `Entrypoint` + `Cmd`. Its stdin is `/dev/null` unless the config document
    asks for `stdin`.
-6. It reaps children, forwards `SIGTERM`, `SIGINT`, `SIGQUIT`, and `SIGHUP` to
-   the process group, and powers off when the main child exits. The child's
-   status is logged.
+6. The outer init reaps the namespace init, forwards `SIGTERM`, `SIGINT`,
+   `SIGQUIT`, and `SIGHUP` to its process group, escalates to `SIGKILL` after
+   10 seconds, and powers off when the main child exits. The child's status is
+   logged.
+
+The workload being PID 1 in its own namespace is what lets images that ship an
+init (systemd, s6, tini) see the environment they expect; the outer init remains
+the VM's PID 1.
 
 ## Building
 
