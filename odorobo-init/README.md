@@ -30,8 +30,8 @@ mounts for the VM.
 
 The bytes are not rewritten. The init uses only the `config` object and ignores
 `architecture`, `os`, `rootfs`, and `history`. A missing share, unreadable file,
-invalid JSON, or file over 1 MiB is fatal: the init logs
-`odorobo-init: fatal: ...` and powers off.
+invalid JSON, or file over 1 MiB is fatal: the init logs the error at
+`ERROR` and powers off.
 
 ```json
 {
@@ -116,7 +116,7 @@ archive holds only `init`. The root `justfile` has the same recipe.
 
 ## Debugging
 
-- Console (`console=ttyS0`): kernel messages and `odorobo-init:` lines.
+- Console (`console=ttyS0`): kernel messages and `INFO`/`WARN`/`ERROR` lines from the init.
 - Workload logs: `GET /vms/<vmid>/logs`, the virtio console stream the workload
   writes to.
 - Input: `/run/odorobo/vms/<vmid>/config/.odorobo-config.json`, visible to the

@@ -59,7 +59,7 @@ impl ImageConfigDocument {
     }
 
     /// Whether the workload's stdin is attached to the workload console.
-    pub fn stdin(&self) -> bool {
+    pub const fn stdin(&self) -> bool {
         self.odorobo.stdin
     }
 

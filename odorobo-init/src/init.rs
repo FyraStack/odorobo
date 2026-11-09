@@ -10,6 +10,7 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use crate::image::{ImageConfig, ImageConfigDocument};
+use tracing::{error, info, warn};
 
 const ROOTFS_TAG: &CStr = c"rootfs";
 const ROOT_MOUNT: &str = "/newroot";
@@ -38,31 +39,32 @@ const HANDLED_SIGNALS: [libc::c_int; 5] = [
 /// Write end of the self-pipe the signal handler reports through.
 static SIGNAL_FD: AtomicI32 = AtomicI32::new(-1);
 
-macro_rules! log {
-    ($($arg:tt)*) => {{
-        use std::io::Write as _;
-        #[expect(
-            clippy::let_underscore_must_use,
-            reason = "a missing console must not stop the init"
-        )]
-        let _ = writeln!(std::io::stderr(), "odorobo-init: {}", format_args!($($arg)*));
-    }};
+/// Write init logs to the serial console through the current stderr.
+fn init_logging() {
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .without_time()
+        .with_target(false)
+        .compact()
+        .init();
 }
 
 /// Runs as PID 1 and never returns on success: the VM is powered off when the
 /// workload exits.
 pub fn run() -> ExitCode {
+    init_logging();
     // SAFETY: getpid takes no arguments and cannot fail.
     let pid = unsafe { libc::getpid() };
     if pid != 1 {
-        log!("must run as PID 1, not {pid}");
+        error!(pid, "must run as PID 1");
         return ExitCode::FAILURE;
     }
     restore_console();
     match run_pid1() {
         Ok(code) => power_off(code),
         Err(err) => {
-            log!("fatal: {err}");
+            error!(error = %err, "fatal");
             power_off(1)
         }
     }
@@ -122,12 +124,13 @@ fn run_pid1() -> io::Result<i32> {
                 // SAFETY: pid is a live child.
                 unsafe { libc::setpgid(pid, pid) };
             }
-            log!(
-                "workload started with pid {pid}: {:?}",
-                workload.process.args()
-            );
+            info!(pid, args = ?workload.process.args(), "workload started");
             let info = supervise(pid, read_fd)?;
-            log!("workload {} (status {})", info.description, info.code);
+            info!(
+                description = %info.description,
+                status = info.code,
+                "workload exited"
+            );
             Ok(info.code)
         }
         _ => Err(io::Error::last_os_error()),
@@ -159,9 +162,9 @@ fn attach_workload_console(attach_stdin: bool) {
     // SAFETY: opening a fixed device path read-write.
     let fd = unsafe { libc::open(c"/dev/hvc0".as_ptr(), libc::O_RDWR) };
     if fd < 0 {
-        log!(
-            "cannot open /dev/hvc0: {}; the workload keeps the init console",
-            io::Error::last_os_error()
+        warn!(
+            error = %io::Error::last_os_error(),
+            "cannot open /dev/hvc0; the workload keeps the init console"
         );
         return;
     }
@@ -183,9 +186,9 @@ fn attach_workload_console(attach_stdin: bool) {
                 unsafe { libc::close(null) };
             }
         } else {
-            log!(
-                "cannot open /dev/null: {}; closing the workload's stdin",
-                io::Error::last_os_error()
+            warn!(
+                error = %io::Error::last_os_error(),
+                "cannot open /dev/null; closing the workload's stdin"
             );
             // SAFETY: closing an inherited descriptor.
             unsafe { libc::close(libc::STDIN_FILENO) };
@@ -197,9 +200,9 @@ fn attach_workload_console(attach_stdin: bool) {
         // SAFETY: fd is an open tty and the process is now a session leader.
         unsafe { libc::ioctl(fd, libc::TIOCSCTTY, 0) };
     } else {
-        log!(
-            "workload console cannot become the controlling terminal: {}",
-            io::Error::last_os_error()
+        warn!(
+            error = %io::Error::last_os_error(),
+            "workload console cannot become the controlling terminal"
         );
     }
     if fd > libc::STDERR_FILENO {
@@ -279,7 +282,7 @@ fn child_main(workload: &Workload) -> ! {
     match exec_workload(&workload.process) {
         Ok(never) => match never {},
         Err(err) => {
-            log!("cannot start workload: {err}");
+            error!(error = %err, "cannot start workload");
             // SAFETY: _exit terminates the child without running destructors.
             unsafe { libc::_exit(127) }
         }
@@ -339,28 +342,19 @@ fn mount_image() -> io::Result<Workload> {
     };
 
     for mount in ["/proc", "/sys", "/dev"] {
-        let target = format!("{root}{mount}");
-        if let Err(err) = fs::create_dir_all(&target) {
-            // A read-only image without these mount points cannot receive
-            // them; warn and keep going rather than refusing to boot.
-            log!("cannot create {target}: {err}; skipping the {mount} mount");
-            continue;
-        }
-        let source = cstring(mount, "mount source")?;
-        mount_fs(Some(&source), &target, None, libc::MS_MOVE, None)
-            .map_err(|err| with_context(err, format!("moving {mount} into the image")))?;
+        early_mount(&root, mount)?;
     }
 
     switch_root(&root)?;
     let args = config.args();
-    log!(
-        "image mounted; running {} with {} environment entries",
-        if args.is_empty() {
-            FALLBACK_INIT.join(" or ")
-        } else {
-            args[0].clone()
-        },
-        config.env().len()
+    let program = args
+        .first()
+        .cloned()
+        .unwrap_or_else(|| FALLBACK_INIT.join(" or "));
+    info!(
+        %program,
+        environment = config.env().len(),
+        "image mounted; running workload"
     );
     Ok(Workload {
         process: config,
@@ -368,29 +362,40 @@ fn mount_image() -> io::Result<Workload> {
     })
 }
 
+/// Moves an early-boot mount under the image root.
+fn early_mount(root: &str, mount: &str) -> io::Result<()> {
+    let target = format!("{root}{mount}");
+    if let Err(err) = fs::create_dir_all(&target) {
+        // A read-only image without these mount points cannot receive them;
+        // warn and keep going rather than refusing to boot.
+        warn!(%target, mount = %mount, %err, "cannot create mount target; skipping the mount");
+        return Ok(());
+    }
+    let source = cstring(mount, "mount source")?;
+    mount_fs(Some(&source), &target, None, libc::MS_MOVE, None)
+        .map_err(|err| with_context(err, format!("moving {mount} into the image")))
+}
+
 /// Builds the merged root of an ephemeral VM: the image share is the read-only
 /// overlay lower and a size-bounded tmpfs holds the writable upper, so guest
 /// writes are charged to this VM instead of host memory. `redirect_dir=on`
 /// keeps directory renames working against image content.
 fn mount_ephemeral_root(upper_bytes: u64) -> io::Result<String> {
-    for directory in [UPPER_MOUNT, OVERLAY_MOUNT] {
-        fs::create_dir_all(directory)
-            .map_err(|err| with_context(err, format!("creating {directory}")))?;
-    }
-    let options = cstring(&format!("size={upper_bytes},mode=0700"), "tmpfs options")?;
+    create_directories([UPPER_MOUNT, OVERLAY_MOUNT])?;
+
+    let tmpfs_options = cstring(&format!("size={upper_bytes},mode=0700"), "tmpfs options")?;
     mount_fs(
         Some(c"tmpfs"),
         UPPER_MOUNT,
         Some(c"tmpfs"),
         libc::MS_NOSUID | libc::MS_NODEV,
-        Some(&options),
+        Some(&tmpfs_options),
     )
     .map_err(|err| with_context(err, format!("mounting the {upper_bytes}-byte tmpfs upper")))?;
-    for directory in [UPPER_DIR, WORK_DIR] {
-        fs::create_dir_all(directory)
-            .map_err(|err| with_context(err, format!("creating {directory}")))?;
-    }
-    let data = cstring(
+
+    create_directories([UPPER_DIR, WORK_DIR])?;
+
+    let overlay_options = cstring(
         &format!("lowerdir={ROOT_MOUNT},upperdir={UPPER_DIR},workdir={WORK_DIR},redirect_dir=on"),
         "overlay options",
     )?;
@@ -399,11 +404,20 @@ fn mount_ephemeral_root(upper_bytes: u64) -> io::Result<String> {
         OVERLAY_MOUNT,
         Some(c"overlay"),
         0,
-        Some(&data),
+        Some(&overlay_options),
     )
     .map_err(|err| with_context(err, format!("mounting the overlay at {OVERLAY_MOUNT}")))?;
-    log!("ephemeral root merged from {ROOT_MOUNT} with a {upper_bytes}-byte tmpfs upper");
+
+    info!(upper_bytes, root = %ROOT_MOUNT, "ephemeral root merged");
     Ok(OVERLAY_MOUNT.to_owned())
+}
+
+fn create_directories<const N: usize>(directories: [&str; N]) -> io::Result<()> {
+    for directory in directories {
+        fs::create_dir_all(directory)
+            .map_err(|err| with_context(err, format!("creating {directory}")))?;
+    }
+    Ok(())
 }
 
 fn read_config() -> io::Result<ImageConfigDocument> {
@@ -455,7 +469,7 @@ fn switch_root(root: &str) -> io::Result<()> {
         ));
     }
     std::env::set_current_dir("/").map_err(|err| with_context(err, "setting / as cwd"))?;
-    log!("switched to the workload root; the initramfs mount is hidden underneath");
+    info!("switched to the workload root; the initramfs mount is hidden underneath");
     Ok(())
 }
 
@@ -678,13 +692,16 @@ fn exec_workload(config: &ImageConfig) -> io::Result<Infallible> {
         .iter()
         .map(|argument| cstring(argument, "argument"))
         .collect::<io::Result<_>>()?;
+
     let mut argument_ptrs: Vec<*const libc::c_char> =
         arguments.iter().map(|argument| argument.as_ptr()).collect();
     argument_ptrs.push(std::ptr::null());
+
     let env: Vec<CString> = env
         .iter()
         .map(|entry| cstring(entry, "environment entry"))
         .collect::<io::Result<_>>()?;
+
     let mut env_ptrs: Vec<*const libc::c_char> = env.iter().map(|entry| entry.as_ptr()).collect();
     env_ptrs.push(std::ptr::null());
 
@@ -761,32 +778,44 @@ fn resolve_identity(spec: &str) -> io::Result<Identity> {
     let (user, group) = spec
         .split_once(':')
         .map_or((spec, None), |(user, group)| (user, Some(group)));
-    let passwd = read_database("/etc/passwd", parse_passwd)?;
     let (uid, primary_gid) = if let Ok(uid) = user.parse::<libc::uid_t>() {
-        let gid = passwd
-            .iter()
-            .find(|entry| entry.id == uid)
-            .map_or(0, |entry| entry.group);
+        // SAFETY: getpwuid returns a pointer to libc-owned static storage that
+        // stays valid until the next lookup.
+        let gid = unsafe { libc::getpwuid(uid).as_ref() }.map_or(0, |entry| entry.pw_gid);
         (uid, gid)
     } else {
-        let entry = passwd
-            .iter()
-            .find(|entry| entry.name == user)
+        let name = c_name("user", user)?;
+        // SAFETY: the name is NUL-terminated; the returned entry is valid until
+        // the next lookup.
+        let entry = unsafe { libc::getpwnam(name.as_ptr()).as_ref() }
             .ok_or_else(|| not_found(format!("user {user:?} is not in /etc/passwd")))?;
-        (entry.id, entry.group)
+        (entry.pw_uid, entry.pw_gid)
     };
     let gid = match group.filter(|group| !group.is_empty()) {
-        Some(group) => match group.parse::<libc::gid_t>() {
-            Ok(gid) => gid,
-            Err(_) => read_database("/etc/group", parse_group)?
-                .into_iter()
-                .find(|entry| entry.name == group)
-                .map(|entry| entry.id)
-                .ok_or_else(|| not_found(format!("group {group:?} is not in /etc/group")))?,
-        },
+        Some(group) => {
+            if let Ok(gid) = group.parse::<libc::gid_t>() {
+                gid
+            } else {
+                let name = c_name("group", group)?;
+                // SAFETY: the name is NUL-terminated; the returned entry is
+                // valid until the next lookup.
+                let entry = unsafe { libc::getgrnam(name.as_ptr()).as_ref() }
+                    .ok_or_else(|| not_found(format!("group {group:?} is not in /etc/group")))?;
+                entry.gr_gid
+            }
+        }
         None => primary_gid,
     };
     Ok(Identity { uid, gid })
+}
+
+fn c_name(kind: &str, name: &str) -> io::Result<CString> {
+    CString::new(name).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{kind} {name:?} contains a NUL byte"),
+        )
+    })
 }
 
 fn apply_identity(identity: &Identity) -> io::Result<()> {
@@ -809,58 +838,14 @@ fn apply_identity(identity: &Identity) -> io::Result<()> {
     Ok(())
 }
 
-struct DatabaseEntry {
-    name: String,
-    id: u32,
-    group: u32,
-}
-
-fn read_database(
-    path: &str,
-    parse: fn(&str) -> Vec<DatabaseEntry>,
-) -> io::Result<Vec<DatabaseEntry>> {
-    match fs::read_to_string(path) {
-        Ok(contents) => Ok(parse(&contents)),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(err) => Err(with_context(err, format!("reading {path}"))),
-    }
-}
-
-fn parse_passwd(contents: &str) -> Vec<DatabaseEntry> {
-    contents
-        .lines()
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .filter_map(|line| {
-            let mut fields = line.split(':');
-            Some(DatabaseEntry {
-                name: fields.next()?.to_owned(),
-                id: fields.nth(1)?.parse().ok()?,
-                group: fields.next()?.parse().ok()?,
-            })
-        })
-        .collect()
-}
-
-fn parse_group(contents: &str) -> Vec<DatabaseEntry> {
-    contents
-        .lines()
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .filter_map(|line| {
-            let mut fields = line.split(':');
-            Some(DatabaseEntry {
-                name: fields.next()?.to_owned(),
-                id: fields.nth(1)?.parse().ok()?,
-                group: 0,
-            })
-        })
-        .collect()
-}
-
 fn power_off(code: i32) -> ! {
-    log!("powering off (status {code})");
+    info!(status = code, "powering off");
     // SAFETY: PID 1 with CAP_SYS_BOOT may reboot, and RB_POWER_OFF is valid.
     if unsafe { libc::reboot(libc::RB_POWER_OFF) } < 0 {
-        log!("poweroff failed: {}", io::Error::last_os_error());
+        error!(
+            error = %io::Error::last_os_error(),
+            "poweroff failed; rebooting"
+        );
         // SAFETY: a restart is the next best way to end the VM.
         unsafe { libc::reboot(libc::RB_AUTOBOOT) };
     }
@@ -923,23 +908,10 @@ mod tests {
     }
 
     #[test]
-    fn parses_passwd_without_comments() {
-        let entries = parse_passwd(
-            "# comment\nroot:x:0:0:root:/root:/bin/sh\nnobody:x:65534:65534::/:/sbin/nologin",
-        );
-        assert_eq!(entries.len(), 2);
-        assert_eq!(
-            (entries[0].name.as_str(), entries[0].id, entries[0].group),
-            ("root", 0, 0)
-        );
-        assert_eq!(entries[1].id, 65534);
-    }
-
-    #[test]
-    fn parses_group_names() {
-        let entries = parse_group("root:x:0:\ntty:x:5:user");
-        assert_eq!(entries[1].name, "tty");
-        assert_eq!(entries[1].id, 5);
+    fn resolves_numeric_identity_with_explicit_group() {
+        let identity = resolve_identity("0:1234").unwrap();
+        assert_eq!(identity.uid, 0);
+        assert_eq!(identity.gid, 1234);
     }
 
     #[test]

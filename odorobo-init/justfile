@@ -11,7 +11,7 @@ output := "/var/lib/odorobo/microvm/initramfs.cpio.gz"
 default: initramfs
 
 build:
-    cargo build --release -p odorobo-init --target {{ target }} --manifest-path {{ manifest }}
+    cargo build --profile init -p odorobo-init --target {{ target }} --manifest-path {{ manifest }}
 
 initramfs: build
     #!/usr/bin/env bash
@@ -20,7 +20,7 @@ initramfs: build
     trap 'rm -rf "$stage"' EXIT
     target_dir="$(cargo metadata --no-deps --format-version 1 --manifest-path "{{ manifest }}" |
         python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
-    install -Dm755 "$target_dir/{{ target }}/release/odorobo-init" "$stage/init"
+    install -Dm755 "$target_dir/{{ target }}/init/odorobo-init" "$stage/init"
     (cd "$stage" &&
         printf 'init\n' |
             cpio -o -H newc --reproducible --owner=0:0 --quiet |

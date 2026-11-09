@@ -48,6 +48,16 @@ strip = "none"
 
 incremental = false # this is just to get reproducible builds. incremental compiles aren't consistent and can sometimes be broken when combined with optimizations
 
+# Minimal guest PID 1: it ships in the initramfs and never needs symbols.
+[profile.init]
+inherits = "release"
+
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+incremental = false
+
 [workspace.lints.clippy]
 complexity = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }
