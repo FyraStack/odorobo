@@ -34,7 +34,7 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 use tracing::info;
 
 use super::limits::policy;
-use super::oci::{normalize_image_ref, preflight_compressed_size};
+use super::oci::{docker_digest_ref, normalize_image_ref, preflight_compressed_size};
 
 /// Node-local store of fs-verity objects shared by every OCI image.
 pub(super) const REPOSITORY_PATH: &str = "/var/lib/odorobo/composefs";
@@ -105,33 +105,55 @@ impl ImportedImage {
 }
 
 /// Import `image_ref` if it is not stored yet, and return its mountable form.
+/// `pinned_manifest` fetches that digest instead of resolving the tag again.
 pub(super) async fn import_image(
     image_ref: &str,
+    pinned_manifest: Option<&str>,
     max_compressed_bytes: u64,
 ) -> Result<ImportedImage> {
     // The importer future is not `Send` (the layer service holds a boxed reply
     // stream), so it runs on its own runtime on a blocking thread.
     let image_ref = image_ref.to_owned();
-    tokio::task::spawn_blocking(move || import_image_blocking(&image_ref, max_compressed_bytes))
-        .await
-        .wrap_err("joining the composefs import task")?
+    let pinned_manifest = pinned_manifest.map(str::to_owned);
+    tokio::task::spawn_blocking(move || {
+        import_image_blocking(&image_ref, pinned_manifest.as_deref(), max_compressed_bytes)
+    })
+    .await
+    .wrap_err("joining the composefs import task")?
 }
 
-fn import_image_blocking(image_ref: &str, max_compressed_bytes: u64) -> Result<ImportedImage> {
+fn import_image_blocking(
+    image_ref: &str,
+    pinned_manifest: Option<&str>,
+    max_compressed_bytes: u64,
+) -> Result<ImportedImage> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .wrap_err("building the composefs import runtime")?;
-    runtime.block_on(import_image_inner(image_ref, max_compressed_bytes))
+    runtime.block_on(import_image_inner(
+        image_ref,
+        pinned_manifest,
+        max_compressed_bytes,
+    ))
 }
 
 #[expect(
     clippy::future_not_send,
     reason = "the importer runs on the dedicated single-threaded runtime"
 )]
-async fn import_image_inner(image_ref: &str, max_compressed_bytes: u64) -> Result<ImportedImage> {
+async fn import_image_inner(
+    image_ref: &str,
+    pinned_manifest: Option<&str>,
+    max_compressed_bytes: u64,
+) -> Result<ImportedImage> {
     let normalized = normalize_image_ref(image_ref, policy().allow_local_transports)?;
-    let preflight = preflight_compressed_size(image_ref, &normalized, max_compressed_bytes).await?;
+    let pinned = pinned_manifest.filter(|_| normalized.starts_with("docker://"));
+    let fetch_ref = match pinned {
+        Some(digest) => docker_digest_ref(&normalized, digest)?,
+        None => normalized.clone(),
+    };
+    let preflight = preflight_compressed_size(&fetch_ref, &fetch_ref, max_compressed_bytes).await?;
     let repository = repository()?;
     // Wait out a running GC; the guard travels with the result to first mount.
     let write_guard = Arc::clone(&REPOSITORY_WRITES).lock_owned().await;
@@ -145,7 +167,7 @@ async fn import_image_inner(image_ref: &str, max_compressed_bytes: u64) -> Resul
     )
     .await
     .map_err(|error| {
-        eyre!("importing {image_ref} into the composefs repository failed: {error:#}")
+        eyre!("importing {fetch_ref} into the composefs repository failed: {error:#}")
     })?;
     let opened = open_config(
         &repository,
@@ -162,8 +184,16 @@ async fn import_image_inner(image_ref: &str, max_compressed_bytes: u64) -> Resul
         &imported.config_verity,
     )?;
     let manifest_digest = imported.manifest_digest.to_string();
+    if let Some(pinned) = pinned
+        && manifest_digest != pinned
+    {
+        return Err(eyre!(
+            "imported manifest digest {manifest_digest} does not match the pinned {pinned}"
+        ));
+    }
     info!(
         image = image_ref,
+        fetch = %fetch_ref,
         %manifest_digest,
         image_object = %image.to_hex(),
         layers = opened.layer_refs.len(),

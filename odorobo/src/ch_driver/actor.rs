@@ -973,7 +973,14 @@ impl Message<StartVM> for VMActor {
         let actor_ref = ctx.actor_ref().clone();
         let vmid = self.vmid;
         tokio::spawn(async move {
-            let image = crate::ch_driver::containers::prepare_image(&rootfs).await;
+            let pin =
+                crate::ch_driver::containers::pinned_image_digest(&vmid.to_string(), &rootfs).await;
+            let image = match pin {
+                Ok(pin) => {
+                    crate::ch_driver::containers::prepare_image(&rootfs, pin.as_deref()).await
+                }
+                Err(err) => Err(err.wrap_err("reading the pinned OCI image digest")),
+            };
             if actor_ref.tell(ImageReady { attempt, image }).await.is_err() {
                 debug!(%vmid, "VM actor stopped before its image was ready");
             }

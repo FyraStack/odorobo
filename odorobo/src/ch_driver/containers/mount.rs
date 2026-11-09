@@ -87,7 +87,8 @@ pub(super) async fn unmount_layer_mounts(mounts: &[PathBuf]) -> Result<()> {
 /// retained; only per-layer stores and per-reference OCI layouts are cached.
 #[cfg(test)]
 pub(super) async fn mount_rootfs(vmid: &str, rootfs: &Rootfs) -> Result<PreparedRootfs> {
-    let image = prepare_image(rootfs).await?;
+    let pin = pinned_image_digest(vmid, rootfs).await?;
+    let image = prepare_image(rootfs, pin.as_deref()).await?;
     let mut owner = None;
     match mount_rootfs_owned(vmid, rootfs, &image, &mut owner).await {
         Ok(()) => Ok(owner.unwrap()),
@@ -125,9 +126,18 @@ impl PreparedImage {
 }
 
 /// Import the image into the shared composefs repository. Holds no per-VM
-/// state, so it can run off the VM actor.
-pub async fn prepare_image(rootfs: &Rootfs) -> Result<PreparedImage> {
-    let imported = repo::import_image(&rootfs.oci, policy().max_compressed_bytes.as_u64()).await?;
+/// state, so it can run off the VM actor. `pinned_manifest` fetches that digest
+/// instead of resolving the tag again.
+pub async fn prepare_image(
+    rootfs: &Rootfs,
+    pinned_manifest: Option<&str>,
+) -> Result<PreparedImage> {
+    let imported = repo::import_image(
+        &rootfs.oci,
+        pinned_manifest,
+        policy().max_compressed_bytes.as_u64(),
+    )
+    .await?;
     let (digest, image, config, write_guard) = imported.into_parts();
     Ok(PreparedImage {
         digest,
@@ -135,6 +145,15 @@ pub async fn prepare_image(rootfs: &Rootfs) -> Result<PreparedImage> {
         config,
         _write_guard: write_guard,
     })
+}
+
+/// Manifest digest an existing persistent state pinned, read before the tag is
+/// resolved. `None` for non-persistent roots or when no readable state exists.
+pub async fn pinned_image_digest(vmid: &str, rootfs: &Rootfs) -> Result<Option<String>> {
+    if rootfs.mode != RootfsMode::Persistent {
+        return Ok(None);
+    }
+    super::persistent::pinned_manifest_digest(vmid).await
 }
 
 /// Publish acquired resources to a lifecycle owner before the first mount.
@@ -690,7 +709,7 @@ mod tests {
             entrypoint: None,
             cmd: None,
         };
-        let image = prepare_image(&rootfs).await.unwrap();
+        let image = prepare_image(&rootfs, None).await.unwrap();
         assert!(
             mount_rootfs_owned(&vmid, &rootfs, &image, &mut owner)
                 .await

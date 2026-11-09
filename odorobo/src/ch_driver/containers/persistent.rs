@@ -542,6 +542,44 @@ pub(super) async fn prepare_upper(
     })
 }
 
+/// Manifest digest pinned by an existing persistent state, if one is readable.
+/// An RBD volume exposes its state only while mapped; callers fall back to the
+/// tag when there is no pin.
+pub(super) async fn pinned_manifest_digest(vmid: &str) -> Result<Option<String>> {
+    validate_vmid(vmid)?;
+    read_pinned_digest(&Path::new(PERSISTENT_ROOTFS_ROOT).join(vmid)).await
+}
+
+async fn read_pinned_digest(state_dir: &Path) -> Result<Option<String>> {
+    let metadata_path = state_dir.join(STATE_METADATA_FILE);
+    let document = match tokio::fs::read(&metadata_path).await {
+        Ok(document) => document,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err).wrap_err_with(|| format!("reading {}", metadata_path.display()));
+        }
+    };
+    let document: serde_json::Value = serde_json::from_slice(&document)
+        .wrap_err_with(|| format!("parsing {}", metadata_path.display()))?;
+    let digest = document
+        .get("base_manifest_digest")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| eyre!("{} has no base_manifest_digest", metadata_path.display()))?;
+    validate_manifest_digest(digest)
+        .wrap_err_with(|| format!("invalid image pin in {}", metadata_path.display()))?;
+    Ok(Some(digest.to_owned()))
+}
+
+fn validate_manifest_digest(digest: &str) -> Result<()> {
+    let Some(hex) = digest.strip_prefix("sha256:") else {
+        bail!("image digest {digest:?} is not sha256");
+    };
+    if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("image digest {digest:?} is malformed");
+    }
+    Ok(())
+}
+
 /// Manifest digests pinned by persistent upper state metadata.
 ///
 /// Local backends keep the metadata on the host filesystem. An RBD volume
@@ -560,22 +598,9 @@ async fn pinned_base_digests_in(root: &Path) -> Result<Vec<String>> {
         Err(err) => return Err(err).wrap_err_with(|| format!("listing {}", root.display())),
     };
     while let Some(entry) = entries.next_entry().await? {
-        let metadata_path = entry.path().join(STATE_METADATA_FILE);
-        let document = match tokio::fs::read(&metadata_path).await {
-            Ok(document) => document,
-            // An unmapped RBD mountpoint or unused state dir pins nothing.
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(err) => {
-                return Err(err).wrap_err_with(|| format!("reading {}", metadata_path.display()));
-            }
-        };
-        let document: serde_json::Value = serde_json::from_slice(&document)
-            .wrap_err_with(|| format!("parsing {}", metadata_path.display()))?;
-        let digest = document
-            .get("base_manifest_digest")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| eyre!("{} has no base_manifest_digest", metadata_path.display()))?;
-        digests.push(digest.to_owned());
+        if let Some(digest) = read_pinned_digest(&entry.path()).await? {
+            digests.push(digest);
+        }
     }
     Ok(digests)
 }
@@ -687,6 +712,35 @@ pub async fn delete_persistent_rootfs(vmid: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn reads_the_pinned_manifest_digest() {
+        let dir = crate::ch_driver::containers::test_support::TempDir::new("pinned-digest");
+        assert_eq!(read_pinned_digest(&dir).await.unwrap(), None);
+
+        let digest = format!("sha256:{}", "c".repeat(64));
+        tokio::fs::write(
+            dir.join(STATE_METADATA_FILE),
+            serde_json::json!({"base_manifest_digest": digest}).to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(read_pinned_digest(&dir).await.unwrap(), Some(digest));
+    }
+
+    #[tokio::test]
+    async fn rejects_malformed_manifest_digest_pins() {
+        let dir = crate::ch_driver::containers::test_support::TempDir::new("pinned-digest-bad");
+        tokio::fs::write(
+            dir.join(STATE_METADATA_FILE),
+            br#"{"base_manifest_digest":"sha256:not-hex"}"#,
+        )
+        .await
+        .unwrap();
+
+        let error = read_pinned_digest(&dir).await.unwrap_err();
+        assert!(error.to_string().contains("invalid image pin"), "{error}");
+    }
 
     #[tokio::test]
     async fn pinned_base_digests_read_state_metadata_only() {
