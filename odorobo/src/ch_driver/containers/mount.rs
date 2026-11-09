@@ -239,6 +239,8 @@ async fn write_guest_config(
         // An ephemeral root's writable layer is a guest tmpfs the init mounts.
         ephemeral_upper_bytes: (rootfs.mode == RootfsMode::Ephemeral)
             .then(|| policy().ephemeral_upper.as_u64()),
+        entrypoint: rootfs.entrypoint.clone(),
+        cmd: rootfs.cmd.clone(),
     };
     let document = guest_config_document(image.config(), &launch)?;
     tokio::fs::write(config_dir.join(CONFIG_FILE_NAME), document).await?;
@@ -413,6 +415,8 @@ mod tests {
                 oci: oci.to_owned(),
                 mode,
                 stdin: false,
+                entrypoint: None,
+                cmd: None,
             },
         )
         .await
@@ -683,6 +687,8 @@ mod tests {
             oci: oci_ref(&layout),
             mode: RootfsMode::ReadOnly,
             stdin: false,
+            entrypoint: None,
+            cmd: None,
         };
         let image = prepare_image(&rootfs).await.unwrap();
         assert!(

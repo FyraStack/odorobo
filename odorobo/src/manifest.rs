@@ -382,6 +382,12 @@ pub struct Rootfs {
     /// closed, which is what non-interactive workloads expect.
     #[serde(default)]
     pub stdin: bool,
+    /// Replace the image's entrypoint for this VM. An empty list clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entrypoint: Option<Vec<String>>,
+    /// Replace the image's command for this VM. An empty list clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cmd: Option<Vec<String>>,
 }
 
 impl<'de> Deserialize<'de> for Rootfs {
@@ -412,6 +418,10 @@ impl<'de> Deserialize<'de> for Rootfs {
             read_only: Option<bool>,
             #[serde(default)]
             stdin: bool,
+            #[serde(default)]
+            entrypoint: Option<Vec<String>>,
+            #[serde(default)]
+            cmd: Option<Vec<String>>,
         }
 
         let wire = WireRootfs::deserialize(deserializer)?;
@@ -430,6 +440,8 @@ impl<'de> Deserialize<'de> for Rootfs {
             oci: wire.oci,
             mode,
             stdin: wire.stdin,
+            entrypoint: wire.entrypoint,
+            cmd: wire.cmd,
         })
     }
 }
@@ -759,6 +771,8 @@ mod tests {
             oci: "docker://registry.fedoraproject.org/fedora:latest".to_owned(),
             mode: RootfsMode::ReadOnly,
             stdin: false,
+            entrypoint: None,
+            cmd: None,
         });
         assert_eq!(manifest.validate(), Ok(()));
 
@@ -766,6 +780,8 @@ mod tests {
             oci: "   ".to_owned(),
             mode: RootfsMode::Ephemeral,
             stdin: false,
+            entrypoint: None,
+            cmd: None,
         });
         assert_eq!(manifest.validate(), Err(ManifestError::EmptyRootfsOci));
 
@@ -857,6 +873,8 @@ mod tests {
             oci: "docker://registry.fedoraproject.org/fedora:latest".to_owned(),
             mode: RootfsMode::ReadOnly,
             stdin: false,
+            entrypoint: None,
+            cmd: None,
         });
         assert_eq!(manifest.validate(), Ok(()));
 

@@ -134,6 +134,10 @@ pub(super) struct GuestLaunchOptions {
     /// Bytes of guest-side tmpfs holding an ephemeral root's writable layer;
     /// `None` makes the image share the root itself.
     pub ephemeral_upper_bytes: Option<u64>,
+    /// Replace the image's entrypoint; an empty list clears it.
+    pub entrypoint: Option<Vec<String>>,
+    /// Replace the image's command; an empty list clears it.
+    pub cmd: Option<Vec<String>>,
 }
 
 /// The guest-visible config document: the image's OCI config plus the launch
@@ -142,7 +146,11 @@ pub(super) fn guest_config_document(
     config: &[u8],
     options: &GuestLaunchOptions,
 ) -> Result<Vec<u8>> {
-    if !options.stdin && options.ephemeral_upper_bytes.is_none() {
+    if !options.stdin
+        && options.ephemeral_upper_bytes.is_none()
+        && options.entrypoint.is_none()
+        && options.cmd.is_none()
+    {
         return Ok(config.to_vec());
     }
     let mut document: serde_json::Value =
@@ -150,6 +158,22 @@ pub(super) fn guest_config_document(
     let object = document
         .as_object_mut()
         .ok_or_else(|| eyre!("the imported OCI config document is not a JSON object"))?;
+    if options.entrypoint.is_some() || options.cmd.is_some() {
+        let config_value = object
+            .entry("config")
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        if !config_value.is_object() {
+            *config_value = serde_json::Value::Object(serde_json::Map::new());
+        }
+        if let Some(config_object) = config_value.as_object_mut() {
+            if let Some(entrypoint) = &options.entrypoint {
+                config_object.insert("Entrypoint".to_owned(), json!(entrypoint));
+            }
+            if let Some(cmd) = &options.cmd {
+                config_object.insert("Cmd".to_owned(), json!(cmd));
+            }
+        }
+    }
     let mut odorobo = serde_json::Map::new();
     if options.stdin {
         odorobo.insert("stdin".to_owned(), serde_json::Value::Bool(true));
@@ -162,7 +186,9 @@ pub(super) fn guest_config_document(
             json!({ "mode": "ephemeral", "tmpfs_upper_bytes": bytes }),
         );
     }
-    object.insert("odorobo".to_owned(), serde_json::Value::Object(odorobo));
+    if !odorobo.is_empty() {
+        object.insert("odorobo".to_owned(), serde_json::Value::Object(odorobo));
+    }
     serde_json::to_vec(&document).wrap_err("serializing the guest config document")
 }
 
@@ -197,6 +223,7 @@ mod tests {
         let options = GuestLaunchOptions {
             stdin: true,
             ephemeral_upper_bytes: Some(1024 * 1024),
+            ..GuestLaunchOptions::default()
         };
         let document: serde_json::Value =
             serde_json::from_slice(&guest_config_document(image, &options).unwrap()).unwrap();
@@ -212,8 +239,37 @@ mod tests {
         let options = GuestLaunchOptions {
             stdin: false,
             ephemeral_upper_bytes: None,
+            ..GuestLaunchOptions::default()
         };
         assert_eq!(guest_config_document(image, &options).unwrap(), image);
+    }
+
+    #[test]
+    fn guest_config_document_applies_launch_overrides() {
+        let image = br#"{"config":{"Entrypoint":["/docker-entrypoint.sh"],"Cmd":["nginx","-g","daemon off;"]}}"#;
+        let options = GuestLaunchOptions {
+            entrypoint: Some(Vec::new()),
+            cmd: Some(vec!["sh".to_owned(), "-c".to_owned(), "sleep 1".to_owned()]),
+            ..GuestLaunchOptions::default()
+        };
+        let document: serde_json::Value =
+            serde_json::from_slice(&guest_config_document(image, &options).unwrap()).unwrap();
+        assert_eq!(document["config"]["Entrypoint"], json!([]));
+        assert_eq!(document["config"]["Cmd"], json!(["sh", "-c", "sleep 1"]));
+        assert!(document.get("odorobo").is_none());
+    }
+
+    #[test]
+    fn guest_config_document_creates_a_missing_config_object() {
+        let options = GuestLaunchOptions {
+            cmd: Some(vec!["/bin/true".to_owned()]),
+            ..GuestLaunchOptions::default()
+        };
+        let document: serde_json::Value = serde_json::from_slice(
+            &guest_config_document(br#"{"config":null}"#, &options).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(document["config"]["Cmd"], json!(["/bin/true"]));
     }
 
     #[tokio::test]

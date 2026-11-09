@@ -244,6 +244,8 @@ mod tests {
             oci: "docker://busybox:latest".to_owned(),
             mode: crate::manifest::RootfsMode::ReadOnly,
             stdin: false,
+            entrypoint: None,
+            cmd: None,
         });
         let config = to_vm_config(&manifest).expect("rootfs manifest converts");
 
@@ -283,6 +285,8 @@ mod tests {
             oci: "docker://busybox:latest".to_owned(),
             mode: crate::manifest::RootfsMode::Ephemeral,
             stdin: false,
+            entrypoint: None,
+            cmd: None,
         });
         manifest.desired.boot.kernel = Some("/custom/vmlinux".to_owned());
         manifest.desired.boot.initramfs = Some("/custom/initramfs.img".to_owned());

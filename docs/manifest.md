@@ -53,7 +53,10 @@ Odorobo should provision. It contains:
   or `false` is accepted only when `mode` is absent and maps to `read_only` or
   `ephemeral`; the boolean is never serialized. `stdin` attaches the workload's
   stdin to the VM's workload console and is off by default, so containers that
-  probe stdin for interactivity see it closed. Rootfs VMs cannot be
+  probe stdin for interactivity see it closed. `entrypoint` and `cmd` replace the
+  image's OCI entrypoint and command for this VM, and an empty list clears the
+  image value; the init still composes arguments as entrypoint followed by
+  command. Rootfs VMs cannot be
   live-migrated; see [`containers.md`](containers.md) for storage details.
 - `cloud_init`: paired NoCloud user-data and meta-data.
 - `vsock`: guest CID and the desired host-side socket location.
