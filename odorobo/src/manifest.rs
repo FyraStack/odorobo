@@ -9,6 +9,7 @@ use std::{collections::BTreeMap, collections::BTreeSet, path::Path};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::Error as DeError};
 use thiserror::Error;
+use tracing::trace;
 use ulid::Ulid;
 
 use crate::ports::PortMapping;
@@ -113,6 +114,10 @@ impl VmManifest {
     /// intent from being hidden by defaults or rejected later as an opaque
     /// provider error.
     pub fn validate(&self) -> Result<(), ManifestError> {
+        trace!(
+            api_version = self.api_version,
+            "validating manifest version"
+        );
         if self.api_version != MANIFEST_VERSION {
             return Err(ManifestError::UnsupportedVersion(self.api_version));
         }
@@ -149,9 +154,34 @@ impl DesiredState {
     /// Validates relationships between fields that JSON deserialization alone
     /// cannot express, such as a boot storage attachment needing a writable source.
     fn validate(&self) -> Result<(), ManifestError> {
+        trace!(name = %self.metadata.name, "validating metadata");
         if self.metadata.name.trim().is_empty() {
             return Err(ManifestError::EmptyMetadataName);
         }
+        self.validate_compute()?;
+        self.validate_storage()?;
+        self.validate_networks()?;
+        trace!(present = self.rootfs.is_some(), "validating rootfs");
+        // A virtiofs rootfs needs an image to serve; an empty reference would
+        // only fail later at pull time with a worse error.
+        if self
+            .rootfs
+            .as_ref()
+            .is_some_and(|rootfs| rootfs.oci.trim().is_empty())
+        {
+            return Err(ManifestError::EmptyRootfsOci);
+        }
+        self.validate_affinity()?;
+        self.validate_cloud_init()?;
+        self.validate_vsock()
+    }
+
+    fn validate_compute(&self) -> Result<(), ManifestError> {
+        trace!(
+            vcpus = self.compute.vcpus,
+            memory_bytes = self.compute.memory_bytes,
+            "validating compute"
+        );
         if self.compute.vcpus == 0 {
             return Err(ManifestError::NoVcpus);
         }
@@ -166,11 +196,22 @@ impl DesiredState {
         if self.compute.memory_bytes == 0 {
             return Err(ManifestError::NoMemory);
         }
+        Ok(())
+    }
+
+    fn validate_storage(&self) -> Result<(), ManifestError> {
+        trace!(disks = self.storage.len(), "validating storage");
         // A disk source remains abstract here. URI resolution and volume
         // attachment belong to storage backends, so the manifest only checks
         // that the converter has one usable source from which to begin.
         let mut storage_ids = std::collections::HashSet::with_capacity(self.storage.len());
         for storage in &self.storage {
+            trace!(
+                id = %storage.id,
+                uri = storage.uri.is_some(),
+                volume = storage.volume_id.is_some(),
+                "validating storage attachment"
+            );
             if storage.id.trim().is_empty() {
                 return Err(ManifestError::EmptyStorageId);
             }
@@ -186,18 +227,25 @@ impl DesiredState {
                 return Err(ManifestError::InvalidStorageSource(storage.id.clone()));
             }
         }
-        self.validate_networks()?;
-        // A virtiofs rootfs needs an image to serve; an empty reference would
-        // only fail later at pull time with a worse error.
-        if self
-            .rootfs
-            .as_ref()
-            .is_some_and(|rootfs| rootfs.oci.trim().is_empty())
-        {
-            return Err(ManifestError::EmptyRootfsOci);
-        }
-        for rule in &self.placement.affinity {
+        Ok(())
+    }
+
+    fn validate_affinity(&self) -> Result<(), ManifestError> {
+        trace!(rules = self.placement.affinity.len(), "validating affinity");
+        for (index, rule) in self.placement.affinity.iter().enumerate() {
+            trace!(
+                index,
+                strictness = ?rule.strictness,
+                requirements = rule.requirements.len(),
+                "validating affinity rule"
+            );
             for requirement in &rule.requirements {
+                trace!(
+                    key = %requirement.key,
+                    operator = ?requirement.operator,
+                    values = ?requirement.values,
+                    "validating affinity requirement"
+                );
                 let valid_comparison = match requirement.values.as_slice() {
                     [value] => value.parse::<f64>().is_ok_and(f64::is_finite),
                     _ => false,
@@ -210,6 +258,11 @@ impl DesiredState {
                 }
             }
         }
+        Ok(())
+    }
+
+    fn validate_cloud_init(&self) -> Result<(), ManifestError> {
+        trace!(present = self.cloud_init.is_some(), "validating cloud-init");
         // NoCloud treats user-data and meta-data as one instance-data set.
         // Accepting only half of it would produce a provider configuration that
         // looks valid but can fail during guest initialization.
@@ -231,6 +284,12 @@ impl DesiredState {
                 return Err(ManifestError::EmptyCloudInitData);
             }
         }
+        Ok(())
+    }
+
+    #[tracing::instrument(level = "debug", skip(self), fields(vsock = self.vsock.is_some()))]
+    fn validate_vsock(&self) -> Result<(), ManifestError> {
+        trace!(present = self.vsock.is_some(), "validating vsock");
         if let Some(vsock) = &self.vsock {
             if vsock.guest_cid == 0 {
                 return Err(ManifestError::InvalidVsockCid);
@@ -242,9 +301,18 @@ impl DesiredState {
         Ok(())
     }
 
+    #[tracing::instrument(level = "debug", skip(self), fields(networks = self.networks.len()))]
     fn validate_networks(&self) -> Result<(), ManifestError> {
+        trace!(networks = self.networks.len(), "validating networks");
         let mut published_ports = BTreeSet::new();
         for (index, network) in self.networks.iter().enumerate() {
+            trace!(
+                index,
+                id = %network.id,
+                ports = network.ports.len(),
+                mac = network.mac_address.is_some(),
+                "validating network"
+            );
             if network.id.trim().is_empty() {
                 return Err(ManifestError::NetworkWithoutId(index));
             }
