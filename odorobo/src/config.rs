@@ -8,6 +8,32 @@ use tracing::{info, warn};
 
 const CONFIG_PATH: &str = "config.json";
 
+/// A secret value that is redacted from `Debug` output and never serialized.
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+#[serde(transparent)]
+pub struct SecretString(String);
+
+impl SecretString {
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SecretString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+impl std::str::FromStr for SecretString {
+    type Err = std::convert::Infallible;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self(value.to_owned()))
+    }
+}
+
 fn default_bridge_name() -> String {
     "vmbr0".into()
 }
@@ -18,6 +44,10 @@ fn default_subnet() -> Ipv4Net {
 
 fn default_gateway() -> Ipv4Addr {
     "10.0.0.1".parse().unwrap()
+}
+
+fn default_etcd_endpoint() -> String {
+    "http://127.0.0.1:2379".to_owned()
 }
 /// Infers the default upstream interface from the system's default route
 fn default_upstream_iface() -> String {
@@ -151,6 +181,51 @@ pub struct Config {
     /// Ignore lockfiles and do not create a lockfile
     #[clap(long, action = clap::ArgAction::SetTrue)]
     pub no_lockfile: Option<bool>,
+
+    /// etcd endpoints used for durable cluster state.
+    #[clap(long, value_delimiter = ',')]
+    #[serde(default = "default_etcd_endpoints")]
+    #[allow(clippy::unnecessary_wraps)]
+    pub etcd_endpoints: Option<Vec<String>>,
+    /// Optional etcd username.
+    #[clap(long)]
+    pub etcd_username: Option<String>,
+    /// Optional etcd password. Prefer the `ODOROBO_ETCD_PASSWORD` environment variable.
+    #[clap(long, env = "ODOROBO_ETCD_PASSWORD", hide_env_values = true)]
+    #[serde(default, skip_serializing)]
+    pub etcd_password: Option<SecretString>,
+    /// Enable TLS for etcd connections.
+    #[clap(long)]
+    #[serde(default)]
+    pub etcd_tls: Option<bool>,
+    /// CA certificate PEM file for etcd TLS.
+    #[clap(long)]
+    pub etcd_ca_file: Option<String>,
+    /// Per-request etcd timeout in milliseconds.
+    #[clap(long)]
+    #[serde(default = "default_etcd_timeout_ms")]
+    #[allow(clippy::unnecessary_wraps)]
+    pub etcd_timeout_ms: Option<u64>,
+    /// Number of connection attempts when creating the etcd client.
+    #[clap(long)]
+    #[serde(default = "default_etcd_retries")]
+    #[allow(clippy::unnecessary_wraps)]
+    pub etcd_retries: Option<u32>,
+}
+
+#[allow(clippy::unnecessary_wraps)]
+fn default_etcd_endpoints() -> Option<Vec<String>> {
+    Some(vec![default_etcd_endpoint()])
+}
+
+#[allow(clippy::unnecessary_wraps)]
+const fn default_etcd_timeout_ms() -> Option<u64> {
+    Some(5_000)
+}
+
+#[allow(clippy::unnecessary_wraps)]
+const fn default_etcd_retries() -> Option<u32> {
+    Some(3)
 }
 
 impl Config {
@@ -198,6 +273,12 @@ impl Config {
     pub fn get_reserved_vcpus(&self) -> u32 {
         self.reserved_vcpus.unwrap_or(2)
     }
+    #[must_use]
+    pub fn get_etcd_endpoints(&self) -> Vec<String> {
+        self.etcd_endpoints
+            .clone()
+            .unwrap_or_else(|| vec![default_etcd_endpoint()])
+    }
 }
 
 #[cfg(test)]
@@ -225,5 +306,25 @@ mod tests {
         let json = serde_json::to_string_pretty(&config).unwrap();
         // assert_eq!(json, )
         println!("{json}");
+    }
+
+    #[test]
+    fn etcd_password_is_redacted_and_not_serialized() {
+        let config = Config {
+            etcd_password: Some("hunter2".parse().unwrap()),
+            ..Config::default()
+        };
+        assert!(!format!("{config:?}").contains("hunter2"));
+        assert!(!serde_json::to_string(&config).unwrap().contains("hunter2"));
+        let parsed: Config = serde_json::from_str(r#"{"etcd_password":"hunter2"}"#).unwrap();
+        assert_eq!(parsed.etcd_password.unwrap().expose(), "hunter2");
+    }
+
+    #[test]
+    fn default_etcd_endpoint_is_available_without_a_config_file() {
+        assert_eq!(
+            Config::default().get_etcd_endpoints(),
+            vec!["http://127.0.0.1:2379"]
+        );
     }
 }

@@ -15,48 +15,46 @@ else
   exit 1
 fi
 
-
 if [[ -z "$(losetup -f 2>/dev/null)" ]]; then
   echo "No free loop device is available. Run: sudo modprobe loop" >&2
   exit 1
 fi
 
-# Start Ceph independently: `odorobo` depends on its health check, and starting
-# both at once hides a Ceph bootstrap failure behind Compose's dependency wait.
-"${COMPOSE[@]}" up --build -d ceph
+"${COMPOSE[@]}" up --build -d ceph etcd
 
-echo "Waiting for Ceph to become healthy..."
-for attempt in {1..60}; do
-  # Inspect the engine directly; the external podman-compose provider's `ps`
-  # command is not a reliable readiness API.
-  container_state=$(timeout 5 "${ENGINE[@]}" inspect --format '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}' odorobo-ceph 2>/dev/null || true)
-  if [[ "$container_state" == running\ healthy* ]]; then
-    break
-  elif [[ "$container_state" != running* && -n "$container_state" ]]; then
-    echo "Ceph stopped before becoming healthy. Recent logs:" >&2
-    "${COMPOSE[@]}" logs --tail=200 ceph >&2 || true
+for service in etcd ceph; do
+  container="odorobo-$service"
+  echo "Waiting for $service to become healthy..."
+  for attempt in {1..60}; do
+    state=$(timeout 5 "${ENGINE[@]}" inspect --format '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}' "$container" 2>/dev/null || true)
+    if [[ "$state" == running\ healthy* ]]; then
+      break
+    elif [[ "$state" == exited* || "$state" == dead* || "$state" == running\ unhealthy* ]]; then
+      echo "$service failed to become healthy (state: '$state'). Recent logs:" >&2
+      "${COMPOSE[@]}" logs --tail=200 "$service" >&2 || true
+      exit 1
+    fi
+    if (( attempt % 10 == 0 )); then
+      echo "$service is still starting; recent logs:" >&2
+      "${COMPOSE[@]}" logs --tail=40 "$service" >&2 || true
+    fi
+    sleep 2
+  done
+  state=$(timeout 5 "${ENGINE[@]}" inspect --format '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}' "$container" 2>/dev/null || true)
+  if [[ "$state" != running\ healthy* ]]; then
+    echo "$service did not become healthy within 120 seconds. Recent logs:" >&2
+    "${COMPOSE[@]}" logs --tail=200 "$service" >&2 || true
     exit 1
   fi
-
-  if (( attempt % 10 == 0 )); then
-    echo "Ceph is still not ready; recent logs:" >&2
-    "${COMPOSE[@]}" logs --tail=40 ceph >&2 || true
-  fi
-  sleep 2
 done
-
-if [[ $(timeout 5 "${ENGINE[@]}" inspect --format '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}' odorobo-ceph 2>/dev/null || true) != running\ healthy* ]]; then
-  echo "Ceph did not become healthy within 120 seconds. Recent logs:" >&2
-  "${COMPOSE[@]}" logs --tail=200 ceph >&2 || true
-  exit 1
-fi
 
 "${COMPOSE[@]}" up -d odorobo
 
 cat <<EOF
 
-Ceph is ready.
-Credentials live in the  ceph_creds named volume, mounted at /generated
+etcd, Ceph, and Odorobo are ready.
+etcd data is stored in the etcd_data volume; compose down --volumes resets it.
+Ceph credentials live in the ceph_creds named volume, mounted at /generated
 in both containers.
 
 For tools running inside the Odorobo container:

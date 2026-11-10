@@ -17,7 +17,7 @@ use std::{
 };
 use thiserror::Error;
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, trace};
 
 use crate::ch_driver::{
     provisioning::hooks::HookManager,
@@ -93,13 +93,6 @@ impl VMInstance {
             child_process,
             vm_config: None,
         }
-    }
-
-    /// Takes the child process out of this instance, transferring ownership to the caller.
-    /// Useful for watching the process lifecycle externally (e.g. in an actor watcher task).
-    /// After calling this, `destroy()` will skip the child-kill step.
-    pub const fn take_child_process(&mut self) -> Option<tokio::process::Child> {
-        self.child_process.take()
     }
 
     /// Get a VM instance by its ID through the filesystem database
@@ -335,10 +328,32 @@ impl VMInstance {
         &self.ch_socket_path
     }
 
-    async fn stop_child_after_failed_start(&mut self) {
+    // `create_dir` is intentional: exclusive creation prevents taking over a live/stale VM.
+    #[allow(clippy::create_dir)]
+    fn claim_runtime_dir(runtime_dir: &Path) -> Result<()> {
+        fs::create_dir_all(runtime_dir.parent().unwrap())?;
+        fs::create_dir(runtime_dir).wrap_err_with(|| {
+            eyre!(
+                "VM runtime directory {} already exists or cannot be claimed; refusing takeover",
+                runtime_dir.display()
+            )
+        })
+    }
+
+    /// Undoes a failed spawn. This instance claimed the runtime directory, so
+    /// removing it (after releasing any transformed resources) is safe and lets
+    /// a later create retry instead of tripping the takeover guard.
+    async fn cleanup_failed_start(&mut self) {
         if let Some(mut child) = self.child_process.take() {
             _ = child.start_kill();
             _ = child.wait().await;
+        }
+        if let Err(error) = self.purge_instance_data() {
+            error!(
+                vm_id = self.vm_id(),
+                ?error,
+                "Failed to clean up after unsuccessful VM start; runtime directory retained"
+            );
         }
     }
 
@@ -392,14 +407,20 @@ impl VMInstance {
     ) -> Result<Self> {
         let ch_socket_path = Self::runtime_dir_for(id).join(SOCKET_FILE_NAME);
         info!(?ch_socket_path, "Spawning VM");
-        // make sure socket path parent exists
-        if !ch_socket_path.parent().unwrap().exists() {
-            std::fs::create_dir_all(ch_socket_path.parent().unwrap())?;
-        }
-        let ch_process = tokio::process::Command::new("cloud-hypervisor")
+        let runtime_dir = ch_socket_path.parent().unwrap();
+        Self::claim_runtime_dir(runtime_dir)?;
+
+        let ch_process = match tokio::process::Command::new("cloud-hypervisor")
             .arg("--api-socket")
             .arg(&ch_socket_path)
-            .spawn()?;
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => {
+                _ = fs::remove_dir_all(runtime_dir);
+                return Err(error.into());
+            }
+        };
         let mut instance = Self::new(id, ch_socket_path, transformer, Some(ch_process));
 
         const MAX_ATTEMPTS: u32 = 31;
@@ -410,7 +431,7 @@ impl VMInstance {
                 if let Some(vm_config) = vm_config {
                     info!(boot, ?vm_config, "Creating VM config");
                     if let Err(error) = instance.create_config(vm_config, boot).await {
-                        instance.stop_child_after_failed_start().await;
+                        instance.cleanup_failed_start().await;
                         return Err(error);
                     }
                 }
@@ -422,7 +443,7 @@ impl VMInstance {
             }
         }
 
-        instance.stop_child_after_failed_start().await;
+        instance.cleanup_failed_start().await;
         Err(eyre!(
             "CH socket not available after {} attempts for VM {}",
             MAX_ATTEMPTS,
@@ -431,69 +452,140 @@ impl VMInstance {
     }
 
     /// Gracefully shutdown the VM and VMM, then clean up runtime state.
+    ///
+    /// If the VMM API is unreachable, cleanup proceeds only once the VMM is
+    /// confirmed gone: our child process has exited (or was killed and reaped),
+    /// or, without a child handle, nothing is listening on the API socket.
     pub async fn destroy(&mut self) -> Result<()> {
         info!(
             vm_id = self.vm_id(),
             "Destroying VM instance, shutting down VM and cleaning up runtime state"
         );
-        if let Ok(info) = self.info().await {
-            trace!(vm_id = self.vm_id(), state = ?info.state, "Checking VM state before destroy");
-            self.hook_manager.before_stop(self.vm_id(), &info).await?;
-            if matches!(
-                info.state,
-                models::VmState::Running | models::VmState::Paused
-            ) {
-                info!(vm_id = self.vm_id(), "Shutting down VM before destroy");
-                self.shutdown().await?;
+        match self.info().await {
+            Ok(info) => {
+                trace!(vm_id = self.vm_id(), state = ?info.state, "Checking VM state before destroy");
+                self.hook_manager.before_stop(self.vm_id(), &info).await?;
+                if matches!(
+                    info.state,
+                    models::VmState::Running | models::VmState::Paused
+                ) {
+                    self.shutdown().await?;
+                }
+                self.conn()
+                    .shutdown_vmm()
+                    .await
+                    .map_err(ChApiError::from)
+                    .wrap_err("failed to confirm VMM shutdown; runtime data retained")?;
+                self.reap_child().await?;
+                if self.vm_config.is_none() {
+                    self.vm_config = Some(info.config);
+                }
             }
-        } else {
-            warn!(
-                vm_id = self.vm_id(),
-                "Failed to get VM info before destroy, proceeding with shutdown and cleanup anyway"
-            );
-        }
-
-        if matches!(self.conn().shutdown_vmm().await, Ok(())) {
-            debug!(vm_id = self.vm_id(), "VMM shutdown successfully");
-        } else {
-            warn!(
-                vm_id = self.vm_id(),
-                "Failed to shutdown VMM, assuming it is already stopped or unresponsive"
-            );
-        }
-        let vm_config = self.vm_config.clone().unwrap_or_default();
-        if let Some(mut child) = self.child_process.take() {
-            trace!("VMM stopped... checking child process");
-            _ = child.start_kill();
-            if let Err(err) = child.wait().await {
-                warn!(
+            Err(error) => {
+                self.confirm_vmm_gone().await.map_err(|gone_error| {
+                    eyre!(
+                        "cannot confirm VMM state; refusing destructive cleanup: \
+                         {gone_error:#} (API error: {error:#})"
+                    )
+                })?;
+                info!(
                     vm_id = self.vm_id(),
-                    ?err,
-                    "Failed to wait for child process, manual cleanup may be required"
+                    "VMM is no longer running; cleaning up its runtime state"
                 );
+                if let Some(config) = self.vm_config.clone() {
+                    let info = VmInfo::new(config, models::VmState::Shutdown);
+                    self.hook_manager.before_stop(self.vm_id(), &info).await?;
+                }
             }
         }
 
+        let vm_config = self.vm_config.clone().unwrap_or_default();
         self.hook_manager
             .after_stop(self.vm_id(), &vm_config)
             .await?;
-
-        if let Err(err) = self.purge_instance_data() {
-            warn!(
-                vm_id = self.vm_id(),
-                ?err,
-                "Failed to purge runtime data, manual cleanup may be required"
-            );
-        }
-
+        self.purge_instance_data()?;
         Ok(())
+    }
+
+    /// Waits for our VMM child to exit after a confirmed shutdown, killing it if
+    /// it lingers.
+    async fn reap_child(&mut self) -> Result<()> {
+        if let Some(child) = self.child_process.as_mut() {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => return Err(eyre!("failed waiting for VMM process: {error}")),
+                Err(_) => {
+                    child.start_kill().map_err(|error| {
+                        eyre!("failed to stop confirmed-shutdown VMM process: {error}")
+                    })?;
+                    tokio::time::timeout(std::time::Duration::from_secs(5), child.wait())
+                        .await
+                        .map_err(|_| eyre!("VMM process did not exit after termination"))?
+                        .map_err(|error| eyre!("failed waiting for VMM process: {error}"))?;
+                }
+            }
+        }
+        self.child_process.take();
+        Ok(())
+    }
+
+    /// Proves the VMM is not running when its API cannot be reached.
+    ///
+    /// With a child handle, an exited child is proof; a live but unresponsive
+    /// child is ours, so it is killed and reaped. Without one (an orphan left
+    /// by an earlier agent process), a refused or missing API socket is proof,
+    /// while a socket that still accepts connections is not.
+    async fn confirm_vmm_gone(&mut self) -> Result<()> {
+        if let Some(child) = self.child_process.as_mut() {
+            if child.try_wait()?.is_none() {
+                info!(vm_id = %self.id, "VMM API is unresponsive; killing VMM process");
+                child.start_kill()?;
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(5), child.wait())
+                .await
+                .map_err(|_| eyre!("VMM process did not exit after termination"))??;
+            self.child_process.take();
+            return Ok(());
+        }
+        match std::os::unix::net::UnixStream::connect(&self.ch_socket_path) {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                ) =>
+            {
+                Ok(())
+            }
+            Ok(_) => Err(eyre!(
+                "VMM socket accepts connections but its API is unresponsive"
+            )),
+            Err(error) => Err(eyre!("cannot probe VMM socket: {error}")),
+        }
+    }
+
+    /// Tears down a VM runtime this process does not hold an instance for, such
+    /// as one left by a previous agent process or a timed-out teardown.
+    ///
+    /// An absent runtime directory is confirmation: spawn claims it exclusively
+    /// and only a completed cleanup removes it. Otherwise the VMM is destroyed
+    /// through its API, or cleaned up if it is confirmed gone.
+    pub async fn teardown_orphan(id: &str) -> Result<()> {
+        let runtime_dir = Self::runtime_dir_for(id);
+        if !runtime_dir.exists() {
+            return Ok(());
+        }
+        let mut instance = Self::new(id, runtime_dir.join(SOCKET_FILE_NAME), None, None);
+        if instance.config_path().exists() {
+            instance.vm_config = Some(instance.load_config()?);
+        }
+        instance.destroy().await
     }
 
     /// Purge the runtime data for this VM instance.
     ///
     /// This removes the runtime directory and all its contents if it exists.
     pub fn purge_instance_data(&mut self) -> Result<()> {
-        let mut vm_config = self.vm_config.take().unwrap_or_default();
+        let mut vm_config = self.vm_config.clone().unwrap_or_default();
         self.transformer.teardown(self.vm_id(), &mut vm_config)?;
         let runtime_dir = self.runtime_dir();
         if runtime_dir.exists() {
@@ -502,6 +594,7 @@ impl VMInstance {
                 self.vm_id()
             ))?;
         }
+        self.vm_config = None;
         Ok(())
     }
 
@@ -540,6 +633,9 @@ impl VMInstance {
             ))?;
 
         self.vm_config = Some(transformed_config.clone());
+        // Persist what teardown needs to release, so a runtime orphaned by an
+        // agent restart can still be cleaned up.
+        self.save_config(&transformed_config)?;
 
         trace!(vm_id = self.vm_id(), "Creating VM via CH API");
         self.conn()
@@ -574,6 +670,7 @@ impl VMInstance {
                 self.vm_id()
             ))?;
 
+        self.save_config(&transformed_config)?;
         self.hook_manager.before_boot(self.vm_id(), &config).await?;
 
         Ok(())
@@ -622,5 +719,76 @@ impl VMInstance {
                 })
             })
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::VMInstance;
+    use std::{fs, path::Path};
+
+    #[test]
+    fn existing_runtime_directory_is_never_taken_over_or_purged() {
+        let runtime_dir =
+            std::env::temp_dir().join(format!("odorobo-runtime-{}", ulid::Ulid::generate()));
+        fs::create_dir_all(&runtime_dir).expect("create runtime dir");
+        let marker = runtime_dir.join("config.json");
+        fs::write(&marker, b"keep").expect("write marker");
+
+        assert!(VMInstance::claim_runtime_dir(Path::new(&runtime_dir)).is_err());
+        assert_eq!(fs::read(&marker).expect("marker remains"), b"keep");
+        fs::remove_dir_all(runtime_dir).expect("remove fixture");
+    }
+
+    fn scratch_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("odorobo-vmm-{}", ulid::Ulid::generate()));
+        fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    }
+
+    fn instance(socket: std::path::PathBuf, child: Option<tokio::process::Child>) -> VMInstance {
+        VMInstance::new("test-vm", socket, None, child)
+    }
+
+    #[tokio::test]
+    async fn missing_or_refused_socket_confirms_an_orphaned_vmm_is_gone() {
+        let dir = scratch_dir();
+        let socket = dir.join("ch.sock");
+        instance(socket.clone(), None)
+            .confirm_vmm_gone()
+            .await
+            .unwrap();
+
+        // A stale socket file with no listener refuses connections.
+        drop(std::os::unix::net::UnixListener::bind(&socket).expect("bind"));
+        instance(socket, None).confirm_vmm_gone().await.unwrap();
+        fs::remove_dir_all(dir).expect("remove fixture");
+    }
+
+    #[tokio::test]
+    async fn listening_socket_without_a_child_is_not_proof_of_absence() {
+        let dir = scratch_dir();
+        let socket = dir.join("ch.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+        assert!(instance(socket, None).confirm_vmm_gone().await.is_err());
+        fs::remove_dir_all(dir).expect("remove fixture");
+    }
+
+    #[tokio::test]
+    async fn owned_child_is_reaped_or_killed_before_cleanup() {
+        let dir = scratch_dir();
+        let exited = tokio::process::Command::new("true").spawn().expect("spawn");
+        let mut vm = instance(dir.join("ch.sock"), Some(exited));
+        vm.confirm_vmm_gone().await.unwrap();
+        assert!(vm.child_process.is_none());
+
+        let hung = tokio::process::Command::new("sleep")
+            .arg("600")
+            .spawn()
+            .expect("spawn");
+        let mut vm = instance(dir.join("ch.sock"), Some(hung));
+        vm.confirm_vmm_gone().await.unwrap();
+        assert!(vm.child_process.is_none());
+        fs::remove_dir_all(dir).expect("remove fixture");
     }
 }

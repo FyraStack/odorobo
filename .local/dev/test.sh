@@ -8,7 +8,7 @@
 #   sudo bash .local/dev/test.sh     # this test
 #
 # What it does:
-#   1. verifies the stack is up (Ceph healthy, agent healthy)
+#   1. verifies the stack is up (etcd and Ceph healthy, agent healthy)
 #   2. fetches the UEFI firmware and the Fedora image into test-assets/
 #      (cached; the image is sha256-pinned, the firmware is size/magic-pinned)
 #   3. writes the image into the Ceph RBD pool. The rbd control commands run
@@ -135,6 +135,8 @@ if ! command -v socat >/dev/null 2>&1 && ! command -v nc >/dev/null 2>&1; then
 fi
 
 log "checking the stack"
+etcd_state=$("${ENGINE[@]}" inspect --format '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}' odorobo-etcd 2>/dev/null || true)
+[[ "$etcd_state" == running\ healthy* ]] || die "odorobo-etcd is not running+healthy (state: '$etcd_state'); run init.sh first"
 ceph_state=$("${ENGINE[@]}" inspect --format '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}' odorobo-ceph 2>/dev/null || true)
 [[ "$ceph_state" == running\ healthy* ]] || die "odorobo-ceph is not running+healthy (state: '$ceph_state'); run init.sh first"
 odorobo_state=$("${ENGINE[@]}" inspect --format '{{.State.Status}}' odorobo 2>/dev/null || true)
@@ -145,7 +147,7 @@ health=$(in_container curl -sf http://127.0.0.1:3000/health) || die "agent /heal
 # host (the container's modprobe would also load it, but fail early here).
 [[ -d /sys/module/rbd ]] || modprobe rbd || die "rbd kernel module not available"
 [[ -d /sys/module/loop ]] || modprobe loop || die "loop kernel module not available"
-log "stack is up (engine: ${ENGINE[0]})"
+log "stack is up (etcd, Ceph, and agent healthy; engine: ${ENGINE[0]})"
 
 # --- 1. assets ---------------------------------------------------------------
 mkdir -p "$ASSET_DIR"
