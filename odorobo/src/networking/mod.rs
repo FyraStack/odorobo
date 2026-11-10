@@ -6,5 +6,8 @@ mod actor_linux;
 mod actor_unsupported;
 #[cfg(target_os = "linux")]
 mod fabric;
+#[cfg(target_os = "linux")]
+mod mesh;
 
 pub mod messages;
+mod sync;

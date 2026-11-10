@@ -6,14 +6,15 @@ use kameo::prelude::*;
 use libp2p::futures::TryStreamExt;
 use stable_eyre::{Report, eyre::eyre};
 use tracing::{trace, warn};
+use ulid::Ulid;
 
 use crate::actors::agent_actor::AgentActor;
 use crate::ch_driver::actor::VMActor;
+use crate::manifest::VmManifest;
 use crate::messages::agent::{AgentStatusUpdate, GetAgentStatus, apply_status_update};
 use crate::messages::vm::{GetVMHeartbeat, GetVMInfo};
 use crate::utils::actor_names::{AGENT, VM};
 
-use super::networks;
 use super::{
     AgentActorDiscovered, AgentUpdated, AgentUpdaterStopped, CachedActorKind, CachedAgentActor,
     CachedVMActor, ReconcileVmPlacements, SchedulerActor, VmActorDiscovered, VmUpdated,
@@ -183,6 +184,7 @@ impl SchedulerActor {
     pub(super) fn start_actor_finder(&mut self, actor_ref: ActorRef<Self>) {
         self.cache_actor_finder = Some(tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(5));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 let vm_result = Self::vm_actor_finder(actor_ref.clone()).await;
                 let agent_result = Self::agent_actor_finder(actor_ref.clone()).await;
@@ -322,7 +324,6 @@ impl Message<AgentUpdated> for SchedulerActor {
                     &mut self.vm_placements,
                 );
                 self.invalidate_pending_resources();
-                networks::sync_networks_to(self, status.hostname.clone(), msg.actor_ref.clone());
                 self.agent_data_cache.insert(
                     msg.actor_id,
                     CachedAgentActor {
@@ -410,48 +411,58 @@ impl Message<ReconcileVmPlacements> for SchedulerActor {
             .collect();
 
         for (vmid, config) in unplaced_vms {
-            // Discovery can precede agent inventory. Known/discoverable owners
-            // must never be replaced just for lacking placement observations.
-            if !self.should_resolve_unplaced_owner(vmid) {
-                continue;
+            self.recreate_unplaced_vm(vmid, config).await;
+        }
+    }
+}
+
+impl SchedulerActor {
+    /// Recreates a VM that has no placement and no live owner.
+    ///
+    /// Discovery can precede agent inventory. Known/discoverable owners must never
+    /// be replaced just for lacking placement observations.
+    async fn recreate_unplaced_vm(&mut self, vmid: Ulid, config: VmManifest) {
+        if !self.should_resolve_unplaced_owner(vmid) {
+            return;
+        }
+        match RemoteActorRef::<VMActor>::lookup(crate::utils::actor_names::vm_actor_id(vmid)).await
+        {
+            Ok(Some(_)) => return,
+            Err(error) => {
+                warn!(%vmid, ?error, "ownership lookup failed; refusing recreation");
+                return;
             }
-            match RemoteActorRef::<VMActor>::lookup(crate::utils::actor_names::vm_actor_id(vmid))
-                .await
-            {
-                Ok(Some(_)) => continue,
-                Err(error) => {
-                    warn!(%vmid, ?error, "ownership lookup failed; refusing recreation");
-                    continue;
-                }
-                Ok(None) => {}
+            Ok(None) => {}
+        }
+
+        let request = crate::messages::vm::CreateVM { vmid, config };
+        let agent = match self.schedule_agent(&request) {
+            Ok(agent) => agent,
+            Err(error) => {
+                trace!(?error, %vmid, "no eligible agent to recreate VM");
+                return;
             }
-            let request = crate::messages::vm::CreateVM { vmid, config };
-            match self.schedule_agent(&request) {
-                Ok(agent) => {
-                    self.vm_placements
-                        .entry(vmid)
-                        .or_default()
-                        .push(super::VmPlacement {
-                            agent_id: agent.id(),
-                            lifecycle: super::VmLifecycle::Pending,
-                            created_at: std::time::Instant::now(),
-                            last_confirmed_at: None,
-                        });
-                    self.vm_data_cache
-                        .entry(vmid)
-                        .or_default()
-                        .push(CachedVMActor { actor_ref: None });
-                    if let Err(error) = agent.tell(&request).send() {
-                        warn!(?error, %vmid, "failed to recreate unplaced VM");
-                        self.vm_placements.insert(vmid, Vec::new());
-                        self.vm_data_cache.remove(&vmid);
-                    } else {
-                        // The next iteration must account for this new pending reservation.
-                        self.invalidate_pending_resources();
-                    }
-                }
-                Err(error) => trace!(?error, %vmid, "no eligible agent to recreate VM"),
-            }
+        };
+        self.vm_placements
+            .entry(vmid)
+            .or_default()
+            .push(super::VmPlacement {
+                agent_id: agent.id(),
+                lifecycle: super::VmLifecycle::Pending,
+                created_at: std::time::Instant::now(),
+                last_confirmed_at: None,
+            });
+        self.vm_data_cache
+            .entry(vmid)
+            .or_default()
+            .push(CachedVMActor { actor_ref: None });
+        if let Err(error) = agent.tell(&request).send() {
+            warn!(?error, %vmid, "failed to recreate unplaced VM");
+            self.vm_placements.insert(vmid, Vec::new());
+            self.vm_data_cache.remove(&vmid);
+        } else {
+            // The next iteration must account for this new pending reservation.
+            self.invalidate_pending_resources();
         }
     }
 }

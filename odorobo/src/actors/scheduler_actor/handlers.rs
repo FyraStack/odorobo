@@ -49,9 +49,13 @@ impl Actor for SchedulerActor {
             agent_vm_index: AHashMap::new(),
             actor_kinds: AHashMap::new(),
             networks: AHashMap::new(),
+            network_sync: super::network_sync::NetworkSync::default(),
             cache_actor_finder: None,
         };
 
+        scheduler_actor
+            .network_sync
+            .start_background(actor_ref.clone());
         scheduler_actor.start_actor_finder(actor_ref);
 
         Ok(scheduler_actor)
@@ -73,10 +77,32 @@ impl Actor for SchedulerActor {
         match self.actor_kinds.remove(&id) {
             Some(CachedActorKind::Agent) => self.cleanup_agent_actor(id),
             Some(CachedActorKind::Vm) => self.cleanup_vm_actor(id),
+            Some(CachedActorKind::Network) => self.network_sync.remove_target(id),
             None => {}
         }
 
         Ok(ControlFlow::Continue(()))
+    }
+
+    async fn on_stop(
+        &mut self,
+        _actor_ref: WeakActorRef<Self>,
+        _reason: ActorStopReason,
+    ) -> Result<(), Self::Error> {
+        if let Some(task) = self.cache_actor_finder.take() {
+            task.abort();
+            _ = task.await;
+        }
+        for (_, task) in self
+            .agent_keepalive_tasks
+            .drain()
+            .chain(self.vm_keepalive_tasks.drain())
+        {
+            task.abort();
+            _ = task.await;
+        }
+        self.network_sync.stop().await;
+        Ok(())
     }
 }
 /// Optimistically reserves a placement, then forwards VM creation to the chosen agent.

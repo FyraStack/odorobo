@@ -6,13 +6,11 @@
 
 use ahash::AHashSet;
 use kameo::prelude::*;
-use tracing::{info, warn};
-
-use crate::actors::agent_actor::AgentActor;
+use tracing::info;
 
 use crate::messages::network::{
-    CreateNetwork, CreateNetworkReply, DeleteNetwork, DeleteNetworkReply, EnsureNetwork,
-    GetNetwork, GetNetworkReply, ListNetworks, ListNetworksReply, RemoveNetwork,
+    CreateNetwork, CreateNetworkReply, DeleteNetwork, DeleteNetworkReply, GetNetwork,
+    GetNetworkReply, ListNetworks, ListNetworksReply, NetworkUpdate,
 };
 use crate::network::{Network, NetworkProvider, NetworkState, VNI_RANGE, vni_valid};
 use std::{
@@ -38,152 +36,148 @@ fn vni_allocatable(vni: u32) -> bool {
 fn assign_vni(id: &str, taken: impl Fn(u32) -> bool) -> Option<u32> {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     id.hash(&mut hasher);
-    let span = u64::from(VNI_POOL_SIZE);
-    let offset = u32::try_from(hasher.finish().checked_rem(span).unwrap_or(0)).unwrap_or(0);
+    // Fold the hash into the pool size; the remainder is always a valid offset.
+    let slot = hasher
+        .finish()
+        .checked_rem(u64::from(VNI_POOL_SIZE))
+        .unwrap_or_default();
+    let offset = u32::try_from(slot).unwrap_or_default();
     let candidate = VNI_RANGE.start().saturating_add(offset);
+
+    // Walk from the hash slot to the pool end, then wrap around to the start.
     (candidate..=*VNI_RANGE.end())
         .chain(*VNI_RANGE.start()..candidate)
-        .find(|&candidate| vni_allocatable(candidate) && !taken(candidate))
+        .find(|&vni| vni_allocatable(vni) && !taken(vni))
 }
 
-/// Pushes one network to every known agent, returning per-agent failures.
-async fn ensure_on_agents(scheduler: &SchedulerActor, network: &Network) -> Vec<String> {
-    futures_util::future::join_all(
-        scheduler
-            .agent_data_cache
-            .values()
-            .map(|agent| (agent.data.hostname.clone(), agent.actor_ref.clone()))
-            .map(|(hostname, actor_ref)| {
-                let network = network.clone();
-                async move {
-                    match actor_ref.ask(&EnsureNetwork { network }).await {
-                        Ok(reply) => reply.error.map(|error| format!("{hostname}: {error}")),
-                        Err(err) => Some(format!("{hostname}: {err}")),
-                    }
-                }
-            }),
-    )
-    .await
-    .into_iter()
-    .flatten()
-    .collect()
-}
-
-/// Replays the registry onto an agent the manager has just found, such as a late joiner or a
-/// restarted agent; failures are logged, not retried.
-pub(super) fn sync_networks_to(
-    scheduler: &SchedulerActor,
-    hostname: String,
-    actor_ref: RemoteActorRef<AgentActor>,
-) {
-    let networks: Vec<Network> = scheduler.networks.values().cloned().collect();
-    if networks.is_empty() {
-        return;
-    }
-    tokio::spawn(async move {
-        for network in networks {
-            let network_id = network.id.clone();
-            let error = match actor_ref.ask(&EnsureNetwork { network }).await {
-                Ok(reply) => reply.error,
-                Err(err) => Some(err.to_string()),
-            };
-            if let Some(error) = error {
-                warn!(%hostname, %network_id, %error, "agent did not take a network");
-            } else {
-                info!(%hostname, %network_id, "synced network to agent");
-            }
-        }
-    });
-}
-
-/// Removes one network from every known agent, returning per-agent failures.
-async fn remove_from_agents(scheduler: &SchedulerActor, id: &str) -> Vec<String> {
-    futures_util::future::join_all(
-        scheduler
-            .agent_data_cache
-            .values()
-            .map(|agent| (agent.data.hostname.clone(), agent.actor_ref.clone()))
-            .map(|(hostname, actor_ref)| {
-                let id = id.to_owned();
-                async move {
-                    match actor_ref.ask(&RemoveNetwork { id }).await {
-                        Ok(reply) => reply.error.map(|error| format!("{hostname}: {error}")),
-                        Err(err) => Some(format!("{hostname}: {err}")),
-                    }
-                }
-            }),
-    )
-    .await
-    .into_iter()
-    .flatten()
-    .collect()
+/// Fails with the nodes that still lack a network actor, if any.
+fn require_network_actors(scheduler: &SchedulerActor) -> Result<(), String> {
+    let missing: Vec<String> = scheduler
+        .agent_data_cache
+        .values()
+        .filter(|agent| !scheduler.network_sync.contains_agent(agent.actor_ref.id()))
+        .map(|agent| format!("{}: network actor is not available", agent.data.hostname))
+        .collect();
+    let error = missing.join("; ");
+    if error.is_empty() { Ok(()) } else { Err(error) }
 }
 
 /// Creates a network and applies it to every known agent.
-///
-/// Runtime state is the manager's, never input; the registry is only updated
-/// once every node accepted the object, so a partial failure leaves the
-/// manager unchanged and reports the failing nodes.
 impl Message<CreateNetwork> for SchedulerActor {
     type Reply = CreateNetworkReply;
 
+    #[tracing::instrument(level = "debug", skip(self, ctx), fields(network = %msg.network.id))]
     async fn handle(
         &mut self,
         msg: CreateNetwork,
-        _ctx: &mut Context<Self, Self::Reply>,
+        ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        let mut network = msg.network;
+        match self.create_network(msg.network, ctx.actor_ref().id()).await {
+            Ok(network) => CreateNetworkReply {
+                network: Some(network),
+                error: None,
+            },
+            Err(error) => CreateNetworkReply {
+                network: None,
+                error: Some(error),
+            },
+        }
+    }
+}
+
+impl SchedulerActor {
+    /// Registers a network and applies it to every known agent.
+    ///
+    /// Runtime state is the manager's, never input; the registry is only updated
+    /// once every node accepted the object, so a partial failure leaves the
+    /// manager unchanged and reports the failing nodes.
+    #[tracing::instrument(level = "debug", skip(self), fields(network = %network.id))]
+    async fn create_network(
+        &mut self,
+        mut network: Network,
+        manager_id: ActorId,
+    ) -> Result<Network, String> {
         network.state = None;
-        if let Err(err) = network.validate() {
-            return CreateNetworkReply {
-                network: None,
-                error: Some(err.to_string()),
-            };
-        }
-        if self.networks.contains_key(&network.id) {
-            return CreateNetworkReply {
-                network: None,
-                error: Some(format!("network {} already exists", network.id)),
-            };
-        }
-
-        // The VNI is derived runtime state: the manager assigns it, agents
-        // realize it, and nothing durable stores it.
+        self.admit_network(&network)?;
         if network.provider == NetworkProvider::Routed {
-            let taken: AHashSet<u32> = self.networks.values().filter_map(Network::vni).collect();
-            let Some(vni) = assign_vni(&network.id, |candidate| taken.contains(&candidate)) else {
-                return CreateNetworkReply {
-                    network: None,
-                    error: Some(format!(
-                        "the VNI pool {}-{} is exhausted",
-                        VNI_RANGE.start(),
-                        VNI_RANGE.end()
-                    )),
-                };
-            };
-            network.state = Some(NetworkState { vni });
+            network.state = Some(NetworkState {
+                vni: self.assign_network_vni(&network.id)?,
+            });
         }
 
-        let failures = ensure_on_agents(self, &network).await;
+        let intent = self
+            .network_sync
+            .publish(manager_id, NetworkUpdate::Ensure(network.clone()));
+        let failures = self.network_sync.send(&intent).await;
         if !failures.is_empty() {
-            return CreateNetworkReply {
-                network: None,
-                error: Some(failures.join("; ")),
-            };
+            let cleanup = self
+                .network_sync
+                .publish(manager_id, NetworkUpdate::Remove(network));
+            self.network_sync.retire(cleanup);
+            return Err(failures.join("; "));
         }
 
-        info!(
-            network = %network.id,
-            provider = ?network.provider,
-            vni = ?network.vni(),
-            "created network"
-        );
-        let assigned = network.clone();
-        self.networks.insert(network.id.clone(), network);
-        CreateNetworkReply {
-            network: Some(assigned),
-            error: None,
+        info!(provider = ?network.provider, vni = ?network.vni(), "created network");
+        self.networks.insert(network.id.clone(), network.clone());
+        Ok(network)
+    }
+
+    /// Rejects a create that cannot be applied as requested.
+    fn admit_network(&self, network: &Network) -> Result<(), String> {
+        network.validate().map_err(|error| error.to_string())?;
+        if self.networks.contains_key(&network.id) {
+            return Err(format!("network {} already exists", network.id));
         }
+        if self.network_sync.retirement_pending(&network.id) {
+            return Err(format!(
+                "network {} is still awaiting cleanup acknowledgements",
+                network.id
+            ));
+        }
+        require_network_actors(self)
+    }
+
+    /// Reserves a VNI for a new routed network.
+    fn assign_network_vni(&self, id: &str) -> Result<u32, String> {
+        let taken: AHashSet<u32> = self
+            .networks
+            .values()
+            .filter_map(Network::vni)
+            .chain(self.network_sync.reserved_vnis())
+            .collect();
+        assign_vni(id, |candidate| taken.contains(&candidate)).ok_or_else(|| {
+            format!(
+                "the VNI pool {}-{} is exhausted",
+                VNI_RANGE.start(),
+                VNI_RANGE.end()
+            )
+        })
+    }
+
+    /// Applies a network removal to every known agent before dropping the entry.
+    #[tracing::instrument(level = "debug", skip(self), fields(network = %id))]
+    async fn delete_network(&mut self, id: String, manager_id: ActorId) -> Result<(), String> {
+        let network = self
+            .networks
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| format!("network {id} is not defined"))?;
+        require_network_actors(self)?;
+
+        let intent = self
+            .network_sync
+            .publish(manager_id, NetworkUpdate::Remove(network.clone()));
+        let failures = self.network_sync.send(&intent).await;
+        if !failures.is_empty() {
+            self.network_sync
+                .publish(manager_id, NetworkUpdate::Ensure(network));
+            return Err(failures.join("; "));
+        }
+
+        self.network_sync.retire(intent);
+        info!(network = %id, "deleted network");
+        self.networks.remove(&id);
+        Ok(())
     }
 }
 
@@ -191,27 +185,16 @@ impl Message<CreateNetwork> for SchedulerActor {
 impl Message<DeleteNetwork> for SchedulerActor {
     type Reply = DeleteNetworkReply;
 
+    #[tracing::instrument(level = "debug", skip(self, ctx), fields(network = %msg.id))]
     async fn handle(
         &mut self,
         msg: DeleteNetwork,
-        _ctx: &mut Context<Self, Self::Reply>,
+        ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        if !self.networks.contains_key(&msg.id) {
-            return DeleteNetworkReply {
-                error: Some(format!("network {} is not defined", msg.id)),
-            };
+        match self.delete_network(msg.id, ctx.actor_ref().id()).await {
+            Ok(()) => DeleteNetworkReply { error: None },
+            Err(error) => DeleteNetworkReply { error: Some(error) },
         }
-
-        let failures = remove_from_agents(self, &msg.id).await;
-        if !failures.is_empty() {
-            return DeleteNetworkReply {
-                error: Some(failures.join("; ")),
-            };
-        }
-
-        info!(network = %msg.id, "deleted network");
-        self.networks.remove(&msg.id);
-        DeleteNetworkReply { error: None }
     }
 }
 

@@ -78,7 +78,8 @@ pub struct EvpnConfig {
 #[derive(Serialize, Deserialize, Default, Clone, Debug)]
 pub struct NetworkConfig {
     pub dhcp_config: Option<DhcpConfig>,
-    pub network_mode: NetworkMode,
+    /// The node-local `default` network; without it the node only has API-created networks.
+    pub network_mode: Option<NetworkMode>,
     /// Without it, routed networks stay node-local VRFs.
     pub evpn: Option<EvpnConfig>,
 }
@@ -251,12 +252,12 @@ mod tests {
                     subnet: Ipv4Net::new(Ipv4Addr::new(10, 10, 1, 0), 24).unwrap(),
                     lease_time: "12h".to_owned(),
                 }),
-                network_mode: NetworkMode::HostonlyNat {
+                network_mode: Some(NetworkMode::HostonlyNat {
                     bridge: "vmbr0".to_owned(),
                     gateway: Ipv4Addr::new(10, 10, 100, 1),
                     subnet: Ipv4Net::new(Ipv4Addr::new(10, 10, 100, 0), 24).unwrap(),
                     upstream_iface: "test0".to_owned(),
-                },
+                }),
                 evpn: None,
             },
             ..Default::default()
@@ -265,5 +266,14 @@ mod tests {
         let json = serde_json::to_string_pretty(&config).unwrap();
         // assert_eq!(json, )
         println!("{json}");
+    }
+
+    #[test]
+    fn network_config_parses_without_a_legacy_network() {
+        let network: NetworkConfig =
+            serde_json::from_str(r#"{"evpn":{"underlay":"10.77.0.0/24"}}"#).unwrap();
+        assert!(network.network_mode.is_none());
+        assert!(network.dhcp_config.is_none());
+        assert_eq!(network.evpn.unwrap().asn, 65_000);
     }
 }

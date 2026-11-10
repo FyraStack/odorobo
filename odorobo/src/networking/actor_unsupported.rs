@@ -2,7 +2,8 @@ use std::path::PathBuf;
 
 use crate::config::NetworkConfig;
 use crate::messages::network::{
-    EnsureNetwork, EnsureNetworkReply, RemoveNetwork, RemoveNetworkReply,
+    EnsureNetwork, EnsureNetworkReply, GetVtep, GetVtepReply, RemoveNetwork, RemoveNetworkReply,
+    SyncNetwork, SyncNetworkReply,
 };
 use crate::networking::messages::{
     AttachNic, DetachNic, LookupNetwork, LookupNetworkReply, NetworkStatus, PublishPorts, Status,
@@ -14,6 +15,7 @@ use stable_eyre::eyre::eyre;
 use tracing::warn;
 
 #[derive(RemoteActor)]
+#[remote_actor(id = "odorobo::networking::actor_linux::NetworkAgentActor")]
 pub struct NetworkAgentActor {
     pub config: NetworkConfig,
 }
@@ -29,6 +31,38 @@ impl Actor for NetworkAgentActor {
         );
 
         Ok(Self { config: args.0 })
+    }
+}
+
+#[remote_message("odorobo.network.sync.v2")]
+impl Message<SyncNetwork> for NetworkAgentActor {
+    type Reply = SyncNetworkReply;
+
+    async fn handle(
+        &mut self,
+        msg: SyncNetwork,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        SyncNetworkReply {
+            revision: msg.revision,
+            error: Some("host networking management is only supported on Linux".to_owned()),
+        }
+    }
+}
+
+#[remote_message("odorobo.network.vtep.v1")]
+impl Message<GetVtep> for NetworkAgentActor {
+    type Reply = GetVtepReply;
+
+    async fn handle(
+        &mut self,
+        _msg: GetVtep,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        GetVtepReply {
+            node_id: None,
+            fabric: None,
+        }
     }
 }
 

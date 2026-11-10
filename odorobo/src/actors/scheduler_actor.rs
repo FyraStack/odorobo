@@ -18,6 +18,7 @@
 mod cache;
 mod discovery;
 mod handlers;
+mod network_sync;
 mod networks;
 mod scheduling;
 
@@ -55,6 +56,7 @@ struct AgentActorDiscovered {
 enum CachedActorKind {
     Agent,
     Vm,
+    Network,
 }
 
 /// A VM's initial identity and configuration snapshot from its updater task.
@@ -169,6 +171,7 @@ pub struct SchedulerActor {
     ///
     /// Ephemeral process memory, not a durable source of truth.
     pub networks: AHashMap<String, Network>,
+    network_sync: network_sync::NetworkSync,
     /// Background discovery and reconciliation task.
     pub cache_actor_finder: Option<JoinHandle<()>>,
 }

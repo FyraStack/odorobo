@@ -7,14 +7,17 @@ use std::{
 
 use crate::config::{DhcpConfig, NetworkConfig, NetworkMode};
 use crate::messages::network::{
-    EnsureNetwork, EnsureNetworkReply, RemoveNetwork, RemoveNetworkReply,
+    EnsureNetwork, EnsureNetworkReply, GetVtep, GetVtepReply, NetworkUpdate, RemoveNetwork,
+    RemoveNetworkReply, SyncNetwork, SyncNetworkReply,
 };
 use crate::network::{DhcpPool, Network, NetworkProvider};
 use crate::networking::fabric::Fabric;
+use crate::networking::mesh::{MeshPeers, PeerDiscovery, PeerUpdate};
 use crate::networking::messages::{
     AttachNic, AttachedNic, DetachNic, LookupNetwork, LookupNetworkReply, NetworkStatus,
     NetworkSummary, PublishPorts, Status, UnpublishPorts,
 };
+use crate::networking::sync::{NetworkSyncFence, SyncDecision};
 use crate::ports::{PortMapping, lease_ip};
 use futures_util::{StreamExt, TryStreamExt};
 
@@ -42,7 +45,7 @@ use rtnetlink::{
 };
 use stable_eyre::Report;
 use stable_eyre::eyre::{Context as EyreContext, eyre};
-use tokio::time::sleep;
+use tokio::time::{Instant, sleep};
 use tracing::{error, info, warn};
 use ulid::Ulid;
 
@@ -54,6 +57,7 @@ const DNAT_PRIORITY: i32 = -100;
 const ANTISPOOF_PRIORITY: i32 = -150;
 const GUEST_NAT_PRIORITY: i32 = 100;
 const VXLAN_PORT: u16 = 4789;
+const NODE_ID_LENGTH: usize = 32;
 /// Tenant routing tables sit above the 24-bit VNI range.
 const VRF_TABLE_BASE: u32 = 0x0100_0000;
 /// Metric of a VRF's unreachable default, high enough for any learned default to win.
@@ -149,9 +153,7 @@ struct Member {
 /// The bridge and VXLAN devices that carry a routed network across the EVPN fabric.
 struct L3Vni {
     bridge: String,
-    bridge_index: u32,
     vxlan: String,
-    vxlan_index: u32,
 }
 
 struct RoutedState {
@@ -180,6 +182,7 @@ enum Realized {
 struct NetworkEntry {
     network: Network,
     realized: Realized,
+    needs_rebuild: bool,
 }
 
 impl NetworkEntry {
@@ -204,9 +207,10 @@ impl NetworkEntry {
     }
 }
 
-/// Builds the legacy network object from the `config.json` network settings.
-fn legacy_network(config: &NetworkConfig) -> Network {
-    let (bridge, subnet, gateway, upstream) = match &config.network_mode {
+/// Builds the node-local `default` network when the config defines one.
+fn legacy_network(config: &NetworkConfig) -> Option<Network> {
+    let mode = config.network_mode.as_ref()?;
+    let (bridge, subnet, gateway, upstream) = match mode {
         NetworkMode::HostonlyNat {
             bridge,
             subnet,
@@ -225,7 +229,7 @@ fn legacy_network(config: &NetworkConfig) -> Network {
         } => (bridge.clone(), *subnet, *gateway, None),
     };
 
-    Network {
+    Some(Network {
         id: LEGACY_NETWORK_ID.to_owned(),
         subnet,
         gateway: Some(gateway),
@@ -239,7 +243,24 @@ fn legacy_network(config: &NetworkConfig) -> Network {
             lease_time: dhcp.lease_time.clone(),
         }),
         upstream,
+    })
+}
+
+async fn read_node_id() -> Result<String, Report> {
+    let value = tokio::fs::read_to_string("/etc/machine-id")
+        .await
+        .wrap_err("failed to read the node's machine ID")?;
+    let id = value.trim();
+    if !node_id_valid(id) {
+        return Err(eyre!("the node needs a nonzero 32-digit machine ID"));
     }
+    Ok(id.to_ascii_lowercase())
+}
+
+fn node_id_valid(id: &str) -> bool {
+    id.len() == NODE_ID_LENGTH
+        && id.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && id.bytes().any(|byte| byte != b'0')
 }
 
 fn write_sysctl(key: &str, value: &str) -> Result<(), Report> {
@@ -317,6 +338,10 @@ async fn underlay_address(handle: &Handle, underlay: Ipv4Net) -> Result<Ipv4Addr
             "several local addresses are inside the EVPN underlay {underlay}: {many:?}"
         )),
     }
+}
+
+const fn routed_table_id(vni: u32) -> u32 {
+    VRF_TABLE_BASE.saturating_add(vni)
 }
 
 fn vrf_table_id(link: &LinkMessage) -> Option<u32> {
@@ -461,12 +486,7 @@ async fn ensure_l3vni(
             .wrap_err_with(|| format!("failed to configure vxlan {vxlan}"))?;
     }
 
-    Ok(L3Vni {
-        bridge,
-        bridge_index,
-        vxlan,
-        vxlan_index,
-    })
+    Ok(L3Vni { bridge, vxlan })
 }
 
 async fn ensure_address(
@@ -534,26 +554,33 @@ enum PublishTarget {
 }
 
 #[derive(RemoteActor)]
+#[remote_actor(id = "odorobo::networking::actor_linux::NetworkAgentActor")]
 pub struct NetworkAgentActor {
     pub config: NetworkConfig,
+    node_id: String,
     runtime_root: PathBuf,
     networks: HashMap<String, NetworkEntry>,
+    network_sync: NetworkSyncFence,
     port_tasks: HashMap<Ulid, tokio::task::JoinHandle<()>>,
     netlink_thread: tokio::task::JoinHandle<()>,
     netlink_handle: Handle,
     /// Set when the node is part of an EVPN fabric.
     fabric: Option<Fabric>,
     fabric_reconciler: Option<tokio::task::JoinHandle<()>>,
+    mesh: MeshPeers,
 }
 
 /// Re-applies this node's FRR configuration.
-struct ReconcileFabric;
+struct ReconcileFabric {
+    peers: PeerUpdate,
+}
 
 impl Actor for NetworkAgentActor {
     type Args = (NetworkConfig, PathBuf);
     type Error = Report;
     async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
         let (config, runtime_root) = args;
+        let node_id = read_node_id().await?;
         let (connection, handle, _) = rtnetlink::new_connection()?;
         let netlink_thread = tokio::spawn(connection);
 
@@ -568,19 +595,28 @@ impl Actor for NetworkAgentActor {
             None => None,
         };
 
+        let mut mesh = MeshPeers::default();
+        if let Some(fabric) = &fabric {
+            let owned = fabric.owned_neighbors().await?;
+            mesh.seed(&fabric.info(), &owned, Instant::now());
+        }
         let legacy = legacy_network(&config);
-        info!(
-            network_id = %legacy.id,
-            provider = ?legacy.provider,
-            subnet = %legacy.subnet,
-            bridge = ?legacy.bridge,
-            "realizing the legacy network from config.json"
-        );
+        if let Some(legacy) = &legacy {
+            info!(
+                network_id = %legacy.id,
+                provider = ?legacy.provider,
+                subnet = %legacy.subnet,
+                bridge = ?legacy.bridge,
+                "realizing the legacy network from config.json"
+            );
+        }
 
         let mut actor = Self {
             config,
+            node_id,
             runtime_root,
             networks: HashMap::new(),
+            network_sync: NetworkSyncFence::default(),
             port_tasks: HashMap::new(),
             netlink_thread,
             netlink_handle: handle,
@@ -588,12 +624,15 @@ impl Actor for NetworkAgentActor {
                 .is_some()
                 .then(|| spawn_fabric_reconciler(&actor_ref)),
             fabric,
+            mesh,
         };
 
-        actor
-            .ensure_network(&actor_ref, legacy)
-            .await
-            .wrap_err("failed to realize the legacy network from config.json")?;
+        if let Some(legacy) = legacy {
+            actor
+                .ensure_network(&actor_ref, legacy)
+                .await
+                .wrap_err("failed to realize the legacy network from config.json")?;
+        }
 
         enable_host_forwarding().wrap_err("failed to enable host forwarding settings")?;
         Self::clear_port_rules().wrap_err("failed to clear stale port rules")?;
@@ -624,12 +663,17 @@ impl Actor for NetworkAgentActor {
             }
         }
 
+        let mut first_error = None;
         for (id, entry) in &mut self.networks {
             if let Realized::Bridged(state) = &mut entry.realized
                 && let Some(dhcp_actor) = state.dhcp_actor.take()
             {
                 info!(network_id = %id, bridge = %state.bridge, "stopping dnsmasq");
-                dhcp_actor.stop_gracefully().await?;
+                if let Err(error) = dhcp_actor.stop_gracefully().await {
+                    error!(network_id = %id, %error, "failed to stop dnsmasq");
+                    first_error
+                        .get_or_insert_with(|| eyre!("failed to stop dnsmasq for {id}: {error}"));
+                }
             }
         }
 
@@ -645,7 +689,7 @@ impl Actor for NetworkAgentActor {
         self.netlink_thread.abort();
         _ = (&mut self.netlink_thread).await;
 
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 }
 
@@ -669,7 +713,7 @@ impl NetworkAgentActor {
                     network.id
                 ));
             }
-            if existing.network.vni() == network.vni() {
+            if existing.network.vni() == network.vni() && !existing.needs_rebuild {
                 return Ok(());
             }
             // The manager reassigns VNIs per process lifetime; migrate the
@@ -678,6 +722,14 @@ impl NetworkAgentActor {
             return Ok(());
         }
 
+        if let Some(vni) = network.vni()
+            && self
+                .networks
+                .values()
+                .any(|entry| entry.network.vni() == Some(vni))
+        {
+            return Err(eyre!("VNI {vni} is already owned by another network"));
+        }
         let realized = match network.provider {
             NetworkProvider::Routed => Realized::Routed(self.realize_routed(&network).await?),
             NetworkProvider::Bridged => {
@@ -691,8 +743,14 @@ impl NetworkAgentActor {
             subnet = %network.subnet,
             "realized network"
         );
-        self.networks
-            .insert(network.id.clone(), NetworkEntry { network, realized });
+        self.networks.insert(
+            network.id.clone(),
+            NetworkEntry {
+                network,
+                realized,
+                needs_rebuild: false,
+            },
+        );
         Ok(())
     }
 
@@ -711,7 +769,7 @@ impl NetworkAgentActor {
         for member in &state.members {
             Self::detach_tap(&self.netlink_handle, &member.tap_name).await?;
         }
-        if let Err(err) = self.delete_routed(&state).await {
+        if let Err(err) = self.delete_routed(state.vni).await {
             warn!(network_id = %network.id, vrf = %state.vrf, ?err, "old vrf not fully removed; realizing the new vni anyway");
         }
 
@@ -721,6 +779,7 @@ impl NetworkAgentActor {
             NetworkEntry {
                 network: network.clone(),
                 realized,
+                needs_rebuild: false,
             },
         );
 
@@ -752,25 +811,59 @@ impl NetworkAgentActor {
         Ok(())
     }
 
-    /// Withdraws the network from FRR and deletes its devices; taps are released, not deleted.
-    async fn delete_routed(&self, state: &RoutedState) -> Result<(), Report> {
+    async fn ensure_routed_unused(&self, vni: u32) -> Result<(), Report> {
         let handle = &self.netlink_handle;
+        let vrf = lookup_link(handle, &format!("vrf{vni}")).await?;
+        if vrf
+            .as_ref()
+            .is_some_and(|link| vrf_table_id(link) != Some(routed_table_id(vni)))
+        {
+            return Err(eyre!("vrf{vni} uses a different routing table"));
+        }
+        let bridge = lookup_link(handle, &format!("vrfbr{vni}")).await?;
+        let vxlan = lookup_link(handle, &format!("vrfvx{vni}")).await?;
+        for (controller, allowed) in [
+            (vrf.as_ref(), bridge.as_ref()),
+            (bridge.as_ref(), vxlan.as_ref()),
+        ] {
+            let Some(controller) = controller else {
+                continue;
+            };
+            let mut links = handle.link().get().execute();
+            while let Some(link) = links.try_next().await? {
+                let attached = link.attributes.iter().any(|attribute| {
+                    matches!(attribute, LinkAttribute::Controller(index) if *index == controller.header.index)
+                });
+                if attached
+                    && allowed.is_none_or(|allowed| allowed.header.index != link.header.index)
+                {
+                    return Err(eyre!("network VNI {vni} still has attached interfaces"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolves owned devices by name so retries cannot delete a reused interface index.
+    async fn delete_routed(&self, vni: u32) -> Result<(), Report> {
+        self.ensure_routed_unused(vni).await?;
+        let handle = &self.netlink_handle;
+        let vrf = format!("vrf{vni}");
+        let table_id = routed_table_id(vni);
         let mut first_error = match &self.fabric {
-            Some(fabric) => fabric.withdraw_network(&state.vrf, state.vni).await.err(),
+            Some(fabric) => fabric.withdraw_network(&vrf, vni).await.err(),
             None => None,
         };
-        if let Some(err) = &first_error {
-            error!(vrf = %state.vrf, ?err, "failed to remove the network from FRR");
-        }
-
-        let l3vni_links = state.l3vni.iter().flat_map(|l3vni| {
-            [
-                (l3vni.vxlan_index, &l3vni.vxlan),
-                (l3vni.bridge_index, &l3vni.bridge),
-            ]
-        });
-        for (index, name) in l3vni_links.chain([(state.vrf_index, &state.vrf)]) {
-            match handle.link().del(index).execute().await {
+        for name in [format!("vrfvx{vni}"), format!("vrfbr{vni}"), vrf.clone()] {
+            let link = match lookup_link(handle, &name).await {
+                Ok(Some(link)) => link,
+                Ok(None) => continue,
+                Err(err) => {
+                    first_error.get_or_insert(err);
+                    continue;
+                }
+            };
+            match handle.link().del(link.header.index).execute().await {
                 Err(NetlinkError::NetlinkError(err)) if err.raw_code() == -libc::ENODEV => {}
                 Err(err) => {
                     error!(link = %name, %err, "failed to delete link");
@@ -779,16 +872,14 @@ impl NetworkAgentActor {
                 Ok(()) => {}
             }
         }
-        // The defaults sit on lo, so deleting the VRF leaves them in its table.
-        for route in unreachable_defaults(state.table_id) {
+        for route in unreachable_defaults(table_id) {
             match handle.route().del(route).execute().await {
                 Err(NetlinkError::NetlinkError(err)) if err.raw_code() == -libc::ESRCH => {}
                 Err(err) => {
-                    error!(table = state.table_id, %err, "failed to delete the unreachable default");
+                    error!(table = table_id, %err, "failed to delete the unreachable default");
                     first_error.get_or_insert_with(|| {
                         eyre!(
-                            "failed to delete the unreachable default from table {}: {err}",
-                            state.table_id
+                            "failed to delete the unreachable default from table {table_id}: {err}"
                         )
                     });
                 }
@@ -796,12 +887,54 @@ impl NetworkAgentActor {
             }
         }
         if let Some(fabric) = &self.fabric
-            && let Err(err) = fabric.forget_vrf(&state.vrf).await
+            && let Err(err) = fabric.forget_vrf(&vrf).await
         {
-            error!(vrf = %state.vrf, ?err, "failed to remove the VRF from FRR");
+            error!(%vrf, ?err, "failed to remove the VRF from FRR");
             first_error.get_or_insert(err);
         }
         first_error.map_or(Ok(()), Err)
+    }
+
+    async fn ensure_synced_network(
+        &mut self,
+        actor_ref: &ActorRef<Self>,
+        network: &Network,
+    ) -> Result<(), Report> {
+        if let Some(vni) = network.vni() {
+            let previous = self
+                .networks
+                .values()
+                .find(|entry| entry.network.id != network.id && entry.network.vni() == Some(vni))
+                .map(|entry| entry.network.id.clone());
+            if let Some(previous) = previous {
+                self.remove_network(&previous).await?;
+            }
+        }
+        self.ensure_network(actor_ref, network.clone()).await
+    }
+
+    async fn remove_synced_network(&mut self, network: &Network) -> Result<(), Report> {
+        if self
+            .networks
+            .get(&network.id)
+            .is_some_and(|entry| entry.network == *network)
+        {
+            return self.remove_network(&network.id).await;
+        }
+        if network.vni().is_some_and(|vni| {
+            self.networks
+                .values()
+                .any(|entry| entry.network.vni() == Some(vni))
+        }) {
+            return Ok(());
+        }
+        if network.provider == NetworkProvider::Routed {
+            let vni = network
+                .vni()
+                .ok_or_else(|| eyre!("routed retirement has no VNI"))?;
+            self.delete_routed(vni).await?;
+        }
+        Ok(())
     }
 
     /// Re-attaches recorded members, skipping taps that no longer exist.
@@ -834,18 +967,54 @@ impl NetworkAgentActor {
         Ok(())
     }
 
+    async fn ensure_taps_owned(
+        &self,
+        vrf_index: u32,
+        vni: u32,
+        network_id: &str,
+    ) -> Result<(), Report> {
+        let bridge = format!("vrfbr{vni}");
+        let mut links = self.netlink_handle.link().get().execute();
+        while let Some(link) = links.try_next().await? {
+            if !link.attributes.iter().any(|attribute| matches!(attribute, LinkAttribute::Controller(index) if *index == vrf_index)) {
+                continue;
+            }
+            if link.attributes.iter().any(
+                |attribute| matches!(attribute, LinkAttribute::IfName(name) if *name == bridge),
+            ) {
+                continue;
+            }
+            let owned = link.attributes.iter().any(|attribute| {
+                let LinkAttribute::IfAlias(alias) = attribute else {
+                    return false;
+                };
+                let mut words = alias.split_whitespace();
+                words.next() == Some("odorobo")
+                    && words.next().is_some()
+                    && words.next() == Some(network_id)
+                    && words.next().is_none()
+            });
+            if !owned {
+                return Err(eyre!("VNI {vni} has an interface owned by another network"));
+            }
+        }
+        Ok(())
+    }
+
     async fn realize_routed(&self, network: &Network) -> Result<RoutedState, Report> {
         let vni = network
             .vni()
             .ok_or_else(|| eyre!("routed network {:?} requires a vni", network.id))?;
-        let table_id = VRF_TABLE_BASE.saturating_add(vni);
+        let table_id = routed_table_id(vni);
         let vrf = format!("vrf{vni}");
-        if let Some(link) = lookup_link(&self.netlink_handle, &vrf).await?
-            && vrf_table_id(&link) != Some(table_id)
-        {
-            return Err(eyre!(
-                "vrf device {vrf} does not use routing table {table_id}; remove it before retrying"
-            ));
+        if let Some(link) = lookup_link(&self.netlink_handle, &vrf).await? {
+            if vrf_table_id(&link) != Some(table_id) {
+                return Err(eyre!(
+                    "vrf device {vrf} does not use routing table {table_id}; remove it before retrying"
+                ));
+            }
+            self.ensure_taps_owned(link.header.index, vni, &network.id)
+                .await?;
         }
         let vrf_index = ensure_link(
             &self.netlink_handle,
@@ -888,6 +1057,7 @@ impl NetworkAgentActor {
             vni,
             table = table_id,
             gateway = %state.gateway,
+            bridge = ?state.l3vni.as_ref().map(|l3vni| &l3vni.bridge),
             vxlan = ?state.l3vni.as_ref().map(|l3vni| &l3vni.vxlan),
             "routed network realized"
         );
@@ -965,8 +1135,13 @@ impl NetworkAgentActor {
             return Err(eyre!("network {id} still has attached NICs"));
         }
         // Keep the entry until cleanup succeeds so a failed removal can be retried.
-        if let Realized::Routed(state) = &entry.realized {
-            self.delete_routed(state).await?;
+        if let Realized::Routed(state) = &entry.realized
+            && let Err(error) = self.delete_routed(state.vni).await
+        {
+            if let Some(entry) = self.networks.get_mut(id) {
+                entry.needs_rebuild = true;
+            }
+            return Err(error);
         }
 
         let Some(entry) = self.networks.remove(id) else {
@@ -1604,6 +1779,77 @@ impl NetworkAgentActor {
     }
 }
 
+#[remote_message("odorobo.network.sync.v2")]
+impl Message<SyncNetwork> for NetworkAgentActor {
+    type Reply = SyncNetworkReply;
+
+    async fn handle(
+        &mut self,
+        msg: SyncNetwork,
+        ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let revision = msg.revision;
+        if let Err(error) = msg.update.network().validate() {
+            return SyncNetworkReply {
+                revision,
+                error: Some(error.to_string()),
+            };
+        }
+        if let Some(owner) = &msg.active_owner
+            && let Err(error) = owner.validate()
+        {
+            return SyncNetworkReply {
+                revision,
+                error: Some(error.to_string()),
+            };
+        }
+        match self.network_sync.begin(&msg) {
+            Ok(SyncDecision::Acknowledge) => {
+                return SyncNetworkReply {
+                    revision,
+                    error: None,
+                };
+            }
+            Err(error) => {
+                return SyncNetworkReply {
+                    revision,
+                    error: Some(error.to_owned()),
+                };
+            }
+            Ok(SyncDecision::Apply) => {}
+        }
+        let result = match &msg.update {
+            NetworkUpdate::Ensure(network) => {
+                self.ensure_synced_network(ctx.actor_ref(), network).await
+            }
+            NetworkUpdate::Remove(network) => self.remove_synced_network(network).await,
+        };
+        if result.is_ok() {
+            self.network_sync.acknowledge(&msg);
+        }
+        SyncNetworkReply {
+            revision,
+            error: result.err().map(|error| format!("{error:#}")),
+        }
+    }
+}
+
+#[remote_message("odorobo.network.vtep.v1")]
+impl Message<GetVtep> for NetworkAgentActor {
+    type Reply = GetVtepReply;
+
+    async fn handle(
+        &mut self,
+        _msg: GetVtep,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        GetVtepReply {
+            node_id: Some(self.node_id.clone()),
+            fabric: self.fabric.as_ref().map(Fabric::info),
+        }
+    }
+}
+
 impl Message<EnsureNetwork> for NetworkAgentActor {
     type Reply = EnsureNetworkReply;
 
@@ -1759,10 +2005,12 @@ fn spawn_fabric_reconciler(actor_ref: &ActorRef<NetworkAgentActor>) -> tokio::ta
     let actor_ref = actor_ref.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(FABRIC_RECONCILE_INTERVAL);
-        interval.tick().await;
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut discovery = PeerDiscovery::default();
         loop {
             interval.tick().await;
-            if actor_ref.tell(ReconcileFabric).send().await.is_err() {
+            let peers = discovery.probe(actor_ref.id()).await;
+            if actor_ref.ask(ReconcileFabric { peers }).await.is_err() {
                 return;
             }
         }
@@ -1772,10 +2020,12 @@ fn spawn_fabric_reconciler(actor_ref: &ActorRef<NetworkAgentActor>) -> tokio::ta
 impl Message<ReconcileFabric> for NetworkAgentActor {
     type Reply = ();
 
-    async fn handle(&mut self, _msg: ReconcileFabric, _ctx: &mut Context<Self, Self::Reply>) {
+    async fn handle(&mut self, msg: ReconcileFabric, _ctx: &mut Context<Self, Self::Reply>) {
         let Some(fabric) = &self.fabric else {
             return;
         };
+        self.mesh.observe(&fabric.info(), msg.peers);
+        let peers = self.mesh.desired(Instant::now());
         let routed: Vec<(&str, u32)> = self
             .networks
             .values()
@@ -1784,7 +2034,7 @@ impl Message<ReconcileFabric> for NetworkAgentActor {
                 Realized::Bridged(_) => None,
             })
             .collect();
-        if let Err(err) = fabric.reconcile(&routed).await {
+        if let Err(err) = fabric.reconcile(&routed, &peers).await {
             warn!(?err, "failed to reconcile the FRR configuration");
         }
     }
@@ -1853,13 +2103,16 @@ mod tests {
         let (connection, handle, _) = rtnetlink::new_connection()?;
         let actor = NetworkAgentActor {
             config: NetworkConfig::default(),
+            node_id: "isolated-test".to_owned(),
             runtime_root: PathBuf::new(),
             networks: HashMap::new(),
+            network_sync: NetworkSyncFence::default(),
             port_tasks: HashMap::new(),
             netlink_thread: tokio::spawn(connection),
             netlink_handle: handle,
             fabric_reconciler: None,
             fabric: None,
+            mesh: MeshPeers::default(),
         };
         let handle = &actor.netlink_handle;
         let mut network = Network {
@@ -1911,7 +2164,7 @@ mod tests {
                 )
                 .await?,
             );
-            actor.delete_routed(&state).await?;
+            actor.delete_routed(state.vni).await?;
             assert!(lookup_link(handle, &state.vrf).await?.is_none());
             assert_eq!(
                 routes_in_table(handle, state.table_id).await?,
@@ -1922,6 +2175,90 @@ mod tests {
 
         actor.netlink_thread.abort();
         _ = actor.netlink_thread.await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires root and an isolated network namespace"]
+    async fn reused_vni_survives_retirement_replay_after_actor_restart() -> Result<(), Report> {
+        use rtnetlink::LinkDummy;
+        let config = NetworkConfig {
+            network_mode: Some(NetworkMode::Bridged {
+                bridge: "vmbr-test".to_owned(),
+                subnet: "10.10.0.0/24".parse()?,
+                gateway: "10.10.0.1".parse()?,
+            }),
+            dhcp_config: None,
+            evpn: None,
+        };
+        let network = Network {
+            id: "sync-test".to_owned(),
+            subnet: "10.40.10.0/24".parse()?,
+            gateway: None,
+            provider: NetworkProvider::Routed,
+            state: Some(NetworkState { vni: 1001 }),
+            mtu: None,
+            bridge: None,
+            dhcp: None,
+            upstream: None,
+        };
+        let ensure = |revision| SyncNetwork {
+            manager_id: ActorId::new(1),
+            revision,
+            owners_revision: revision,
+            update: NetworkUpdate::Ensure(network.clone()),
+            active_owner: Some(network.clone()),
+        };
+        let remove = |revision| SyncNetwork {
+            manager_id: ActorId::new(1),
+            revision,
+            owners_revision: revision,
+            update: NetworkUpdate::Remove(network.clone()),
+            active_owner: None,
+        };
+        let actor = NetworkAgentActor::spawn((config.clone(), PathBuf::new()));
+        assert_eq!(actor.ask(ensure(1)).await?.error, None);
+        assert_eq!(actor.ask(remove(2)).await?.error, None);
+        assert_eq!(actor.ask(ensure(3)).await?.error, None);
+        let (connection, handle, _) = rtnetlink::new_connection()?;
+        let netlink = tokio::spawn(connection);
+        handle
+            .link()
+            .add(LinkDummy::new("vmtap-test").up().build())
+            .execute()
+            .await?;
+        actor
+            .ask(AttachNic {
+                vmid: "01ARZ3NDEKTSV4RRFFQ69G5FAV".parse()?,
+                network_id: network.id.clone(),
+                tap_name: "vmtap-test".to_owned(),
+                mac_address: None,
+                address: Some("10.40.10.6".parse()?),
+            })
+            .await
+            .map_err(|error| eyre!("failed to attach test TAP: {error}"))?;
+        let original = lookup_link(&handle, "vrf1001")
+            .await?
+            .ok_or_else(|| eyre!("missing original VRF"))?;
+        actor.stop_gracefully().await?;
+        let restarted = NetworkAgentActor::spawn((config, PathBuf::new()));
+        let mut retirement = remove(2);
+        retirement.owners_revision = 3;
+        retirement.active_owner = Some(network.clone());
+        assert_eq!(restarted.ask(retirement).await?.error, None);
+        let retained = lookup_link(&handle, "vrf1001")
+            .await?
+            .ok_or_else(|| eyre!("retirement deleted the live VRF"))?;
+        assert_eq!(retained.header.index, original.header.index);
+        assert_eq!(restarted.ask(ensure(3)).await?.error, None);
+        let tap = lookup_link(&handle, "vmtap-test")
+            .await?
+            .ok_or_else(|| eyre!("missing live TAP"))?;
+        handle.link().del(tap.header.index).execute().await?;
+        assert_eq!(restarted.ask(remove(4)).await?.error, None);
+        restarted.stop_gracefully().await?;
+        netlink.abort();
+        _ = netlink.await;
         Ok(())
     }
 
@@ -1936,16 +2273,16 @@ mod tests {
                 subnet: "10.10.100.0/24".parse().unwrap(),
                 lease_time: "12h".to_owned(),
             }),
-            network_mode: NetworkMode::HostonlyNat {
+            network_mode: Some(NetworkMode::HostonlyNat {
                 bridge: "vmbr0".to_owned(),
                 subnet: "10.10.100.0/24".parse().unwrap(),
                 gateway: "10.10.100.1".parse().unwrap(),
                 upstream_iface: "enp4s0".to_owned(),
-            },
+            }),
             evpn: None,
         };
 
-        let network = legacy_network(&config);
+        let network = legacy_network(&config).expect("a legacy network");
         network.validate().unwrap();
         assert_eq!(network.id, LEGACY_NETWORK_ID);
         assert_eq!(network.provider, NetworkProvider::Bridged);
@@ -1960,18 +2297,29 @@ mod tests {
     fn legacy_network_maps_bridged_config() {
         let config = NetworkConfig {
             dhcp_config: None,
-            network_mode: NetworkMode::Bridged {
+            network_mode: Some(NetworkMode::Bridged {
                 bridge: "vmbr1".to_owned(),
                 subnet: "10.20.0.0/24".parse().unwrap(),
                 gateway: "10.20.0.1".parse().unwrap(),
-            },
+            }),
             evpn: None,
         };
 
-        let network = legacy_network(&config);
+        let network = legacy_network(&config).expect("a legacy network");
         network.validate().unwrap();
         assert_eq!(network.bridge.as_deref(), Some("vmbr1"));
         assert!(network.dhcp.is_none());
         assert!(network.upstream.is_none());
+    }
+
+    #[test]
+    fn legacy_network_is_absent_without_a_network_mode() {
+        let config = NetworkConfig {
+            dhcp_config: None,
+            network_mode: None,
+            evpn: None,
+        };
+
+        assert!(legacy_network(&config).is_none());
     }
 }

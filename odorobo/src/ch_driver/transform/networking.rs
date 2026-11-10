@@ -1,4 +1,7 @@
+use std::hash::{Hash, Hasher};
+
 use cloud_hypervisor_client::models::{NetConfig, VmConfig};
+use siphasher::sip::SipHasher13;
 use stable_eyre::{
     Result,
     eyre::{WrapErr, eyre},
@@ -14,24 +17,28 @@ use super::ConfigTransform;
 ///
 /// Rewritten output:
 /// - `net.id = Some("net://<network_id>")`
-/// - `net.tap = Some("vmtap-<vmid>-<network_id>")`
+/// - `net.tap = Some("vmtap-<digest>")`
 ///
 /// This lets Cloud Hypervisor use a known TAP name instead of relying on runtime
 /// auto-generated TAP names, which are not reflected back in VM info reliably,
-/// while preserving the Odorobo-local URI marker for later hook logic.
+/// while preserving the odorobo-local URI marker for later hook logic.
 ///
 /// Notes:
-/// - The TAP name is deterministic per `(vmid, network_id)`.
+/// - The TAP name is a stable digest of `(vmid, network_id)`, so it is unique per
+///   NIC and cannot collide by truncating either id.
 /// - We intentionally do not create the TAP device here yet; this transformer only
 ///   mutates the VM config into a host-specific concrete value.
-/// - `network_id` is restricted to a conservative character set suitable for Linux
-///   interface naming and CH IDs.
+/// - The readable provenance lives in the interface alias the network actor stamps,
+///   `odorobo <vmid> <network_id>`.
 #[derive(Debug, Clone)]
 pub struct NetworkTransform;
 
 const NETWORK_URI_PREFIX: &str = "net://";
 const TAP_PREFIX: &str = "vmtap";
+/// Interface names are limited to `IFNAMSIZ`, including the terminating NUL byte.
 const MAX_IFNAME_LEN: usize = 15;
+/// Hex digits of the digest that fit after [`TAP_PREFIX`] within [`MAX_IFNAME_LEN`].
+const TAP_HASH_DIGITS: usize = MAX_IFNAME_LEN - TAP_PREFIX.len() - 1;
 
 impl ConfigTransform for NetworkTransform {
     #[tracing::instrument(skip(config))]
@@ -78,52 +85,24 @@ fn validate_network_id(network_id: &str) -> Result<()> {
     crate::network::validate_network_id(network_id).map_err(|err| eyre!(err.to_string()))
 }
 
-pub fn deterministic_tap_name(vmid: &str, network_id: &str) -> String {
-    let mut vmid_part = sanitize_component(vmid);
-    let mut network_part = sanitize_component(network_id);
-
-    // Linux interface names are typically limited to 15 bytes.
-    // Prefer keeping some of both the VMID and network id rather than truncating
-    // one side entirely. For VMIDs we keep the suffix rather than the prefix,
-    // because ULID prefixes are timestamp-derived and less useful for uniqueness.
-    let separator_len = 2; // two '-'
-    let fixed_len = TAP_PREFIX.len().saturating_add(separator_len);
-    let available = MAX_IFNAME_LEN.saturating_sub(fixed_len);
-
-    if available == 0 {
-        return TAP_PREFIX[..MAX_IFNAME_LEN.min(TAP_PREFIX.len())].to_string();
-    }
-
-    let half = available / 2;
-    let vmid_budget = half.max(1);
-    let network_budget = available.saturating_sub(vmid_budget).max(1);
-
-    if vmid_part.len() > vmid_budget {
-        vmid_part = vmid_part[vmid_part.len().saturating_sub(vmid_budget)..].to_string();
-    }
-    if network_part.len() > network_budget {
-        network_part =
-            network_part[network_part.len().saturating_sub(network_budget)..].to_string();
-    }
-
-    let mut tap = format!("{TAP_PREFIX}-{vmid_part}-{network_part}");
-    if tap.len() > MAX_IFNAME_LEN {
-        tap.truncate(MAX_IFNAME_LEN);
-    }
-    tap
+/// The `(vmid, network_id)` pair a TAP name is derived from: one TAP per NIC.
+#[derive(Hash)]
+struct TapIdentity<'a> {
+    vmid: &'a str,
+    network_id: &'a str,
 }
 
-fn sanitize_component(value: &str) -> String {
-    value
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .collect()
+/// Returns the deterministic TAP name for a VM's NIC on a network.
+///
+/// The name is a digest rather than the readable ids, because both ids can exceed
+/// the interface-name length and truncating them collides.
+pub fn deterministic_tap_name(vmid: &str, network_id: &str) -> String {
+    // Fixed-key SipHash, so the name survives restarts and agent upgrades.
+    let mut hasher = SipHasher13::new();
+    TapIdentity { vmid, network_id }.hash(&mut hasher);
+    let hex = format!("{:x}", hasher.finish());
+    let hash: String = hex.chars().take(TAP_HASH_DIGITS).collect();
+    format!("{TAP_PREFIX}-{hash}")
 }
 
 #[cfg(test)]
@@ -147,7 +126,28 @@ mod tests {
 
         let net = &config.net.as_ref().unwrap()[0];
         assert_eq!(net.id.as_deref(), Some("net://devnet"));
-        assert_eq!(net.tap.as_deref(), Some("vmtap-mhwt-vnet"));
+        assert_eq!(net.tap.as_deref(), Some("vmtap-b5f37edc6"));
+    }
+
+    #[test]
+    fn tap_names_do_not_collide_when_ids_differ_only_at_the_end() {
+        let vmid = "01KPB9AMVWXC2D1PF4W6E7MHWT";
+        let other_vmid = "01ARZ3NDEKTSV4RRFFQ69G5MHWT";
+        assert_ne!(
+            deterministic_tap_name(vmid, "vmnet1"),
+            deterministic_tap_name(vmid, "vmnet2")
+        );
+        assert_ne!(
+            deterministic_tap_name(vmid, "vmnet1"),
+            deterministic_tap_name(other_vmid, "vmnet1")
+        );
+    }
+
+    #[test]
+    fn tap_names_fill_the_interface_name_limit() {
+        let tap = deterministic_tap_name("01KPB9AMVWXC2D1PF4W6E7MHWT", "some-long-network-id");
+        assert_eq!(tap.len(), MAX_IFNAME_LEN);
+        assert!(tap.starts_with("vmtap-"));
     }
 
     #[test]
