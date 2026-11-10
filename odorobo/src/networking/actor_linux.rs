@@ -5,6 +5,7 @@ use std::{
     time::Duration,
 };
 
+use crate::ch_driver::transform::networking::MAX_IFNAME_LEN;
 use crate::config::{DhcpConfig, NetworkConfig, NetworkMode};
 use crate::messages::network::{
     EnsureNetwork, EnsureNetworkReply, GetVtep, GetVtepReply, NetworkUpdate, RemoveNetwork,
@@ -41,7 +42,7 @@ use rtnetlink::packet_route::{
 };
 use rtnetlink::{
     Error as NetlinkError, Handle, LinkBridge, LinkBridgePort, LinkMessageBuilder, LinkUnspec,
-    LinkVrf, LinkVxlan, RouteMessageBuilder,
+    LinkVeth, LinkVrf, LinkVxlan, RouteMessageBuilder,
 };
 use stable_eyre::Report;
 use stable_eyre::eyre::{Context as EyreContext, eyre};
@@ -60,6 +61,8 @@ const VXLAN_PORT: u16 = 4789;
 const NODE_ID_LENGTH: usize = 32;
 /// Tenant routing tables sit above the 24-bit VNI range.
 const VRF_TABLE_BASE: u32 = 0x0100_0000;
+/// Routing table of the node-local VRF from `network_mode`, one per node.
+const NODE_VRF_TABLE: u32 = 0x0200_0000;
 /// Metric of a VRF's unreachable default, high enough for any learned default to win.
 const VRF_UNREACHABLE_METRIC: u32 = 4_278_198_272;
 /// How often the agent re-applies its FRR configuration, which FRR loses when it restarts.
@@ -159,7 +162,8 @@ struct L3Vni {
 struct RoutedState {
     vrf: String,
     vrf_index: u32,
-    vni: u32,
+    /// L3 VNI from the manager; `None` for node-local networks.
+    vni: Option<u32>,
     table_id: u32,
     gateway: Ipv4Addr,
     mtu: u16,
@@ -210,40 +214,95 @@ impl NetworkEntry {
 /// Builds the node-local `default` network when the config defines one.
 fn legacy_network(config: &NetworkConfig) -> Option<Network> {
     let mode = config.network_mode.as_ref()?;
-    let (bridge, subnet, gateway, upstream) = match mode {
+    let network = match mode {
         NetworkMode::HostonlyNat {
             bridge,
             subnet,
             gateway,
             upstream_iface,
-        } => (
-            bridge.clone(),
-            *subnet,
-            *gateway,
-            Some(upstream_iface.clone()),
-        ),
+        } => Network {
+            id: LEGACY_NETWORK_ID.to_owned(),
+            subnet: *subnet,
+            gateway: Some(*gateway),
+            provider: NetworkProvider::Bridged,
+            state: None,
+            mtu: None,
+            bridge: Some(bridge.clone()),
+            dhcp: config.dhcp_config.as_ref().map(|dhcp| DhcpPool {
+                start: dhcp.range.0,
+                end: dhcp.range.1,
+                lease_time: dhcp.lease_time.clone(),
+            }),
+            upstream: Some(upstream_iface.clone()),
+        },
         NetworkMode::Bridged {
             bridge,
             subnet,
             gateway,
-        } => (bridge.clone(), *subnet, *gateway, None),
+        } => Network {
+            id: LEGACY_NETWORK_ID.to_owned(),
+            subnet: *subnet,
+            gateway: Some(*gateway),
+            provider: NetworkProvider::Bridged,
+            state: None,
+            mtu: None,
+            bridge: Some(bridge.clone()),
+            dhcp: None,
+            upstream: None,
+        },
+        NetworkMode::NodeVrf {
+            subnet,
+            gateway,
+            mtu,
+            upstream_iface,
+        } => Network {
+            id: LEGACY_NETWORK_ID.to_owned(),
+            subnet: *subnet,
+            gateway: *gateway,
+            provider: NetworkProvider::NodeVrf,
+            state: None,
+            mtu: *mtu,
+            bridge: None,
+            dhcp: None,
+            upstream: upstream_iface.clone(),
+        },
     };
 
-    Some(Network {
-        id: LEGACY_NETWORK_ID.to_owned(),
-        subnet,
-        gateway: Some(gateway),
-        provider: NetworkProvider::Bridged,
-        state: None,
-        mtu: None,
-        bridge: Some(bridge),
-        dhcp: config.dhcp_config.as_ref().map(|dhcp| DhcpPool {
-            start: dhcp.range.0,
-            end: dhcp.range.1,
-            lease_time: dhcp.lease_time.clone(),
-        }),
-        upstream,
-    })
+    Some(network)
+}
+
+/// VRF device name for a node-local network.
+fn node_vrf_name(network_id: &str) -> Result<String, Report> {
+    let name = format!("vrf{network_id}");
+    if name.len() > MAX_IFNAME_LEN {
+        return Err(eyre!(
+            "node-local network id {network_id} is too long for a VRF device name"
+        ));
+    }
+    Ok(name)
+}
+
+/// Egress device names for a node-local network: `(veth in the VRF, nat in the main domain)`.
+fn node_vrf_egress_names(network_id: &str) -> (String, String) {
+    (format!("veth{network_id}"), format!("nat{network_id}"))
+}
+
+/// Addresses of the egress link (`/31`, RFC 3021): `(nat side, veth side)`.
+fn node_vrf_egress_addresses() -> (Ipv4Addr, Ipv4Addr) {
+    (
+        Ipv4Addr::new(169, 254, 255, 0),
+        Ipv4Addr::new(169, 254, 255, 1),
+    )
+}
+
+/// nft comment identifying a node-local network's masquerade rule.
+fn node_vrf_nat_comment(network_id: &str) -> String {
+    format!("odorobo node-vrf NAT {network_id}")
+}
+
+/// The NAT device sees traffic the main table has no route back for.
+fn write_egress_sysctls(nat_name: &str) -> Result<(), Report> {
+    write_sysctl(&format!("net/ipv4/conf/{nat_name}/rp_filter"), "0")
 }
 
 async fn read_node_id() -> Result<String, Report> {
@@ -732,6 +791,7 @@ impl NetworkAgentActor {
         }
         let realized = match network.provider {
             NetworkProvider::Routed => Realized::Routed(self.realize_routed(&network).await?),
+            NetworkProvider::NodeVrf => Realized::Routed(self.realize_node_vrf(&network).await?),
             NetworkProvider::Bridged => {
                 Realized::Bridged(self.realize_bridged(actor_ref, &network).await?)
             }
@@ -754,7 +814,7 @@ impl NetworkAgentActor {
         Ok(())
     }
 
-    /// Re-realizes a routed network under a newly assigned VNI.
+    /// Re-realizes a routed network after its desired state changed.
     async fn reassign_vni(&mut self, network: &Network) -> Result<(), Report> {
         let Some(entry) = self.networks.remove(&network.id) else {
             return Err(eyre!("network {:?} is not realized", network.id));
@@ -769,11 +829,19 @@ impl NetworkAgentActor {
         for member in &state.members {
             Self::detach_tap(&self.netlink_handle, &member.tap_name).await?;
         }
-        if let Err(err) = self.delete_routed(state.vni).await {
+        let cleanup = match state.vni {
+            Some(vni) => self.delete_routed(vni).await,
+            None => self.delete_node_vrf(&network.id).await,
+        };
+        if let Err(err) = cleanup {
             warn!(network_id = %network.id, vrf = %state.vrf, ?err, "old vrf not fully removed; realizing the new vni anyway");
         }
 
-        let realized = Realized::Routed(self.realize_routed(network).await?);
+        let realized = if network.provider == NetworkProvider::NodeVrf {
+            Realized::Routed(self.realize_node_vrf(network).await?)
+        } else {
+            Realized::Routed(self.realize_routed(network).await?)
+        };
         self.networks.insert(
             network.id.clone(),
             NetworkEntry {
@@ -811,51 +879,110 @@ impl NetworkAgentActor {
         Ok(())
     }
 
-    async fn ensure_routed_unused(&self, vni: u32) -> Result<(), Report> {
+    /// Fails when a controller has members that are not ours, so deletes cannot
+    /// remove another network's device.
+    async fn ensure_controller_unused(
+        &self,
+        controller: &str,
+        allowed: &[String],
+        label: &str,
+    ) -> Result<(), Report> {
         let handle = &self.netlink_handle;
-        let vrf = lookup_link(handle, &format!("vrf{vni}")).await?;
-        if vrf
-            .as_ref()
-            .is_some_and(|link| vrf_table_id(link) != Some(routed_table_id(vni)))
-        {
-            return Err(eyre!("vrf{vni} uses a different routing table"));
-        }
-        let bridge = lookup_link(handle, &format!("vrfbr{vni}")).await?;
-        let vxlan = lookup_link(handle, &format!("vrfvx{vni}")).await?;
-        for (controller, allowed) in [
-            (vrf.as_ref(), bridge.as_ref()),
-            (bridge.as_ref(), vxlan.as_ref()),
-        ] {
-            let Some(controller) = controller else {
+        let Some(controller) = lookup_link(handle, controller).await? else {
+            return Ok(());
+        };
+        let mut links = handle.link().get().execute();
+        while let Some(link) = links.try_next().await? {
+            let attached = link.attributes.iter().any(|attribute| {
+                matches!(attribute, LinkAttribute::Controller(index) if *index == controller.header.index)
+            });
+            if !attached {
                 continue;
-            };
-            let mut links = handle.link().get().execute();
-            while let Some(link) = links.try_next().await? {
-                let attached = link.attributes.iter().any(|attribute| {
-                    matches!(attribute, LinkAttribute::Controller(index) if *index == controller.header.index)
-                });
-                if attached
-                    && allowed.is_none_or(|allowed| allowed.header.index != link.header.index)
-                {
-                    return Err(eyre!("network VNI {vni} still has attached interfaces"));
-                }
             }
+            let name = link
+                .attributes
+                .iter()
+                .find_map(|attribute| match attribute {
+                    LinkAttribute::IfName(name) => Some(name.as_str()),
+                    _ => None,
+                });
+            if name.is_some_and(|name| allowed.iter().any(|allowed| allowed == name)) {
+                continue;
+            }
+            return Err(eyre!("{label} still has attached interfaces"));
+        }
+        Ok(())
+    }
+
+    /// Fails when an existing VRF device is not the one this network owns.
+    async fn ensure_vrf_table(&self, vrf: &str, table_id: u32) -> Result<(), Report> {
+        if let Some(link) = lookup_link(&self.netlink_handle, vrf).await?
+            && vrf_table_id(&link) != Some(table_id)
+        {
+            return Err(eyre!(
+                "vrf device {vrf} does not use routing table {table_id}; remove it before retrying"
+            ));
         }
         Ok(())
     }
 
     /// Resolves owned devices by name so retries cannot delete a reused interface index.
     async fn delete_routed(&self, vni: u32) -> Result<(), Report> {
-        self.ensure_routed_unused(vni).await?;
-        let handle = &self.netlink_handle;
         let vrf = format!("vrf{vni}");
         let table_id = routed_table_id(vni);
+        let label = format!("network VNI {vni}");
+        self.ensure_vrf_table(&vrf, table_id).await?;
+        self.ensure_controller_unused(&vrf, &[format!("vrfbr{vni}")], &label)
+            .await?;
+        self.ensure_controller_unused(&format!("vrfbr{vni}"), &[format!("vrfvx{vni}")], &label)
+            .await?;
         let mut first_error = match &self.fabric {
             Some(fabric) => fabric.withdraw_network(&vrf, vni).await.err(),
             None => None,
         };
-        for name in [format!("vrfvx{vni}"), format!("vrfbr{vni}"), vrf.clone()] {
-            let link = match lookup_link(handle, &name).await {
+        if first_error.is_none() {
+            first_error = Self::delete_links(
+                &self.netlink_handle,
+                &[format!("vrfvx{vni}"), format!("vrfbr{vni}"), vrf.clone()],
+            )
+            .await;
+        }
+        if first_error.is_none() {
+            first_error = Self::delete_unreachable_defaults(&self.netlink_handle, table_id).await;
+        }
+        if let Some(fabric) = &self.fabric
+            && let Err(err) = fabric.forget_vrf(&vrf).await
+        {
+            error!(%vrf, ?err, "failed to remove the VRF from FRR");
+            first_error.get_or_insert(err);
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    /// Removes a node-local network: NAT rules, egress pair and VRF.
+    async fn delete_node_vrf(&self, network_id: &str) -> Result<(), Report> {
+        let vrf = node_vrf_name(network_id)?;
+        let (veth, nat) = node_vrf_egress_names(network_id);
+        let label = format!("node-local network {network_id}");
+        self.ensure_vrf_table(&vrf, NODE_VRF_TABLE).await?;
+        self.ensure_controller_unused(&vrf, &[veth.clone()], &label)
+            .await?;
+        let mut first_error = Self::remove_nat_rules(&node_vrf_nat_comment(network_id)).err();
+        if first_error.is_none() {
+            first_error = Self::delete_links(&self.netlink_handle, &[nat, veth, vrf]).await;
+        }
+        if first_error.is_none() {
+            first_error =
+                Self::delete_unreachable_defaults(&self.netlink_handle, NODE_VRF_TABLE).await;
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    /// Deletes links by name, tolerating devices that are already gone.
+    async fn delete_links(handle: &Handle, names: &[String]) -> Option<Report> {
+        let mut first_error = None;
+        for name in names {
+            let link = match lookup_link(handle, name).await {
                 Ok(Some(link)) => link,
                 Ok(None) => continue,
                 Err(err) => {
@@ -872,6 +999,12 @@ impl NetworkAgentActor {
                 Ok(()) => {}
             }
         }
+        first_error
+    }
+
+    /// Deletes a VRF's unreachable defaults, tolerating absent routes.
+    async fn delete_unreachable_defaults(handle: &Handle, table_id: u32) -> Option<Report> {
+        let mut first_error = None;
         for route in unreachable_defaults(table_id) {
             match handle.route().del(route).execute().await {
                 Err(NetlinkError::NetlinkError(err)) if err.raw_code() == -libc::ESRCH => {}
@@ -886,13 +1019,7 @@ impl NetworkAgentActor {
                 Ok(()) => {}
             }
         }
-        if let Some(fabric) = &self.fabric
-            && let Err(err) = fabric.forget_vrf(&vrf).await
-        {
-            error!(%vrf, ?err, "failed to remove the VRF from FRR");
-            first_error.get_or_insert(err);
-        }
-        first_error.map_or(Ok(()), Err)
+        first_error
     }
 
     async fn ensure_synced_network(
@@ -900,6 +1027,11 @@ impl NetworkAgentActor {
         actor_ref: &ActorRef<Self>,
         network: &Network,
     ) -> Result<(), Report> {
+        if network.provider == NetworkProvider::NodeVrf {
+            return Err(eyre!(
+                "node-local networks are configured on the node, not synced"
+            ));
+        }
         if let Some(vni) = network.vni() {
             let previous = self
                 .networks
@@ -967,21 +1099,27 @@ impl NetworkAgentActor {
         Ok(())
     }
 
+    /// Fails when a VRF member is neither one of our devices nor a TAP of this network.
     async fn ensure_taps_owned(
         &self,
         vrf_index: u32,
-        vni: u32,
+        label: &str,
+        allowed: &[String],
         network_id: &str,
     ) -> Result<(), Report> {
-        let bridge = format!("vrfbr{vni}");
         let mut links = self.netlink_handle.link().get().execute();
         while let Some(link) = links.try_next().await? {
             if !link.attributes.iter().any(|attribute| matches!(attribute, LinkAttribute::Controller(index) if *index == vrf_index)) {
                 continue;
             }
-            if link.attributes.iter().any(
-                |attribute| matches!(attribute, LinkAttribute::IfName(name) if *name == bridge),
-            ) {
+            let name = link
+                .attributes
+                .iter()
+                .find_map(|attribute| match attribute {
+                    LinkAttribute::IfName(name) => Some(name.as_str()),
+                    _ => None,
+                });
+            if name.is_some_and(|name| allowed.iter().any(|allowed| allowed == name)) {
                 continue;
             }
             let owned = link.attributes.iter().any(|attribute| {
@@ -995,7 +1133,7 @@ impl NetworkAgentActor {
                     && words.next().is_none()
             });
             if !owned {
-                return Err(eyre!("VNI {vni} has an interface owned by another network"));
+                return Err(eyre!("{label} has an interface owned by another network"));
             }
         }
         Ok(())
@@ -1013,8 +1151,13 @@ impl NetworkAgentActor {
                     "vrf device {vrf} does not use routing table {table_id}; remove it before retrying"
                 ));
             }
-            self.ensure_taps_owned(link.header.index, vni, &network.id)
-                .await?;
+            self.ensure_taps_owned(
+                link.header.index,
+                &format!("VNI {vni}"),
+                &[format!("vrfbr{vni}")],
+                &network.id,
+            )
+            .await?;
         }
         let vrf_index = ensure_link(
             &self.netlink_handle,
@@ -1043,7 +1186,7 @@ impl NetworkAgentActor {
         let state = RoutedState {
             vrf,
             vrf_index,
-            vni,
+            vni: Some(vni),
             table_id,
             gateway: network.gateway(),
             mtu: network.mtu(),
@@ -1062,6 +1205,125 @@ impl NetworkAgentActor {
             "routed network realized"
         );
         Ok(state)
+    }
+
+    /// Realizes a node-local VRF: one VRF on this node, no VXLAN, nothing announced.
+    async fn realize_node_vrf(&self, network: &Network) -> Result<RoutedState, Report> {
+        let vrf = node_vrf_name(&network.id)?;
+        let table_id = NODE_VRF_TABLE;
+        if let Some(link) = lookup_link(&self.netlink_handle, &vrf).await? {
+            if vrf_table_id(&link) != Some(table_id) {
+                return Err(eyre!(
+                    "vrf device {vrf} does not use routing table {table_id}; remove it before retrying"
+                ));
+            }
+            let (veth, _) = node_vrf_egress_names(&network.id);
+            self.ensure_taps_owned(
+                link.header.index,
+                &format!("node-local network {}", network.id),
+                &[veth],
+                &network.id,
+            )
+            .await?;
+        }
+        let vrf_index = ensure_link(
+            &self.netlink_handle,
+            &vrf,
+            LinkVrf::new(&vrf, table_id).up().build(),
+        )
+        .await?;
+        ensure_unreachable_default(&self.netlink_handle, table_id).await?;
+        self.ensure_vrf_egress(network, &vrf, vrf_index).await?;
+
+        let state = RoutedState {
+            vrf,
+            vrf_index,
+            vni: None,
+            table_id,
+            gateway: network.gateway(),
+            mtu: network.mtu(),
+            l3vni: None,
+            members: Vec::new(),
+        };
+
+        info!(
+            network_id = %network.id,
+            vrf = %state.vrf,
+            table = table_id,
+            gateway = %state.gateway,
+            upstream = ?network.upstream,
+            "node-local network realized"
+        );
+        Ok(state)
+    }
+
+    /// Connects a node-local VRF to the host's routing domain and NATs it out.
+    async fn ensure_vrf_egress(
+        &self,
+        network: &Network,
+        vrf: &str,
+        vrf_index: u32,
+    ) -> Result<(), Report> {
+        let Some(upstream) = network.upstream.clone() else {
+            return Ok(());
+        };
+        let handle = &self.netlink_handle;
+        let (veth, nat) = node_vrf_egress_names(&network.id);
+        let (nat_address, veth_address) = node_vrf_egress_addresses();
+        let nat_index = ensure_link(handle, &nat, LinkVeth::new(&nat, &veth).up().build()).await?;
+        let veth_index = lookup_link(handle, &veth)
+            .await?
+            .ok_or_else(|| eyre!("veth peer {veth} was not found"))?
+            .header
+            .index;
+        // The peer joins the VRF; the NAT end stays in the host's main domain.
+        handle
+            .link()
+            .set(
+                LinkUnspec::new_with_index(veth_index)
+                    .controller(vrf_index)
+                    .up()
+                    .build(),
+            )
+            .execute()
+            .await
+            .wrap_err_with(|| format!("failed to enslave {veth} to {vrf}"))?;
+        ensure_address(handle, nat_index, &nat, nat_address, 31).await?;
+        ensure_address(handle, veth_index, &veth, veth_address, 31).await?;
+        Self::ensure_vrf_default_route(handle, veth_index, nat_address, NODE_VRF_TABLE).await?;
+        write_egress_sysctls(&nat)?;
+        Self::ensure_vrf_nat_rules(&nat, &upstream, &node_vrf_nat_comment(&network.id))?;
+
+        info!(
+            network_id = %network.id,
+            veth = %veth,
+            nat = %nat,
+            upstream = %upstream,
+            "node-local egress ready"
+        );
+        Ok(())
+    }
+
+    /// Points a node-local VRF's default route at the veth peer in the host domain.
+    async fn ensure_vrf_default_route(
+        handle: &Handle,
+        veth_index: u32,
+        nat_address: Ipv4Addr,
+        table_id: u32,
+    ) -> Result<(), Report> {
+        let route = RouteMessageBuilder::<Ipv4Addr>::new()
+            .table_id(table_id)
+            .output_interface(veth_index)
+            .gateway(nat_address)
+            .destination_prefix(Ipv4Addr::UNSPECIFIED, 0)
+            .build();
+        handle
+            .route()
+            .add(route)
+            .replace()
+            .execute()
+            .await
+            .wrap_err_with(|| format!("failed to add the default route to table {table_id}"))
     }
 
     async fn realize_bridged(
@@ -1135,13 +1397,17 @@ impl NetworkAgentActor {
             return Err(eyre!("network {id} still has attached NICs"));
         }
         // Keep the entry until cleanup succeeds so a failed removal can be retried.
-        if let Realized::Routed(state) = &entry.realized
-            && let Err(error) = self.delete_routed(state.vni).await
-        {
-            if let Some(entry) = self.networks.get_mut(id) {
-                entry.needs_rebuild = true;
+        if let Realized::Routed(state) = &entry.realized {
+            let cleanup = match state.vni {
+                Some(vni) => self.delete_routed(vni).await,
+                None => self.delete_node_vrf(&entry.network.id).await,
+            };
+            if let Err(error) = cleanup {
+                if let Some(entry) = self.networks.get_mut(id) {
+                    entry.needs_rebuild = true;
+                }
+                return Err(error);
             }
-            return Err(error);
         }
 
         let Some(entry) = self.networks.remove(id) else {
@@ -1156,7 +1422,7 @@ impl NetworkAgentActor {
                 info!(network_id = %id, bridge = %state.bridge, "removed bridged network");
             }
             Realized::Routed(state) => {
-                info!(network_id = %id, vrf = %state.vrf, "removed routed network");
+                info!(network_id = %id, vrf = %state.vrf, vni = ?state.vni, "removed routed network");
             }
         }
 
@@ -1473,6 +1739,95 @@ impl NetworkAgentActor {
             handle: None,
             index: None,
             comment: Some("odorobo host-only NAT".into()),
+        }
+    }
+
+    /// Ensures a node-local VRF's masquerade rule, matched on both devices.
+    fn ensure_vrf_nat_rules(
+        nat_iface: &str,
+        upstream_iface: &str,
+        comment: &str,
+    ) -> Result<(), Report> {
+        let ruleset = get_current_ruleset().wrap_err("failed to fetch current nftables ruleset")?;
+        if Self::rules_in_chain(ruleset.objects.as_ref(), NFT_GUEST_NAT_CHAIN)
+            .any(|rule| rule.comment.as_deref() == Some(comment))
+        {
+            return Ok(());
+        }
+
+        Self::ensure_base_chain(
+            NFT_GUEST_NAT_CHAIN,
+            NfChainType::NAT,
+            NfHook::Postrouting,
+            GUEST_NAT_PRIORITY,
+        )?;
+
+        let mut batch = NftBatch::new();
+        batch.add(NfListObject::Rule(Self::vrf_masquerade_rule(
+            nat_iface,
+            upstream_iface,
+            comment,
+        )));
+        apply_ruleset(&batch.to_nftables())
+            .wrap_err_with(|| format!("failed to apply the nftables masquerade for {nat_iface}"))?;
+        info!(
+            nat = nat_iface,
+            upstream = upstream_iface,
+            "created node-local NAT rule"
+        );
+        Ok(())
+    }
+
+    /// Removes a node-local VRF's masquerade rules; absent rules are not an error.
+    fn remove_nat_rules(comment: &str) -> Result<(), Report> {
+        let ruleset = get_current_ruleset().wrap_err("failed to fetch nftables ruleset")?;
+        let mut batch = NftBatch::new();
+        let mut removed = 0u32;
+        for rule in Self::rules_in_chain(ruleset.objects.as_ref(), NFT_GUEST_NAT_CHAIN) {
+            if rule.comment.as_deref() == Some(comment) && Self::delete_nft_rule(&mut batch, rule) {
+                removed = removed.saturating_add(1);
+            }
+        }
+        if removed == 0 {
+            return Ok(());
+        }
+        apply_ruleset(&batch.to_nftables())
+            .wrap_err_with(|| format!("failed to remove nftables rules for {comment}"))?;
+        info!(comment, removed, "removed node-local NAT rules");
+        Ok(())
+    }
+
+    /// Builds the masquerade rule for a node-local VRF's host-side device.
+    fn vrf_masquerade_rule(
+        nat_iface: &str,
+        upstream_iface: &str,
+        comment: &str,
+    ) -> NftRule<'static> {
+        NftRule {
+            family: NfFamily::IP,
+            table: NFT_TABLE.into(),
+            chain: NFT_GUEST_NAT_CHAIN.into(),
+            expr: vec![
+                Statement::Match(NftMatch {
+                    left: Expression::Named(NamedExpression::Meta(Meta {
+                        key: MetaKey::Iifname,
+                    })),
+                    right: Expression::String(nat_iface.to_owned().into()),
+                    op: Operator::EQ,
+                }),
+                Statement::Match(NftMatch {
+                    left: Expression::Named(NamedExpression::Meta(Meta {
+                        key: MetaKey::Oifname,
+                    })),
+                    right: Expression::String(upstream_iface.to_owned().into()),
+                    op: Operator::EQ,
+                }),
+                Statement::Masquerade(None),
+            ]
+            .into(),
+            handle: None,
+            index: None,
+            comment: Some(comment.to_owned().into()),
         }
     }
 
@@ -2030,7 +2385,7 @@ impl Message<ReconcileFabric> for NetworkAgentActor {
             .networks
             .values()
             .filter_map(|entry| match &entry.realized {
-                Realized::Routed(state) => Some((state.vrf.as_str(), state.vni)),
+                Realized::Routed(state) => state.vni.map(|vni| (state.vrf.as_str(), vni)),
                 Realized::Bridged(_) => None,
             })
             .collect();
@@ -2164,7 +2519,10 @@ mod tests {
                 )
                 .await?,
             );
-            actor.delete_routed(state.vni).await?;
+            let Some(vni) = state.vni else {
+                return Err(eyre!("routed network without a vni"));
+            };
+            actor.delete_routed(vni).await?;
             assert!(lookup_link(handle, &state.vrf).await?.is_none());
             assert_eq!(
                 routes_in_table(handle, state.table_id).await?,
@@ -2310,6 +2668,40 @@ mod tests {
         assert_eq!(network.bridge.as_deref(), Some("vmbr1"));
         assert!(network.dhcp.is_none());
         assert!(network.upstream.is_none());
+    }
+
+    #[test]
+    fn legacy_network_maps_node_vrf_mode() {
+        let config = NetworkConfig {
+            dhcp_config: None,
+            network_mode: Some(NetworkMode::NodeVrf {
+                subnet: "192.168.10.0/24".parse().unwrap(),
+                gateway: None,
+                mtu: Some(1400),
+                upstream_iface: Some("enp4s0".to_owned()),
+            }),
+            evpn: None,
+        };
+
+        let network = legacy_network(&config).expect("a legacy network");
+        network.validate().unwrap();
+        assert_eq!(network.provider, NetworkProvider::NodeVrf);
+        assert_eq!(network.id, LEGACY_NETWORK_ID);
+        assert_eq!(
+            network.gateway(),
+            "192.168.10.1".parse::<Ipv4Addr>().unwrap()
+        );
+        assert_eq!(network.mtu(), 1400);
+        assert_eq!(network.upstream.as_deref(), Some("enp4s0"));
+        assert!(network.bridge.is_none());
+        assert!(network.dhcp.is_none());
+    }
+
+    #[test]
+    fn node_vrf_name_fits_the_interface_limit() {
+        assert_eq!(node_vrf_name(LEGACY_NETWORK_ID).unwrap(), "vrfdefault");
+        let too_long = "a".repeat(MAX_IFNAME_LEN);
+        assert!(node_vrf_name(&too_long).is_err());
     }
 
     #[test]

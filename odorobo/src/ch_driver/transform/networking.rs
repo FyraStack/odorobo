@@ -36,7 +36,7 @@ pub struct NetworkTransform;
 const NETWORK_URI_PREFIX: &str = "net://";
 const TAP_PREFIX: &str = "vmtap";
 /// Interface names are limited to `IFNAMSIZ`, including the terminating NUL byte.
-const MAX_IFNAME_LEN: usize = 15;
+pub(crate) const MAX_IFNAME_LEN: usize = 15;
 /// Hex digits of the digest that fit after [`TAP_PREFIX`] within [`MAX_IFNAME_LEN`].
 const TAP_HASH_DIGITS: usize = MAX_IFNAME_LEN - TAP_PREFIX.len() - 1;
 

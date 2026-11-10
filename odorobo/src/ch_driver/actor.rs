@@ -1113,7 +1113,7 @@ async fn resolve_nics(vmid: ulid::Ulid, manifest: Option<&VmManifest>) -> Result
             return Err(eyre!("network {} is not defined on this node", nic.id));
         };
         let plan = match network.provider {
-            NetworkProvider::Routed => {
+            NetworkProvider::Routed | NetworkProvider::NodeVrf => {
                 let address = nic.address.ok_or_else(|| {
                     eyre!(
                         "network {} is routed; NIC {} needs a static address",

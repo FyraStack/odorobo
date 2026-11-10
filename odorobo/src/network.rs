@@ -27,7 +27,11 @@ const RESERVED_VNI_RANGE: RangeInclusive<u32> = 253..=255;
 #[serde(rename_all = "snake_case")]
 pub enum NetworkProvider {
     /// One VRF per network; the gateway lives on every VM TAP, no bridging.
+    /// Routed networks are cluster-wide: the manager assigns a VNI and agents
+    /// announce the network over EVPN.
     Routed,
+    /// One VRF on this node only; no VXLAN, no EVPN, never synced.
+    NodeVrf,
     /// One host bridge per network with dnsmasq DHCP and optional NAT.
     Bridged,
 }
@@ -157,8 +161,33 @@ impl Network {
 
         match self.provider {
             NetworkProvider::Routed => self.validate_routed(),
+            NetworkProvider::NodeVrf => self.validate_node_vrf(),
             NetworkProvider::Bridged => self.validate_bridged(),
         }
+    }
+
+    fn validate_node_vrf(&self) -> Result<(), NetworkError> {
+        if self.state.is_some() {
+            return Err(NetworkError::NodeVrfTakesNoState {
+                id: self.id.clone(),
+            });
+        }
+        if self.bridge.is_some() {
+            return Err(NetworkError::NodeVrfTakesNoBridge {
+                id: self.id.clone(),
+            });
+        }
+        if self.dhcp.is_some() {
+            return Err(NetworkError::NodeVrfTakesNoDhcp {
+                id: self.id.clone(),
+            });
+        }
+        if self.upstream.as_deref().is_some_and(str::is_empty) {
+            return Err(NetworkError::EmptyUpstream {
+                id: self.id.clone(),
+            });
+        }
+        Ok(())
     }
 
     fn validate_routed(&self) -> Result<(), NetworkError> {
@@ -305,6 +334,12 @@ pub enum NetworkError {
     RoutedTakesNoDhcp { id: String },
     #[error("network {id:?}: routed networks do not take an upstream")]
     RoutedTakesNoUpstream { id: String },
+    #[error("network {id:?}: node-local networks do not take runtime state")]
+    NodeVrfTakesNoState { id: String },
+    #[error("network {id:?}: node-local networks do not take a bridge")]
+    NodeVrfTakesNoBridge { id: String },
+    #[error("network {id:?}: node-local networks do not take dhcp")]
+    NodeVrfTakesNoDhcp { id: String },
     #[error("network {id:?}: bridged networks do not take runtime state")]
     BridgedTakesNoState { id: String },
     #[error("network {id:?}: bridged networks require a bridge")]
@@ -414,6 +449,38 @@ mod tests {
         assert!(matches!(
             expect_invalid(&network),
             NetworkError::InvalidVni { vni: 253, .. }
+        ));
+    }
+
+    #[test]
+    fn node_vrf_network_takes_no_state_bridge_or_dhcp() {
+        let mut network = routed();
+        network.provider = NetworkProvider::NodeVrf;
+        network.state = None;
+        network.validate().unwrap();
+
+        network.state = Some(NetworkState { vni: 1001 });
+        assert!(matches!(
+            expect_invalid(&network),
+            NetworkError::NodeVrfTakesNoState { .. }
+        ));
+
+        network.state = None;
+        network.bridge = Some("vmbr0".to_owned());
+        assert!(matches!(
+            expect_invalid(&network),
+            NetworkError::NodeVrfTakesNoBridge { .. }
+        ));
+
+        network.bridge = None;
+        network.dhcp = Some(DhcpPool {
+            start: "10.40.10.100".parse().unwrap(),
+            end: "10.40.10.200".parse().unwrap(),
+            lease_time: "12h".to_owned(),
+        });
+        assert!(matches!(
+            expect_invalid(&network),
+            NetworkError::NodeVrfTakesNoDhcp { .. }
         ));
     }
 

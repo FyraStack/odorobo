@@ -125,6 +125,12 @@ impl SchedulerActor {
     /// Rejects a create that cannot be applied as requested.
     fn admit_network(&self, network: &Network) -> Result<(), String> {
         network.validate().map_err(|error| error.to_string())?;
+        if network.provider == NetworkProvider::NodeVrf {
+            return Err(format!(
+                "network {} is node-local; configure it in config.json on the node",
+                network.id
+            ));
+        }
         if self.networks.contains_key(&network.id) {
             return Err(format!("network {} already exists", network.id));
         }

@@ -113,6 +113,23 @@ pub enum NetworkMode {
         subnet: Ipv4Net,
         gateway: Ipv4Addr,
     },
+    /// Node-local routed network.
+    ///
+    /// One VRF on this node with the gateway on every guest TAP and each guest
+    /// keeping its own address. Nothing is announced to the EVPN fabric, and
+    /// guests need a static address (there is no DHCP).
+    NodeVrf {
+        subnet: Ipv4Net,
+        /// Defaults to the first host address of `subnet`.
+        #[serde(default)]
+        gateway: Option<Ipv4Addr>,
+        #[serde(default)]
+        mtu: Option<u16>,
+        /// Masquerade guest traffic onto this interface; without it the
+        /// network only routes between its own guests and the host.
+        #[serde(default)]
+        upstream_iface: Option<String>,
+    },
 }
 
 impl Default for NetworkMode {

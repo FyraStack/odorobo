@@ -93,9 +93,33 @@ network at all.
 }
 ```
 
+`NodeVrf` creates a minimal node-only VRF. Guests get static addresses
+and reach each other and the host through the VRF; `ip vrf exec vrfdefault …` is how you talk to them
+from the host. `upstream_iface` is opt-in and NATs egress through the host, scoped to that interface:
+
+```json
+{
+  "datacenter": "dc1",
+  "region": "r1",
+  "network": {
+    "network_mode": {
+      "NodeVrf": {
+        "subnet": "192.168.10.0/24",
+        "gateway": "192.168.10.1",
+        "upstream_iface": "eth0"
+      }
+    }
+  }
+}
+```
+
+Nothing about a `NodeVrf` network reaches the fabric: there is no VNI, no VXLAN device and no
+advertisement, and it never appears in `GET /networks` — the API creates cluster-wide `routed`
+networks only. Its VRF device is `vrfdefault` (the id is always `default`).
+
 | Key | Meaning |
 |---|---|
-| `network.network_mode` | optional; the node-local `default` network: `HostonlyNat` (private bridge, NAT out `upstream_iface`, which defaults to the default-route interface) or `Bridged` (operator-managed bridge with an uplink; `bridge`, `subnet`, `gateway`). Without it, the node only realizes networks created through the API |
+| `network.network_mode` | optional; the node-local `default` network: `HostonlyNat` (private bridge, NAT out `upstream_iface`, which defaults to the default-route interface), `Bridged` (operator-managed bridge with an uplink; `bridge`, `subnet`, `gateway`), or `NodeVrf` (one routed VRF on this node, static guest addresses, no DHCP, nothing announced; `subnet`, optional `gateway`, `mtu`, optional `upstream_iface` for host NAT egress). Without it, the node only realizes networks created through the API |
 | `network.dhcp_config` | optional dnsmasq pool on that bridge; needs `network_mode` |
 | `network.evpn.underlay` | the fabric's underlay CIDR; the node's one local address inside it becomes its VTEP. Without `evpn`, routed networks stay node-local VRFs with no VXLAN devices |
 | `network.evpn.asn` | BGP autonomous system of the fabric, default `65000`. Every node uses the same value |
