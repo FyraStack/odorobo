@@ -288,7 +288,7 @@ fn node_vrf_egress_names(network_id: &str) -> (String, String) {
 }
 
 /// Addresses of the egress link (`/31`, RFC 3021): `(nat side, veth side)`.
-fn node_vrf_egress_addresses() -> (Ipv4Addr, Ipv4Addr) {
+const fn node_vrf_egress_addresses() -> (Ipv4Addr, Ipv4Addr) {
     (
         Ipv4Addr::new(169, 254, 255, 0),
         Ipv4Addr::new(169, 254, 255, 1),
@@ -965,7 +965,7 @@ impl NetworkAgentActor {
         let (veth, nat) = node_vrf_egress_names(network_id);
         let label = format!("node-local network {network_id}");
         self.ensure_vrf_table(&vrf, NODE_VRF_TABLE).await?;
-        self.ensure_controller_unused(&vrf, &[veth.clone()], &label)
+        self.ensure_controller_unused(&vrf, std::slice::from_ref(&veth), &label)
             .await?;
         let mut first_error = Self::remove_nat_rules(&node_vrf_nat_comment(network_id)).err();
         if first_error.is_none() {
@@ -2701,7 +2701,13 @@ mod tests {
     fn node_vrf_name_fits_the_interface_limit() {
         assert_eq!(node_vrf_name(LEGACY_NETWORK_ID).unwrap(), "vrfdefault");
         let too_long = "a".repeat(MAX_IFNAME_LEN);
-        assert!(node_vrf_name(&too_long).is_err());
+        let error = node_vrf_name(&too_long)
+            .expect_err("a too-long node-local network id must not fit a VRF device name");
+        assert!(
+            error
+                .to_string()
+                .contains("is too long for a VRF device name")
+        );
     }
 
     #[test]
