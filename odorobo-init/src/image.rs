@@ -25,6 +25,27 @@ struct OdoroboOptions {
     stdin: bool,
     #[serde(default)]
     rootfs: Option<RootfsOptions>,
+    #[serde(default)]
+    network: Vec<NicOptions>,
+    #[serde(default)]
+    hostname: Option<String>,
+}
+
+/// Static interface configuration the guest init applies itself, one entry per
+/// NIC whose addressing the host already knows.
+#[derive(Debug, Clone, Deserialize)]
+pub struct NicOptions {
+    /// MAC address that identifies the interface.
+    pub mac: String,
+    /// Addresses with prefixes, `10.40.10.7/24`.
+    #[serde(default)]
+    pub addresses: Vec<String>,
+    /// Default route gateway.
+    #[serde(default)]
+    pub gateway: Option<String>,
+    /// Interface MTU.
+    #[serde(default)]
+    pub mtu: Option<u32>,
 }
 
 /// Writable-layer contract for the guest root, sent for ephemeral roots.
@@ -61,6 +82,16 @@ impl ImageConfigDocument {
     /// Whether the workload's stdin is attached to the workload console.
     pub const fn stdin(&self) -> bool {
         self.odorobo.stdin
+    }
+
+    /// Static interface configuration for the guest.
+    pub fn network(&self) -> &[NicOptions] {
+        &self.odorobo.network
+    }
+
+    /// UTS hostname the workload should see, when the host set one.
+    pub fn hostname(&self) -> Option<&str> {
+        self.odorobo.hostname.as_deref()
     }
 
     /// Bytes of tmpfs the guest must provide as the ephemeral root's writable
@@ -164,5 +195,24 @@ mod tests {
 
         let plain = ImageConfigDocument::parse(br#"{"config":{}}"#).unwrap();
         assert_eq!(plain.tmpfs_upper_bytes(), None);
+    }
+
+    #[test]
+    fn reads_static_network_configuration() {
+        let document = ImageConfigDocument::parse(
+            br#"{"config":{"Cmd":["/bin/x"]},"odorobo":{"hostname":"01M6YGFHMJFFX6KA8QNEF6GCJ4","network":[{"mac":"46:59:52:67:67:6b","addresses":["10.40.10.7/24"],"gateway":"10.40.10.1","mtu":1450}]}}"#,
+        )
+        .unwrap();
+        let network = document.network();
+        assert_eq!(network.len(), 1);
+        assert_eq!(network[0].mac, "46:59:52:67:67:6b");
+        assert_eq!(network[0].addresses, ["10.40.10.7/24"]);
+        assert_eq!(network[0].gateway.as_deref(), Some("10.40.10.1"));
+        assert_eq!(network[0].mtu, Some(1450));
+        assert_eq!(document.hostname(), Some("01M6YGFHMJFFX6KA8QNEF6GCJ4"));
+
+        let plain = ImageConfigDocument::parse(br#"{"config":{}}"#).unwrap();
+        assert!(plain.network().is_empty());
+        assert_eq!(plain.hostname(), None);
     }
 }

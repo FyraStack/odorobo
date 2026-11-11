@@ -36,7 +36,7 @@ use std::sync::Arc;
 use serde_json::json;
 use stable_eyre::{
     Result,
-    eyre::{WrapErr, bail, eyre},
+    eyre::{WrapErr, bail},
 };
 
 use crate::config::Config;
@@ -140,6 +140,20 @@ pub(super) struct GuestLaunchOptions {
     pub entrypoint: Option<Vec<String>>,
     /// Replace the image's command; an empty list clears it.
     pub cmd: Option<Vec<String>>,
+    /// Static NIC configuration the guest init applies itself.
+    pub network: Vec<GuestNicOptions>,
+    /// UTS hostname the guest init sets before starting the workload.
+    pub hostname: Option<String>,
+}
+
+/// One NIC's static configuration, matched in the guest by MAC address.
+#[derive(Debug, Clone)]
+pub struct GuestNicOptions {
+    pub mac_address: String,
+    pub address: std::net::Ipv4Addr,
+    pub prefix_len: u8,
+    pub gateway: std::net::Ipv4Addr,
+    pub mtu: Option<u16>,
 }
 
 /// The guest-visible config document: the image's OCI config plus the launch
@@ -152,14 +166,16 @@ pub(super) fn guest_config_document(
         && options.ephemeral_upper_bytes.is_none()
         && options.entrypoint.is_none()
         && options.cmd.is_none()
+        && options.network.is_empty()
+        && options.hostname.is_none()
     {
         return Ok(config.to_vec());
     }
     let mut document: serde_json::Value =
         serde_json::from_slice(config).wrap_err("parsing the imported OCI config document")?;
-    let object = document
-        .as_object_mut()
-        .ok_or_else(|| eyre!("the imported OCI config document is not a JSON object"))?;
+    let Some(object) = document.as_object_mut() else {
+        bail!("the imported OCI config document is not a JSON object");
+    };
     if options.entrypoint.is_some() || options.cmd.is_some() {
         let config_value = object
             .entry("config")
@@ -186,6 +202,42 @@ pub(super) fn guest_config_document(
         odorobo.insert(
             "rootfs".to_owned(),
             json!({ "mode": "ephemeral", "tmpfs_upper_bytes": bytes }),
+        );
+    }
+    if !options.network.is_empty() {
+        odorobo.insert(
+            "network".to_owned(),
+            serde_json::Value::Array(
+                options
+                    .network
+                    .iter()
+                    .map(|nic| {
+                        let mut entry = serde_json::Map::new();
+                        entry.insert(
+                            "mac".to_owned(),
+                            serde_json::Value::String(nic.mac_address.clone()),
+                        );
+                        entry.insert(
+                            "addresses".to_owned(),
+                            json!([format!("{}/{}", nic.address, nic.prefix_len)]),
+                        );
+                        entry.insert(
+                            "gateway".to_owned(),
+                            serde_json::Value::String(nic.gateway.to_string()),
+                        );
+                        if let Some(mtu) = nic.mtu {
+                            entry.insert("mtu".to_owned(), json!(mtu));
+                        }
+                        serde_json::Value::Object(entry)
+                    })
+                    .collect(),
+            ),
+        );
+    }
+    if let Some(hostname) = &options.hostname {
+        odorobo.insert(
+            "hostname".to_owned(),
+            serde_json::Value::String(hostname.clone()),
         );
     }
     if !odorobo.is_empty() {
@@ -329,5 +381,38 @@ mod tests {
         std::fs::write(dir.join("partial"), b"partial").unwrap();
         drop(RemovePathOnDrop::new(dir.to_path_buf()));
         assert!(!dir.exists());
+    }
+
+    #[test]
+    fn guest_config_document_carries_static_network_configuration() {
+        let image = br#"{"config":{"Entrypoint":["/bin/sh"]}}"#;
+        let options = GuestLaunchOptions {
+            network: vec![GuestNicOptions {
+                mac_address: "46:59:52:67:67:6b".to_owned(),
+                address: "10.40.10.7".parse().unwrap(),
+                prefix_len: 24,
+                gateway: "10.40.10.1".parse().unwrap(),
+                mtu: Some(1450),
+            }],
+            hostname: Some("01M6YGFHMJFFX6KA8QNEF6GCJ4".to_owned()),
+            ..GuestLaunchOptions::default()
+        };
+        let document: serde_json::Value =
+            serde_json::from_slice(&guest_config_document(image, &options).unwrap()).unwrap();
+        assert_eq!(
+            document["odorobo"]["hostname"],
+            "01M6YGFHMJFFX6KA8QNEF6GCJ4"
+        );
+        assert_eq!(
+            document["odorobo"]["network"][0]["mac"],
+            "46:59:52:67:67:6b"
+        );
+        assert_eq!(
+            document["odorobo"]["network"][0]["addresses"][0],
+            "10.40.10.7/24"
+        );
+        assert_eq!(document["odorobo"]["network"][0]["gateway"], "10.40.10.1");
+        assert_eq!(document["odorobo"]["network"][0]["mtu"], 1450);
+        assert_eq!(document["config"]["Entrypoint"][0], "/bin/sh");
     }
 }

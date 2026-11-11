@@ -61,10 +61,27 @@ pub struct DhcpConfig {
     pub lease_time: String,
 }
 
+const fn default_evpn_asn() -> u32 {
+    65_000
+}
+
+/// EVPN fabric membership for routed networks.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct EvpnConfig {
+    /// Underlay network; this node's VTEP is its one local address inside it.
+    pub underlay: Ipv4Net,
+    /// BGP autonomous system shared by the fabric.
+    #[serde(default = "default_evpn_asn")]
+    pub asn: u32,
+}
+
 #[derive(Serialize, Deserialize, Default, Clone, Debug)]
 pub struct NetworkConfig {
     pub dhcp_config: Option<DhcpConfig>,
-    pub network_mode: NetworkMode,
+    /// The node-local `default` network; without it the node only has API-created networks.
+    pub network_mode: Option<NetworkMode>,
+    /// Without it, routed networks stay node-local VRFs.
+    pub evpn: Option<EvpnConfig>,
 }
 
 /// L3 routing configuration for guests
@@ -95,6 +112,23 @@ pub enum NetworkMode {
         bridge: String,
         subnet: Ipv4Net,
         gateway: Ipv4Addr,
+    },
+    /// Node-local routed network.
+    ///
+    /// One VRF on this node with the gateway on every guest TAP and each guest
+    /// keeping its own address. Nothing is announced to the EVPN fabric, and
+    /// guests need a static address (there is no DHCP).
+    NodeVrf {
+        subnet: Ipv4Net,
+        /// Defaults to the first host address of `subnet`.
+        #[serde(default)]
+        gateway: Option<Ipv4Addr>,
+        #[serde(default)]
+        mtu: Option<u16>,
+        /// Masquerade guest traffic onto this interface; without it the
+        /// network only routes between its own guests and the host.
+        #[serde(default)]
+        upstream_iface: Option<String>,
     },
 }
 
@@ -235,12 +269,13 @@ mod tests {
                     subnet: Ipv4Net::new(Ipv4Addr::new(10, 10, 1, 0), 24).unwrap(),
                     lease_time: "12h".to_owned(),
                 }),
-                network_mode: NetworkMode::HostonlyNat {
+                network_mode: Some(NetworkMode::HostonlyNat {
                     bridge: "vmbr0".to_owned(),
                     gateway: Ipv4Addr::new(10, 10, 100, 1),
                     subnet: Ipv4Net::new(Ipv4Addr::new(10, 10, 100, 0), 24).unwrap(),
                     upstream_iface: "test0".to_owned(),
-                },
+                }),
+                evpn: None,
             },
             ..Default::default()
         };
@@ -248,5 +283,14 @@ mod tests {
         let json = serde_json::to_string_pretty(&config).unwrap();
         // assert_eq!(json, )
         println!("{json}");
+    }
+
+    #[test]
+    fn network_config_parses_without_a_legacy_network() {
+        let network: NetworkConfig =
+            serde_json::from_str(r#"{"evpn":{"underlay":"10.77.0.0/24"}}"#).unwrap();
+        assert!(network.network_mode.is_none());
+        assert!(network.dhcp_config.is_none());
+        assert_eq!(network.evpn.unwrap().asn, 65_000);
     }
 }

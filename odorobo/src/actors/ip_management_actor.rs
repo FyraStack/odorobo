@@ -1,9 +1,7 @@
 use kameo::prelude::*;
 use stable_eyre::{Report, Result};
 
-// idk if we ever agreed upon an OUI for fyra, but im reserving `FYR` for this
-// -cappy
-pub const FYRA_OUI: [u8; 3] = [0x46, 0x59, 0x52];
+use crate::manifest::FYRA_OUI;
 
 /// Calculates a MAC address for a given IP address using the FYRA OUI prefix.
 ///

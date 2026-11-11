@@ -1,4 +1,8 @@
 use crate::messages::agent::{CollectRepositoryGarbage, RepositoryGcReply};
+use crate::messages::network::{
+    CreateNetwork, CreateNetworkReply, DeleteNetwork, DeleteNetworkReply, GetNetwork,
+    GetNetworkReply, ListNetworks, ListNetworksReply,
+};
 use crate::messages::vm::{
     AgentListVMs, AgentListVMsReply, CreateVM, CreateVMReply, DeleteVM, DeleteVMReply,
     GetConsoleHistory, GetConsoleHistoryReply, GetVMInfo, GetVMInfoReply, GetWorkloadLogs,
@@ -165,5 +169,69 @@ impl Message<CollectRepositoryGarbage> for HTTPActor {
             .await
             .map_err(|err| eyre!(err.to_string()))
             .wrap_err("failed to collect repository garbage via scheduler")
+    }
+}
+
+impl Message<CreateNetwork> for HTTPActor {
+    type Reply = Result<CreateNetworkReply, Report>;
+
+    async fn handle(
+        &mut self,
+        msg: CreateNetwork,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.scheduler
+            .ask(msg)
+            .await
+            .map_err(|err| eyre!(err.to_string()))
+            .wrap_err("failed to create network via scheduler")
+    }
+}
+
+impl Message<DeleteNetwork> for HTTPActor {
+    type Reply = Result<DeleteNetworkReply, Report>;
+
+    async fn handle(
+        &mut self,
+        msg: DeleteNetwork,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.scheduler
+            .ask(msg)
+            .await
+            .map_err(|err| eyre!(err.to_string()))
+            .wrap_err("failed to delete network via scheduler")
+    }
+}
+
+impl Message<GetNetwork> for HTTPActor {
+    type Reply = Result<GetNetworkReply, Report>;
+
+    async fn handle(
+        &mut self,
+        msg: GetNetwork,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.scheduler
+            .ask(msg)
+            .await
+            .map_err(|err| eyre!(err.to_string()))
+            .wrap_err("failed to get network via scheduler")
+    }
+}
+
+impl Message<ListNetworks> for HTTPActor {
+    type Reply = Result<ListNetworksReply, Report>;
+
+    async fn handle(
+        &mut self,
+        msg: ListNetworks,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.scheduler
+            .ask(msg)
+            .await
+            .map_err(|err| eyre!(err.to_string()))
+            .wrap_err("failed to list networks via scheduler")
     }
 }

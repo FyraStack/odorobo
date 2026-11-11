@@ -4,10 +4,11 @@
 //! The manifest is the provider-neutral desired state exchanged with Odorobo;
 //! provider-specific configuration is produced by the driver.
 
-use std::{collections::BTreeMap, collections::BTreeSet, path::Path};
+use std::{collections::BTreeMap, collections::BTreeSet, hash::Hasher, path::Path};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::Error as DeError};
+use siphasher::sip::SipHasher13;
 use thiserror::Error;
 use tracing::trace;
 use ulid::Ulid;
@@ -20,6 +21,9 @@ use crate::ports::PortMapping;
 /// driver may translate one manifest version into a different provider API
 /// shape, while callers continue to exchange the same Odorobo-level intent.
 pub const MANIFEST_VERSION: u32 = 1;
+
+/// Locally administered unicast prefix (`FYR`) of the guest MACs odorobo derives.
+pub const FYRA_OUI: [u8; 3] = [0x46, 0x59, 0x52];
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ManifestError {
@@ -48,8 +52,6 @@ pub enum ManifestError {
     NetworkWithoutId(usize),
     #[error("network {0} publishes ports, which requires an OCI rootfs")]
     PortForwardingRequiresRootfs(usize),
-    #[error("network {0} publishes ports but has no mac_address")]
-    PortForwardingWithoutMac(usize),
     #[error("host port {0} is published more than once")]
     DuplicatePublishedPort(u16),
     #[error("cloud-init user-data and meta-data must be supplied together")]
@@ -140,7 +142,7 @@ pub struct DesiredState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rootfs: Option<Rootfs>,
     #[serde(default)]
-    pub networks: Vec<Network>,
+    pub networks: Vec<Nic>,
     #[serde(default)]
     pub placement: Placement,
     pub boot: Boot,
@@ -305,27 +307,24 @@ impl DesiredState {
     fn validate_networks(&self) -> Result<(), ManifestError> {
         trace!(networks = self.networks.len(), "validating networks");
         let mut published_ports = BTreeSet::new();
-        for (index, network) in self.networks.iter().enumerate() {
+        for (index, nic) in self.networks.iter().enumerate() {
             trace!(
                 index,
-                id = %network.id,
-                ports = network.ports.len(),
-                mac = network.mac_address.is_some(),
+                id = %nic.id,
+                ports = nic.ports.len(),
+                mac = nic.mac_address.is_some(),
                 "validating network"
             );
-            if network.id.trim().is_empty() {
+            if nic.id.trim().is_empty() {
                 return Err(ManifestError::NetworkWithoutId(index));
             }
-            if network.ports.is_empty() {
+            if nic.ports.is_empty() {
                 continue;
             }
             if self.rootfs.is_none() {
                 return Err(ManifestError::PortForwardingRequiresRootfs(index));
             }
-            if network.mac_address.is_none() {
-                return Err(ManifestError::PortForwardingWithoutMac(index));
-            }
-            for port in &network.ports {
+            for port in &nic.ports {
                 if !published_ports.insert((port.protocol, port.host)) {
                     return Err(ManifestError::DuplicatePublishedPort(port.host));
                 }
@@ -461,14 +460,40 @@ pub enum RootfsMode {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct Network {
+pub struct Nic {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mac_address: Option<String>,
+    /// Static guest address for routed networks; allocated by the control plane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<String>")]
+    pub address: Option<std::net::Ipv4Addr>,
     /// Published ports for OCI-mode VMs, in `<host>:<guest>[/udp]` form.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(with = "Vec<String>")]
     pub ports: Vec<PortMapping>,
+}
+
+impl Nic {
+    /// Returns the requested guest MAC, else a stable one derived from the VM and network ids.
+    #[must_use]
+    pub fn mac(&self, vmid: Ulid) -> String {
+        self.mac_address
+            .clone()
+            .unwrap_or_else(|| derived_mac(vmid, &self.id))
+    }
+}
+
+fn derived_mac(vmid: Ulid, network_id: &str) -> String {
+    // Explicit bytes, not `Hash`: the fixed-width VM id keeps the input prefix-free.
+    let mut hasher = SipHasher13::new();
+    hasher.write(&vmid.to_bytes());
+    hasher.write(network_id.as_bytes());
+    let digest = hasher.finish().to_le_bytes();
+    let mut mac = [0_u8; 6];
+    mac[..3].copy_from_slice(&FYRA_OUI);
+    mac[3..].copy_from_slice(&digest[..3]);
+    mac.map(|byte| format!("{byte:02x}")).join(":")
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -859,9 +884,10 @@ mod tests {
     #[test]
     fn validates_published_ports() {
         let mut manifest = minimal_manifest();
-        manifest.desired.networks.push(Network {
+        manifest.desired.networks.push(Nic {
             id: "private".to_owned(),
             mac_address: Some("02:00:00:00:00:01".to_owned()),
+            address: None,
             ports: vec!["8080:80".parse().expect("valid mapping")],
         });
         assert_eq!(
@@ -896,16 +922,36 @@ mod tests {
         manifest.desired.networks[0]
             .ports
             .push("8080:80".parse().expect("valid mapping"));
-        assert_eq!(
-            manifest.validate(),
-            Err(ManifestError::PortForwardingWithoutMac(0))
-        );
+        assert_eq!(manifest.validate(), Ok(()));
+    }
+
+    #[test]
+    fn nic_without_a_mac_gets_a_stable_locally_administered_one() {
+        let vmid = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("valid ulid");
+        let other_vmid = Ulid::from_string("01KPB9AMVWXC2D1PF4W6E7MHWT").expect("valid ulid");
+        let nic = |id: &str| Nic {
+            id: id.to_owned(),
+            ..Default::default()
+        };
+
+        let mac = nic("vmnet1").mac(vmid);
+        assert_eq!(mac, nic("vmnet1").mac(vmid));
+        assert!(mac.starts_with("46:59:52:"));
+        assert_eq!(mac.len(), 17);
+        assert_ne!(mac, nic("vmnet2").mac(vmid));
+        assert_ne!(mac, nic("vmnet1").mac(other_vmid));
+
+        let requested = Nic {
+            mac_address: Some("02:00:00:00:00:01".to_owned()),
+            ..nic("vmnet1")
+        };
+        assert_eq!(requested.mac(vmid), "02:00:00:00:00:01");
     }
 
     #[test]
     fn rejects_invalid_network_and_cloud_init() {
         let mut manifest = minimal_manifest();
-        manifest.desired.networks.push(Network {
+        manifest.desired.networks.push(Nic {
             id: "  ".to_owned(),
             ..Default::default()
         });

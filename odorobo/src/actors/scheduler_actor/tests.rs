@@ -329,6 +329,7 @@ fn vm_cleanup_unplaces_vm_without_another_discovered_actor() {
     let vm_actor_id = super::ActorId::new(2);
     let vmid = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("valid ulid");
     let mut scheduler = SchedulerActor {
+        network_sync: super::network_sync::NetworkSync::default(),
         agent_data_cache: AHashMap::new(),
         agent_keepalive_tasks: AHashMap::new(),
         vm_actorid_ulid_map: AHashMap::from([(vm_actor_id, vmid)]),
@@ -350,6 +351,7 @@ fn vm_cleanup_unplaces_vm_without_another_discovered_actor() {
         agent_vm_index: AHashMap::new(),
         actor_kinds: AHashMap::new(),
         cache_actor_finder: None,
+        networks: AHashMap::new(),
     };
 
     scheduler.cleanup_vm_actor(vm_actor_id);
@@ -416,6 +418,7 @@ fn explicit_stop_removes_vm_intent_and_actor_mapping() {
     let vm_actor_id = super::ActorId::new(2);
     let agent_id = super::ActorId::new(1);
     let mut scheduler = SchedulerActor {
+        network_sync: super::network_sync::NetworkSync::default(),
         agent_data_cache: AHashMap::new(),
         agent_keepalive_tasks: AHashMap::new(),
         vm_actorid_ulid_map: AHashMap::from([(vm_actor_id, vmid)]),
@@ -429,6 +432,7 @@ fn explicit_stop_removes_vm_intent_and_actor_mapping() {
         agent_vm_index: AHashMap::from([(agent_id, AHashSet::from([vmid]))]),
         actor_kinds: AHashMap::new(),
         cache_actor_finder: None,
+        networks: AHashMap::new(),
     };
 
     scheduler.suppress_vm_intent(vmid);
@@ -457,6 +461,7 @@ fn agent_cleanup_does_not_remove_unrelated_vm_state() {
     let placement_agent_id = super::ActorId::new(3);
     let vmid = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("valid ulid");
     let mut scheduler = SchedulerActor {
+        network_sync: super::network_sync::NetworkSync::default(),
         agent_data_cache: AHashMap::new(),
         agent_keepalive_tasks: AHashMap::new(),
         vm_actorid_ulid_map: AHashMap::from([(vm_actor_id, vmid)]),
@@ -478,6 +483,7 @@ fn agent_cleanup_does_not_remove_unrelated_vm_state() {
         agent_vm_index: AHashMap::new(),
         actor_kinds: AHashMap::from([(agent_id, CachedActorKind::Agent)]),
         cache_actor_finder: None,
+        networks: AHashMap::new(),
     };
 
     scheduler.cleanup_agent_actor(agent_id);
@@ -494,6 +500,7 @@ fn vm_cleanup_does_not_remove_unrelated_agent_state() {
     let vm_actor_id = super::ActorId::new(2);
     let vmid = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("valid ulid");
     let mut scheduler = SchedulerActor {
+        network_sync: super::network_sync::NetworkSync::default(),
         agent_data_cache: AHashMap::new(),
         agent_keepalive_tasks: AHashMap::new(),
         vm_actorid_ulid_map: AHashMap::from([(vm_actor_id, vmid)]),
@@ -507,6 +514,7 @@ fn vm_cleanup_does_not_remove_unrelated_agent_state() {
         agent_vm_index: AHashMap::new(),
         actor_kinds: AHashMap::from([(agent_id, CachedActorKind::Agent)]),
         cache_actor_finder: None,
+        networks: AHashMap::new(),
     };
 
     scheduler.cleanup_vm_actor(vm_actor_id);

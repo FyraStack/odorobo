@@ -29,7 +29,7 @@ Odorobo will automatically detect the `net://` scheme and transform it before VM
   "net": [
     {
       "id": "devnet",
-      "tap": "vmtap-7mhwt-vnet",
+      "tap": "vmtap-b5f37edc6",
       "mac": "46:59:52:67:67:67"
     }
   ]
@@ -40,10 +40,9 @@ The transformed `tap` field gives Cloud Hypervisor a known host-side TAP name to
 
 The TAP name is deterministic per `(vmid, network_id)` pair and is generated using the following rules:
 
-- The TAP name format is `vmtap-<vmid-suffix>-<network-id-suffix>`.
-- Linux interface names are limited in length, so Odorobo truncates both the VM ID and network ID components to fit within the interface name limit.
-- Odorobo keeps the **suffix** of the VM ID rather than the prefix, because ULID prefixes are timestamp-derived and less useful for uniqueness when many VMs are created close together.
-- The network ID is sanitized to a conservative Linux-interface-safe character set.
+- The TAP name format is `vmtap-<digest>`, a stable SipHash of the `(vmid, network_id)` pair.
+- Linux interface names are limited in length, so the digest is truncated to fit; readable id suffixes would collide when two ids differ only at the end.
+- The readable provenance is not part of the name: the agent stamps the interface alias `odorobo <vmid> <network-id>` when it attaches the NIC.
 - Network IDs may only contain ASCII alphanumeric characters, `_`, and `-`.
 
 This transform currently only rewrites the VM configuration.
@@ -84,7 +83,7 @@ On startup the network actor does the following, in order:
 3. Creates an nftables table `ip odorobo` with a `guest_nat` postrouting chain and a rule `oifname "<upstream>" masquerade`. The rule matches all traffic leaving the upstream interface, not only traffic from the guest subnet.
 4. Starts `dnsmasq --interface <bridge> --bind-interfaces --dhcp-range ... --dhcp-leasefile <runtime>/dnsmasq.leases --no-daemon` as a child process when `dhcp_config` is set. `dnsmasq` also serves DNS on the gateway address, and its DHCP log lines appear in the agent's journal. The lease file is recreated on every agent start.
 
-When a VM boots, the transform names its TAP device `vmtap-<vmid suffix>-<network suffix>`. Cloud Hypervisor creates the TAP, then the after-boot hook enslaves it to the bridge and brings it up. The before-stop hook detaches it.
+When a VM boots, the transform names its TAP device `vmtap-<digest>` (a stable hash of the VM and network ids). Cloud Hypervisor creates the TAP up; the agent brings it down, enslaves it to the bridge, and only then brings it back up, so it never forwards before it is configured. The before-stop hook brings it down and detaches it.
 
 The agent does **not** enable `net.ipv4.ip_forward`, and it adds no forwarding or input firewall rules. The host must forward IPv4 itself (`sysctl -w net.ipv4.ip_forward=1`), and any host firewall must accept traffic from the bridge.
 
@@ -121,7 +120,7 @@ Add the network to the manifest. The ID becomes the TAP name suffix and may cont
 "networks": [{ "id": "devnet", "mac_address": "46:59:52:67:67:67" }]
 ```
 
-Omit `mac_address` unless you need a fixed address. Two VMs on the same bridge with the same MAC receive the same lease and conflict.
+Without `mac_address` the agent derives one from the VM and network IDs: `46:59:52` followed by three digest bytes. It stays the same across restarts, so the guest keeps its DHCP lease. Set `mac_address` to choose the MAC yourself; two VMs on the same bridge with the same MAC receive the same lease and conflict.
 
 ### Guest configuration
 
@@ -135,19 +134,18 @@ The console then shows `IP-Config: Got DHCP answer from 10.10.100.1`, with the g
 
 ### Publishing container ports
 
-OCI-mode VMs can publish guest ports on the host. Add `ports` to a network that already has a `mac_address`; entries use `<host>:<guest>` with an optional `/udp` suffix.
+OCI-mode VMs can publish guest ports on the host. Add `ports` to a network; entries use `<host>:<guest>` with an optional `/udp` suffix.
 
 ```json
 "networks": [
   {
     "id": "devnet",
-    "mac_address": "46:59:52:67:67:67",
     "ports": ["8080:80", "5353:53/udp"]
   }
 ]
 ```
 
-Publishing only applies to VMs with a `rootfs`; a plain VM manifest that sets `ports` is rejected, as is a network without a MAC or a host port published twice for the same protocol. The same host port may be used by TCP and UDP independently.
+Publishing only applies to VMs with a `rootfs`; a plain VM manifest that sets `ports` is rejected, as is a host port published twice for the same protocol. The same host port may be used by TCP and UDP independently.
 
 After the VM boots, the agent starts a background task that polls the dnsmasq lease file for the VM's MAC, then adds DNAT rules to a `container_dnat` prerouting chain (`priority -100`) in the `ip odorobo` table. Publishing gives up after 15 seconds and logs a warning; the VM keeps running. Rules are tagged `odorobo container <vmid> <mapping>` and are removed when the VM stops, even if its TAP already disappeared. Rules left behind by a killed agent are cleared at startup.
 
@@ -187,7 +185,7 @@ At the moment, the `net://` transformer is intentionally conservative:
 
 - It only interprets `net://<network_id>` in the network device `id` field.
 - It does not currently resolve arbitrary remote or provider-backed virtual networks.
-- It does not currently create a higher-level virtual network inventory or multi-tenant network object model.
+- It does not currently create a higher-level virtual network inventory or multi-tenant network object model. The design for that model lives in `docs/vm-networking.md`.
 - It relies on deterministic TAP naming instead of Cloud Hypervisor runtime TAP discovery, because Cloud Hypervisor does not reliably reflect auto-generated TAP device names back into VM info after boot.
 
 This makes the current networking integration a practical first step: Odorobo can transform user-friendly network references into stable Cloud Hypervisor network config while keeping host-side naming deterministic and debuggable.

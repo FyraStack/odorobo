@@ -10,6 +10,7 @@ use crate::{
             STATUS_CHANGE_HISTORY_LIMIT, StatusChangeHistory,
         },
         debug::PanicAgent,
+        network::{EnsureNetwork, EnsureNetworkReply, RemoveNetwork, RemoveNetworkReply},
         vm::{
             AgentListVMs, AgentListVMsReply, CreateVM, CreateVMReply, DeleteVM, DeleteVMReply,
             GetVMInfo, GetVMInfoReply, MigrateVMReceive, MigrateVMReceiveReply, ShutdownVM,
@@ -105,8 +106,14 @@ impl Actor for AgentActor {
         info!(?peer_id, "Agent Actor started!");
 
         // spawn networking actor
-        let network_actor: ActorRef<NetworkAgentActor> =
-            NetworkAgentActor::spawn_link(&actor_ref, args.network.clone()).await;
+        let network_actor: ActorRef<NetworkAgentActor> = NetworkAgentActor::spawn_link(
+            &actor_ref,
+            (
+                args.network.clone(),
+                crate::ch_driver::instance::VMInstance::configured_runtime_root(),
+            ),
+        )
+        .await;
         network_actor.register(NETWORK).await?;
 
         let sys = System::new_all();
@@ -583,5 +590,69 @@ impl Message<GetAgentStatus> for AgentActor {
             used_vcpus,
             used_ram,
         }
+    }
+}
+
+/// Applies a network object's desired state on this agent's network actor.
+#[remote_message]
+impl Message<EnsureNetwork> for AgentActor {
+    type Reply = EnsureNetworkReply;
+
+    async fn handle(
+        &mut self,
+        msg: EnsureNetwork,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let actor_ref = match ActorRef::<NetworkAgentActor>::lookup(NETWORK).await {
+            Ok(Some(actor_ref)) => actor_ref,
+            Ok(None) => {
+                return EnsureNetworkReply {
+                    error: Some("network actor is not running".to_owned()),
+                };
+            }
+            Err(err) => {
+                return EnsureNetworkReply {
+                    error: Some(err.to_string()),
+                };
+            }
+        };
+        actor_ref
+            .ask(msg)
+            .await
+            .unwrap_or_else(|err| EnsureNetworkReply {
+                error: Some(err.to_string()),
+            })
+    }
+}
+
+/// Removes a network object from this agent's network actor.
+#[remote_message]
+impl Message<RemoveNetwork> for AgentActor {
+    type Reply = RemoveNetworkReply;
+
+    async fn handle(
+        &mut self,
+        msg: RemoveNetwork,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let actor_ref = match ActorRef::<NetworkAgentActor>::lookup(NETWORK).await {
+            Ok(Some(actor_ref)) => actor_ref,
+            Ok(None) => {
+                return RemoveNetworkReply {
+                    error: Some("network actor is not running".to_owned()),
+                };
+            }
+            Err(err) => {
+                return RemoveNetworkReply {
+                    error: Some(err.to_string()),
+                };
+            }
+        };
+        actor_ref
+            .ask(msg)
+            .await
+            .unwrap_or_else(|err| RemoveNetworkReply {
+                error: Some(err.to_string()),
+            })
     }
 }

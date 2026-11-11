@@ -18,6 +18,9 @@ use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::Subscribe
 #[aide(output)]
 pub enum OdoroboError {
     #[error("{0}")]
+    #[api_error(status_code = 400, message = "{0}")]
+    BadRequest(String),
+    #[error("{0}")]
     #[api_error(status_code = 404, message = "{0}")]
     NotFound(String),
     #[error("{0}")]

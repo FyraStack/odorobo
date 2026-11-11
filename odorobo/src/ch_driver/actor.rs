@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, sync::Arc};
+use std::{collections::VecDeque, net::Ipv4Addr, sync::Arc};
 
 use crate::messages::vm::{
     DeleteVM, DeleteVMReply, GetConsoleHistory, GetConsoleHistoryReply, GetVMHeartbeat,
@@ -11,15 +11,22 @@ use crate::{
         VMInstance,
         containers::{PreparedRootfs, VirtioFsSupervisor, VirtiofsdSpec},
         manifest::to_vm_config,
-        transform::{ConsoleTransform, TransformChain},
+        transform::{ConsoleTransform, TransformChain, networking::deterministic_tap_name},
     },
     manifest::VmManifest,
-    networking::{actor::NetworkAgentActor, messages::PublishPorts},
+    network::NetworkProvider,
+    networking::{
+        actor::NetworkAgentActor,
+        messages::{AttachNic, LookupNetwork, PublishPorts},
+    },
 };
 use cloud_hypervisor_client::models::VmConfig;
 use kameo::prelude::*;
 use serde::{Deserialize, Serialize};
-use stable_eyre::{Report, Result, eyre::eyre};
+use stable_eyre::{
+    Report, Result,
+    eyre::{WrapErr, eyre},
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{UnixStream, unix::OwnedWriteHalf},
@@ -1054,13 +1061,10 @@ async fn publish_ports(vmid: ulid::Ulid, manifest: &VmManifest) {
         if network.ports.is_empty() {
             continue;
         }
-        let Some(mac_address) = network.mac_address.as_deref() else {
-            continue;
-        };
         if let Err(err) = actor
             .ask(PublishPorts {
                 vmid,
-                mac_address: mac_address.to_owned(),
+                mac_address: network.mac(manifest.id),
                 ports: network.ports.clone(),
             })
             .await
@@ -1068,6 +1072,173 @@ async fn publish_ports(vmid: ulid::Ulid, manifest: &VmManifest) {
             warn!(%vmid, network = %network.id, ?err, "failed to request port publishing");
         }
     }
+}
+
+/// Resolved NIC attachment plan for one manifest NIC.
+struct NicPlan {
+    network_id: String,
+    tap_name: String,
+    mac_address: String,
+    address: Option<Ipv4Addr>,
+    gateway: Option<Ipv4Addr>,
+    netmask: Option<Ipv4Addr>,
+    mtu: Option<u16>,
+}
+
+/// Resolves manifest NICs against the agent's network objects.
+///
+/// Fails the start for unknown networks, routed NICs without an address, and
+/// bridged NICs that carry one.
+async fn resolve_nics(vmid: ulid::Ulid, manifest: Option<&VmManifest>) -> Result<Vec<NicPlan>> {
+    let Some(manifest) = manifest else {
+        return Ok(Vec::new());
+    };
+    if manifest.desired.networks.is_empty() {
+        return Ok(Vec::new());
+    }
+    let actor = ActorRef::<NetworkAgentActor>::lookup("network_actor")
+        .await
+        .map_err(|err| eyre!(err))?
+        .ok_or_else(|| eyre!("network actor is not running; VM networks cannot be resolved"))?;
+    let mut plans = Vec::with_capacity(manifest.desired.networks.len());
+    for nic in &manifest.desired.networks {
+        let reply = actor
+            .ask(LookupNetwork { id: nic.id.clone() })
+            .await
+            .map_err(|err| eyre!(err))?;
+        let Some(network) = reply.network else {
+            return Err(eyre!("network {} is not defined on this node", nic.id));
+        };
+        let plan = match network.provider {
+            NetworkProvider::Routed | NetworkProvider::NodeVrf => {
+                let address = nic.address.ok_or_else(|| {
+                    eyre!(
+                        "network {} is routed; NIC {} needs a static address",
+                        network.id,
+                        nic.id
+                    )
+                })?;
+                NicPlan {
+                    network_id: network.id.clone(),
+                    tap_name: deterministic_tap_name(&vmid.to_string(), &network.id),
+                    mac_address: nic.mac(manifest.id),
+                    address: Some(address),
+                    gateway: Some(network.gateway()),
+                    netmask: Some(network.subnet.netmask()),
+                    mtu: Some(network.mtu()),
+                }
+            }
+            NetworkProvider::Bridged => {
+                if nic.address.is_some() {
+                    return Err(eyre!(
+                        "network {} is bridged; NIC {} cannot carry a static address",
+                        network.id,
+                        nic.id
+                    ));
+                }
+                NicPlan {
+                    network_id: network.id.clone(),
+                    tap_name: deterministic_tap_name(&vmid.to_string(), &network.id),
+                    mac_address: nic.mac(manifest.id),
+                    address: None,
+                    gateway: None,
+                    netmask: None,
+                    mtu: None,
+                }
+            }
+        };
+        plans.push(plan);
+    }
+    Ok(plans)
+}
+
+/// Guest-side NIC configuration for the config document.
+fn guest_nic_options(
+    plans: &[NicPlan],
+) -> Result<Vec<crate::ch_driver::containers::GuestNicOptions>> {
+    let mut options = Vec::new();
+    for plan in plans {
+        let (Some(address), Some(gateway), Some(netmask)) =
+            (plan.address, plan.gateway, plan.netmask)
+        else {
+            continue;
+        };
+        let prefix_len = u8::try_from(u32::from(netmask).count_ones())
+            .map_err(|_| eyre!("netmask {netmask} has more bits than a prefix can hold"))?;
+        options.push(crate::ch_driver::containers::GuestNicOptions {
+            mac_address: plan.mac_address.clone(),
+            address,
+            prefix_len,
+            gateway,
+            mtu: plan.mtu,
+        });
+    }
+    Ok(options)
+}
+
+/// Sets the guest's static network on the kernel command line.
+///
+/// An OCI VM's init applies the config document itself, so its cmdline only
+/// keeps `ip=dhcp` for NICs without a static address; a disk VM has no init and
+/// gets the addresses as `ip=` tokens.
+fn apply_nic_cmdline(config: &mut VmConfig, plans: &[NicPlan], guest_configures_nics: bool) {
+    if config.payload.kernel.is_none() {
+        return;
+    }
+    let has_address = plans.iter().any(|plan| plan.address.is_some());
+    if !guest_configures_nics && !has_address {
+        return;
+    }
+    let cmdline = config
+        .payload
+        .cmdline
+        .clone()
+        .unwrap_or_else(|| crate::ch_driver::containers::DEFAULT_ROOTFS_CMDLINE.to_owned());
+    let mut tokens = cmdline
+        .split_whitespace()
+        .filter(|token| !token.starts_with("ip="))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if guest_configures_nics {
+        // Keep DHCP for any NIC the config document does not address.
+        if plans.iter().any(|plan| plan.address.is_none()) {
+            tokens.push("ip=dhcp".to_owned());
+        }
+    } else {
+        for (index, plan) in plans.iter().enumerate() {
+            if let (Some(address), Some(gateway), Some(netmask)) =
+                (plan.address, plan.gateway, plan.netmask)
+            {
+                tokens.push(format!("ip={address}::{gateway}:{netmask}::eth{index}:off"));
+            }
+        }
+    }
+    config.payload.cmdline = Some(tokens.join(" "));
+}
+
+/// Configures the TAP devices Cloud Hypervisor created during boot.
+async fn attach_nics(vmid: ulid::Ulid, plans: &[NicPlan]) -> Result<()> {
+    if plans.is_empty() {
+        return Ok(());
+    }
+    let actor = ActorRef::<NetworkAgentActor>::lookup("network_actor")
+        .await
+        .map_err(|err| eyre!(err))?
+        .ok_or_else(|| eyre!("network actor is not running; VM NICs were not configured"))?;
+    for plan in plans {
+        actor
+            .ask(AttachNic {
+                vmid,
+                network_id: plan.network_id.clone(),
+                tap_name: plan.tap_name.clone(),
+                mac_address: plan.mac_address.clone(),
+                address: plan.address,
+            })
+            .await
+            .map_err(|err| eyre!(err))
+            .wrap_err_with(|| format!("failed to attach NIC on network {}", plan.network_id))?;
+    }
+    Ok(())
 }
 
 impl VMActor {
@@ -1097,6 +1268,7 @@ impl VMActor {
         vmid: ulid::Ulid,
         rootfs: &crate::manifest::Rootfs,
         image: Option<crate::ch_driver::containers::PreparedImage>,
+        network: &[crate::ch_driver::containers::GuestNicOptions],
     ) -> Result<()> {
         let virtiofs = &mut self.virtiofs;
         let rootfs_mount = &mut self.rootfs_mount;
@@ -1113,6 +1285,7 @@ impl VMActor {
             &vmid.to_string(),
             rootfs,
             &image,
+            network,
             rootfs_mount,
         )
         .await?;
@@ -1162,7 +1335,16 @@ impl VMActor {
         let boot = vm_config
             .as_ref()
             .is_some_and(|manifest| manifest.desired.boot.start);
-        let vm_config_for_ch = vm_config.as_ref().map(to_vm_config).transpose()?;
+        let mut vm_config_for_ch = vm_config.as_ref().map(to_vm_config).transpose()?;
+        // Resolve NICs against the agent's network objects before anything is
+        // created so unknown networks fail the start before any teardown work.
+        let nic_plan = resolve_nics(vmid, vm_config.as_ref()).await?;
+        let guest_configures_nics = vm_config
+            .as_ref()
+            .is_some_and(|manifest| manifest.desired.rootfs.is_some());
+        if let Some(config) = vm_config_for_ch.as_mut() {
+            apply_nic_cmdline(config, &nic_plan, guest_configures_nics);
+        }
 
         // OCI rootfs (issue #112): the composefs mount and the supervised
         // virtiofsd processes must exist BEFORE Cloud Hypervisor creates the
@@ -1170,7 +1352,8 @@ impl VMActor {
         if let Some(manifest) = &vm_config
             && let Some(rootfs) = &manifest.desired.rootfs
         {
-            self.start_rootfs(vmid, rootfs, image).await?;
+            let nic_network = guest_nic_options(&nic_plan)?;
+            self.start_rootfs(vmid, rootfs, image, &nic_network).await?;
         }
 
         let virtiofs = &mut self.virtiofs;
@@ -1231,6 +1414,9 @@ impl VMActor {
 
         if boot && let Some(manifest) = &vm_config {
             self.vm_instance.boot().await?;
+            // Cloud Hypervisor creates the TAPs while booting; configure them
+            // before the guest's virtio-net driver can transmit.
+            attach_nics(vmid, &nic_plan).await?;
             publish_ports(vmid, manifest).await;
         }
 
