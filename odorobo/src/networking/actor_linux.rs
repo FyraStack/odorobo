@@ -38,7 +38,7 @@ use rtnetlink::packet_route::{
         AfSpecInet6, AfSpecUnspec, In6AddrGenMode, InfoData, InfoVrf, LinkAttribute, LinkInfo,
         LinkMessage,
     },
-    route::{RouteMessage, RouteScope, RouteType},
+    route::{RouteAddress, RouteAttribute, RouteMessage, RouteScope, RouteType},
 };
 use rtnetlink::{
     Error as NetlinkError, Handle, LinkBridge, LinkBridgePort, LinkMessageBuilder, LinkUnspec,
@@ -863,6 +863,8 @@ impl NetworkAgentActor {
 
     /// Detaches one tap, tolerating a tap that is already gone.
     async fn detach_tap(handle: &Handle, tap_name: &str) -> Result<(), Report> {
+        // Down first: the guard only comes off while the tap cannot transmit.
+        Self::set_link_down(handle, tap_name).await?;
         Self::remove_antispoof_rules(tap_name)?;
         if let Some(tap) = lookup_link(handle, tap_name).await? {
             handle
@@ -1495,15 +1497,20 @@ impl NetworkAgentActor {
             .ok_or_else(|| eyre!("tap {} not found", msg.tap_name))?;
         let tap_index = tap.header.index;
 
+        // Quiesce first: the hypervisor created the tap up, before its guard.
+        Self::set_link_down(handle, &msg.tap_name).await?;
         Self::configure_tap(handle, tap_index, msg, state.vrf_index, Some(state.mtu))
             .await
             .wrap_err_with(|| {
                 format!("failed to attach tap {} to vrf {}", msg.tap_name, state.vrf)
             })?;
         ensure_address(handle, tap_index, &msg.tap_name, state.gateway, 32).await?;
-        Self::add_vm_route(handle, tap_index, &msg.tap_name, address, state.table_id).await?;
         write_tap_sysctls(&msg.tap_name)?;
         Self::ensure_antispoof_rule(&msg.tap_name, address)?;
+        // The guard is in place; only now may the TAP transmit.
+        Self::set_link_up(handle, &msg.tap_name).await?;
+        // The kernel refuses a nexthop route while its device is down.
+        Self::add_vm_route(handle, tap_index, &msg.tap_name, address, state.table_id).await?;
         Ok(())
     }
 
@@ -1519,6 +1526,7 @@ impl NetworkAgentActor {
             .await?
             .ok_or_else(|| eyre!("tap {} not found", msg.tap_name))?;
 
+        Self::set_link_down(handle, &msg.tap_name).await?;
         Self::configure_tap(handle, tap.header.index, msg, bridge.header.index, None)
             .await
             .wrap_err_with(|| {
@@ -1527,9 +1535,11 @@ impl NetworkAgentActor {
                     msg.tap_name, state.bridge
                 )
             })?;
+        Self::set_link_up(handle, &msg.tap_name).await?;
         Ok(())
     }
 
+    /// Sets the TAP alias, controller and MTU; the caller brings it up last.
     async fn configure_tap(
         handle: &Handle,
         tap_index: u32,
@@ -1539,14 +1549,43 @@ impl NetworkAgentActor {
     ) -> Result<(), NetlinkError> {
         let mut link = LinkUnspec::new_with_index(tap_index)
             .alias(format!("odorobo {} {}", msg.vmid, msg.network_id))
-            .controller(controller_index)
-            .up();
+            .controller(controller_index);
         if let Some(mtu) = mtu {
             link = link.mtu(u32::from(mtu));
         }
         handle.link().set(link.build()).execute().await
     }
 
+    /// Brings a TAP down; a TAP that is already gone counts as quiesced.
+    async fn set_link_down(handle: &Handle, tap_name: &str) -> Result<(), Report> {
+        if let Some(tap) = lookup_link(handle, tap_name).await? {
+            handle
+                .link()
+                .set(LinkUnspec::new_with_index(tap.header.index).down().build())
+                .execute()
+                .await
+                .wrap_err_with(|| format!("failed to bring tap {tap_name} down"))?;
+        }
+        Ok(())
+    }
+
+    /// Brings a configured TAP up; the caller does this only once its guard exists.
+    async fn set_link_up(handle: &Handle, tap_name: &str) -> Result<(), Report> {
+        let tap = lookup_link(handle, tap_name)
+            .await?
+            .ok_or_else(|| eyre!("tap {tap_name} vanished before it could be brought up"))?;
+        handle
+            .link()
+            .set(LinkUnspec::new_with_index(tap.header.index).up().build())
+            .execute()
+            .await
+            .wrap_err_with(|| format!("failed to bring tap {tap_name} up"))
+    }
+
+    /// Adds the VM's `/32` to the network table.
+    ///
+    /// An identical route from an earlier attempt is accepted so a failed
+    /// attach can be retried; another tap claiming the address is not.
     async fn add_vm_route(
         handle: &Handle,
         tap_index: u32,
@@ -1554,22 +1593,76 @@ impl NetworkAgentActor {
         address: Ipv4Addr,
         table_id: u32,
     ) -> Result<(), Report> {
-        handle
-            .route()
-            .add(
-                RouteMessageBuilder::<Ipv4Addr>::new()
-                    .table_id(table_id)
-                    .output_interface(tap_index)
-                    .scope(RouteScope::Link)
-                    .destination_prefix(address, 32)
-                    .build(),
-            )
-            .execute()
-            .await
-            .wrap_err_with(|| {
+        let route = RouteMessageBuilder::<Ipv4Addr>::new()
+            .table_id(table_id)
+            .output_interface(tap_index)
+            .scope(RouteScope::Link)
+            .destination_prefix(address, 32)
+            .build();
+        match handle.route().add(route).execute().await {
+            Ok(()) => Ok(()),
+            Err(NetlinkError::NetlinkError(err)) if err.raw_code() == -libc::EEXIST => {
+                Self::accept_existing_vm_route(handle, tap_index, tap_name, address, table_id).await
+            }
+            Err(err) => Err(err).wrap_err_with(|| {
                 format!("failed to add route {address}/32 via tap {tap_name} to table {table_id}")
-            })?;
-        Ok(())
+            }),
+        }
+    }
+
+    /// Accepts an existing `/32` route only when it already points at the tap.
+    async fn accept_existing_vm_route(
+        handle: &Handle,
+        tap_index: u32,
+        tap_name: &str,
+        address: Ipv4Addr,
+        table_id: u32,
+    ) -> Result<(), Report> {
+        let mut stream = handle
+            .route()
+            .get(RouteMessageBuilder::<Ipv4Addr>::new().build())
+            .execute();
+        while let Some(route) = stream
+            .try_next()
+            .await
+            .wrap_err_with(|| format!("failed to inspect routes in table {table_id}"))?
+        {
+            if Self::route_table_id(&route) != table_id
+                || route.header.destination_prefix_length != 32
+                || !route.attributes.iter().any(|attribute| {
+                    matches!(
+                        attribute,
+                        RouteAttribute::Destination(RouteAddress::Inet(destination))
+                            if *destination == address
+                    )
+                })
+            {
+                continue;
+            }
+            if route.attributes.iter().any(
+                |attribute| matches!(attribute, RouteAttribute::Oif(index) if *index == tap_index),
+            ) {
+                return Ok(());
+            }
+            return Err(eyre!(
+                "address {address} is already routed in table {table_id} without tap {tap_name}"
+            ));
+        }
+        Err(eyre!(
+            "the kernel reported a route for {address} in table {table_id} but did not list one"
+        ))
+    }
+
+    /// Reads a route's table id; large ids live in `RTA_TABLE`, not the header.
+    fn route_table_id(route: &RouteMessage) -> u32 {
+        route
+            .attributes
+            .iter()
+            .find_map(|attribute| match attribute {
+                RouteAttribute::Table(table) => Some(*table),
+                _ => None,
+            })
+            .unwrap_or_else(|| u32::from(route.header.table))
     }
 
     async fn detach_nic(&mut self, msg: DetachNic) -> Result<(), Report> {
@@ -2425,7 +2518,6 @@ impl Message<Status> for NetworkAgentActor {
 mod tests {
     use super::*;
     use crate::network::{NetworkState, VNI_RANGE};
-    use rtnetlink::packet_route::route::RouteAttribute;
     use std::net::Ipv6Addr;
 
     async fn routes_in_table(handle: &Handle, table_id: u32) -> Result<Vec<RouteMessage>, Report> {
@@ -2436,15 +2528,7 @@ mod tests {
         ] {
             let mut stream = handle.route().get(query).execute();
             while let Some(route) = stream.try_next().await? {
-                let table = route
-                    .attributes
-                    .iter()
-                    .find_map(|attribute| match attribute {
-                        RouteAttribute::Table(table) => Some(*table),
-                        _ => None,
-                    })
-                    .unwrap_or_else(|| u32::from(route.header.table));
-                if table == table_id {
+                if NetworkAgentActor::route_table_id(&route) == table_id {
                     routes.push(route);
                 }
             }
@@ -2615,6 +2699,161 @@ mod tests {
         handle.link().del(tap.header.index).execute().await?;
         assert_eq!(restarted.ask(remove(4)).await?.error, None);
         restarted.stop_gracefully().await?;
+        netlink.abort();
+        _ = netlink.await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires root and an isolated network namespace"]
+    async fn detach_brings_the_tap_down_before_its_guard_comes_off() -> Result<(), Report> {
+        use rtnetlink::LinkDummy;
+        use rtnetlink::packet_route::link::LinkFlags;
+
+        let network = Network {
+            id: "tap-transition".to_owned(),
+            subnet: "10.40.12.0/24".parse()?,
+            gateway: None,
+            provider: NetworkProvider::Routed,
+            state: Some(NetworkState { vni: 1002 }),
+            mtu: None,
+            bridge: None,
+            dhcp: None,
+            upstream: None,
+        };
+        let ensure = SyncNetwork {
+            manager_id: ActorId::new(1),
+            revision: 1,
+            owners_revision: 1,
+            update: NetworkUpdate::Ensure(network.clone()),
+            active_owner: Some(network.clone()),
+        };
+        let actor = NetworkAgentActor::spawn((NetworkConfig::default(), PathBuf::new()));
+        assert_eq!(actor.ask(ensure).await?.error, None);
+
+        let (connection, handle, _) = rtnetlink::new_connection()?;
+        let netlink = tokio::spawn(connection);
+        // Cloud Hypervisor creates the TAP up while booting the VM.
+        let tap = "vmtap-trans";
+        handle
+            .link()
+            .add(LinkDummy::new(tap).up().build())
+            .execute()
+            .await?;
+        let tap_index = lookup_link(&handle, tap)
+            .await?
+            .ok_or_else(|| eyre!("test TAP disappeared"))?
+            .header
+            .index;
+        let vmid: Ulid = "01ARZ3NDEKTSV4RRFFQ69G5FAV".parse()?;
+        let address: Ipv4Addr = "10.40.12.6".parse()?;
+        actor
+            .ask(AttachNic {
+                vmid,
+                network_id: network.id.clone(),
+                tap_name: tap.to_owned(),
+                mac_address: None,
+                address: Some(address),
+            })
+            .await
+            .map_err(|error| eyre!("failed to send AttachNic: {error}"))?;
+
+        let attached = lookup_link(&handle, tap)
+            .await?
+            .ok_or_else(|| eyre!("test TAP disappeared"))?;
+        assert!(
+            attached.header.flags.contains(LinkFlags::Up),
+            "a successfully attached TAP must be up"
+        );
+        assert!(
+            attached
+                .attributes
+                .iter()
+                .any(|attribute| matches!(attribute, LinkAttribute::Controller(_))),
+            "a successfully attached TAP must be enslaved"
+        );
+
+        actor
+            .ask(DetachNic {
+                vmid,
+                tap_name: tap.to_owned(),
+            })
+            .await
+            .map_err(|error| eyre!("failed to send DetachNic: {error}"))?;
+        let detached = lookup_link(&handle, tap)
+            .await?
+            .ok_or_else(|| eyre!("test TAP disappeared"))?;
+        assert!(
+            !detached.header.flags.contains(LinkFlags::Up),
+            "a detached TAP must be down so it cannot send unguarded traffic"
+        );
+        assert!(
+            !detached
+                .attributes
+                .iter()
+                .any(|attribute| matches!(attribute, LinkAttribute::Controller(_))),
+            "a detached TAP must not stay enslaved"
+        );
+
+        let ruleset = get_current_ruleset().wrap_err("failed to read the nftables ruleset")?;
+        let guard = format!("odorobo antispoof {tap} {address}");
+        assert!(
+            !NetworkAgentActor::rules_in_chain(ruleset.objects.as_ref(), NFT_NIC_GUARD_CHAIN)
+                .any(|rule| rule.comment.as_deref() == Some(guard.as_str())),
+            "detach must remove the anti-spoof rule"
+        );
+
+        // A TAP that vanished before its detach is already quiesced.
+        NetworkAgentActor::detach_tap(&handle, "vmtap-vanished").await?;
+
+        handle.link().del(tap_index).execute().await?;
+        actor.stop_gracefully().await?;
+        netlink.abort();
+        _ = netlink.await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires root and an isolated network namespace"]
+    async fn vm_route_retry_only_accepts_the_tap_that_owns_it() -> Result<(), Report> {
+        use rtnetlink::LinkDummy;
+
+        let (connection, handle, _) = rtnetlink::new_connection()?;
+        let netlink = tokio::spawn(connection);
+        let first = "vmtap-route-a";
+        let second = "vmtap-route-b";
+        for tap in [first, second] {
+            // Up: the kernel refuses a nexthop route via a down device.
+            handle
+                .link()
+                .add(LinkDummy::new(tap).up().build())
+                .execute()
+                .await?;
+        }
+        let first_index = lookup_link(&handle, first)
+            .await?
+            .ok_or_else(|| eyre!("missing {first}"))?
+            .header
+            .index;
+        let second_index = lookup_link(&handle, second)
+            .await?
+            .ok_or_else(|| eyre!("missing {second}"))?
+            .header
+            .index;
+        let address: Ipv4Addr = "192.0.2.10".parse()?;
+        let table_id = 4_242;
+
+        NetworkAgentActor::add_vm_route(&handle, first_index, first, address, table_id).await?;
+        NetworkAgentActor::add_vm_route(&handle, first_index, first, address, table_id).await?;
+        assert!(
+            NetworkAgentActor::add_vm_route(&handle, second_index, second, address, table_id)
+                .await
+                .is_err(),
+            "a second TAP must not take over an address that is already routed"
+        );
+
+        handle.link().del(first_index).execute().await?;
+        handle.link().del(second_index).execute().await?;
         netlink.abort();
         _ = netlink.await;
         Ok(())

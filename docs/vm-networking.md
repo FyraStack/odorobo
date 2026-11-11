@@ -28,7 +28,7 @@ currently the agents discover each other with libp2p mDNS, look each other up an
 
 ## CH taps
 
-when a VM boots with a routed network attachment, CH creates a tap device on the host and passes it into the VM. the transform pins the tap name (`vmtap-<digest>` of the vmid and network id) so the agent knows the device before the VM boots. right after boot, before the guest can send, the agent enslaves the tap to the network's VRF, stamps the `odorobo <vmid> <network-id>` alias, puts the per-tap gateway (`.1` as a `/32`) on it, and adds the VM's `/32` route plus the anti-spoof rule and `rp_filter`. FRR then picks the route up through that VRF's `redistribute kernel` and announces it to the other agents as an EVPN type-5 route.
+when a VM boots with a routed network attachment, CH creates a tap device on the host and passes it into the VM. the transform pins the tap name (`vmtap-<digest>` of the vmid and network id) so the agent knows the device before the VM boots. right after boot the agent brings the tap down (CH created it up), enslaves it to the network's VRF, stamps the `odorobo <vmid> <network-id>` alias, puts the per-tap gateway (`.1` as a `/32`) on it, installs the anti-spoof rule and `rp_filter`, and only then brings the tap back up: it never forwards before its guard exists. the VM's `/32` route goes in after that, because the kernel rejects a nexthop route whose device is down. FRR then picks the route up through that VRF's `redistribute kernel` and announces it to the other agents as an EVPN type-5 route.
 
 ## Public addresses (planned)
 

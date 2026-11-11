@@ -83,7 +83,7 @@ On startup the network actor does the following, in order:
 3. Creates an nftables table `ip odorobo` with a `guest_nat` postrouting chain and a rule `oifname "<upstream>" masquerade`. The rule matches all traffic leaving the upstream interface, not only traffic from the guest subnet.
 4. Starts `dnsmasq --interface <bridge> --bind-interfaces --dhcp-range ... --dhcp-leasefile <runtime>/dnsmasq.leases --no-daemon` as a child process when `dhcp_config` is set. `dnsmasq` also serves DNS on the gateway address, and its DHCP log lines appear in the agent's journal. The lease file is recreated on every agent start.
 
-When a VM boots, the transform names its TAP device `vmtap-<digest>` (a stable hash of the VM and network ids). Cloud Hypervisor creates the TAP, then the after-boot hook enslaves it to the bridge and brings it up. The before-stop hook detaches it.
+When a VM boots, the transform names its TAP device `vmtap-<digest>` (a stable hash of the VM and network ids). Cloud Hypervisor creates the TAP up; the agent brings it down, enslaves it to the bridge, and only then brings it back up, so it never forwards before it is configured. The before-stop hook brings it down and detaches it.
 
 The agent does **not** enable `net.ipv4.ip_forward`, and it adds no forwarding or input firewall rules. The host must forward IPv4 itself (`sysctl -w net.ipv4.ip_forward=1`), and any host firewall must accept traffic from the bridge.
 
