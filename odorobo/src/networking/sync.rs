@@ -1,8 +1,10 @@
-use std::collections::HashMap;
+use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 
 use crate::messages::network::{NetworkUpdate, SyncNetwork};
 use crate::network::Network;
 use kameo::prelude::ActorId;
+use tracing::info;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SyncDecision {
@@ -46,19 +48,57 @@ struct Owner {
 
 #[derive(Default)]
 pub(super) struct NetworkSyncFence {
+    /// The manager lifetime this node follows.
+    manager: Option<ActorId>,
+    /// Manager lifetimes this node has seen replaced; their updates are refused.
+    retired_managers: HashSet<ActorId>,
     seen: HashMap<String, SeenIntent>,
     owners: HashMap<Resource, Owner>,
 }
 
 impl NetworkSyncFence {
+    /// Decides whether to apply an update; a rejected update leaves the fence unchanged.
     pub fn begin(&mut self, intent: &SyncNetwork) -> Result<SyncDecision, &'static str> {
-        self.adopt_owner(intent)?;
-        let obsolete = self.is_obsolete(&intent.update);
-        self.replay(intent, obsolete)
+        if self.retired_managers.contains(&intent.manager_id) {
+            return Err("the manager that sent this update has been replaced");
+        }
+        let owner = self.adopted_owner(intent)?;
+        let active = owner.as_ref().map_or_else(
+            || self.active_owner(intent.update.network()),
+            |owner| owner.network.as_ref(),
+        );
+        let obsolete = is_obsolete(&intent.update, active);
+        let replayed = self.replayed(intent, obsolete)?;
+
+        self.follow_manager(intent.manager_id);
+        if let Some(owner) = owner {
+            self.owners.insert(resource(intent.update.network()), owner);
+        }
+        if let Some(decision) = replayed {
+            return Ok(decision);
+        }
+        self.seen.insert(
+            intent.update.network().id.clone(),
+            SeenIntent {
+                intent: intent.clone(),
+                applied: obsolete,
+            },
+        );
+        Ok(SyncDecision::resolve(obsolete))
     }
 
-    /// Validates the ownership context and adopts it into the resource fence.
-    fn adopt_owner(&mut self, intent: &SyncNetwork) -> Result<(), &'static str> {
+    /// Retires the previous manager lifetime once a different one is accepted.
+    fn follow_manager(&mut self, manager_id: ActorId) {
+        if let Some(previous) = self.manager.replace(manager_id)
+            && previous != manager_id
+        {
+            info!(%previous, current = %manager_id, "following a new network manager");
+            self.retired_managers.insert(previous);
+        }
+    }
+
+    /// Validates the ownership context; returns the owner to install, if it changes.
+    fn adopted_owner(&self, intent: &SyncNetwork) -> Result<Option<Owner>, &'static str> {
         let key = resource(intent.update.network());
         if intent.owners_revision < intent.revision {
             return Err("network ownership revision precedes the update");
@@ -80,57 +120,33 @@ impl NetworkSyncFence {
             }
             _ => true,
         };
-        if replace_owner {
-            self.owners.insert(
-                key,
-                Owner {
-                    manager_id: intent.manager_id,
-                    revision: intent.owners_revision,
-                    network: intent.active_owner.clone(),
-                },
-            );
-        }
-        Ok(())
+        Ok(replace_owner.then(|| Owner {
+            manager_id: intent.manager_id,
+            revision: intent.owners_revision,
+            network: intent.active_owner.clone(),
+        }))
     }
 
-    /// Returns whether current ownership already covers the update, so it needs no mutation.
-    fn is_obsolete(&self, update: &NetworkUpdate) -> bool {
-        // active owner is already the same as the update
-        let active = self.active_owner(update.network());
-        match update {
-            NetworkUpdate::Ensure(expected) => active != Some(expected),
-            NetworkUpdate::Remove(_) => active.is_some(),
-        }
-    }
-
-    /// Replays the last-seen intent, recording the newest one per network ID.
-    fn replay(
-        &mut self,
+    /// Decides from the same manager's last-seen intent; `None` means the intent is new.
+    fn replayed(
+        &self,
         intent: &SyncNetwork,
         obsolete: bool,
-    ) -> Result<SyncDecision, &'static str> {
-        let id = &intent.update.network().id;
-        if let Some(previous) = self.seen.get(id)
-            && previous.intent.manager_id == intent.manager_id
-        {
-            if previous.intent.revision > intent.revision {
-                return Ok(SyncDecision::Acknowledge);
-            }
-            if previous.intent.revision == intent.revision {
-                if !previous.intent.same_update(intent) {
-                    return Err("conflicting network updates have the same revision");
-                }
-                return Ok(SyncDecision::resolve(previous.applied || obsolete));
-            }
+    ) -> Result<Option<SyncDecision>, &'static str> {
+        let Some(previous) = self.seen.get(&intent.update.network().id) else {
+            return Ok(None);
+        };
+        if previous.intent.manager_id != intent.manager_id {
+            return Ok(None);
         }
-        self.seen.insert(
-            id.clone(),
-            SeenIntent {
-                intent: intent.clone(),
-                applied: obsolete,
-            },
-        );
-        Ok(SyncDecision::resolve(obsolete))
+        match previous.intent.revision.cmp(&intent.revision) {
+            Ordering::Greater => Ok(Some(SyncDecision::Acknowledge)),
+            Ordering::Equal if !previous.intent.same_update(intent) => {
+                Err("conflicting network updates have the same revision")
+            }
+            Ordering::Equal => Ok(Some(SyncDecision::resolve(previous.applied || obsolete))),
+            Ordering::Less => Ok(None),
+        }
     }
 
     pub fn active_owner(&self, network: &Network) -> Option<&Network> {
@@ -145,6 +161,14 @@ impl NetworkSyncFence {
         {
             previous.applied = true;
         }
+    }
+}
+
+/// Whether the active owner already covers the update, so it needs no mutation.
+fn is_obsolete(update: &NetworkUpdate, active: Option<&Network>) -> bool {
+    match update {
+        NetworkUpdate::Ensure(expected) => active != Some(expected),
+        NetworkUpdate::Remove(_) => active.is_some(),
     }
 }
 
@@ -247,5 +271,45 @@ mod tests {
         conflicting.manager_id = ActorId::new(2);
         conflicting.active_owner = None;
         assert_eq!(fence.begin(&conflicting), Ok(SyncDecision::Apply));
+    }
+
+    #[test]
+    fn delayed_work_from_a_replaced_manager_cannot_undo_the_new_one() {
+        let mut fence = NetworkSyncFence::default();
+        let original = ensure(1);
+        assert_eq!(fence.begin(&original), Ok(SyncDecision::Apply));
+        fence.acknowledge(&original);
+
+        let mut restarted = ensure(1);
+        restarted.manager_id = ActorId::new(2);
+        assert_eq!(fence.begin(&restarted), Ok(SyncDecision::Apply));
+        fence.acknowledge(&restarted);
+
+        assert_eq!(
+            fence.begin(&removal(2)),
+            Err("the manager that sent this update has been replaced")
+        );
+        assert_eq!(
+            fence.active_owner(restarted.update.network()),
+            Some(restarted.update.network())
+        );
+    }
+
+    #[test]
+    fn a_rejected_update_leaves_the_fence_unchanged() {
+        let mut fence = NetworkSyncFence::default();
+        let intent = ensure(1);
+        assert_eq!(fence.begin(&intent), Ok(SyncDecision::Apply));
+        let mut conflicting = removal(1);
+        conflicting.owners_revision = 2;
+        assert_eq!(
+            fence.begin(&conflicting),
+            Err("conflicting network updates have the same revision")
+        );
+        assert_eq!(
+            fence.begin(&intent),
+            Ok(SyncDecision::Apply),
+            "the unapplied ensure must still apply after a rejected update"
+        );
     }
 }

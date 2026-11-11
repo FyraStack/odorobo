@@ -24,8 +24,8 @@ struct NodeIdentity {
     fabric: Option<VtepInfo>,
 }
 
-struct Target {
-    actor_ref: RemoteActorRef<NetworkAgentActor>,
+struct Target<R> {
+    actor_ref: R,
     acknowledged: AHashSet<u64>,
     identity: NodeIdentity,
     attempt: u64,
@@ -40,15 +40,28 @@ struct Retirement {
 // damn this really needs a proper etcd sync instead of
 // distributed over libp2p -cappy
 // todo: rewrite to watcher after #109
-#[derive(Default)]
-pub(super) struct NetworkSync {
+pub(super) struct NetworkSync<R = RemoteActorRef<NetworkAgentActor>> {
     revision: u64,
     next_attempt: u64,
     holders: AHashMap<String, AHashMap<ActorId, NodeIdentity>>,
     current: AHashMap<String, SyncNetwork>,
     retired: Vec<Retirement>,
-    targets: AHashMap<ActorId, Target>,
+    targets: AHashMap<ActorId, Target<R>>,
     background: Option<JoinHandle<()>>,
+}
+
+impl<R> Default for NetworkSync<R> {
+    fn default() -> Self {
+        Self {
+            revision: 0,
+            next_attempt: 0,
+            holders: AHashMap::new(),
+            current: AHashMap::new(),
+            retired: Vec::new(),
+            targets: AHashMap::new(),
+            background: None,
+        }
+    }
 }
 
 pub(super) struct NetworkActorDiscovered {
@@ -69,7 +82,7 @@ struct NetworkSyncFinished {
     results: Vec<SyncResult>,
 }
 
-impl NetworkSync {
+impl<R> NetworkSync<R> {
     pub fn start_background(&mut self, parent: ActorRef<SchedulerActor>) {
         self.background = Some(tokio::spawn(async move {
             let mut interval = tokio::time::interval(NETWORK_SYNC_INTERVAL);
@@ -258,6 +271,79 @@ impl NetworkSync {
         }
     }
 
+    /// Applies one attempt's results; only the target's current attempt frees it for a retry.
+    #[tracing::instrument(level = "debug", skip(self, results), fields(actor_id = %actor_id, attempt))]
+    fn finish_attempt(&mut self, actor_id: ActorId, attempt: u64, results: Vec<SyncResult>) {
+        let Some(target) = self.targets.get_mut(&actor_id) else {
+            trace!("network synchronization finished for an unknown actor");
+            return;
+        };
+        if target.attempt == attempt {
+            target.task.take();
+        } else {
+            trace!(
+                current = target.attempt,
+                "recording results from an earlier synchronization attempt"
+            );
+        }
+        for result in results {
+            if !self.applicable(&result.intent) {
+                trace!(
+                    network = %result.intent.update.network().id,
+                    revision = result.intent.revision,
+                    "discarded a result for a superseded network update"
+                );
+                continue;
+            }
+            if let Some(error) = result.error {
+                warn!(%actor_id, network_id = %result.intent.update.network().id,
+                    revision = result.intent.revision, %error, "network synchronization will retry");
+            } else {
+                self.acknowledge(actor_id, &result.intent);
+                info!(%actor_id, network_id = %result.intent.update.network().id,
+                    revision = result.intent.revision, "network update acknowledged");
+            }
+        }
+    }
+
+    #[tracing::instrument(level = "debug", skip(self), fields(actor_id = %actor_id))]
+    pub fn remove_target(&mut self, actor_id: ActorId) {
+        let quarantined = self
+            .holders
+            .values()
+            .filter(|holders| holders.contains_key(&actor_id))
+            .count();
+        if let Some(mut target) = self.targets.remove(&actor_id) {
+            trace!(
+                node_id = ?target.identity.node_id,
+                acknowledged = target.acknowledged.len(),
+                quarantined,
+                "removed a network actor"
+            );
+            if let Some(task) = target.task.take() {
+                task.abort();
+            }
+        }
+    }
+
+    #[tracing::instrument(level = "debug", skip(self))]
+    pub async fn stop(&mut self) {
+        if let Some(task) = self.background.take() {
+            task.abort();
+            _ = task.await;
+        }
+        let targets = self.targets.len();
+        for (_, mut target) in self.targets.drain() {
+            if let Some(task) = target.task.take() {
+                task.abort();
+                _ = task.await;
+            }
+        }
+        info!(targets, "network synchronization stopped");
+    }
+}
+
+impl NetworkSync {
     #[tracing::instrument(level = "debug", skip(self, intent), fields(network = %intent.update.network().id, revision = intent.revision))]
     pub async fn send(&mut self, intent: &SyncNetwork) -> Vec<String> {
         let unidentified: Vec<_> = self
@@ -352,7 +438,9 @@ impl NetworkSync {
             }));
         }
     }
+}
 
+impl<R> NetworkSync<R> {
     #[tracing::instrument(level = "debug", skip(self, identity), fields(actor_id = %actor_id))]
     fn update_identity(&mut self, actor_id: ActorId, identity: &NodeIdentity) {
         if identity.node_id.is_none() && identity.fabric.is_none() {
@@ -399,42 +487,6 @@ impl NetworkSync {
         for intent in completed {
             self.acknowledge(actor_id, &intent);
         }
-    }
-
-    #[tracing::instrument(level = "debug", skip(self), fields(actor_id = %actor_id))]
-    pub fn remove_target(&mut self, actor_id: ActorId) {
-        let quarantined = self
-            .holders
-            .values()
-            .filter(|holders| holders.contains_key(&actor_id))
-            .count();
-        if let Some(mut target) = self.targets.remove(&actor_id) {
-            trace!(
-                node_id = ?target.identity.node_id,
-                acknowledged = target.acknowledged.len(),
-                quarantined,
-                "removed a network actor"
-            );
-            if let Some(task) = target.task.take() {
-                task.abort();
-            }
-        }
-    }
-
-    #[tracing::instrument(level = "debug", skip(self))]
-    pub async fn stop(&mut self) {
-        if let Some(task) = self.background.take() {
-            task.abort();
-            _ = task.await;
-        }
-        let targets = self.targets.len();
-        for (_, mut target) in self.targets.drain() {
-            if let Some(task) = target.task.take() {
-                task.abort();
-                _ = task.await;
-            }
-        }
-        info!(targets, "network synchronization stopped");
     }
 }
 
@@ -610,39 +662,9 @@ impl Message<ReconcileNetworks> for SchedulerActor {
 impl Message<NetworkSyncFinished> for SchedulerActor {
     type Reply = ();
 
-    #[tracing::instrument(level = "debug", skip(self, msg, _ctx), fields(actor_id = %msg.actor_id, attempt = msg.attempt))]
     async fn handle(&mut self, msg: NetworkSyncFinished, _ctx: &mut Context<Self, Self::Reply>) {
-        let Some(target) = self.network_sync.targets.get_mut(&msg.actor_id) else {
-            trace!("network synchronization finished for an unknown actor");
-            return;
-        };
-        if target.attempt != msg.attempt {
-            trace!(
-                attempt = msg.attempt,
-                current = target.attempt,
-                "discarded a stale synchronization attempt"
-            );
-            return;
-        }
-        target.task.take();
-        for result in msg.results {
-            if !self.network_sync.applicable(&result.intent) {
-                trace!(
-                    network = %result.intent.update.network().id,
-                    revision = result.intent.revision,
-                    "discarded a result for a superseded network update"
-                );
-                continue;
-            }
-            if let Some(error) = result.error {
-                warn!(actor_id = %msg.actor_id, network_id = %result.intent.update.network().id,
-                    revision = result.intent.revision, %error, "network synchronization will retry");
-            } else {
-                self.network_sync.acknowledge(msg.actor_id, &result.intent);
-                info!(actor_id = %msg.actor_id, network_id = %result.intent.update.network().id,
-                    revision = result.intent.revision, "network update acknowledged");
-            }
-        }
+        self.network_sync
+            .finish_attempt(msg.actor_id, msg.attempt, msg.results);
     }
 }
 
@@ -665,9 +687,50 @@ mod tests {
         }
     }
 
+    fn target(attempt: u64, task: Option<JoinHandle<()>>) -> Target<()> {
+        Target {
+            actor_ref: (),
+            acknowledged: AHashSet::new(),
+            identity: NodeIdentity::default(),
+            attempt,
+            task,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_retry_started_before_the_previous_completion_keeps_its_acknowledgements() {
+        let mut sync = NetworkSync::<()>::default();
+        let update = sync.publish(ActorId::new(1), NetworkUpdate::Ensure(network()));
+        let actor_id = ActorId::new(7);
+        sync.targets
+            .insert(actor_id, target(2, Some(tokio::spawn(async {}))));
+        let acknowledged = vec![SyncResult {
+            intent: update.clone(),
+            error: None,
+        }];
+
+        sync.finish_attempt(actor_id, 1, acknowledged);
+        assert!(
+            sync.targets[&actor_id]
+                .acknowledged
+                .contains(&update.revision)
+        );
+        assert!(
+            sync.targets[&actor_id].task.is_some(),
+            "an earlier attempt must not free the retry that replaced it"
+        );
+        assert_eq!(
+            sync.pending(&sync.targets[&actor_id].acknowledged),
+            Vec::<SyncNetwork>::new()
+        );
+
+        sync.finish_attempt(actor_id, 2, Vec::new());
+        assert!(sync.targets[&actor_id].task.is_none());
+    }
+
     #[test]
     fn only_acknowledged_revisions_leave_the_retry_plan() {
-        let mut sync = NetworkSync::default();
+        let mut sync = NetworkSync::<()>::default();
         let update = sync.publish(ActorId::new(1), NetworkUpdate::Ensure(network()));
         let mut acknowledged = AHashSet::new();
         assert_eq!(sync.pending(&acknowledged), vec![update.clone()]);
@@ -678,7 +741,7 @@ mod tests {
 
     #[test]
     fn retirement_precedes_recreation_and_old_results_cannot_acknowledge_it() {
-        let mut sync = NetworkSync::default();
+        let mut sync = NetworkSync::<()>::default();
         let original = sync.publish(ActorId::new(1), NetworkUpdate::Ensure(network()));
         let removed = sync.publish(ActorId::new(1), NetworkUpdate::Remove(network()));
         sync.retire(removed.clone());
@@ -696,7 +759,7 @@ mod tests {
 
     #[test]
     fn provider_transition_does_not_assign_a_routed_owner_to_a_bridged_retirement() {
-        let mut sync = NetworkSync::default();
+        let mut sync = NetworkSync::<()>::default();
         let mut bridged = network();
         bridged.provider = NetworkProvider::Bridged;
         bridged.state = None;
@@ -711,7 +774,7 @@ mod tests {
 
     #[test]
     fn disconnected_holders_keep_the_vni_quarantined() {
-        let mut sync = NetworkSync::default();
+        let mut sync = NetworkSync::<()>::default();
         let original = sync.publish(ActorId::new(1), NetworkUpdate::Ensure(network()));
         sync.holders
             .entry(original.update.network().id.clone())
@@ -742,7 +805,7 @@ mod tests {
             ActorId::new(9),
             &identity
         ));
-        let mut sync = NetworkSync::default();
+        let mut sync = NetworkSync::<()>::default();
         sync.holders
             .entry("sync-test".to_owned())
             .or_default()

@@ -1061,13 +1061,10 @@ async fn publish_ports(vmid: ulid::Ulid, manifest: &VmManifest) {
         if network.ports.is_empty() {
             continue;
         }
-        let Some(mac_address) = network.mac_address.as_deref() else {
-            continue;
-        };
         if let Err(err) = actor
             .ask(PublishPorts {
                 vmid,
-                mac_address: mac_address.to_owned(),
+                mac_address: network.mac(manifest.id),
                 ports: network.ports.clone(),
             })
             .await
@@ -1081,7 +1078,7 @@ async fn publish_ports(vmid: ulid::Ulid, manifest: &VmManifest) {
 struct NicPlan {
     network_id: String,
     tap_name: String,
-    mac_address: Option<String>,
+    mac_address: String,
     address: Option<Ipv4Addr>,
     gateway: Option<Ipv4Addr>,
     netmask: Option<Ipv4Addr>,
@@ -1124,7 +1121,7 @@ async fn resolve_nics(vmid: ulid::Ulid, manifest: Option<&VmManifest>) -> Result
                 NicPlan {
                     network_id: network.id.clone(),
                     tap_name: deterministic_tap_name(&vmid.to_string(), &network.id),
-                    mac_address: nic.mac_address.clone(),
+                    mac_address: nic.mac(manifest.id),
                     address: Some(address),
                     gateway: Some(network.gateway()),
                     netmask: Some(network.subnet.netmask()),
@@ -1142,7 +1139,7 @@ async fn resolve_nics(vmid: ulid::Ulid, manifest: Option<&VmManifest>) -> Result
                 NicPlan {
                     network_id: network.id.clone(),
                     tap_name: deterministic_tap_name(&vmid.to_string(), &network.id),
-                    mac_address: nic.mac_address.clone(),
+                    mac_address: nic.mac(manifest.id),
                     address: None,
                     gateway: None,
                     netmask: None,
@@ -1161,18 +1158,15 @@ fn guest_nic_options(
 ) -> Result<Vec<crate::ch_driver::containers::GuestNicOptions>> {
     let mut options = Vec::new();
     for plan in plans {
-        let (Some(address), Some(gateway), Some(netmask), Some(mac_address)) = (
-            plan.address,
-            plan.gateway,
-            plan.netmask,
-            plan.mac_address.as_ref(),
-        ) else {
+        let (Some(address), Some(gateway), Some(netmask)) =
+            (plan.address, plan.gateway, plan.netmask)
+        else {
             continue;
         };
         let prefix_len = u8::try_from(u32::from(netmask).count_ones())
             .map_err(|_| eyre!("netmask {netmask} has more bits than a prefix can hold"))?;
         options.push(crate::ch_driver::containers::GuestNicOptions {
-            mac_address: mac_address.clone(),
+            mac_address: plan.mac_address.clone(),
             address,
             prefix_len,
             gateway,

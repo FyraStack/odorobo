@@ -120,7 +120,7 @@ Add the network to the manifest. The ID becomes the TAP name suffix and may cont
 "networks": [{ "id": "devnet", "mac_address": "46:59:52:67:67:67" }]
 ```
 
-Omit `mac_address` unless you need a fixed address. Two VMs on the same bridge with the same MAC receive the same lease and conflict.
+Without `mac_address` the agent derives one from the VM and network IDs: `46:59:52` followed by three digest bytes. It stays the same across restarts, so the guest keeps its DHCP lease. Set `mac_address` to choose the MAC yourself; two VMs on the same bridge with the same MAC receive the same lease and conflict.
 
 ### Guest configuration
 
@@ -134,19 +134,18 @@ The console then shows `IP-Config: Got DHCP answer from 10.10.100.1`, with the g
 
 ### Publishing container ports
 
-OCI-mode VMs can publish guest ports on the host. Add `ports` to a network that already has a `mac_address`; entries use `<host>:<guest>` with an optional `/udp` suffix.
+OCI-mode VMs can publish guest ports on the host. Add `ports` to a network; entries use `<host>:<guest>` with an optional `/udp` suffix.
 
 ```json
 "networks": [
   {
     "id": "devnet",
-    "mac_address": "46:59:52:67:67:67",
     "ports": ["8080:80", "5353:53/udp"]
   }
 ]
 ```
 
-Publishing only applies to VMs with a `rootfs`; a plain VM manifest that sets `ports` is rejected, as is a network without a MAC or a host port published twice for the same protocol. The same host port may be used by TCP and UDP independently.
+Publishing only applies to VMs with a `rootfs`; a plain VM manifest that sets `ports` is rejected, as is a host port published twice for the same protocol. The same host port may be used by TCP and UDP independently.
 
 After the VM boots, the agent starts a background task that polls the dnsmasq lease file for the VM's MAC, then adds DNAT rules to a `container_dnat` prerouting chain (`priority -100`) in the `ip odorobo` table. Publishing gives up after 15 seconds and logs a warning; the VM keeps running. Rules are tagged `odorobo container <vmid> <mapping>` and are removed when the VM stops, even if its TAP already disappeared. Rules left behind by a killed agent are cleared at startup.
 

@@ -40,7 +40,7 @@ pub fn to_vm_config(manifest: &VmManifest) -> Result<VmConfig> {
         .iter()
         .map(|network| NetConfig {
             id: Some(format!("net://{}", network.id)),
-            mac: network.mac_address.clone(),
+            mac: Some(network.mac(manifest.id)),
             ..Default::default()
         })
         .collect::<Vec<_>>();
@@ -320,10 +320,19 @@ mod tests {
             address: None,
             ports: Vec::new(),
         });
+        manifest.desired.networks.push(crate::manifest::Nic {
+            id: "public".to_owned(),
+            ..Default::default()
+        });
         let config = to_vm_config(&manifest).expect("network manifest converts");
-        let network = &config.net.expect("network config")[0];
-        assert_eq!(network.id.as_deref(), Some("net://private"));
-        assert_eq!(network.mac.as_deref(), Some("02:00:00:00:00:01"));
+        let networks = config.net.expect("network config");
+        assert_eq!(networks[0].id.as_deref(), Some("net://private"));
+        assert_eq!(networks[0].mac.as_deref(), Some("02:00:00:00:00:01"));
+        assert_eq!(
+            networks[1].mac,
+            Some(manifest.desired.networks[1].mac(manifest.id)),
+            "a NIC without a requested MAC reaches Cloud Hypervisor with the derived one"
+        );
     }
 
     #[test]

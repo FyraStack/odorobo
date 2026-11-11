@@ -149,7 +149,7 @@ impl Actor for DhcpActor {
 struct Member {
     vmid: Ulid,
     tap_name: String,
-    mac_address: Option<String>,
+    mac_address: String,
     address: Option<Ipv4Addr>,
 }
 
@@ -1702,17 +1702,21 @@ impl NetworkAgentActor {
         for entry in self.networks.values() {
             match &entry.realized {
                 Realized::Routed(state) => {
-                    if let Some(member) = state.members.iter().find(|member| {
-                        member.vmid == vmid && member.mac_address.as_deref() == Some(mac_address)
-                    }) && let Some(address) = member.address
+                    if let Some(member) = state
+                        .members
+                        .iter()
+                        .find(|member| member.vmid == vmid && member.mac_address == mac_address)
+                        && let Some(address) = member.address
                     {
                         return PublishTarget::Static(address);
                     }
                 }
                 Realized::Bridged(state) => {
-                    if state.members.iter().any(|member| {
-                        member.vmid == vmid && member.mac_address.as_deref() == Some(mac_address)
-                    }) {
+                    if state
+                        .members
+                        .iter()
+                        .any(|member| member.vmid == vmid && member.mac_address == mac_address)
+                    {
                         return PublishTarget::Lease(state.lease_file.clone());
                     }
                 }
@@ -2674,7 +2678,7 @@ mod tests {
                 vmid: "01ARZ3NDEKTSV4RRFFQ69G5FAV".parse()?,
                 network_id: network.id.clone(),
                 tap_name: "vmtap-test".to_owned(),
-                mac_address: None,
+                mac_address: "46:59:52:00:00:01".to_owned(),
                 address: Some("10.40.10.6".parse()?),
             })
             .await
@@ -2752,7 +2756,7 @@ mod tests {
                 vmid,
                 network_id: network.id.clone(),
                 tap_name: tap.to_owned(),
-                mac_address: None,
+                mac_address: "46:59:52:00:00:02".to_owned(),
                 address: Some(address),
             })
             .await

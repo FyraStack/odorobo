@@ -250,8 +250,15 @@ interfaces and an FRR VRF on every agent.
 ## Synchronization recovery
 
 The manager retries unacknowledged updates every five seconds. A successful node reply stops that
-revision's retries; a restarted network actor gets fresh acknowledgement state. Updates carry the
-manager lifetime and operation revision, and the node rejects conflicting or stale work.
+revision's retries, even when it arrives after a newer retry attempt has started; a restarted network
+actor gets fresh acknowledgement state. Updates carry the manager lifetime and operation revision,
+and the node rejects conflicting or stale work. A rejected update changes nothing on the node.
+
+A node follows the last manager lifetime it accepted an update from. Once a new manager (for
+example after a manager restart) reaches it, the node refuses every later update from the previous
+one, so delayed retries from a dead manager cannot undo the new manager's networks. A second live
+manager would see its updates refused with `the manager that sent this update has been replaced`.
+The node forgets which managers it has replaced when its agent restarts.
 
 A failed create schedules cleanup of any partial realization. A failed delete restores the retained
 network on nodes that already removed it. Cleanup keeps the old network metadata and current VNI

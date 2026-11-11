@@ -20,8 +20,8 @@ pub struct AttachNic {
     pub network_id: String,
     /// Host TAP device name created for this VM by Cloud Hypervisor.
     pub tap_name: String,
-    /// MAC address used for DHCP lease lookups on bridged networks.
-    pub mac_address: Option<String>,
+    /// Guest MAC; matches published ports to this NIC and DHCP leases on bridged networks.
+    pub mac_address: String,
     /// Static guest address; required on routed networks.
     pub address: Option<Ipv4Addr>,
 }
